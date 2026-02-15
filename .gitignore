@@ -1,17 +1,23 @@
-<<<<<<< HEAD
-# 忽略所有数据文件
+# ===================== Project-specific =====================
+# 数据文件
 *.h5ad
 *.csv
 *.tsv
 *.bam
 *.fastq.gz
 data/
+
+# IDE / 编辑器
 .cursor/
+.vscode/
+
+# 运行产物
 results/
+
+# 参考仓库（只读，不入版本控制）
 references/
 
-=======
->>>>>>> e257a371e45d7bf7970f427fff1e55cb782153c4
+# ===================== Python gitignore =====================
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
