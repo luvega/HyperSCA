@@ -1,0 +1,11 @@
+{
+  "figure": "segmentation_quality.png",
+  "created": "2026-02-15T17:27:18",
+  "dpi": 200,
+  "data_version": "",
+  "model_version": "",
+  "seed": null,
+  "config": {
+    "chart": "segmentation_quality_3panel"
+  }
+}

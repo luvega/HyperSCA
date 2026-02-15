@@ -1,0 +1,12 @@
+{
+  "figure": "spatial_graph_region.png",
+  "created": "2026-02-15T17:27:00",
+  "dpi": 200,
+  "data_version": "",
+  "model_version": "",
+  "seed": null,
+  "config": {
+    "chart": "spatial_graph_colored",
+    "label": "Tissue Region"
+  }
+}

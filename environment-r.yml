@@ -1,0 +1,30 @@
+# =============================================================================
+# HyperSCA - R 环境依赖配置 (仅作参考，不在 Python 环境搭建中安装)
+#
+# 安装方式: conda env create -f environment-r.yml
+# 或在现有 R 环境中手动安装以下 R 包
+# =============================================================================
+
+name: hypersca-r
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+
+dependencies:
+  - r-base>=4.2
+  - r-seurat>=5.0
+  - r-reticulate
+  - r-arrow            # R <-> Python parquet 交互
+  - r-devtools
+  - r-ggplot2
+  - r-dplyr
+  - r-tidyverse
+
+  # Bioconductor 包 (需在 R 中通过 BiocManager 安装)
+  # BiocManager::install(c("CellChat", "nichenetr", "SingleCellExperiment", "ComplexHeatmap"))
+  #
+  # CellChat:    细胞通讯推断 (配体-受体)
+  # nichenetr:   NicheNet 配体活性预测
+  # SingleCellExperiment: Bioconductor 单细胞数据结构
+  # ComplexHeatmap: 高级热图可视化

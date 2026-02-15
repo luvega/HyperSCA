@@ -1,0 +1,57 @@
+# =============================================================================
+# HyperSCA - Core Dependencies (Layer A + B)
+# 安装顺序: 先装此文件, 再装 requirements-research.txt
+#
+# 环境: Python 3.10, CUDA 12.4 (RTX 3070)
+# PyTorch 需要从官方 index 安装, 见下方 --extra-index-url
+# =============================================================================
+
+# ---------- A1. 科学计算基础 ----------
+numpy
+scipy
+pandas
+scikit-learn
+matplotlib
+seaborn
+h5py
+pyyaml
+tqdm
+leidenalg
+igraph
+
+# ---------- A2. 单细胞 / 空间生态 ----------
+anndata
+scanpy
+squidpy
+scvi-tools
+
+# ---------- A3. 深度学习主栈 ----------
+# PyTorch + CUDA 12.4 (从官方 index 安装)
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+torch
+torchvision
+torchaudio
+
+# ---------- A4. 图学习 ----------
+# PyG 核心 + 依赖组件 (需与 torch 版本对齐)
+# pip install torch-geometric -f https://data.pyg.org/whl/torch-2.6.0+cu124.html
+torch-geometric
+torch-scatter
+torch-sparse
+torch-cluster
+torch-spline-conv
+
+# ---------- A5. 双曲几何 ----------
+geoopt
+
+# ---------- B1. 因果推断 ----------
+dowhy
+econml
+
+# ---------- B2. 图 / 概率建模辅助 ----------
+networkx
+pgmpy
+
+# ---------- B3. 统计检验 ----------
+statsmodels
+pingouin

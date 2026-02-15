@@ -1,0 +1,11 @@
+{
+  "figure": "area_hist.png",
+  "created": "2026-02-15T17:27:17",
+  "dpi": 200,
+  "data_version": "",
+  "model_version": "",
+  "seed": null,
+  "config": {
+    "chart": "area_hist_basic"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "figure": "fig_celltype.png",
+  "created": "2026-02-15T17:26:56",
+  "dpi": 200,
+  "data_version": "",
+  "model_version": "",
+  "seed": null,
+  "config": {
+    "chart": "celltype_bar_level1"
+  }
+}
