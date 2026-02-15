@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # 忽略所有数据文件
 *.h5ad
 *.csv
@@ -5,7 +6,12 @@
 *.bam
 *.fastq.gz
 data/
+.cursor/
+results/
+references/
 
+=======
+>>>>>>> e257a371e45d7bf7970f427fff1e55cb782153c4
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

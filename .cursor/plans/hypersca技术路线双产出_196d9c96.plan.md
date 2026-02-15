@@ -28,8 +28,10 @@ isProject: false
 
 ## 已完成调研要点（用于指导产出）
 
-- 第一步（Embedding）可优先复用：`TopoLa`（拓扑增强邻接）+ `scDHMap`（双曲 VAE/双曲距离工具）。
-- 第二、三步（Causal + Counterfactual）建议主干：`FlowSig` 做空间因果结构学习，`DoWhy` 做识别与可证伪验证，`CPA/scGen` 做扰动预测，`CausCell/Squidiff/DynPerturb` 作为增强层。
+- **阶段1（Embedding）** 可优先复用：`TopoLa`（拓扑增强邻接）+ `scDHMap`（双曲 VAE/双曲距离工具）。
+- **阶段2（Causal Disentanglement）** 主干：`celcomen`（G2G 因果解缠，Z_int/Z_ext 分离）+ `FlowSig`（空间因果结构学习）+ `DoWhy`（因果识别与可证伪验证）。
+- **阶段3（Counterfactual Generation）** 主干：`CausCell`（因果约束条件扩散反事实生成）+ `CPA/scGen`（潜空间扰动算术）；`Squidiff`、`DynPerturb` 作为增强层。
+- **先验信号通路数据库**：下载整合 `LIANA`（统一细胞通讯推断接口）、`NicheNet`（配体→受体→TF→靶基因先验网络）、`OmniPath`（蛋白互作/TF-靶基因/信号通路综合数据库）。三者在阶段2为因果结构学习提供先验约束（先验图、配受体对、TF-target 网络），在阶段3为反事实验证提供 pathway-level 生物学基准。
 - 当前环境已满足 P0/P1 的主要依赖（PyTorch、scanpy、geoopt、dowhy、scgen、diffusers 等）。
 
 ## 交付物 A：学术化技术路线文档

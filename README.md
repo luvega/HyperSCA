@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # HyperSCA: Hyperbolic Spatiotemporal Causal Analysis
 
 [![PyPI version](https://badge.fury.io/py/hypersca.svg)](https://badge.fury.io/py/hypersca)
@@ -35,3 +36,7 @@ It uniquely combines:
 ### Install from PyPI (Coming Soon)
 ```bash
 pip install hypersca
+=======
+# HyperSCA
+Source code for HyperSCA framework
+>>>>>>> e257a371e45d7bf7970f427fff1e55cb782153c4
