@@ -17,6 +17,10 @@ results/
 # 参考仓库（只读，不入版本控制）
 references/
 
+# 临时进度与草稿文档
+HyperSCA技术路线-v0.1.md
+SETUP_PROGRESS_*.md
+
 # ===================== Python gitignore =====================
 # Byte-compiled / optimized / DLL files
 __pycache__/
