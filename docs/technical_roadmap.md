@@ -1,7 +1,53 @@
 # HyperSCA 技术路线文档
 
 **Hyperbolic Spatiotemporal Causal Analysis (HyperSCA)**
-*版本: v1.0 | 日期: 2026-02-15*
+*版本: v2.0 | 日期: 2026-02-15 | 上次更新: 2026-02-15*
+
+---
+
+## 当前实现状态
+
+> 本节基于仓库代码与数据事实，标注各组件的落地程度。文档后续章节中的算法描述为**设计路线**，不代表已全部实现。
+
+### 已完成（可运行并验证）
+
+| 组件 | 代码位置 | 验证方式 |
+|------|----------|----------|
+| 四模态数据加载与校验 | `src/data/loaders.py`, `src/data/validators.py` | 4/4 Example 脚本退出码 0 |
+| Chromium scRNA-seq 元数据 QC | `src/examples/metadata_qc.py` | `results/examples/example01/` |
+| Visium 空间 k-NN 图构建 | `src/examples/spatial_graph.py` | `results/examples/example02/` |
+| VisiumHD 细胞/核分割统计 | `src/examples/segmentation_stats.py` | `results/examples/example03/` |
+| Xenium 基因面板摘要 | `src/examples/gene_panel_summary.py` | `results/examples/example04/` |
+| 统一绘图风格系统 | `src/utils/plot_style.py` | 所有 `.png` 附带 `.meta.json` |
+| 增强可视化模板（14 种图型） | `src/examples/*.py` | 嵌套条形/Sunburst/空间着色/NC Ratio/面板 Dashboard 等 |
+
+### 已有框架（Skeleton，可接入真实数据）
+
+| 组件 | 代码位置 | 函数数量 | 当前行为 |
+|------|----------|----------|----------|
+| Phase 1 双曲嵌入可视化 | `src/visualization/hyperbolic.py` | 5 | 传入 None 时显示占位图 |
+| Phase 2 因果图可视化 | `src/visualization/causal.py` | 5 | 传入 None 时显示占位图 |
+| Phase 3 扰动可视化 | `src/visualization/perturbation.py` | 5 | 传入 None 时显示占位图 |
+
+### 待实现（规划中，无可运行代码）
+
+| 模块 | 规划位置 | 前置条件 |
+|------|----------|----------|
+| TopoLa 拓扑增强 | `src/data/spatial_graph.py` | 基础 k-NN 图已就绪（`src/examples/spatial_graph.py`） |
+| Hyperbolic VAE | `src/models/hyperbolic/` | 需表达矩阵 `.h5ad` + 空间坐标 |
+| 因果解缠 + CMI 剪枝 | `src/causal/` | 需阶段 1 双曲嵌入输出 |
+| 扰动算术 + 扩散反事实 | `src/perturbation/` | 需阶段 2 因果图 + 阶段 1 训练后解码器 |
+| 评估指标（全部） | `src/evaluation/` | 需对应阶段模型输出 |
+| 阶段流水线编排 | `src/pipeline/` | 需以上所有模块 |
+
+### 数据现状
+
+| 数据集 | 当前可用文件 | 阶段 1-3 额外需求 |
+|--------|-------------|-------------------|
+| Chromium scRNA-seq | `cell_metadata.csv`（279,609 细胞） | 表达矩阵 `.h5ad`（含 raw counts） |
+| Visium ST | `tissue_positions.csv` + `scalefactors_json.json`（4,269 in-tissue spots） | 表达矩阵 `.h5ad` |
+| VisiumHD | `cell_segmentations.geojson` + `nucleus_segmentations.geojson`（220,704 细胞） | 表达矩阵 `.h5ad` |
+| Xenium | `experiment.xenium` + `gene_panel.json`（422 gene targets, 340,837 细胞） | 转录本矩阵 |
 
 ---
 
@@ -51,27 +97,59 @@ HyperSCA 旨在：
 
 ## 2. 方法总览
 
-HyperSCA 框架分为三个递进阶段，每一阶段的输出构成下一阶段的输入：
+HyperSCA 框架分为 **Phase 0（数据底座）** 和 **三个递进算法阶段**，每一阶段的输出构成下一阶段的输入：
 
 ```
-阶段 1: 双曲流形嵌入与多模态数据融合
+Phase 0: 数据基线与可视化底座 ✅ 已完成
+  能力: 四模态数据加载 / 空间 k-NN 图 / 元数据 QC / 统一绘图风格
+  代码: src/data/, src/examples/, src/utils/plot_style.py
+  验收: scripts/run_examples_all.py → 4/4 通过
+
+阶段 1: 双曲流形嵌入与多模态数据融合 ⏳ 规划中
   输入: scRNA-seq (X) + ST 空间坐标 (S) + 基因表达 (X_st)
   输出: 双曲潜变量 z ∈ H^d_K, 增强邻接矩阵 Ã
+  前置: 需补齐 .h5ad 表达矩阵
 
-阶段 2: 空间约束下的因果通讯网络构建
+阶段 2: 空间约束下的因果通讯网络构建 ⏳ 规划中
   输入: z, Ã, 配受体数据库 (CellChatDB / CellPhoneDB)
   输出: 因果细胞图 G_causal, 多层信号流
+  前置: 需阶段 1 输出 + 配体-受体数据库版本冻结
 
-阶段 3: 微环境演化的扰动模拟与反事实预测
+阶段 3: 微环境演化的扰动模拟与反事实预测 ⏳ 规划中
   输入: G_causal, 训练后的 H-VAE 或 Diffusion 模型, 靶基因列表
   输出: 反事实基因表达谱, 空间传播预测图
+  前置: 需阶段 1+2 完整输出
 ```
+
+### 当前可运行范围
+
+Phase 0 已通过验收（`results/examples/run_log.txt` 显示 Passed: 4/4），提供以下可复用能力：
+
+- **数据加载**: `load_chromium_meta()`, `load_visium_spatial()`, `load_visiumhd_geojson()`, `load_xenium_meta()`
+- **空间图构建**: `build_knn_edges(coords, k=6)` 基于 scipy KDTree，输出 `(source, target, distance)` 边表
+- **统一绘图**: `src/utils/plot_style.py` 提供 colorblind-friendly 色板、`save_figure()` 自动生成 `.meta.json`
+- **可视化模板**: 14 种图型覆盖细胞类型层级、空间着色、分割质量、面板组成等
+- **可视化 Skeleton**: `src/visualization/` 下 15 个占位函数，接口固定，数据就绪后直接填充
 
 ---
 
 ## 3. 阶段 1：双曲流形嵌入与多模态数据融合
 
-### 3.1 概述
+### 3.1 当前仓库状态
+
+| 子组件 | 状态 | 代码位置 |
+|--------|------|----------|
+| 基础 k-NN 空间图（k=6） | **已实现** | `src/examples/spatial_graph.py` — `build_knn_edges()` |
+| 空间图统计与可视化 | **已实现** | `plot_spatial_graph()`, `plot_spatial_graph_colored()`, `plot_edge_distance_distribution()` |
+| Poincaré 圆盘可视化 | **Skeleton** | `src/visualization/hyperbolic.py` — `plot_poincare_disk()` |
+| Hyperboloid 3D 可视化 | **Skeleton** | `src/visualization/hyperbolic.py` — `plot_hyperboloid_3d()` |
+| 径向分支与指标 Dashboard | **Skeleton** | `src/visualization/hyperbolic.py` — `plot_radial_branch()`, `plot_embedding_metrics_dashboard()` |
+| TopoLa 拓扑增强 | **待实现** | 规划位置: `src/data/spatial_graph.py` |
+| Hyperbolic VAE 模型 | **待实现** | 规划位置: `src/models/hyperbolic/hvae.py` |
+| Lorentz / Poincaré 工具 | **待实现** | 规划位置: `src/models/hyperbolic/lorentz.py`, `poincare.py` |
+| Wrapped Normal 分布 | **待实现** | 规划位置: `src/models/hyperbolic/wrapped_normal.py` |
+
+### 3.2 目标与概述
 
 **目标**：克服欧氏空间在表征细胞发育层级（Hierarchies）和复杂拓扑结构时的畸变问题，构建保真度更高的低维潜在空间，整合 scRNA-seq 转录组特征与 ST 空间邻域信息。
 
@@ -83,13 +161,15 @@ HyperSCA 框架分为三个递进阶段，每一阶段的输出构成下一阶�
 - 双曲嵌入 $\{\mathbf{z}_i\}_{i=1}^N \subset \mathbb{H}^d_K$
 - TopoLa 增强邻接矩阵 $\tilde{\mathbf{A}}$
 
-### 3.2 空间邻域图构建与拓扑增强
+### 3.3 空间邻域图构建与拓扑增强
 
-#### 3.2.1 基础图构建
+#### 3.3.1 基础图构建（已实现）
 
 利用 ST 数据的物理坐标 $\mathbf{S}$，以 k-nearest neighbors（$k = 6 \sim 15$）或 Delaunay 三角剖分构建空间邻域图 $\mathcal{G} = (\mathcal{V}, \mathcal{E})$，初始邻接矩阵为 $\mathbf{A}$。
 
-#### 3.2.2 TopoLa 拓扑编码增强
+> **已实现**: `src/examples/spatial_graph.py` 中的 `build_knn_edges(coords, k)` 基于 `scipy.spatial.KDTree`，已在 Visium 数据上验证（4,269 spots, k=6, 25,614 边）。输出边表保存于 `results/examples/example02/knn_edges.csv`。
+
+#### 3.3.2 TopoLa 拓扑编码增强（规划中）
 
 为避免仅基于距离的伪连接，引入 TopoLa（Topology-encoding distance）策略。其核心思想是通过加权偶数跳路径（even-hop paths）量化细胞间的几何结构相似性，从而将拓扑信息编码至邻接矩阵中。
 
@@ -107,11 +187,11 @@ $$\tilde{\mathbf{A}} = \mathbf{U} \tilde{\boldsymbol{\Sigma}} \mathbf{V}^T$$
 
 该变换增强高阶拓扑相似的边权、抑制拓扑不一致的伪连接。
 
-**参考实现**：`TopoLa` 框架（`references/TopoLa/`），核心函数 `TopoLa(A, lambda_val)` 位于 `utils_TopoLa.py`。
+> **参考实现**（仅参考，不直接 import）：`references/TopoLa/` 中 `utils_TopoLa.py` 的 `TopoLa(A, lambda_val)` 函数。将通过 adapter 模式重写至 `src/data/spatial_graph.py`。
 
-### 3.3 双曲变分自编码器 (Hyperbolic VAE)
+### 3.4 双曲变分自编码器 (Hyperbolic VAE)（规划中）
 
-#### 3.3.1 双曲空间选择
+#### 3.4.1 双曲空间选择
 
 采用 **Lorentz 模型** $\mathbb{L}^d = \{ \mathbf{x} \in \mathbb{R}^{d+1} : \langle \mathbf{x}, \mathbf{x} \rangle_{\mathcal{L}} = -1/K \}$ 作为潜空间的主计算模型（数值更稳定），通过微分同胚映射至 **Poincaré 球** $\mathbb{B}^d_c$ 用于可视化：
 
@@ -119,7 +199,7 @@ $$\phi_{\mathbb{L} \to \mathbb{B}}(\mathbf{x}) = \frac{(x_1, \dots, x_d)}{x_0 + 
 
 双曲空间的关键性质——面积/体积随离原点距离指数增长——使其天然适合嵌入树状分支结构（如 T 细胞分化谱系），且低维即可保持低畸变。
 
-#### 3.3.2 编码器 (Encoder)
+#### 3.4.2 编码器 (Encoder)
 
 编码器由两条通路组成：
 
@@ -135,7 +215,7 @@ $$\text{Exp}_{\mathbf{o}}(\mathbf{v}) = \cosh(\|\mathbf{v}\|_{\mathcal{L}}) \cdo
 
 其中 $\mathbf{o}$ 为 Lorentz 模型原点。编码器输出双曲潜变量的参数 $(\boldsymbol{\mu}_i, \boldsymbol{\sigma}_i)$，采用 **Wrapped Normal** 分布 $\mathcal{W}\mathcal{N}(\boldsymbol{\mu}, \boldsymbol{\Sigma})$ 进行重参数化采样。
 
-#### 3.3.3 解码器 (Decoder)
+#### 3.4.3 解码器 (Decoder)
 
 解码器从双曲潜变量 $\mathbf{z}_i$ 出发，先通过对数映射（Logarithmic Map）回到切空间，再经全连接层恢复基因表达谱。
 
@@ -145,7 +225,7 @@ $$p(x_{ig} \mid \mathbf{z}_i) = \text{NB}(x_{ig}; \mu_{ig}(\mathbf{z}_i), \theta
 
 其中 $\mu_{ig}$ 由解码器网络输出，$\theta_g$ 为基因特异性逆离散参数。
 
-#### 3.3.4 损失函数
+#### 3.4.4 损失函数
 
 $$\mathcal{L}_{\text{H-VAE}} = \underbrace{-\mathbb{E}_{q(\mathbf{z}|\mathbf{X})}[\log p(\mathbf{X}|\mathbf{z})]}_{\text{NB 重建损失}} + \beta \cdot \underbrace{D_{\text{KL}}(q(\mathbf{z}|\mathbf{X}) \| p(\mathbf{z}))}_{\text{双曲 KL 散度}} + \gamma \cdot \underbrace{\mathcal{L}_{\text{topo}}(\tilde{\mathbf{A}}, \mathbf{z})}_{\text{拓扑正则化}}$$
 
@@ -154,21 +234,43 @@ $$\mathcal{L}_{\text{H-VAE}} = \underbrace{-\mathbb{E}_{q(\mathbf{z}|\mathbf{X})
 - KL 散度在双曲空间中计算（Wrapped Normal 先验 vs. 后验）；
 - 拓扑正则化 $\mathcal{L}_{\text{topo}}$ 鼓励双曲空间中的距离结构与增强邻接矩阵 $\tilde{\mathbf{A}}$ 所描述的拓扑结构一致（如 Cauchy 核吸引力 + 斥力项）。
 
-**参考实现**：`scDHMap` 框架（`references/scDHMap/`），核心类 `scDHMap`，双曲工具 `lorentzian_helper.py` / `wrapped_normal.py`。
+> **参考实现**（仅参考，不直接 import）：`references/scDHMap/` 中 `scDHMap` 主类，双曲工具 `lorentzian_helper.py` / `wrapped_normal.py`。将通过 adapter 模式重写至 `src/models/hyperbolic/`。
 
-### 3.4 可验证命题（阶段 1）
+### 3.5 可验证命题（阶段 1）
 
-| 编号 | 命题 | 验证方式 |
-|------|------|----------|
-| H1.1 | 双曲嵌入在保持细胞谱系层级方面优于欧氏嵌入（如 PCA/UMAP） | 对比 Distortion Score ($\delta$-hyperbolicity) 与分支纯度 |
-| H1.2 | TopoLa 增强的邻接矩阵去除伪连接后，下游聚类 ARI 优于原始 k-NN 图 | 以已知细胞类型注释计算 ARI/NMI |
-| H1.3 | Poincaré 嵌入中，从 naive T → effector → exhausted T 的分化路径呈径向展开结构 | 可视化检查 + 径向梯度相关性 |
+> 以下命题需阶段 1 模型训练完成后验证。对应可视化 Skeleton 已就绪（`src/visualization/hyperbolic.py`），评估指标定义见 `docs/evaluation_suite.md` §1。
+
+| 编号 | 命题 | 验证方式 | 评估指标 |
+|------|------|----------|----------|
+| H1.1 | 双曲嵌入在保持细胞谱系层级方面优于欧氏嵌入（如 PCA/UMAP） | 对比 Distortion Score ($\delta$-hyperbolicity) 与分支纯度 | Distortion, Triplet Acc |
+| H1.2 | TopoLa 增强的邻接矩阵去除伪连接后，下游聚类 ARI 优于原始 k-NN 图 | 以已知细胞类型注释计算 ARI/NMI | ARI, NMI |
+| H1.3 | Poincaré 嵌入中，从 naive T → effector → exhausted T 的分化路径呈径向展开结构 | 可视化检查 + 径向梯度相关性 | Branch Purity, 径向 Spearman |
+
+### 3.6 落地前置条件
+
+- **数据**: 标准化 AnnData `.h5ad`（含 raw counts、cell type annotation、patient/region 标签）
+- **硬件**: GPU 训练（RTX 3070, CUDA 12.4）
+- **环境**: `geoopt`, `torch-geometric` 已安装并验证
+- **验收触发**: `scripts/run_step1.py` 生成嵌入并通过 `evaluation/embedding_metrics.py` 最低阈值
 
 ---
 
 ## 4. 阶段 2：空间约束下的因果通讯网络构建
 
-### 4.1 概述
+### 4.1 当前仓库状态
+
+| 子组件 | 状态 | 代码位置 |
+|--------|------|----------|
+| 因果 DAG 可视化 | **Skeleton** | `src/visualization/causal.py` — `plot_causal_dag()` |
+| 信号流 Sankey 可视化 | **Skeleton** | `src/visualization/causal.py` — `plot_signaling_flow()` |
+| 邻接热图与证据卡 | **Skeleton** | `src/visualization/causal.py` — `plot_causal_heatmap()`, `plot_key_axis_evidence()` |
+| 因果指标 Dashboard | **Skeleton** | `src/visualization/causal.py` — `plot_causal_metrics_dashboard()` |
+| 因果解缠 (Z_int / Z_ext) | **待实现** | 规划位置: `src/causal/disentangle.py` |
+| CMI 剪枝 + Bootstrap | **待实现** | 规划位置: `src/causal/cmi_pruning.py` |
+| 因果图数据结构 | **待实现** | 规划位置: `src/causal/causal_graph.py` |
+| 多层信号流推断 | **待实现** | 规划位置: `src/causal/signaling_flow.py` |
+
+### 4.2 目标与概述
 
 **目标**：在双曲潜空间中，剥离细胞内在调控与外在通讯信号，构建定向的因果通讯网络。
 
@@ -180,7 +282,7 @@ $$\mathcal{L}_{\text{H-VAE}} = \underbrace{-\mathbb{E}_{q(\mathbf{z}|\mathbf{X})
 - 因果细胞图 $\mathcal{G}_{\text{causal}}$：节点为细胞亚群或单细胞，有向边表示因果通讯
 - 多层信号流：配体 → 受体 → 转录因子 → 靶基因
 
-### 4.2 因果解缠 (Causal Disentanglement)
+### 4.3 因果解缠 (Causal Disentanglement)（规划中）
 
 参考 Celcomen 算法，假设细胞 $i$ 的基因表达潜变量可分解为两个因果不可约分量：
 
@@ -202,9 +304,9 @@ $$\mathcal{L}_{\text{disentangle}} = \mathcal{L}_{\text{recon}}(\mathbf{X} \mid 
 
 其中 HSIC（Hilbert-Schmidt Independence Criterion）惩罚两个分量之间的统计依赖性。
 
-**参考实现**：`Celcomen` 框架（`references/celcomen/`），核心模型类 `celcomen`，G2G 消息传递层。
+> **参考实现**（仅参考，不直接 import）：`references/celcomen/` 中 `celcomen` 模型类与 G2G 消息传递层。将通过 adapter 模式重写至 `src/causal/disentangle.py`。
 
-### 4.3 条件互信息剪枝 (CMI Pruning)
+### 4.4 条件互信息剪枝 (CMI Pruning)（规划中）
 
 为消除由共享微环境、batch effect 或混杂因素引起的伪因果边：
 
@@ -217,9 +319,9 @@ $$\mathcal{L}_{\text{disentangle}} = \mathcal{L}_{\text{recon}}(\mathbf{X} \mid 
 
 3. **阈值剪枝**：剔除 $w_{ij} < \tau$（建议 $\tau = 0.5 \sim 0.8$）的边，保留稀疏且鲁棒的因果细胞图 $\mathcal{G}_{\text{causal}}$。
 
-**参考实现**：`FlowSig` 框架（`references/flowsig/`），核心函数 `learn_intercellular_flows()`、`run_utigsp()`。
+> **参考实现**（仅参考，不直接 import）：`references/flowsig/` 中 `learn_intercellular_flows()`、`run_utigsp()` 函数。将通过 adapter 模式重写至 `src/causal/cmi_pruning.py`。
 
-### 4.4 多层信号流推断 (Multilayer Signaling Flow)
+### 4.5 多层信号流推断 (Multilayer Signaling Flow)（规划中）
 
 在确立因果细胞图后，进一步解析因果边所承载的分子机制，构建完整信号流：
 
@@ -235,22 +337,42 @@ $$\text{配体 (Ligand)} \xrightarrow{\text{分泌}} \text{受体 (Receptor)} \x
 - **MFAP2** (CAF 分泌) → **Integrin** $\alpha 5 \beta 1$ (TAM 受体) → **FAK/Src** → 下游 EMT 转录程序
 - **INHBA** (CAF 分泌) → **ACVR1B/ACVR2A** (Treg 受体) → **SMAD2/3** → Foxp3 转录调控
 
-**参考实现**：`FlowSig`（`references/flowsig/`）的 GEM (Gene Expression Mixture) 聚合 + `SigXTalk` 策略。
+> **参考实现**（仅参考，不直接 import）：`references/flowsig/` 中 GEM (Gene Expression Mixture) 聚合 + `SigXTalk` 策略。将通过 adapter 模式重写至 `src/causal/signaling_flow.py`。
 
-### 4.5 可验证命题（阶段 2）
+### 4.6 可验证命题（阶段 2）
 
-| 编号 | 命题 | 验证方式 |
-|------|------|----------|
-| H2.1 | 因果解缠后的 $\mathbf{z}^{\text{ext}}$ 能预测邻居组成，而 $\mathbf{z}^{\text{int}}$ 不能 | 以邻居细胞类型比例为标签回归/分类 |
-| H2.2 | CMI 剪枝后的因果图识别 CAF→TAM/Treg 轴的定向性与文献报道一致 | 与已知信号轴（如 POSTN/MFAP2→M2 TAM 极化）对照 |
-| H2.3 | 因果图中 CAF 分泌的 POSTN/MFAP2 边直接指向 TAM 的 CD163/MRC1 上调，而非空间共定位 artifact | 通过 DoWhy `refute_causal_structure()` 的 falsification p-value 验证 |
-| H2.4 | 多层信号流可追溯 INHBA→SMAD2/3→Foxp3 的完整转导链路 | 信号流 TF 活性与 SCENIC AUCell 得分一致性检验 |
+> 以下命题需阶段 2 模型训练完成后验证。对应可视化 Skeleton 已就绪（`src/visualization/causal.py`），评估指标定义见 `docs/evaluation_suite.md` §2。
+
+| 编号 | 命题 | 验证方式 | 评估指标 |
+|------|------|----------|----------|
+| H2.1 | 因果解缠后的 $\mathbf{z}^{\text{ext}}$ 能预测邻居组成，而 $\mathbf{z}^{\text{int}}$ 不能 | 以邻居细胞类型比例为标签回归/分类 | HSIC, Z_ext R², Z_int R² |
+| H2.2 | CMI 剪枝后的因果图识别 CAF→TAM/Treg 轴的定向性与文献报道一致 | 与已知信号轴（如 POSTN/MFAP2→M2 TAM 极化）对照 | Known Axis Recall, Direction Acc |
+| H2.3 | 因果图中 CAF 分泌的 POSTN/MFAP2 边直接指向 TAM 的 CD163/MRC1 上调，而非空间共定位 artifact | 通过 DoWhy `refute_causal_structure()` 的 falsification p-value 验证 | Falsification p-value |
+| H2.4 | 多层信号流可追溯 INHBA→SMAD2/3→Foxp3 的完整转导链路 | 信号流 TF 活性与 SCENIC AUCell 得分一致性检验 | Flow Completeness |
+
+### 4.7 落地前置条件
+
+- **数据**: 阶段 1 输出的双曲嵌入 + 配受体数据库版本冻结（CellChatDB/CellPhoneDB/LIANA）+ 已知信号轴真值边集（CSV/JSON）
+- **环境**: `dowhy`, `pgmpy`, `networkx` 已安装并验证
+- **验收触发**: `scripts/run_step2.py` 生成因果图并通过 `evaluation/causal_metrics.py` 最低阈值
 
 ---
 
 ## 5. 阶段 3：微环境演化的扰动模拟与反事实预测
 
-### 5.1 概述
+### 5.1 当前仓库状态
+
+| 子组件 | 状态 | 代码位置 |
+|--------|------|----------|
+| 干预前后表达对比可视化 | **Skeleton** | `src/visualization/perturbation.py` — `plot_perturbation_comparison()` |
+| 反事实空间热图 | **Skeleton** | `src/visualization/perturbation.py` — `plot_counterfactual_spatial()` |
+| 传播梯度与 BFS 分层 | **Skeleton** | `src/visualization/perturbation.py` — `plot_propagation_gradient()` |
+| 多靶点对比与指标 Dashboard | **Skeleton** | `src/visualization/perturbation.py` — `plot_multi_target_heatmap()`, `plot_perturbation_metrics_dashboard()` |
+| 扰动潜变量算术 | **待实现** | 规划位置: `src/perturbation/latent_arithmetic.py` |
+| 扩散反事实生成 | **待实现** | 规划位置: `src/perturbation/diffusion_cf.py` |
+| 空间传播模拟 | **待实现** | 规划位置: `src/perturbation/spatial_propagation.py` |
+
+### 5.2 目标与概述
 
 **目标**：利用训练好的模型进行虚拟敲除（Virtual Knockout），预测靶向干预后 TME 的动态重塑。
 
@@ -263,7 +385,7 @@ $$\text{配体 (Ligand)} \xrightarrow{\text{分泌}} \text{受体 (Receptor)} \x
 - 反事实基因表达谱 $\hat{\mathbf{X}}^{\text{CF}}$
 - 空间传播预测图（扰动效应在组织空间上的扩散分布）
 
-### 5.2 扰动潜变量算术 (Latent Space Arithmetic)
+### 5.3 扰动潜变量算术 (Latent Space Arithmetic)（规划中）
 
 参考 CPA / scGen 的逻辑，在双曲潜空间中学习基因特异性的扰动向量。
 
@@ -279,9 +401,9 @@ $$\mathbf{z}^{\text{pred}}_i = \text{Exp}_{\mathbf{z}^{\text{obs}}_i}\left(\text
 
 $$\hat{\mathbf{x}}^{\text{CF}}_i = \text{Decoder}(\mathbf{z}^{\text{pred}}_i)$$
 
-**参考实现**：`CPA`（`references/CPA/`）的 `ComPertAPI.predict()` + `scGen`（`references/scgen/`）的 `SCGEN.predict()`。
+> **参考实现**（仅参考，不直接 import）：`references/CPA/` 中 `ComPertAPI.predict()` + `references/scgen/` 中 `SCGEN.predict()`。将通过 adapter 模式重写至 `src/perturbation/latent_arithmetic.py`。
 
-### 5.3 基于扩散模型的反事实生成 (Diffusion-based Counterfactual)
+### 5.4 基于扩散模型的反事实生成 (Diffusion-based Counterfactual)（规划中）
 
 为捕捉更复杂的非线性细胞状态转变，采用条件扩散模型（Conditional Diffusion Model），以因果图作为结构约束：
 
@@ -291,9 +413,9 @@ $$\hat{\mathbf{x}}^{\text{CF}}_i = \text{Decoder}(\mathbf{z}^{\text{pred}}_i)$$
 
 3. **因果一致性约束**：反事实生成过程中，要求干预的下游效应遵循 $\mathcal{G}_{\text{causal}}$ 的拓扑序（topological ordering）——只有因果图中干预节点的后继节点才被修改，非后继节点保持不变。
 
-**参考实现**：`CausCell`（`references/CausCell/`）的因果解耦 + 扩散生成框架，`Squidiff`（`references/Squidiff/`）的 `GaussianDiffusion` 模型。
+> **参考实现**（仅参考，不直接 import）：`references/CausCell/` 的因果解耦 + 扩散生成框架，`references/Squidiff/` 的 `GaussianDiffusion` 模型。将通过 adapter 模式重写至 `src/perturbation/diffusion_cf.py`。
 
-### 5.4 空间传播预测 (Spatial Propagation)
+### 5.5 空间传播预测 (Spatial Propagation)（规划中）
 
 虚拟敲除不仅改变靶细胞自身状态，还将通过空间因果网络向邻近区域传播。
 
@@ -309,16 +431,24 @@ $$\hat{\mathbf{x}}^{\text{CF}}_i = \text{Decoder}(\mathbf{z}^{\text{pred}}_i)$$
 - 敲除 INHBA → SMAD2/3 通路下调 → Treg 分化受阻 → 局部免疫抑制减轻
 - 敲除 MFAP2 → Integrin $\alpha 5 \beta 1$/FAK 信号减弱 → 远端肿瘤细胞 EMT 减缓
 
-**参考实现**：`DynPerturb`（`references/DynPerturb/`）的时空嵌入传播机制。
+> **参考实现**（仅参考，不直接 import）：`references/DynPerturb/` 的时空嵌入传播机制。将通过 adapter 模式重写至 `src/perturbation/spatial_propagation.py`。
 
-### 5.5 可验证命题（阶段 3）
+### 5.6 可验证命题（阶段 3）
 
-| 编号 | 命题 | 验证方式 |
-|------|------|----------|
-| H3.1 | INHBA 虚拟敲除后，SPP1+ TAM 的 M2 标志物（CD163, MRC1）下调 | 反事实 vs 观测的 DEG 检验 + marker 方向一致性 |
-| H3.2 | POSTN 虚拟敲除后，空间上 T 细胞浸润深度增加（靠近肿瘤核心） | 反事实空间图中 T 细胞-肿瘤距离分布对比 |
-| H3.3 | 扰动效应沿因果图传播，且符合空间距离衰减规律 | Moran's I 变化 + 传播梯度分析 |
-| H3.4 | 扩散模型生成的反事实状态与 CPA/scGen 预测在关键 marker 方向上一致 | 跨方法 PCC/cosine similarity |
+> 以下命题需阶段 3 完成后验证。对应可视化 Skeleton 已就绪（`src/visualization/perturbation.py`），评估指标定义见 `docs/evaluation_suite.md` §3-4。
+
+| 编号 | 命题 | 验证方式 | 评估指标 |
+|------|------|----------|----------|
+| H3.1 | INHBA 虚拟敲除后，SPP1+ TAM 的 M2 标志物（CD163, MRC1）下调 | 反事实 vs 观测的 DEG 检验 + marker 方向一致性 | R² (mean), Marker Direction Acc |
+| H3.2 | POSTN 虚拟敲除后，空间上 T 细胞浸润深度增加（靠近肿瘤核心） | 反事实空间图中 T 细胞-肿瘤距离分布对比 | PCC, MSE |
+| H3.3 | 扰动效应沿因果图传播，且符合空间距离衰减规律 | Moran's I 变化 + 传播梯度分析 | Moran's I, Gradient Decay R² |
+| H3.4 | 扩散模型生成的反事实状态与 CPA/scGen 预测在关键 marker 方向上一致 | 跨方法 PCC/cosine similarity | PCC, DEG Overlap Jaccard |
+
+### 5.7 落地前置条件
+
+- **数据**: 阶段 1+2 完整输出 + 扰动相关先验或外部验证数据（文献 marker 集、公开 perturbation 结果）
+- **环境**: `scgen`, `diffusers` 已安装并验证
+- **验收触发**: `scripts/run_step3.py` 对至少 3 个靶基因生成反事实预测，并通过 `evaluation/cf_metrics.py` + `evaluation/spatial_metrics.py` 最低阈值
 
 ---
 
@@ -343,30 +473,58 @@ $$\hat{\mathbf{x}}^{\text{CF}}_i = \text{Decoder}(\mathbf{z}^{\text{pred}}_i)$$
 
 ## 附录 A：参考框架映射表
 
-| 阶段 | 组件 | 主要参考 | 仓库路径 |
-|------|------|----------|----------|
-| 1 | 拓扑增强邻接 | TopoLa | `references/TopoLa/` |
-| 1 | 双曲 VAE + 双曲工具 | scDHMap | `references/scDHMap/` |
-| 2 | 因果解缠 (SCM + G2G) | Celcomen | `references/celcomen/` |
-| 2 | 空间因果结构学习 (UT-IGSP) | FlowSig | `references/flowsig/` |
-| 2 | 因果识别与可证伪验证 | DoWhy | `references/dowhy/` |
-| 3 | 扰动潜变量算术 | CPA / scGen | `references/CPA/`, `references/scgen/` |
-| 3 | 扩散反事实生成 | CausCell / Squidiff | `references/CausCell/`, `references/Squidiff/` |
-| 3 | 时空传播模拟 | DynPerturb | `references/DynPerturb/` |
+> `references/` 目录下的仓库**仅供参考**，代码通过 adapter 模式重写至 `src/`，禁止直接 `import`。
+
+| 阶段 | 组件 | 主要参考 | 参考仓库路径 | 目标实现位置 | 当前状态 |
+|------|------|----------|-------------|-------------|----------|
+| 0 | 数据加载与校验 | — | — | `src/data/loaders.py`, `validators.py` | **已实现** |
+| 0 | 统一绘图风格 | — | — | `src/utils/plot_style.py` | **已实现** |
+| 0 | 基础 k-NN 空间图 | — | — | `src/examples/spatial_graph.py` | **已实现** |
+| 1 | 拓扑增强邻接 | TopoLa | `references/TopoLa/` | `src/data/spatial_graph.py` | 待实现 |
+| 1 | 双曲 VAE + 双曲工具 | scDHMap | `references/scDHMap/` | `src/models/hyperbolic/` | 待实现 |
+| 1 | 嵌入可视化 | — | — | `src/visualization/hyperbolic.py` | **Skeleton** |
+| 2 | 因果解缠 (SCM + G2G) | Celcomen | `references/celcomen/` | `src/causal/disentangle.py` | 待实现 |
+| 2 | 空间因果结构学习 (UT-IGSP) | FlowSig | `references/flowsig/` | `src/causal/cmi_pruning.py` | 待实现 |
+| 2 | 因果识别与可证伪验证 | DoWhy | `references/dowhy/` | `src/causal/` | 待实现 |
+| 2 | 因果图可视化 | — | — | `src/visualization/causal.py` | **Skeleton** |
+| 3 | 扰动潜变量算术 | CPA / scGen | `references/CPA/`, `references/scgen/` | `src/perturbation/latent_arithmetic.py` | 待实现 |
+| 3 | 扩散反事实生成 | CausCell / Squidiff | `references/CausCell/`, `references/Squidiff/` | `src/perturbation/diffusion_cf.py` | 待实现 |
+| 3 | 时空传播模拟 | DynPerturb | `references/DynPerturb/` | `src/perturbation/spatial_propagation.py` | 待实现 |
+| 3 | 扰动可视化 | — | — | `src/visualization/perturbation.py` | **Skeleton** |
+| 全局 | 嵌入质量评估 | — | — | `src/evaluation/embedding_metrics.py` | 待实现 |
+| 全局 | 因果边可信度评估 | — | — | `src/evaluation/causal_metrics.py` | 待实现 |
+| 全局 | 反事实质量评估 | — | — | `src/evaluation/cf_metrics.py` | 待实现 |
+| 全局 | 空间一致性评估 | — | — | `src/evaluation/spatial_metrics.py` | 待实现 |
 
 ## 附录 B：核心依赖版本基线
 
-| 包 | 版本 | 用途 |
-|---|------|------|
-| Python | 3.10.19 | 运行环境 |
-| PyTorch | 2.6.0+cu124 | 深度学习框架 |
-| torch-geometric | 2.7.0 | 图神经网络 |
-| geoopt | 0.5.1 | 双曲几何优化 |
-| scanpy | 1.11.5 | 单细胞分析 |
-| squidpy | 1.6.5 | 空间转录组工具 |
-| scvi-tools | 1.3.3 | 变分推断框架 |
-| dowhy | 0.14 | 因果推断 |
-| pgmpy | 1.0.0 | 概率图模型 |
-| scgen | 2.1.1 | 扰动预测 |
-| diffusers | 0.36.0 | 扩散模型 |
-| GPU | RTX 3070, CUDA 12.4 | 硬件加速 |
+| 包 | 版本 | 用途 | 安装验证 |
+|---|------|------|---------|
+| Python | 3.10.19 | 运行环境 | `E:\ProgramData\Anaconda3\envs\hypersca\python.exe` |
+| PyTorch | 2.6.0+cu124 | 深度学习框架 | `validate_env.py` 通过 |
+| torch-geometric | 2.7.0 | 图神经网络 | `validate_env.py` 通过 |
+| geoopt | 0.5.1 | 双曲几何优化 | `validate_env.py` 通过 |
+| scanpy | 1.11.5 | 单细胞分析 | `validate_env.py` 通过 |
+| squidpy | 1.6.5 | 空间转录组工具 | `validate_env.py` 通过 |
+| scvi-tools | 1.3.3 | 变分推断框架 | `validate_env.py` 通过 |
+| dowhy | 0.14 | 因果推断 | `validate_env.py` 通过 |
+| pgmpy | 1.0.0 | 概率图模型 | `validate_env.py` 通过 |
+| scgen | 2.1.1 | 扰动预测 | `validate_env.py` 通过 |
+| diffusers | 0.36.0 | 扩散模型 | `validate_env.py` 通过 |
+| GPU | RTX 3070, CUDA 12.4 | 硬件加速 | `validate_env.py` 通过 |
+
+## 附录 C：产物目录规范
+
+所有阶段的图表输出遵循统一规范（`src/utils/plot_style.py`），每张图自动附带 `.meta.json` 元信息文件，包含 `config`, `data_version`, `model_version`, `seed` 字段以保障可复现性。
+
+```
+results/
+├── examples/              # Phase 0 产物（已生成）
+│   ├── example01~04/      # 各 Example 的 CSV/JSON/PNG/meta.json
+│   └── run_log.txt
+└── figures/               # Phase 1-3 产物（目录已创建，待填充）
+    ├── step1/             # 双曲嵌入可视化
+    ├── step2/             # 因果图可视化
+    ├── step3/             # 反事实扰动可视化
+    └── dashboard/         # 综合 Dashboard
+```

@@ -219,3 +219,37 @@ Phase 1-3 的可视化函数已创建为 skeleton 模块，位于 `src/visualiza
 - Example 07: Step3 虚拟敲除最小版
 
 本轮代码（数据加载、空间图、统一绘图风格、Phase 0-3 可视化模板）将作为后续模型 example 的底座。
+
+---
+
+## 阶段3运行与出图（新增）
+
+### 1) 运行阶段3主流程
+
+```bash
+# 默认 latent_arithmetic
+python scripts/run_step3.py --targets INHBA,POSTN,MFAP2
+
+# diffusion_cf 最小原型
+python scripts/run_step3.py --method diffusion_cf --targets POSTN --diffusion-steps 30 --diffusion-epochs 5
+```
+
+### 2) 批量生成阶段3展示图
+
+```bash
+python scripts/generate_step3_figures.py \
+  --input-dir results/step3 \
+  --step2-dir results/step2 \
+  --step1-dir results/step1 \
+  --output-dir results/figures/step3
+```
+
+### 3) 关键输出
+
+- `results/step3/interaction_targets_<GENE>.csv|json`: 候选互作靶点排序结果
+- `results/step3/interpretation_targets_<GENE>.md`: 单靶点筛选逻辑与生物学意义说明
+- `results/figures/step3/interaction_target_ranking_<GENE>.png`: 候选靶点排名图
+- `results/figures/step3/perturbation_comparison_<GENE>.png`: 反事实前后表达对比图
+- `results/figures/step3/multi_target_heatmap_step3.png`: 多靶点对比热图
+- `results/figures/step3/step3_overview_dashboard.png`: 跨靶点总览（Top候选、prior命中率、分数分布、通路频次）
+- `results/figures/step3/figure_summary_step3.md`: 图文摘要（筛选逻辑 + 意义）

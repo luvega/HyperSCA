@@ -418,3 +418,146 @@ def plot_perturbation_metrics_dashboard(
     else:
         plt.close(fig)
     return fig
+
+
+def plot_interaction_target_ranking(
+    ranked_targets=None,
+    top_n: int = 20,
+    score_col: str = "target_priority_score",
+    save_path: str | None = None,
+) -> plt.Figure:
+    """候选互作靶点排名图（基于反事实优先级分数）。"""
+    fig, ax = create_figure(figsize=(12, 7))
+
+    if ranked_targets is None or len(ranked_targets) == 0:
+        ax.text(
+            0.5,
+            0.5,
+            "Awaiting\ntarget ranking data",
+            ha="center",
+            va="center",
+            fontsize=14,
+            color="#999999",
+            transform=ax.transAxes,
+            style="italic",
+        )
+        ax.set_title("Counterfactual Interaction Target Ranking")
+    else:
+        df = ranked_targets.copy()
+        if score_col not in df.columns:
+            score_col = df.columns[-1]
+        df = df.sort_values(score_col, ascending=False).head(top_n).copy()
+        labels = [f"{r['ligand']}→{r['receptor']}" for _, r in df.iterrows()]
+        y = np.arange(len(df))
+        colors = ["#EE6677" if bool(v) else "#4477AA" for v in df.get("prior_hit", [False] * len(df))]
+
+        ax.barh(y, df[score_col].values, color=colors, edgecolor="white", alpha=0.9)
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, fontsize=9)
+        ax.invert_yaxis()
+        ax.set_xlabel("Priority Score")
+        ax.set_title(f"Top-{len(df)} Counterfactual Interaction Targets")
+        ax.grid(axis="x", alpha=0.2, linestyle="--")
+
+        for i, (_, row) in enumerate(df.iterrows()):
+            suffix = " [prior]" if bool(row.get("prior_hit", False)) else ""
+            ax.text(
+                row[score_col] + max(df[score_col].max() * 0.01, 1e-6),
+                i,
+                f"{row[score_col]:.3f}{suffix}",
+                va="center",
+                fontsize=8,
+                color="#333333",
+            )
+
+    add_watermark(ax)
+    if save_path:
+        save_figure(fig, save_path, config={"chart": "interaction_target_ranking"})
+    else:
+        plt.close(fig)
+    return fig
+
+
+def plot_step3_overview_dashboard(
+    top_targets=None,
+    method_name: str = "",
+    pathway_counts: dict[str, int] | None = None,
+    prior_hit_rate: float | None = None,
+    score_values: np.ndarray | None = None,
+    save_path: str | None = None,
+) -> plt.Figure:
+    """阶段3总览仪表盘：多靶点候选汇总。"""
+    fig, axes = create_figure(2, 2, figsize=(14, 10))
+    axes = axes.flatten() if hasattr(axes, "flatten") else [axes]
+
+    # Panel 1: 全局 top 候选
+    ax = axes[0]
+    if top_targets is None or len(top_targets) == 0:
+        ax.text(0.5, 0.5, "Awaiting\noverview targets", ha="center", va="center",
+                transform=ax.transAxes, fontsize=13, color="#999999", style="italic")
+        ax.set_title("Global Top Targets")
+    else:
+        df = top_targets.copy()
+        df = df.sort_values("target_priority_score", ascending=False).head(12)
+        labels = [f"{r['target_gene']}:{r['ligand']}→{r['receptor']}" for _, r in df.iterrows()]
+        y = np.arange(len(df))
+        colors = ["#EE6677" if bool(v) else "#4477AA" for v in df.get("prior_hit", [False] * len(df))]
+        ax.barh(y, df["target_priority_score"].values, color=colors, edgecolor="white")
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.invert_yaxis()
+        ax.set_title("Global Top Interaction Targets")
+        ax.set_xlabel("Priority Score")
+
+    # Panel 2: prior hit rate
+    ax = axes[1]
+    if prior_hit_rate is None:
+        ax.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax.transAxes,
+                fontsize=16, color="#999999", style="italic")
+        ax.set_title("Prior Hit Rate")
+    else:
+        val = float(np.clip(prior_hit_rate, 0.0, 1.0))
+        ax.bar(["Prior Hit"], [val], color="#44AA99", edgecolor="white")
+        ax.set_ylim(0, 1)
+        ax.set_title("Prior Hit Rate (OmniPath/LIANA/NicheNet)")
+        ax.text(0, val + 0.03, f"{val:.1%}", ha="center", fontsize=11, fontweight="bold")
+
+    # Panel 3: score distribution
+    ax = axes[2]
+    if score_values is None or len(score_values) == 0:
+        ax.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax.transAxes,
+                fontsize=16, color="#999999", style="italic")
+        ax.set_title("Score Distribution")
+    else:
+        ax.hist(score_values, bins=40, color="#AA3377", alpha=0.85, edgecolor="white")
+        ax.set_title("Target Priority Score Distribution")
+        ax.set_xlabel("Score")
+        ax.set_ylabel("Count")
+
+    # Panel 4: pathway frequency
+    ax = axes[3]
+    if not pathway_counts:
+        ax.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax.transAxes,
+                fontsize=16, color="#999999", style="italic")
+        ax.set_title("Pathway Summary")
+    else:
+        items = sorted(pathway_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        names = [k if k else "unknown" for k, _ in items]
+        vals = [v for _, v in items]
+        ax.barh(np.arange(len(items)), vals, color="#4477AA", edgecolor="white")
+        ax.set_yticks(np.arange(len(items)))
+        ax.set_yticklabels(names, fontsize=8)
+        ax.invert_yaxis()
+        ax.set_xlabel("Count")
+        ax.set_title("Top Pathways in Candidate Targets")
+
+    title = "Step 3 Overview Dashboard"
+    if method_name:
+        title += f" ({method_name})"
+    fig.suptitle(title, fontsize=15, fontweight="bold")
+    add_watermark(axes[-1])
+    if save_path:
+        save_figure(fig, save_path, config={"chart": "step3_overview_dashboard", "method": method_name})
+    else:
+        plt.close(fig)
+    return fig
