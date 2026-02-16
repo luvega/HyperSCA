@@ -16,10 +16,14 @@ results/
 
 # 参考仓库（只读，不入版本控制）
 references/
+claude-scientific-skills/
+.local-skills/
 
 # 临时进度与草稿文档
 HyperSCA技术路线-v0.1.md
 SETUP_PROGRESS_*.md
+AGENTS.md
+.Trash/
 
 # ===================== Python gitignore =====================
 # Byte-compiled / optimized / DLL files
@@ -218,10 +222,7 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-# Cursor
-#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
+# Editor-specific context ignore files
 .cursorignore
 .cursorindexingignore
 

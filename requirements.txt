@@ -1,0 +1,61 @@
+# =============================================================================
+# HyperSCA unified dependencies
+# Python 3.10
+# =============================================================================
+
+# ---------- Scientific computing ----------
+numpy
+scipy
+pandas
+scikit-learn
+matplotlib
+seaborn
+h5py
+pyyaml
+tqdm
+leidenalg
+igraph
+
+# ---------- Single-cell and spatial ----------
+anndata
+scanpy
+squidpy
+scvi-tools
+
+# ---------- Deep learning ----------
+# Install CUDA-specific torch wheels as needed:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+torch
+torchvision
+torchaudio
+
+# ---------- Graph learning ----------
+# Install PyG stack with matched wheels as needed:
+# pip install torch-geometric -f https://data.pyg.org/whl/torch-2.6.0+cu124.html
+torch-geometric
+torch-scatter
+torch-sparse
+torch-cluster
+torch-spline-conv
+
+# ---------- Hyperbolic geometry ----------
+geoopt
+
+# ---------- Causal inference ----------
+dowhy
+econml
+networkx
+pgmpy
+statsmodels
+pingouin
+
+# ---------- Perturbation and generation ----------
+scgen
+diffusers
+accelerate
+
+# ---------- Utilities ----------
+pyarrow
+openpyxl
+jupyter
+ipywidgets
