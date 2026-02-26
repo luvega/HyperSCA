@@ -15,24 +15,6 @@ HyperSCA 的流程由三个核心阶段和一个整合流程组成：
 
 ![HyperSCA Pipeline Architecture](docs/pipeline_architectures.svg)
 
-## Architecture Overview Diagram
-
-```mermaid
-flowchart TD
-  A[DataLayer] --> B[GeometryLayer]
-  B --> C[CausalLayer]
-  C --> D[InterventionLayer]
-  D --> E[EvaluationLayer]
-  E --> F[VisualizationLayer]
-
-  A1["Loaders + Preprocessing + SpatialGraph"] --> A
-  B1["Lorentz + Poincare + WrappedNormal + HVAE"] --> B
-  C1["Disentangle + PCBootstrap + CausalGraph + SignalingFlow"] --> C
-  D1["LatentArithmetic + SpatialPropagation + DiffusionCF + TargetRanking"] --> D
-  E1["EmbeddingMetrics + CausalMetrics + CFMetrics + SpatialMetrics + CrossSampleMetrics"] --> E
-  F1["StepFigures + MVPFigures + Reports"] --> F
-```
-
 ## Core Algorithms
 
 ### 1) Hyperbolic Embedding
@@ -144,13 +126,6 @@ python scripts/generate_mvp_figures.py
 ```bash
 pytest tests/ -v
 ```
-
-## Notes for Code Update and Upload
-
-- 请勿提交 `data/`, `results/`, `references/` 等大文件目录（已在 `.gitignore`）。
-- 推荐提交范围：`src/`, `scripts/`, `docs/`, `README.md`, `tests/`。
-- 建议参考 `docs/repository_structure.md` 维护必要源代码与示例脚本的仓库边界。
-- 若需论文复现，建议在 release 或 docs 中补充固定版本号和参数快照。
 
 ## License
 
