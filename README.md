@@ -1,12 +1,10 @@
 # HyperSCA
 
-HyperSCA (Hyperbolic Spatiotemporal Causal Analysis) 是一个面向结直肠癌免疫微环境重塑研究的计算框架，融合双曲几何嵌入、因果图发现与反事实扰动分析。项目重点支持多源数据整合（scRNA-seq + 空间转录组 + 临床分层），用于从“相关性描述”升级到“可干预机制推断”。
-
-本 README 的组织方式参考了 GEMGen 项目的介绍风格（清晰模块划分、运行入口与输入输出说明）：[DLS5-Omics/GEMGen](https://github.com/DLS5-Omics/GEMGen)。
+HyperSCA (Hyperbolic Spatiotemporal Causal Analysis) 是一个面向结直肠癌免疫微环境研究的计算框架。该框架集成双曲几何嵌入、因果图发现和反事实扰动分析，支持 scRNA-seq、空间转录组和临床分层数据的联合分析，用于机制推断与可干预靶点评估。
 
 ## Project and Algorithm Overview
 
-HyperSCA 的主线是“三阶段 + 一条整合支线”：
+HyperSCA 的流程由三个核心阶段和一个整合流程组成：
 
 - Stage 1（Embedding）：在 Lorentz/Poincare 双曲流形上学习细胞状态表示。
 - Stage 2（Causal）：在去缠结潜变量上执行因果结构发现与信号流推断。
@@ -15,46 +13,7 @@ HyperSCA 的主线是“三阶段 + 一条整合支线”：
 
 ## Pipeline Flowchart
 
-```mermaid
-flowchart LR
-  subgraph inputData [MultiSourceInput]
-    neu[scCRC_Neu]
-    ifng[scCRC_IFNG]
-    st[ST_CRC_MSS]
-    icbOpt[scCRC_ICBOptional]
-  end
-
-  subgraph standardize [CanonicalSchemaAndNiche]
-    schema[CanonicalSchemaBuilder]
-    niche[NicheClusteringAndCrossSample]
-  end
-
-  subgraph core [HyperSCACore]
-    step1[Stage1HyperbolicEmbedding]
-    step2[Stage2CausalDiscovery]
-    step3[Stage3CounterfactualPerturbation]
-  end
-
-  subgraph output [Outputs]
-    rank[TargetRanking]
-    figs[CNSStyleFigurePack]
-    report[MSIMMRStratifiedReport]
-  end
-
-  neu --> schema
-  ifng --> schema
-  st --> schema
-  icbOpt --> schema
-  schema --> niche
-  niche --> step1
-  niche --> step2
-  step1 --> step2
-  step2 --> step3
-  step3 --> rank
-  step2 --> figs
-  step3 --> figs
-  step3 --> report
-```
+![HyperSCA Pipeline Architecture](docs/pipeline_architectures.svg)
 
 ## Architecture Overview Diagram
 
@@ -190,7 +149,7 @@ pytest tests/ -v
 
 - 请勿提交 `data/`, `results/`, `references/` 等大文件目录（已在 `.gitignore`）。
 - 推荐提交范围：`src/`, `scripts/`, `docs/`, `README.md`, `tests/`。
-- 建议参考 `docs/repository_structure.md` 维护“必要源代码 / 示例脚本”边界。
+- 建议参考 `docs/repository_structure.md` 维护必要源代码与示例脚本的仓库边界。
 - 若需论文复现，建议在 release 或 docs 中补充固定版本号和参数快照。
 
 ## License
