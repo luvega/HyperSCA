@@ -1,4 +1,6 @@
-# HyperSCA <img src="docs/Logo_high%20res.png" alt="HyperSCA Logo" width="64" align="right" />
+<p align="center">
+  <img src="docs/Logo_high%20res.png" alt="HyperSCA Logo" width="280" />
+</p>
 
 HyperSCA (Hyperbolic Spatiotemporal Causal Analysis) 是一个面向结直肠癌免疫微环境研究的计算框架。该框架集成双曲几何嵌入、因果图发现和反事实扰动分析，支持 scRNA-seq、空间转录组和临床分层数据的联合分析，用于机制推断与可干预靶点评估。
 
@@ -13,7 +15,7 @@ HyperSCA 的流程由三个核心阶段和一个整合流程组成：
 
 ## Pipeline Flowchart
 
-![HyperSCA Overall Design](docs/Overall%20Design.png)
+![HyperSCA Overall Design](docs/Overall%20Design%202.png)
 
 ## Core Algorithms
 
