@@ -39,15 +39,15 @@ HyperSCA 的流程由三个核心阶段和一个整合流程组成：
 
 ## Example Data Samples
 
-项目常用示例输入（路径为本地外部数据目录，不纳入版本控制）：
+项目常用示例输入（路径为本地外部数据目录，不纳入版本控制；以下为脱敏占位路径）：
 
-- `G:/scCRC_Neu`  
+- `<PATH_TO_scCRC_Neu>`  
   - 代表文件：`*-NormalizedCounts.tsv`, `*-DESeq2_result.tsv`
   - 用途：构建 cluster-level 表达矩阵、差异基因候选池。
-- `F:/scCRC_IFNG`  
+- `<PATH_TO_scCRC_IFNG>`  
   - 代表文件：`results/tables/sample_clinical_mapping.csv`, `targets_shared_specific_by_mmr.csv`, `niche_shared_specific_by_mmr.csv`
   - 用途：MSI/MMR 分层、IFNG 相关靶点补充、跨样本生态位分析。
-- `G:/ST_CRC_MSS`  
+- `<PATH_TO_ST_CRC_MSS>`  
   - 代表文件：`STmetadata_*.csv`
   - 用途：空间反卷积、细胞共定位邻接、传播梯度评估。
 
