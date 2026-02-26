@@ -53,7 +53,8 @@ class WrappedNormal(dist.Distribution):
 
         # 基分布: d 维独立正态
         self._base_dist = dist.Normal(
-            torch.zeros_like(scale), scale
+            torch.zeros_like(scale), scale.clamp(min=1e-6),
+            validate_args=False,
         )
 
         batch_shape = loc.shape[:-1]

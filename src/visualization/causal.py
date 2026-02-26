@@ -126,14 +126,20 @@ def plot_causal_dag(
             positions[i, 0], positions[i, 1],
             s=600, c=node_colors[i], edgecolors="white", linewidths=2, zorder=3,
         )
+        angle = np.arctan2(positions[i, 1], positions[i, 0])
+        off_x = -0.10 * np.cos(angle)
+        off_y = -0.10 * np.sin(angle) - 0.05
+        fontsize = max(6, min(8, 120 // max(K, 1)))
         ax.text(
-            positions[i, 0], positions[i, 1] - 0.08,
-            node_labels[i], ha="center", va="top", fontsize=8, fontweight="bold",
-            zorder=4,
+            positions[i, 0] + off_x, positions[i, 1] + off_y,
+            node_labels[i], ha="center", va="top", fontsize=fontsize,
+            fontweight="bold", zorder=4,
+            bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.7),
         )
 
-    ax.set_xlim(-1.5, 1.5)
-    ax.set_ylim(-1.5, 1.5)
+    margin = 1.5 if K <= 14 else 1.8
+    ax.set_xlim(-margin, margin)
+    ax.set_ylim(-margin, margin)
     ax.set_aspect("equal")
     ax.axis("off")
     ax.set_title("Causal DAG — Cell Communication Network", fontsize=14)

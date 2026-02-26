@@ -95,7 +95,7 @@ class HyperSCAConfig:
     @classmethod
     def from_yaml(cls, path: str | Path) -> "HyperSCAConfig":
         """从 YAML 文件加载配置"""
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             d = yaml.safe_load(f)
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 

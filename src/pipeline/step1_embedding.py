@@ -59,6 +59,7 @@ class EmbeddingPipeline:
             adata = adata[adata.obs["in_tissue"] == 1].copy()
             print(f"  in_tissue filter: {n_before} -> {adata.n_obs}")
 
+        force_genes = getattr(self.config, "step3_target_genes", None)
         adata = preprocess(
             adata,
             min_cells=self.config.min_cells,
@@ -68,6 +69,7 @@ class EmbeddingPipeline:
             target_sum=self.config.target_sum,
             n_top_genes=self.config.n_top_genes,
             hvg_flavor=self.config.hvg_flavor,
+            force_include_genes=force_genes,
         )
 
         return adata
@@ -192,8 +194,12 @@ class EmbeddingPipeline:
             )
 
             optimizer.zero_grad()
-            loss_dict["total"].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            loss_val = loss_dict["total"]
+            if torch.isnan(loss_val) or torch.isinf(loss_val):
+                print(f"  [WARN] NaN/Inf loss at epoch {epoch+1}, skipping update")
+                continue
+            loss_val.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             if is_pretrain:
