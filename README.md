@@ -6,12 +6,13 @@ HyperSCA (Hyperbolic Spatiotemporal Causal Analysis) 是一个面向结直肠癌
 
 ## Project and Algorithm Overview
 
-HyperSCA 的流程由三个核心阶段和一个整合流程组成：
+HyperSCA 的研究完整版流程由五个连续阶段构成：
 
+- Phase D0（Data Onboarding）：四项目标准化入库与字段校验。
 - Stage 1（Embedding）：在 Lorentz/Poincare 双曲流形上学习细胞状态表示。
 - Stage 2（Causal）：在去缠结潜变量上执行因果结构发现与信号流推断。
-- Stage 3（Counterfactual）：在潜空间做基因扰动并模拟空间传播，完成靶点排序。
-- MVP Integration（Result-level）：整合 `scCRC_Neu + scCRC_IFNG + ST_CRC_MSS`，支持 Hyperbolic/Euclidean 双模式比较与 MSI/MMR 分层。
+- Stage 3（Counterfactual）：在潜空间做基因扰动并模拟空间传播，完成靶点排序与去假阳性过滤。
+- Stage 4（Dynamic Intervention）：在 PK/PD 约束下执行时序传播与联靶组合干预评估，并支持实验回写后的 roundtrip 更新。
 
 ## Pipeline Flowchart
 
@@ -96,32 +97,72 @@ python scripts/validate_env.py
 python scripts/build_canonical_schema.py
 ```
 
-### B. Run Multi-source MVP (Hyperbolic + Euclidean)
+### A0. Onboard Four-project Data to `/data`
 
 ```bash
-python scripts/run_mvp_integration.py --embedding-mode both --max-targets 10
+python scripts/run_data_onboarding.py \
+  --icb-root G:\scCRC_ICB \
+  --neu-root G:\scCRC_Neu \
+  --st-root G:\ST_CRC_MSS \
+  --ifng-root F:\scCRC_IFNG
 ```
 
-### C. Run Open Target Discovery
+### B. Run Step1 (Hyperbolic Embedding)
 
 ```bash
-python scripts/run_target_discovery.py
+python scripts/run_step1.py \
+  --data-dir data/ST/ST_CRC_MSS \
+  --modality visium \
+  --output-dir results/step1
 ```
 
-### D. Generate CNS-style Figures
+### C. Run Step2 (Spatial Causal Inference)
 
 ```bash
-python scripts/generate_mvp_figures.py
+python scripts/run_step2.py \
+  --input-dir results/step1 \
+  --output-dir results/step2
+```
+
+### D. Run Step3 (Counterfactual Perturbation)
+
+```bash
+python scripts/run_step3.py \
+  --input-step1 results/step1 \
+  --input-step2 results/step2 \
+  --output-dir results/step3
+```
+
+### E. Run Target Discovery and Hub Retention
+
+```bash
+python scripts/run_target_discovery.py --max-perturb 10
+```
+
+### F. Run Dynamic Intervention (Step4) and Roundtrip Update
+
+```bash
+python scripts/run_step4.py --with-roundtrip \
+  --experiment-file data/metadata/experiment_roundtrip.csv
+```
+
+### G. Generate CNS-style Figures (Step1/2/3)
+
+```bash
+python scripts/generate_step1_figures.py
+python scripts/generate_step2_figures.py
+python scripts/generate_step3_figures.py
 ```
 
 ## Key Outputs
 
-- Integration schema: `results/integration/schema/`
-- MVP mode-wise outputs:  
-  - `results/integration/mvp/hyperbolic/`
-  - `results/integration/mvp/euclidean/`
-- Figure pack: `results/figures/integration/`
+- Canonical schema and metadata: `data/metadata/`, `results/integration/schema/`
+- Step1 outputs: `results/step1/` (`adata_embedded.h5ad`, `embedding_benchmark.json`)
+- Step2 outputs: `results/step2/`（因果图、稳定性指标、baseline 对比）
+- Step3 outputs: `results/step3/`（扰动结果、去假阳性靶点与组合）
 - Discovery reports: `results/integration/discovery/`
+- Step4 outputs: `results/step4/`（`pkpd_summary.json`, `combination_ranking.csv`, `roundtrip_update_report.json`）
+- CNS figure outputs: `results/figures/step1/`, `results/figures/step2/`, `results/figures/step3/`
 
 ## Testing
 

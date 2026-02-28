@@ -15,6 +15,7 @@ import torch.distributions as dist
 
 from src.models.hyperbolic.lorentz import (
     EPS,
+    MAX_NORM,
     exp_map,
     log_map,
     parallel_transport,
@@ -135,6 +136,7 @@ class WrappedNormal(dist.Distribution):
         # Step 2: 切向量范数（用于体积校正）
         v_sq = lorentzian_inner(v, v, keepdim=False)
         v_norm = torch.sqrt(torch.clamp(v_sq, min=EPS))
+        v_norm = torch.clamp(v_norm, min=EPS, max=MAX_NORM)
 
         # 体积校正: (d-1) * log(sinh(||v||) / ||v||)
         # sinh(r)/r >= 1 对 r >= 0
@@ -157,7 +159,8 @@ class WrappedNormal(dist.Distribution):
         v_spatial = v_at_origin[..., 1:]  # (..., d)
         base_log_prob = self._base_dist.log_prob(v_spatial).sum(dim=-1)
 
-        return base_log_prob - volume_correction
+        logp = base_log_prob - volume_correction
+        return torch.nan_to_num(logp, nan=-1e6, posinf=1e6, neginf=-1e6)
 
     def kl_divergence(self, n_samples: int = 10) -> torch.Tensor:
         """与标准先验 WN(origin, I) 的 KL 散度（Monte Carlo 估计）
@@ -183,5 +186,10 @@ class WrappedNormal(dist.Distribution):
         log_q = self.log_prob(z)   # (n_samples, batch)
         log_p = prior.log_prob(z)  # (n_samples, batch)
 
-        kl = (log_q - log_p).mean(dim=0)  # (batch,)
+        # 数值稳定: 避免少量异常样本放大 KL
+        delta = torch.nan_to_num(log_q - log_p, nan=0.0, posinf=1e4, neginf=-1e4)
+        delta = torch.clamp(delta, min=-1e4, max=1e4)
+        kl = delta.mean(dim=0)  # (batch,)
+        # 理论上 KL >= 0，这里做下界修正防止数值误差导致负值
+        kl = torch.clamp(kl, min=0.0, max=1e4)
         return kl

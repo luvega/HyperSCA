@@ -2,6 +2,14 @@
 
 *版本: v1.0 | 日期: 2026-02-15*
 
+## v1.1 补充（研究完整版）
+
+- 新增 `scripts/run_data_onboarding.py`：四项目数据标准化入库（`data/scRNA/`, `data/ST/`, `data/metadata/`）。
+- 新增 `scripts/run_step4.py`：Step4 动态干预入口，支持 `--with-roundtrip` 执行实验回写后再推理。
+- 新增 `src/pipeline/step4_dynamic_intervention.py`：PK/PD + 时序空间传播 + 组合干预评分。
+- 新增 `src/pipeline/roundtrip_update.py` 与 `src/data/experiment_roundtrip.py`：干湿回写、参数校准、版本比较报告。
+- 新增 `src/causal/temporal_causal.py` 与 `src/perturbation/{pharmacokinetics,dose_response,combinatorial_intervention,temporal_spatial_propagation}.py`：时序因果与动态药效模块。
+
 ---
 
 ## 1. 项目目录结构

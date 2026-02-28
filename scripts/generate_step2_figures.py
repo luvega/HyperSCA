@@ -58,6 +58,13 @@ def main():
     arrow_strength = None
     if (input_dir / "arrow_strength.npy").exists():
         arrow_strength = np.load(input_dir / "arrow_strength.npy")
+    baseline_adj = None
+    baseline_metrics = {}
+    if (input_dir / "baseline_comm_adjacency.npy").exists():
+        baseline_adj = np.load(input_dir / "baseline_comm_adjacency.npy")
+    if (input_dir / "baseline_compare_metrics.json").exists():
+        with open(input_dir / "baseline_compare_metrics.json", encoding="utf-8") as f:
+            baseline_metrics = json.load(f)
 
     with open(input_dir / "node_info.json") as f:
         node_info = json.load(f)
@@ -91,9 +98,9 @@ def main():
         plot_key_axis_evidence,
         plot_causal_metrics_dashboard,
     )
-    from src.utils.plot_style import apply_style, create_figure, save_figure
+    from src.utils.plot_style import apply_cns_style, create_figure, save_figure
 
-    apply_style()
+    apply_cns_style()
 
     # ---- 1. 因果 DAG ----
     print("\n  [1/7] Causal DAG...")
@@ -132,8 +139,50 @@ def main():
             save_path=str(output_dir / "causal_heatmap_strength.png"),
         )
 
-    # ---- 3. 信号流 ----
-    print("  [3/7] Signaling flow...")
+    # ---- 3. CNS 对比图（空间因果 vs 传统通讯）----
+    print("  [3/8] CNS comparison figure...")
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    ax1, ax2, ax3, ax4 = axes.ravel()
+    im1 = ax1.imshow(adjacency, cmap="Reds", vmin=0, vmax=max(adjacency.max(), 1))
+    ax1.set_title("A. Spatial-Constrained Causal Graph")
+    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+    if baseline_adj is not None:
+        im2 = ax2.imshow(baseline_adj, cmap="Blues", vmin=0, vmax=max(baseline_adj.max(), 1))
+        ax2.set_title("B. Traditional Communication Baseline")
+        fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+    else:
+        ax2.text(0.5, 0.5, "baseline_comm_adjacency.npy missing", ha="center", va="center")
+        ax2.set_title("B. Traditional Communication Baseline")
+
+    metric_labels = ["edge_density_causal", "edge_density_baseline", "edge_overlap_jaccard"]
+    metric_vals = [float(baseline_metrics.get(k, 0.0)) for k in metric_labels]
+    ax3.bar(range(len(metric_labels)), metric_vals, color=["#EE6677", "#4477AA", "#228833"])
+    ax3.set_xticks(range(len(metric_labels)))
+    ax3.set_xticklabels(metric_labels, rotation=20, ha="right")
+    ax3.set_title("C. Quantitative Comparison")
+
+    # 生态位+靶点空间分布: 使用节点类型占比近似展示
+    type_vals = list(type_mapping.values())
+    type_counts = {}
+    for t in type_vals:
+        type_counts[t] = type_counts.get(t, 0) + 1
+    keys = list(type_counts.keys())[:12]
+    vals = [type_counts[k] for k in keys]
+    ax4.barh(keys, vals, color="#AA4499")
+    ax4.set_title("D. Niche Strata / Target Spatial Context")
+    ax4.set_xlabel("Node count")
+
+    fig.suptitle("CNS Figure (Step2): Spatial Causal Inference Advantage", fontsize=14)
+    save_figure(fig, str(output_dir / "cns_step2_spatial_causal_advantage.png"),
+                config={"chart": "cns_step2_spatial_causal_advantage"})
+
+    # ---- 4. 信号流 ----
+    print("  [4/8] Signaling flow...")
     if flow_edges:
         plot_signaling_flow(
             flow_edges=flow_edges,
@@ -145,8 +194,8 @@ def main():
             save_path=str(output_dir / "signaling_flow.png"),
         )
 
-    # ---- 4. 关键轴证据卡 ----
-    print("  [4/7] Key axis evidence cards...")
+    # ---- 5. 关键轴证据卡 ----
+    print("  [5/8] Key axis evidence cards...")
     for i, ax in enumerate(axis_results.get("per_axis", [])):
         if not ax.get("found"):
             continue
@@ -183,18 +232,15 @@ def main():
             save_path=str(output_dir / f"key_axis_{safe_name}.png"),
         )
 
-    # ---- 5. 指标仪表盘 ----
-    print("  [5/7] Metrics dashboard...")
+    # ---- 6. 指标仪表盘 ----
+    print("  [6/8] Metrics dashboard...")
     plot_causal_metrics_dashboard(
         metrics=metrics,
         save_path=str(output_dir / "metrics_dashboard.png"),
     )
 
-    # ---- 6. 解缠损失曲线 ----
-    print("  [6/7] Disentangle loss curves...")
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    # ---- 7. 解缠损失曲线 ----
+    print("  [7/8] Disentangle loss curves...")
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
@@ -218,8 +264,8 @@ def main():
     save_figure(fig, str(output_dir / "disentangle_loss.png"),
                 config={"chart": "disentangle_loss"})
 
-    # ---- 7. 图摘要文本 ----
-    print("  [7/7] Summary text...")
+    # ---- 8. 图摘要文本 ----
+    print("  [8/8] Summary text...")
     summary_lines = [
         f"Step 2 Figures Generated",
         f"========================",

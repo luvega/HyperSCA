@@ -28,15 +28,18 @@ import pandas as pd
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
-OUT_DIR = ROOT / "results" / "integration" / "schema"
+DEFAULT_DATA_ROOT = ROOT / "data"
+OUT_DIR = DEFAULT_DATA_ROOT / "metadata"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-NEU_DIR = Path(r"G:\scCRC_Neu\downstream_analyses_de_analysis"
-               r"\0downstream_analyses_de_analysis\de_analysis"
-               r"\de_analysis_tumor_mss_msi\deseq2_dgea")
+NEU_DIR = Path(
+    r"G:\scCRC_Neu\downstream_analyses_de_analysis"
+    r"\0downstream_analyses_de_analysis\de_analysis"
+    r"\de_analysis_tumor_mss_msi\deseq2_dgea"
+)
 IFNG_DIR = Path(r"F:\scCRC_IFNG")
 ICB_DIR = Path(r"G:\scCRC_ICB\output")
-ST_DIR  = Path(r"G:\ST_CRC_MSS")
+ST_DIR = Path(r"G:\ST_CRC_MSS")
 
 SEED_TARGETS = ["MFAP2", "POSTN", "INHBA"]
 
@@ -532,10 +535,28 @@ def write_mapping_rules():
 
 # ── Main ───────────────────────────────────────────────────────────────────
 def main():
+    global OUT_DIR, NEU_DIR, IFNG_DIR, ICB_DIR, ST_DIR
+
     parser = argparse.ArgumentParser(description="Build canonical schema")
     parser.add_argument("--no-icb", action="store_true",
                         help="Skip scCRC_ICB source (use IFNG instead)")
+    parser.add_argument("--data-root", type=str, default=str(DEFAULT_DATA_ROOT))
+    parser.add_argument("--output-dir", type=str, default="")
+    parser.add_argument("--neu-root", type=str, default=str(NEU_DIR))
+    parser.add_argument("--ifng-root", type=str, default=str(IFNG_DIR))
+    parser.add_argument("--icb-root", type=str, default=str(ICB_DIR))
+    parser.add_argument("--st-root", type=str, default=str(ST_DIR))
     args = parser.parse_args()
+
+    data_root = Path(args.data_root)
+    out_dir = Path(args.output_dir) if args.output_dir else data_root / "metadata"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    OUT_DIR = out_dir
+
+    NEU_DIR = Path(args.neu_root)
+    IFNG_DIR = Path(args.ifng_root)
+    ICB_DIR = Path(args.icb_root)
+    ST_DIR = Path(args.st_root)
 
     include_icb = not args.no_icb
 

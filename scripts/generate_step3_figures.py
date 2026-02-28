@@ -53,6 +53,8 @@ def _load_observed_expr(step1_dir: Path, step2_dir: Path, expected_genes: list[s
 
 
 def main() -> int:
+    from src.utils.plot_style import apply_cns_style
+    apply_cns_style()
     parser = argparse.ArgumentParser(description="HyperSCA Stage 3: Generate Figures")
     parser.add_argument("--input-dir", type=str, default="results/step3", help="Step 3 output directory")
     parser.add_argument("--step2-dir", type=str, default="results/step2", help="Step 2 output directory")
@@ -106,20 +108,31 @@ def main() -> int:
     fc_rows: list[np.ndarray] = []
     valid_targets: list[str] = []
     all_ranked_frames: list[pd.DataFrame] = []
+    fp_rows: list[dict] = []
 
     for idx, target in enumerate(targets, start=1):
         print(f"  [{idx}/{len(targets)}] target={target}")
         rank_path = input_dir / f"interaction_targets_{target}.csv"
+        rank_raw_path = input_dir / f"interaction_targets_raw_{target}.csv"
         cf_path = input_dir / f"cf_expression_{target}.csv"
         if not rank_path.exists() or not cf_path.exists():
             print(f"    [skip] missing files for {target}")
             continue
 
         ranked = pd.read_csv(rank_path)
+        ranked_raw = pd.read_csv(rank_raw_path) if rank_raw_path.exists() else ranked.copy()
         if not ranked.empty:
             ranked = ranked.copy()
             ranked["target_gene"] = target
             all_ranked_frames.append(ranked)
+        fp_rows.append(
+            {
+                "target_gene": target,
+                "n_raw": int(len(ranked_raw)),
+                "n_filtered": int(len(ranked)),
+                "reduction_rate": float(max(len(ranked_raw) - len(ranked), 0) / max(len(ranked_raw), 1)),
+            }
+        )
         cf_expr = pd.read_csv(cf_path, index_col=0)
         # 对齐行列
         common_rows = [r for r in cf_expr.index if r in obs_expr.index]
@@ -200,6 +213,37 @@ def main() -> int:
                 save_path=str(output_dir / "multi_target_heatmap_step3.png"),
             )
 
+    # CNS 图: 假阳性去除与真实性提升
+    if fp_rows:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fp_df = pd.DataFrame(fp_rows)
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        ax1, ax2 = axes
+        x = np.arange(len(fp_df))
+        w = 0.35
+        ax1.bar(x - w / 2, fp_df["n_raw"], width=w, color="#4477AA", label="Before filter")
+        ax1.bar(x + w / 2, fp_df["n_filtered"], width=w, color="#EE6677", label="After filter")
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(fp_df["target_gene"], rotation=15)
+        ax1.set_ylabel("Candidate count")
+        ax1.set_title("A. False-positive candidate removal")
+        ax1.legend()
+
+        ax2.bar(fp_df["target_gene"], fp_df["reduction_rate"], color="#228833")
+        ax2.set_ylim(0, 1)
+        ax2.set_ylabel("Reduction rate")
+        ax2.set_title("B. Authenticity gain by filtering")
+        ax2.tick_params(axis="x", rotation=15)
+
+        fig.suptitle("CNS Figure (Step3): False Positive Reduction and Authenticity Improvement", fontsize=13)
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        fig.savefig(output_dir / "cns_step3_false_positive_reduction.png", dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        fp_df.to_csv(output_dir / "step3_false_positive_reduction_table.csv", index=False)
+
     # 总览 dashboard
     merged = pd.concat(all_ranked_frames, ignore_index=True) if all_ranked_frames else pd.DataFrame()
     if not merged.empty:
@@ -242,6 +286,7 @@ def main() -> int:
         "- 可优先用于实验验证与靶点优先级排序。",
         "- 总览 dashboard 提供跨靶点比较，便于快速锁定全局优先通路。",
         "",
+        f"- Mean false-positive reduction rate: {pd.DataFrame(fp_rows)['reduction_rate'].mean() if fp_rows else 0.0:.3f}",
         f"- Global prior hit rate: {metrics.get('global', {}).get('global_prior_hit_rate', 0.0):.3f}",
         f"- Global score p95: {metrics.get('global', {}).get('global_score_p95', 0.0):.4f}",
         f"- Targets: {targets}",

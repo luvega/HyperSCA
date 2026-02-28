@@ -112,10 +112,34 @@ _HYPERSCA_RC: dict[str, Any] = {
     "figure.constrained_layout.use": True,
 }
 
+_CNS_FIGURE_RC: dict[str, Any] = {
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
+    "font.size": 10,
+    "axes.titlesize": 12,
+    "axes.labelsize": 10,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "axes.linewidth": 0.7,
+    "lines.linewidth": 0.8,
+    "axes.grid": False,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "legend.frameon": False,
+    "savefig.dpi": 300,
+    "savefig.bbox": "tight",
+}
+
 
 def apply_style() -> None:
     """应用 HyperSCA 全局 matplotlib 样式"""
     plt.rcParams.update(_HYPERSCA_RC)
+
+
+def apply_cns_style() -> None:
+    """应用 CNS/Cell 风格绘图参数（细线、无网格、严格字号层级）"""
+    plt.rcParams.update(_HYPERSCA_RC)
+    plt.rcParams.update(_CNS_FIGURE_RC)
 
 
 def reset_style() -> None:

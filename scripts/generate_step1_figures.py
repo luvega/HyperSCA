@@ -20,18 +20,19 @@ from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 from scipy import sparse
 import scanpy as sc
+from sklearn.manifold import trustworthiness
 
 # 项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.utils.plot_style import (
-    apply_style, create_figure, save_figure, add_watermark,
+    apply_cns_style, create_figure, save_figure, add_watermark,
     PALETTE_CATEGORICAL, CMAP_SPATIAL, get_color_mapping,
 )
 from src.data.spatial_graph import graph_statistics, spectral_gap
 
-apply_style()
+apply_cns_style()
 
 # 输出目录
 STEP1_DIR = PROJECT_ROOT / "results" / "step1"
@@ -324,6 +325,132 @@ def plot_baseline_comparison(adata, emb_poincare, labels, label_col):
     print(f"  Saved: compare/baseline_comparison_4panel.png")
 
 
+def _knn_overlap_score(base: np.ndarray, emb: np.ndarray, k: int = 15) -> float:
+    from sklearn.neighbors import NearestNeighbors
+
+    n = min(len(base), len(emb))
+    if n < (k + 2):
+        return 0.0
+    nn_base = NearestNeighbors(n_neighbors=k + 1).fit(base)
+    nn_emb = NearestNeighbors(n_neighbors=k + 1).fit(emb)
+    idx_base = nn_base.kneighbors(return_distance=False)[:, 1:]
+    idx_emb = nn_emb.kneighbors(return_distance=False)[:, 1:]
+    overlaps = []
+    for i in range(n):
+        a = set(idx_base[i].tolist())
+        b = set(idx_emb[i].tolist())
+        overlaps.append(len(a & b) / float(k))
+    return float(np.mean(overlaps))
+
+
+def plot_cns_step1_advantage(adata, emb_poincare, labels, label_col):
+    """CNS 级展示: 双曲嵌入 vs UMAP 优势证据图。"""
+    print("[Figure] CNS step1 advantage panel...")
+
+    from sklearn.metrics import silhouette_score
+    from sklearn.preprocessing import LabelEncoder
+
+    adata_work = adata.copy()
+    sc.tl.pca(adata_work, n_comps=50)
+    sc.pp.neighbors(adata_work, n_pcs=50)
+    sc.tl.umap(adata_work)
+    umap_2d = adata_work.obsm["X_umap"]
+    raw_pca = adata_work.obsm["X_pca"][:, :30]
+
+    # 抽样，避免大样本下度量过慢
+    n = len(labels)
+    sample_n = min(3000, n)
+    rng = np.random.default_rng(42)
+    idx = np.sort(rng.choice(n, size=sample_n, replace=False)) if sample_n < n else np.arange(n)
+
+    le = LabelEncoder()
+    y = le.fit_transform(np.asarray(labels)[idx])
+    hyp = emb_poincare[idx, : min(emb_poincare.shape[1], 10)]
+    um2 = umap_2d[idx]
+    raw = raw_pca[idx]
+
+    # 量化指标
+    sil_h = float(silhouette_score(hyp, y))
+    sil_u = float(silhouette_score(um2, y))
+    tw_h = float(trustworthiness(raw, hyp, n_neighbors=15))
+    tw_u = float(trustworthiness(raw, um2, n_neighbors=15))
+    knn_h = _knn_overlap_score(raw, hyp, k=15)
+    knn_u = _knn_overlap_score(raw, um2, k=15)
+
+    # 层级保真: 半径与到群中心距离相关性
+    raw_center = raw.mean(axis=0, keepdims=True)
+    raw_dist = np.linalg.norm(raw - raw_center, axis=1)
+    hyp_radius = np.linalg.norm(hyp[:, :2], axis=1)
+    um_radius = np.linalg.norm(um2 - um2.mean(axis=0, keepdims=True), axis=1)
+    hier_h = float(np.corrcoef(raw_dist, hyp_radius)[0, 1])
+    hier_u = float(np.corrcoef(raw_dist, um_radius)[0, 1])
+
+    unique_labels = sorted(set(labels))
+    cmap = get_color_mapping(unique_labels)
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 13))
+    ax_u, ax_h, ax_b, ax_s = axes[0, 0], axes[0, 1], axes[1, 0], axes[1, 1]
+
+    for lab in unique_labels:
+        mask_all = np.asarray(labels)[idx] == lab
+        ax_u.scatter(um2[mask_all, 0], um2[mask_all, 1], s=8, c=cmap[lab], alpha=0.7, edgecolors="none")
+        ax_h.scatter(hyp[mask_all, 0], hyp[mask_all, 1], s=8, c=cmap[lab], alpha=0.7, edgecolors="none")
+    ax_u.set_title("A. UMAP")
+    ax_h.set_title("B. Hyperbolic (Poincare)")
+    theta = np.linspace(0, 2 * np.pi, 200)
+    ax_h.plot(np.cos(theta), np.sin(theta), "k-", linewidth=1, alpha=0.25)
+    ax_h.set_xlim(-1.05, 1.05)
+    ax_h.set_ylim(-1.05, 1.05)
+    ax_h.set_aspect("equal")
+
+    metric_names = ["Silhouette", "Trustworthiness", "kNN overlap", "Hierarchy corr"]
+    vals_u = [sil_u, tw_u, knn_u, hier_u]
+    vals_h = [sil_h, tw_h, knn_h, hier_h]
+    x = np.arange(len(metric_names))
+    w = 0.35
+    ax_b.bar(x - w / 2, vals_u, width=w, color="#4477AA", label="UMAP")
+    ax_b.bar(x + w / 2, vals_h, width=w, color="#EE6677", label="Hyperbolic")
+    ax_b.set_xticks(x)
+    ax_b.set_xticklabels(metric_names, rotation=12)
+    ax_b.set_ylabel("Score")
+    ax_b.set_title("C. Quantitative Advantage Metrics")
+    ax_b.legend()
+
+    ax_s.scatter(raw_dist, um_radius, s=8, alpha=0.45, color="#4477AA", label=f"UMAP r={hier_u:.3f}")
+    ax_s.scatter(raw_dist, hyp_radius, s=8, alpha=0.45, color="#EE6677", label=f"Hyperbolic r={hier_h:.3f}")
+    ax_s.set_xlabel("Raw-space radial distance")
+    ax_s.set_ylabel("Embedding radial distance")
+    ax_s.set_title("D. Hierarchy Preservation")
+    ax_s.legend()
+
+    fig.suptitle(f"CNS Figure (Step1): Hyperbolic Embedding Advantage ({label_col})", fontsize=14)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    save_figure(fig, str(FIG_DIR / "compare" / "cns_step1_hyperbolic_vs_umap.png"),
+                config={"chart": "cns_step1_hyperbolic_vs_umap"})
+
+    metrics = {
+        "umap": {
+            "silhouette": sil_u,
+            "trustworthiness": tw_u,
+            "knn_overlap": knn_u,
+            "hierarchy_correlation": hier_u,
+        },
+        "hyperbolic": {
+            "silhouette": sil_h,
+            "trustworthiness": tw_h,
+            "knn_overlap": knn_h,
+            "hierarchy_correlation": hier_h,
+        },
+        "label_column": label_col,
+        "n_eval_cells": int(sample_n),
+    }
+    (FIG_DIR / "compare" / "cns_step1_metrics.json").write_text(
+        json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print("  Saved: compare/cns_step1_hyperbolic_vs_umap.png")
+    print("  Saved: compare/cns_step1_metrics.json")
+
+
 # =========================================================================
 # 4. Training Loss Curves
 # =========================================================================
@@ -390,6 +517,9 @@ def main():
     print()
 
     plot_baseline_comparison(adata, emb_poincare, labels, label_col)
+    print()
+
+    plot_cns_step1_advantage(adata, emb_poincare, labels, label_col)
     print()
 
     plot_training_losses()

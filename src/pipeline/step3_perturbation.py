@@ -191,6 +191,19 @@ class PerturbationPipeline:
         )
         return ranked
 
+    def _filter_false_positive(self, ranked: pd.DataFrame) -> pd.DataFrame:
+        from src.perturbation.false_positive_filter import filter_false_positive_targets
+
+        filtered = filter_false_positive_targets(
+            ranked,
+            min_score=0.02,
+            max_fdr=0.25,
+            require_prior_or_large_effect=True,
+        )
+        if "pass_filter" not in filtered.columns:
+            return filtered.copy()
+        return filtered[filtered["pass_filter"]].copy()
+
     def _plot_for_target(
         self,
         target_gene: str,
@@ -467,6 +480,7 @@ class PerturbationPipeline:
         all_ranked = {}
         all_metrics = {}
         fold_change_rows = []
+        fp_reduction_rows = []
 
         for target_gene in self.config.step3_target_genes:
             print("=" * 60)
@@ -491,21 +505,23 @@ class PerturbationPipeline:
             # 保存反事实表达
             cf_expr.to_csv(self.output_dir / f"cf_expression_{target_gene}.csv")
 
-            ranked = self._rank_targets(
+            ranked_raw = self._rank_targets(
                 flow_edges=flow_edges,
                 obs_expr=obs_expr,
                 cf_expr=cf_expr,
                 node_to_type=node_to_type,
             )
-            ranked.to_csv(self.output_dir / f"interaction_targets_{target_gene}.csv", index=False)
-            ranked.to_json(
+            ranked_filtered = self._filter_false_positive(ranked_raw)
+            ranked_raw.to_csv(self.output_dir / f"interaction_targets_raw_{target_gene}.csv", index=False)
+            ranked_filtered.to_csv(self.output_dir / f"interaction_targets_{target_gene}.csv", index=False)
+            ranked_filtered.to_json(
                 self.output_dir / f"interaction_targets_{target_gene}.json",
                 orient="records",
                 force_ascii=False,
                 indent=2,
             )
-            self._plot_for_target(target_gene, obs_expr, cf_expr, ranked)
-            self._write_target_report(target_gene, ranked)
+            self._plot_for_target(target_gene, obs_expr, cf_expr, ranked_filtered)
+            self._write_target_report(target_gene, ranked_filtered)
 
             # 空间传播
             propagation_result = self._run_spatial_propagation(
@@ -552,9 +568,14 @@ class PerturbationPipeline:
             # 汇总指标
             target_metrics = self._compute_target_metrics(
                 target_gene=target_gene,
-                ranked=ranked,
+                ranked=ranked_filtered,
                 obs_expr=obs_expr,
                 cf_expr=cf_expr,
+            )
+            target_metrics["n_candidates_raw"] = int(len(ranked_raw))
+            target_metrics["n_candidates_filtered"] = int(len(ranked_filtered))
+            target_metrics["false_positive_reduction_rate"] = (
+                float(max(len(ranked_raw) - len(ranked_filtered), 0) / max(len(ranked_raw), 1))
             )
             target_metrics["method"] = self.config.step3_method
             target_metrics["cf_quality"] = cf_quality
@@ -562,10 +583,24 @@ class PerturbationPipeline:
             if propagation_result:
                 target_metrics["propagation_fit_params"] = propagation_result.get("fit_params", {})
             all_metrics[target_gene] = target_metrics
-            all_ranked[target_gene] = ranked
+            all_ranked[target_gene] = ranked_filtered
+            fp_reduction_rows.append(
+                {
+                    "target_gene": target_gene,
+                    "n_raw": int(len(ranked_raw)),
+                    "n_filtered": int(len(ranked_filtered)),
+                    "reduction_rate": target_metrics["false_positive_reduction_rate"],
+                }
+            )
 
             # multi-target heatmap 使用：每个 target 对 top marker 的全局 FC
-            top_markers = list(dict.fromkeys([target_gene.upper()] + list(ranked["ligand"].head(6)) + list(ranked["receptor"].head(6))))
+            top_markers = list(
+                dict.fromkeys(
+                    [target_gene.upper()]
+                    + list(ranked_filtered["ligand"].head(6))
+                    + list(ranked_filtered["receptor"].head(6))
+                )
+            )
             gene_cols = {c.upper(): c for c in obs_expr.columns}
             markers = [gene_cols[g] for g in top_markers if g in gene_cols]
             if markers:
@@ -616,12 +651,20 @@ class PerturbationPipeline:
             "per_target": all_metrics,
             "global": {
                 "n_total_candidates": int(sum(m.get("n_candidates", 0) for m in all_metrics.values())),
+                "mean_false_positive_reduction_rate": float(
+                    np.mean([r["reduction_rate"] for r in fp_reduction_rows])
+                )
+                if fp_reduction_rows
+                else 0.0,
                 "global_prior_hit_rate": float(np.mean(all_prior)) if all_prior else 0.0,
                 "global_score_p95": float(np.percentile(all_scores, 95)) if all_scores else 0.0,
                 "global_score_median": float(np.median(all_scores)) if all_scores else 0.0,
             },
             "elapsed_seconds": round(time.time() - t0, 2),
         }
+        pd.DataFrame(fp_reduction_rows).to_csv(
+            self.output_dir / "false_positive_reduction_summary.csv", index=False
+        )
         (self.output_dir / "step3_metrics.json").write_text(
             json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default),
             encoding="utf-8",

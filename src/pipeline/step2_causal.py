@@ -593,6 +593,24 @@ class CausalPipeline:
 
         return metrics
 
+    def compare_with_baseline(self, causal_graph, cluster_data: dict) -> dict:
+        """与传统通讯分析基线对比，量化空间约束因果优势。"""
+        from src.causal.baseline_communication import (
+            build_baseline_communication_network,
+            compare_spatial_causal_advantage,
+        )
+
+        baseline_adj = build_baseline_communication_network(
+            cluster_data["cluster_expr"],
+            threshold_quantile=self.config.step2_baseline_quantile,
+        )
+        metrics = compare_spatial_causal_advantage(
+            causal_adj=causal_graph.adjacency,
+            baseline_adj=baseline_adj,
+            spatial_adj=cluster_data.get("cluster_adj"),
+        )
+        return {"baseline_adj": baseline_adj, "metrics": metrics}
+
     # =================================================================
     # Step 2.9: 保存产物
     # =================================================================
@@ -609,6 +627,7 @@ class CausalPipeline:
         falsification: dict,
         freq_matrix: np.ndarray,
         type_mapping: dict,
+        baseline_compare: Optional[dict] = None,
     ):
         """保存所有产物到 results/step2/"""
         print()
@@ -677,6 +696,11 @@ class CausalPipeline:
         # Cluster 表达（用于后续可视化）
         np.save(out / "cluster_expr.npy", cluster_data["cluster_expr"])
         np.save(out / "cluster_adj.npy", cluster_data["cluster_adj"])
+
+        if baseline_compare is not None:
+            np.save(out / "baseline_comm_adjacency.npy", baseline_compare["baseline_adj"])
+            with open(out / "baseline_compare_metrics.json", "w", encoding="utf-8") as f:
+                json.dump(baseline_compare["metrics"], f, indent=2, ensure_ascii=False)
 
         print(f"  All results saved to: {out}")
 
@@ -864,11 +888,26 @@ class CausalPipeline:
             cluster_labels,
         )
 
+        baseline_compare = None
+        if self.config.step2_enable_baseline_compare:
+            print()
+            print("=" * 60)
+            print("[Step 2.8b] Baseline communication comparison...")
+            print("=" * 60)
+            baseline_compare = self.compare_with_baseline(causal_graph, cluster_data)
+            metrics.update(
+                {
+                    f"baseline_{k}": v
+                    for k, v in baseline_compare["metrics"].items()
+                }
+            )
+
         # 2.9 保存
         self.save_results(
             causal_graph, disentangle_result, cluster_data,
             metrics, axis_results, flow_edges, flow_summary,
             falsification, freq_matrix, type_mapping,
+            baseline_compare=baseline_compare,
         )
 
         # 2.10 解读报告
@@ -888,4 +927,5 @@ class CausalPipeline:
             "flow_edges": flow_edges,
             "flow_summary": flow_summary,
             "falsification": falsification,
+            "baseline_compare": baseline_compare,
         }

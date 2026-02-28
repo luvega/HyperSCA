@@ -488,8 +488,15 @@ class HyperbolicVAE(nn.Module):
         """
         q_z, mu = self.encode(x, edge_index, edge_weight)
         z = q_z.rsample()
+        z = torch.nan_to_num(z, nan=0.0, posinf=1e3, neginf=-1e3)
+        z = project_to_lorentz(z)
 
         mean, disp, pi = self.decode(z)
+        mean = torch.nan_to_num(mean, nan=1e-5, posinf=1e6, neginf=1e-5)
+        disp = torch.nan_to_num(disp, nan=1e-4, posinf=1e4, neginf=1e-4)
+        if pi is not None:
+            pi = torch.nan_to_num(pi, nan=0.5, posinf=1.0, neginf=0.0)
+            pi = torch.clamp(pi, min=1e-6, max=1 - 1e-6)
 
         return {
             "z": z,
@@ -535,12 +542,17 @@ class HyperbolicVAE(nn.Module):
             recon = zinb_loss(x_raw, mean, disp, pi).mean()
         else:
             recon = nb_loss(x_raw, mean, disp).mean()
+        recon = torch.nan_to_num(recon, nan=1e6, posinf=1e6, neginf=1e6)
 
         # KL 散度
         kl = q_z.kl_divergence(n_samples=kl_samples).mean()
+        kl = torch.nan_to_num(kl, nan=0.0, posinf=1e4, neginf=0.0)
+        kl = torch.clamp(kl, min=0.0, max=1e4)
 
         # 拓扑正则化
         topo = topo_regularization(z, edge_index, n_nodes)
+        topo = torch.nan_to_num(topo, nan=0.0, posinf=1e3, neginf=-1e3)
+        topo = torch.clamp(topo, min=-1e3, max=1e3)
 
         total = recon + self.beta * kl + self.gamma * topo
 

@@ -32,6 +32,10 @@ def main():
     parser.add_argument("--latent-dim", type=int, default=None)
     parser.add_argument("--n-top-genes", type=int, default=None)
     parser.add_argument("--spatial-k", type=int, default=None)
+    parser.add_argument("--use-topola", dest="use_topola", action="store_true")
+    parser.add_argument("--no-topola", dest="use_topola", action="store_false")
+    parser.set_defaults(use_topola=None)
+    parser.add_argument("--topola-max-nodes", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--beta", type=float, default=None)
     parser.add_argument("--gamma", type=float, default=None)
@@ -56,6 +60,8 @@ def main():
         "hvae_latent_dim": args.latent_dim,
         "n_top_genes": args.n_top_genes,
         "spatial_k": args.spatial_k,
+        "use_topola": args.use_topola,
+        "topola_max_nodes": args.topola_max_nodes,
         "hvae_lr": args.lr,
         "hvae_beta": args.beta,
         "hvae_gamma": args.gamma,

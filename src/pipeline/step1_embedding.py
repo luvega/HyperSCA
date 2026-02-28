@@ -91,6 +91,7 @@ class EmbeddingPipeline:
             use_topola=self.config.use_topola,
             topola_lambda=self.config.topola_lambda,
             topola_components=self.config.topola_components,
+            topola_max_nodes=self.config.topola_max_nodes,
         )
 
         return adj_orig, adj_enh
@@ -139,6 +140,8 @@ class EmbeddingPipeline:
                 x_raw = torch.tensor(np.array(raw_sub.X), dtype=torch.float32)
         else:
             x_raw = x_input.clone()
+        # 稳定性保护：极端计数会放大 NB 对数似然梯度
+        x_raw = torch.clamp(x_raw, min=0.0, max=1e4)
 
         # 图 → edge_index
         adj_for_gcn = adj_enh if adj_enh is not None else adj_orig
@@ -271,6 +274,41 @@ class EmbeddingPipeline:
         adata.obsm["X_poincare"] = train_results["poincare_emb"]
         adata.obsm["X_lorentz"] = train_results["lorentz_emb"]
         adata.write(out / "adata_embedded.h5ad")
+
+        # 嵌入质量基准（Hyperbolic vs UMAP）
+        try:
+            from src.evaluation.embedding_metrics import evaluate_embedding
+            from sklearn.metrics import silhouette_score
+            from sklearn.preprocessing import LabelEncoder
+            import scanpy as sc
+
+            label_col = None
+            for c in ["cell_type", "Level1", "celltype", "annotation", "leiden"]:
+                if c in adata.obs.columns:
+                    label_col = c
+                    break
+            metrics = {"hyperbolic": {}, "umap": {}, "label_col": label_col}
+            if label_col is not None:
+                y = LabelEncoder().fit_transform(adata.obs[label_col].astype(str).values)
+                metrics["hyperbolic"] = evaluate_embedding(
+                    train_results["poincare_emb"],
+                    labels=y,
+                    dist_original=None,
+                )
+                adata_eval = adata.copy()
+                sc.tl.pca(adata_eval, n_comps=50)
+                sc.pp.neighbors(adata_eval, n_pcs=50)
+                sc.tl.umap(adata_eval)
+                umap_emb = adata_eval.obsm["X_umap"]
+                metrics["umap"] = {
+                    "n_cells": int(umap_emb.shape[0]),
+                    "embedding_dim": int(umap_emb.shape[1]),
+                    "silhouette": float(silhouette_score(umap_emb, y)),
+                }
+            with open(out / "embedding_benchmark.json", "w", encoding="utf-8") as f:
+                json.dump(metrics, f, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            print(f"  [WARN] embedding benchmark skipped: {exc}")
 
         print(f"  All results saved to: {out}")
 

@@ -35,6 +35,7 @@ class HyperSCAConfig:
     use_topola: bool = True
     topola_lambda: float = 1e-3
     topola_components: Optional[int] = None
+    topola_max_nodes: int = 20000
 
     # --- H-VAE ---
     hvae_latent_dim: int = 32
@@ -68,6 +69,8 @@ class HyperSCAConfig:
     step2_pc_max_cond: int = 3                  # PC 算法最大条件集大小
     step2_max_cells: int = 5000                 # single_cell 模式子采样上限
     step2_known_axes_file: Optional[str] = None # 外部先验边集 JSON（可选）
+    step2_enable_baseline_compare: bool = True
+    step2_baseline_quantile: float = 0.8
 
     # --- Step 3: Counterfactual Perturbation ---
     step3_input_step1_dir: str = "results/step1"
@@ -86,6 +89,34 @@ class HyperSCAConfig:
     step3_spatial_decay_length: float = 150.0
     step3_propagation_max_depth: int = 4
     step3_propagation_threshold: float = 0.01
+
+    # --- Step 4: Dynamic Intervention ---
+    step4_input_step2_dir: str = "results/step2"
+    step4_input_step3_dir: str = "results/step3"
+    step4_output_dir: str = "results/step4"
+    step4_hub_genes: List[str] = field(default_factory=lambda: ["POSTN", "MFAP2", "INHBA"])
+    step4_dose_grid: List[float] = field(default_factory=lambda: [0.1, 0.3, 1.0, 3.0, 10.0])
+    step4_time_grid: List[float] = field(default_factory=lambda: [0.0, 6.0, 12.0, 24.0, 48.0, 72.0])
+    step4_combo_max_size: int = 2
+    step4_pk_ka: float = 1.2
+    step4_pk_ke: float = 0.18
+    step4_pk_vd: float = 1.0
+    step4_pk_f: float = 1.0
+    step4_pd_emax: float = 1.0
+    step4_pd_ec50: float = 1.0
+    step4_pd_hill: float = 1.2
+    step4_temporal_diffusion: float = 0.35
+    step4_temporal_decay: float = 0.08
+
+    # --- Roundtrip update ---
+    data_root: str = "data/"
+    data_sources_icb: str = r"G:\scCRC_ICB"
+    data_sources_neu: str = r"G:\scCRC_Neu"
+    data_sources_st: str = r"G:\ST_CRC_MSS"
+    data_sources_ifng: str = r"F:\scCRC_IFNG"
+    cohort_filter_mss_only: bool = True
+    roundtrip_experiment_file: str = "data/metadata/experiment_roundtrip.csv"
+    roundtrip_mapping_schema: str = "data/metadata/roundtrip_mapping.json"
 
     # --- General ---
     device: str = "cuda"

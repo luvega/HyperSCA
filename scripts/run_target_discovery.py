@@ -888,6 +888,40 @@ def score_and_rank(
     return pool
 
 
+def retain_hubs_and_combos(
+    ranking: pd.DataFrame,
+    step3_results_hyp: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """保留三枢纽 + 新发现枢纽与时空调控组合。"""
+    anchors_df = ranking[ranking["gene"].isin(ANCHOR_GENES)].copy()
+    new_hubs = ranking[~ranking["gene"].isin(ANCHOR_GENES)].head(30).copy()
+    retained = pd.concat([anchors_df, new_hubs], ignore_index=True)
+    retained = retained.drop_duplicates(subset=["gene"]).sort_values("rank")
+    retained.to_csv(OUT_BASE / "hub_targets_retained.csv", index=False)
+
+    combo_rows = []
+    for tg, res in step3_results_hyp.items():
+        ranked_df = res.get("ranked_targets")
+        if ranked_df is None or ranked_df.empty:
+            continue
+        for _, row in ranked_df.head(20).iterrows():
+            combo_rows.append(
+                {
+                    "trigger_target": tg,
+                    "ligand": row.get("ligand", ""),
+                    "receptor": row.get("receptor", ""),
+                    "pathway": row.get("pathway", ""),
+                    "causal_edge": row.get("causal_edge", ""),
+                    "target_priority_score": row.get("target_priority_score", np.nan),
+                }
+            )
+    combos = pd.DataFrame(combo_rows)
+    if not combos.empty:
+        combos = combos.sort_values("target_priority_score", ascending=False)
+    combos.to_csv(OUT_BASE / "spatiotemporal_regulatory_combos.csv", index=False)
+    return retained, combos
+
+
 # ============================================================================
 #  Phase 8: Mode Comparison
 # ============================================================================
@@ -1422,6 +1456,13 @@ def main():
         cluster_expr,
     )
 
+    retained_hubs, retained_combos = retain_hubs_and_combos(
+        ranking,
+        results["hyperbolic"]["step3"],
+    )
+    print(f"  Retained hubs: {len(retained_hubs)}")
+    print(f"  Retained combos: {len(retained_combos)}")
+
     # Phase 8: Mode comparison
     comp = compare_modes(
         results["hyperbolic"]["geom"], results["euclidean"]["geom"],
@@ -1451,6 +1492,8 @@ def main():
     print(f"  Key files:")
     print(f"    - candidate_pool.csv ({len(candidate_pool)} genes)")
     print(f"    - target_ranking.csv ({len(ranking)} genes)")
+    print(f"    - hub_targets_retained.csv")
+    print(f"    - spatiotemporal_regulatory_combos.csv")
     print(f"    - evidence_matrix.csv")
     print(f"    - target_discovery_report.md")
     print(f"    - comparison_report.md")
