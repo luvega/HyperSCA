@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Generate multi-dataset spatial combo + communication figures.
+"""Generate multi-dataset spatial anchor-target + communication figures.
 
 Datasets:
 1) ST_CRC_MSS (standardized h5ad)
@@ -18,7 +18,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
-from matplotlib import colors as mcolors
 import numpy as np
 import pandas as pd
 import scanpy as sc
@@ -29,14 +28,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.utils.plot_style import apply_cns_style
+from src.utils.plot_style import CMAP_SPATIAL, apply_cns_style
 
 JOURNAL_SINGLE_COL_WIDTH = 3.35
 JOURNAL_DOUBLE_COL_WIDTH = 7.0
-SPATIAL_CONT_CMAP = mcolors.LinearSegmentedColormap.from_list(
-    "deepblue_to_brightyellow",
-    ["#0B2A6F", "#2A5CAA", "#5E88C5", "#A7BCE0", "#F3D37A", "#F6E84A"],
-)
+SPATIAL_CONT_CMAP = CMAP_SPATIAL
 
 
 def _safe_load_json(path: Path) -> list[dict]:
@@ -325,7 +321,7 @@ def _plot_dot_panel(ax: plt.Axes, summary_df: pd.DataFrame, combo_genes: list[st
         plot_df["y"].values,
         s=sizes,
         c=plot_df["mean_expr"].values,
-        cmap="magma",
+        cmap=SPATIAL_CONT_CMAP,
         alpha=0.8,
         edgecolors="none",
     )
@@ -379,7 +375,8 @@ def _save_single_spatial_panel(
         )
         cb = fig.colorbar(sca, ax=ax, fraction=0.045, pad=0.02)
         cb.ax.tick_params(labelsize=8, width=0.6, length=2)
-        cb.set_label(f"Combo score (normalized): {' + '.join(combo_genes)}", fontsize=10)
+        label = combo_genes[0] if len(combo_genes) == 1 else " + ".join(combo_genes)
+        cb.set_label(f"Target score (normalized): {label}", fontsize=10)
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
 
@@ -402,7 +399,7 @@ def _save_single_comm_panel(edge_df: pd.DataFrame, out_path: Path) -> None:
         fig = plt.figure(figsize=(fig_w, fig_h))
         ax = fig.add_subplot(111)
         _plot_communication_panel(ax, edge_df)
-        ax.set_title("D  Cell communication constrained by discovered combo", fontsize=13, fontweight="bold", pad=6)
+        ax.set_title("D  Cell communication constrained by anchor targets", fontsize=13, fontweight="bold", pad=6)
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
 
@@ -425,7 +422,7 @@ def _save_single_dot_panel(summary_df: pd.DataFrame, combo_genes: list[str], out
         fig = plt.figure(figsize=(fig_w, fig_h))
         ax = fig.add_subplot(111)
         _plot_dot_panel(ax, summary_df, combo_genes, fig)
-        ax.set_title("E  Combo expression dot plot", fontsize=13, fontweight="bold", pad=6)
+        ax.set_title("E  Anchor target expression dot plot", fontsize=13, fontweight="bold", pad=6)
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
 
@@ -468,7 +465,7 @@ def _normalize_scores_for_plot(datasets: list[dict]) -> tuple[float, float]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Generate multi-dataset spatial combo and communication figure."
+        description="Generate multi-dataset spatial anchor-target and communication figure."
     )
     parser.add_argument("--combos-csv", default="results/integration/discovery/spatiotemporal_regulatory_combos.csv")
     parser.add_argument("--step4-combo-csv", default="results/step4/combination_ranking.csv")
@@ -498,64 +495,76 @@ def main() -> int:
     out_dir = PROJECT_ROOT / args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    combo_genes = _discover_combo_genes(combos_csv, step4_combo_csv, max_genes=3)
-    print(f"[info] combo genes: {combo_genes}")
+    anchor_genes = ["POSTN", "MFAP2", "INHBA"]
+    print(f"[info] anchor genes: {anchor_genes}")
 
-    ds_st = _dataset_from_h5ad(
-        name="ST_CRC_MSS",
-        h5ad_path=PROJECT_ROOT / args.st_h5ad,
-        genes=combo_genes,
-        max_points=args.max_points_per_dataset,
-        seed=args.seed,
-    )
-    ds_visiumhd = _dataset_from_visiumhd(
-        name="VisiumHD_HumanColon_Oliveira",
-        h5_path=PROJECT_ROOT / args.visiumhd_h5,
-        tissue_pos_parquet=PROJECT_ROOT / args.visiumhd_tissue_pos,
-        genes=combo_genes,
-        max_points=args.max_points_per_dataset,
-        seed=args.seed + 1,
-    )
-    ds_cosmx = _dataset_from_h5ad(
-        name="CosMx_scCRC_IFNG",
-        h5ad_path=Path(args.ifng_cosmx_h5ad),
-        genes=combo_genes,
-        max_points=args.max_points_per_dataset,
-        seed=args.seed + 2,
-    )
-    datasets = [ds_st, ds_visiumhd, ds_cosmx]
+    all_summary_rows: list[dict] = []
+    datasets_for_layout = None
+    first_vmin, first_vmax = 0.0, 1.0
+    for gi, gene in enumerate(anchor_genes):
+        ds_st = _dataset_from_h5ad(
+            name="ST_CRC_MSS",
+            h5ad_path=PROJECT_ROOT / args.st_h5ad,
+            genes=[gene],
+            max_points=args.max_points_per_dataset,
+            seed=args.seed + gi * 10,
+        )
+        ds_visiumhd = _dataset_from_visiumhd(
+            name="VisiumHD_HumanColon_Oliveira",
+            h5_path=PROJECT_ROOT / args.visiumhd_h5,
+            tissue_pos_parquet=PROJECT_ROOT / args.visiumhd_tissue_pos,
+            genes=[gene],
+            max_points=args.max_points_per_dataset,
+            seed=args.seed + 1 + gi * 10,
+        )
+        ds_cosmx = _dataset_from_h5ad(
+            name="CosMx_scCRC_IFNG",
+            h5ad_path=Path(args.ifng_cosmx_h5ad),
+            genes=[gene],
+            max_points=args.max_points_per_dataset,
+            seed=args.seed + 2 + gi * 10,
+        )
+        datasets = [ds_st, ds_visiumhd, ds_cosmx]
+        vmin, vmax = _normalize_scores_for_plot(datasets)
+        if datasets_for_layout is None:
+            datasets_for_layout = datasets
+            first_vmin, first_vmax = vmin, vmax
 
-    edge_df = _load_combo_edges(flow_json, combo_genes=combo_genes, top_k=18)
-    summary_df = pd.DataFrame(sum([d["summary"] for d in datasets], []))
+        _save_single_spatial_panel(
+            ds_st, [gene],
+            out_dir / f"panel_A_spatial_ST_CRC_MSS_{gene}.png",
+            vmin=vmin, vmax=vmax, panel_label="A",
+        )
+        _save_single_spatial_panel(
+            ds_visiumhd, [gene],
+            out_dir / f"panel_B_spatial_VisiumHD_HumanColon_Oliveira_{gene}.png",
+            vmin=vmin, vmax=vmax, panel_label="B",
+        )
+        _save_single_spatial_panel(
+            ds_cosmx, [gene],
+            out_dir / f"panel_C_spatial_CosMx_scCRC_IFNG_{gene}.png",
+            vmin=vmin, vmax=vmax, panel_label="C",
+        )
+        all_summary_rows.extend(ds_st["summary"] + ds_visiumhd["summary"] + ds_cosmx["summary"])
 
-    # ===== Standalone panel outputs for downstream layout =====
-    vmin, vmax = _normalize_scores_for_plot(datasets)
-    _save_single_spatial_panel(
-        ds_st, combo_genes,
-        out_dir / "panel_A_spatial_ST_CRC_MSS.png",
-        vmin=vmin, vmax=vmax, panel_label="A",
-    )
-    _save_single_spatial_panel(
-        ds_visiumhd, combo_genes,
-        out_dir / "panel_B_spatial_VisiumHD_HumanColon_Oliveira.png",
-        vmin=vmin, vmax=vmax, panel_label="B",
-    )
-    _save_single_spatial_panel(
-        ds_cosmx, combo_genes,
-        out_dir / "panel_C_spatial_CosMx_scCRC_IFNG.png",
-        vmin=vmin, vmax=vmax, panel_label="C",
-    )
+    edge_df = _load_combo_edges(flow_json, combo_genes=anchor_genes, top_k=18)
+    summary_df = pd.DataFrame(all_summary_rows)
+
     _save_single_comm_panel(
         edge_df,
-        out_dir / "panel_D_communication_combo_edges.png",
+        out_dir / "panel_D_communication_anchor_edges.png",
     )
     _save_single_dot_panel(
         summary_df,
-        combo_genes,
-        out_dir / "panel_E_dotplot_combo_expression.png",
+        anchor_genes,
+        out_dir / "panel_E_dotplot_anchor_expression.png",
     )
 
     # ===== Figure layout (GridSpec strict alignment) =====
+    if datasets_for_layout is None:
+        print("[error] no datasets loaded for layout figure")
+        return 1
+    datasets = datasets_for_layout
     fig = plt.figure(figsize=(17, 10))
     gs = gridspec.GridSpec(
         nrows=2, ncols=3, figure=fig,
@@ -578,8 +587,8 @@ def main() -> int:
             s=1.0,
             alpha=0.62,
             edgecolors="none",
-            vmin=vmin,
-            vmax=vmax,
+            vmin=first_vmin,
+            vmax=first_vmax,
             rasterized=True,
         )
         _style_spatial_ax(ax)
@@ -594,27 +603,27 @@ def main() -> int:
 
     cbar = fig.colorbar(sca, ax=spatial_axes, fraction=0.022, pad=0.01)
     cbar.ax.tick_params(labelsize=8, width=0.6, length=2)
-    cbar.set_label(f"Combo score (normalized): {' + '.join(combo_genes)}", fontsize=10)
+    cbar.set_label("Target score (normalized): POSTN", fontsize=10)
 
     _plot_communication_panel(ax_comm, edge_df)
-    ax_comm.set_title("D  Cell communication constrained by discovered combo", fontsize=13, fontweight="bold", pad=6)
+    ax_comm.set_title("D  Cell communication constrained by anchor targets", fontsize=13, fontweight="bold", pad=6)
 
-    _plot_dot_panel(ax_dot, summary_df, combo_genes, fig)
-    ax_dot.set_title("E  Combo expression dot plot", fontsize=13, fontweight="bold", pad=6)
+    _plot_dot_panel(ax_dot, summary_df, anchor_genes, fig)
+    ax_dot.set_title("E  Anchor target expression dot plot", fontsize=13, fontweight="bold", pad=6)
 
     fig.suptitle(
-        "Spatial Co-distribution and Communication of Discovered Target Combo",
+        "Spatial Distribution and Communication of Anchor Targets",
         fontsize=14,
         fontweight="bold",
         y=0.995,
     )
 
-    fig_path = out_dir / "cns_spatial_combo_communication_multidataset.png"
+    fig_path = out_dir / "cns_spatial_anchor_communication_multidataset.png"
     fig.savefig(fig_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
     report = {
-        "combo_genes": combo_genes,
+        "anchor_genes": anchor_genes,
         "datasets": {
             d["name"]: {
                 "n_total": d["n_total"],
@@ -626,14 +635,20 @@ def main() -> int:
         "communication_edges_plotted": int(len(edge_df)),
         "figure_combined": str(fig_path),
         "figures_single_panels": [
-            str(out_dir / "panel_A_spatial_ST_CRC_MSS.png"),
-            str(out_dir / "panel_B_spatial_VisiumHD_HumanColon_Oliveira.png"),
-            str(out_dir / "panel_C_spatial_CosMx_scCRC_IFNG.png"),
-            str(out_dir / "panel_D_communication_combo_edges.png"),
-            str(out_dir / "panel_E_dotplot_combo_expression.png"),
+            str(out_dir / "panel_A_spatial_ST_CRC_MSS_POSTN.png"),
+            str(out_dir / "panel_A_spatial_ST_CRC_MSS_MFAP2.png"),
+            str(out_dir / "panel_A_spatial_ST_CRC_MSS_INHBA.png"),
+            str(out_dir / "panel_B_spatial_VisiumHD_HumanColon_Oliveira_POSTN.png"),
+            str(out_dir / "panel_B_spatial_VisiumHD_HumanColon_Oliveira_MFAP2.png"),
+            str(out_dir / "panel_B_spatial_VisiumHD_HumanColon_Oliveira_INHBA.png"),
+            str(out_dir / "panel_C_spatial_CosMx_scCRC_IFNG_POSTN.png"),
+            str(out_dir / "panel_C_spatial_CosMx_scCRC_IFNG_MFAP2.png"),
+            str(out_dir / "panel_C_spatial_CosMx_scCRC_IFNG_INHBA.png"),
+            str(out_dir / "panel_D_communication_anchor_edges.png"),
+            str(out_dir / "panel_E_dotplot_anchor_expression.png"),
         ],
     }
-    (out_dir / "cns_spatial_combo_communication_multidataset.report.json").write_text(
+    (out_dir / "cns_spatial_anchor_communication_multidataset.report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     print(f"[done] saved figure: {fig_path}")

@@ -168,6 +168,10 @@ def build_sample_table(*, include_icb: bool = True) -> pd.DataFrame:
         print(f"  WARN: IFNG clinical mapping not found at {ifng_clinical}")
 
     if include_icb:
+        icb_h5ad = DEFAULT_DATA_ROOT / "scRNA" / "scCRC_ICB" / "expression.h5ad"
+        icb_has_full = icb_h5ad.exists()
+        if icb_has_full:
+            print(f"  ICB: full expression.h5ad detected → data_level=single_cell")
         rows.append({
             "dataset": "scCRC_ICB",
             "patient_id": "multi",
@@ -178,9 +182,9 @@ def build_sample_table(*, include_icb: bool = True) -> pd.DataFrame:
             "ifn_ip": "",
             "cohort": "scCRC_ICB",
             "treatment": "ICB_response",
-            "modality": "scRNA-seq_DEG",
-            "data_level": "result",
-            "source_path": str(ICB_DIR),
+            "modality": "scRNA-seq" if icb_has_full else "scRNA-seq_DEG",
+            "data_level": "single_cell" if icb_has_full else "result",
+            "source_path": str(icb_h5ad if icb_has_full else ICB_DIR),
         })
 
     for csv_f in sorted(ST_DIR.glob("STmetadata_*.csv")):
@@ -347,23 +351,55 @@ def build_entity_table(*, include_icb: bool = True) -> pd.DataFrame:
             pass
 
     if include_icb:
-        icb_celltypes = [
-            ("Epi", "Major"), ("Mye", "Major"), ("Stromal", "Major"),
-            ("Tumor", "Mid"), ("Macrophage", "Mid"), ("Fibroblast", "Mid"),
-        ]
-        for ct, level in icb_celltypes:
-            alias_info = CELLTYPE_ALIAS.get(ct, {})
-            rows.append({
-                **_entity_base,
-                "entity_id": f"scCRC_ICB__{level}_{ct}",
-                "dataset": "scCRC_ICB",
-                "entity_type": "deg_celltype",
-                "original_label": ct,
-                "canonical_celltype": alias_info.get("canonical", ct),
-                "sub_type": alias_info.get("sub", ""),
-                "major_lineage": alias_info.get("major", ""),
-                "cluster_label": level,
-            })
+        icb_h5ad_path = DEFAULT_DATA_ROOT / "scRNA" / "scCRC_ICB" / "expression.h5ad"
+        icb_entity_added = False
+        if icb_h5ad_path.exists():
+            try:
+                import anndata as _ad
+                _icb = _ad.read_h5ad(str(icb_h5ad_path), backed="r")
+                for lk in ["MajorCellType", "MidCellType", "celltype",
+                            "cell_type", "Level1"]:
+                    if lk in _icb.obs.columns:
+                        vc = _icb.obs[lk].value_counts()
+                        for ct_label, cnt in vc.items():
+                            ct_str = str(ct_label)
+                            alias_info = CELLTYPE_ALIAS.get(ct_str, {})
+                            rows.append({
+                                **_entity_base,
+                                "entity_id": f"scCRC_ICB__{lk}_{ct_str}",
+                                "dataset": "scCRC_ICB",
+                                "entity_type": "h5ad_celltype",
+                                "original_label": ct_str,
+                                "canonical_celltype": alias_info.get("canonical", ct_str),
+                                "sub_type": alias_info.get("sub", ""),
+                                "major_lineage": alias_info.get("major", ""),
+                                "cluster_label": lk,
+                            })
+                        icb_entity_added = True
+                        print(f"  ICB entities: {len(vc)} types from {lk}")
+                        break
+                _icb.file.close()
+            except Exception as exc:
+                print(f"  WARN: ICB h5ad entity extraction failed: {exc}")
+
+        if not icb_entity_added:
+            icb_celltypes = [
+                ("Epi", "Major"), ("Mye", "Major"), ("Stromal", "Major"),
+                ("Tumor", "Mid"), ("Macrophage", "Mid"), ("Fibroblast", "Mid"),
+            ]
+            for ct, level in icb_celltypes:
+                alias_info = CELLTYPE_ALIAS.get(ct, {})
+                rows.append({
+                    **_entity_base,
+                    "entity_id": f"scCRC_ICB__{level}_{ct}",
+                    "dataset": "scCRC_ICB",
+                    "entity_type": "deg_celltype",
+                    "original_label": ct,
+                    "canonical_celltype": alias_info.get("canonical", ct),
+                    "sub_type": alias_info.get("sub", ""),
+                    "major_lineage": alias_info.get("major", ""),
+                    "cluster_label": level,
+                })
 
     st_files = sorted(ST_DIR.glob("STmetadata_*.csv"))
     for csv_f in st_files[:3]:

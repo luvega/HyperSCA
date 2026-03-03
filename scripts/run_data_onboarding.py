@@ -21,6 +21,16 @@ def _run(cmd: list[str]) -> None:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}")
 
 
+def _run_optional(cmd: list[str], label: str) -> bool:
+    """Run a command; on failure print warning but return False instead of raising."""
+    print(f"[CMD] {label}: {' '.join(cmd)}")
+    proc = subprocess.run(cmd, cwd=PROJECT_ROOT)
+    if proc.returncode != 0:
+        print(f"[WARN] {label} failed (rc={proc.returncode}), continuing ...")
+        return False
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run HyperSCA Phase D0 onboarding")
     parser.add_argument("--data-root", default="data")
@@ -29,6 +39,13 @@ def main() -> int:
     parser.add_argument("--st-root", default=r"G:\ST_CRC_MSS")
     parser.add_argument("--ifng-root", default=r"F:\scCRC_IFNG")
     parser.add_argument("--skip-schema", action="store_true")
+    parser.add_argument(
+        "--build-reference", action="store_true",
+        help="After data ingest, train ICB reference model (scVI/scANVI) → data/ref",
+    )
+    parser.add_argument("--ref-label-key", default=None,
+                        help="Cell-type label column for reference (default: auto-detect)")
+    parser.add_argument("--ref-max-epochs", type=int, default=100)
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
@@ -72,7 +89,17 @@ def main() -> int:
             ]
         )
 
-    # 3) 目录完整性校验
+    # 3) Build ICB reference model (optional, non-blocking on failure)
+    if args.build_reference:
+        ref_cmd = [
+            sys.executable, "scripts/build_icb_reference.py",
+            "--max-epochs", str(args.ref_max_epochs),
+        ]
+        if args.ref_label_key:
+            ref_cmd.extend(["--label-key", args.ref_label_key])
+        _run_optional(ref_cmd, "build_icb_reference")
+
+    # 4) 目录完整性校验
     issues = validate_onboarding_tree(data_root)
     if issues:
         print("[WARN] Onboarding validation issues:")

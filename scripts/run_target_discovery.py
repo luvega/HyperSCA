@@ -19,6 +19,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -26,11 +27,14 @@ import torch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from src.utils.plot_style import PALETTE_CATEGORICAL
 
 OUT_BASE = ROOT / "results" / "integration" / "discovery"
 OUT_BASE.mkdir(parents=True, exist_ok=True)
 FIG_DIR = OUT_BASE / "figures"
 FIG_DIR.mkdir(parents=True, exist_ok=True)
+NICHE_DIR = OUT_BASE / "niche"
+NICHE_DIR.mkdir(parents=True, exist_ok=True)
 
 NEU_DIR = Path(
     r"G:\scCRC_Neu\downstream_analyses_de_analysis"
@@ -40,6 +44,22 @@ NEU_DIR = Path(
 IFNG_DIR = Path(r"F:\scCRC_IFNG")
 ICB_DIR = Path(r"G:\scCRC_ICB\output")
 ST_DIR = Path(r"G:\ST_CRC_MSS")
+
+DATA_DIR = ROOT / "data"
+ICB_H5AD_PATH = DATA_DIR / "scRNA" / "scCRC_ICB" / "expression.h5ad"
+REF_MANIFEST_PATH = DATA_DIR / "ref" / "manifest" / "reference_manifest.json"
+
+
+def _detect_icb_data_mode() -> str:
+    """Detect ICB data availability: 'reference' > 'h5ad' > 'deg_only'."""
+    if REF_MANIFEST_PATH.exists():
+        print("[INFO] ICB reference model detected → mode=reference")
+        return "reference"
+    if ICB_H5AD_PATH.exists():
+        print("[INFO] ICB expression.h5ad detected → mode=h5ad (DEGs still used as primary)")
+        return "h5ad"
+    print("[INFO] ICB data mode → deg_only (legacy)")
+    return "deg_only"
 
 ANCHOR_GENES = ["MFAP2", "POSTN", "INHBA"]
 IFNG_FOCUS_GENES = ["CD74", "INHBA", "CXCL10", "IFNG", "COL1A1", "MFAP5", "FN1"]
@@ -162,6 +182,801 @@ def _minmax(arr: np.ndarray) -> np.ndarray:
 
 
 # ============================================================================
+#  Niche Integration (P0)
+# ============================================================================
+
+def _broad_type_from_deconv_col(col: str) -> str:
+    """Map ST deconvolution column name to broad TME type."""
+    c = str(col)
+    cu = c.upper()
+    if cu in {"CAF", "TAM", "CD4T", "CD8T", "DC", "MONOCYTE", "NK", "ENDOTHELIAL", "MAST", "TREG"}:
+        if cu == "MONOCYTE":
+            return "Monocyte"
+        if cu == "ENDOTHELIAL":
+            return "Endothelial"
+        return cu
+    if c.startswith("BT_"):
+        bt = c[3:].upper()
+        if bt in {"CAF", "TAM", "CD4T", "CD8T", "DC", "MONOCYTE", "NK", "ENDOTHELIAL", "MAST", "TREG"}:
+            if bt == "MONOCYTE":
+                return "Monocyte"
+            if bt == "ENDOTHELIAL":
+                return "Endothelial"
+            return bt
+    if c.startswith("Fibro_"):
+        return "CAF"
+    if c.startswith("Mac_"):
+        return "TAM"
+    if c.startswith("CD4_"):
+        return "CD4T"
+    if c.startswith("CD8_"):
+        return "CD8T"
+    if c.startswith("cDC") or c.startswith("DC_") or c.startswith("pDC"):
+        return "DC"
+    if c.startswith("Monocyte_"):
+        return "Monocyte"
+    if c.startswith("NK_"):
+        return "NK"
+    if c.startswith("Endo"):
+        return "Endothelial"
+    if c.startswith("Mast"):
+        return "Mast"
+    return "Other"
+
+
+def _normalize_rows(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.fillna(0.0).astype(float).copy()
+    rs = d.sum(axis=1).replace(0, np.nan)
+    return d.div(rs, axis=0).fillna(0.0)
+
+
+def _read_st_deconv_table() -> pd.DataFrame:
+    """Load all ST deconvolution tables with coordinates and sample-local index."""
+    frames = []
+    spot_counter = 0
+    for csv_f in sorted(ST_DIR.glob("STmetadata_*.csv")):
+        try:
+            df = pd.read_csv(csv_f, low_memory=False)
+        except Exception:
+            continue
+        deconv_cols = [
+            c for c in df.columns
+            if any(c.startswith(p) for p in ["Fibro_", "Mac_", "CD4_", "CD8_", "Monocyte_", "cDC", "pDC", "NK_", "Endo", "Mast"])
+        ]
+        if not deconv_cols:
+            continue
+        sample_id = csv_f.stem.replace("STmetadata_", "")
+        sub = _normalize_rows(df[deconv_cols])
+        sub["sample_id"] = sample_id
+        sub["sample_spot_idx"] = np.arange(len(sub), dtype=int)
+        sub["spot_id"] = [f"{sample_id}__spot_{i + spot_counter}" for i in range(len(sub))]
+        spot_counter += len(sub)
+
+        if {"x", "y"}.issubset(set(df.columns)):
+            sub["x"] = pd.to_numeric(df["x"], errors="coerce").fillna(0.0).values
+            sub["y"] = pd.to_numeric(df["y"], errors="coerce").fillna(0.0).values
+        elif {"pxl_col_in_fullres", "pxl_row_in_fullres"}.issubset(set(df.columns)):
+            sub["x"] = pd.to_numeric(df["pxl_col_in_fullres"], errors="coerce").fillna(0.0).values
+            sub["y"] = pd.to_numeric(df["pxl_row_in_fullres"], errors="coerce").fillna(0.0).values
+        else:
+            sub["x"] = np.arange(len(sub), dtype=float)
+            sub["y"] = 0.0
+        frames.append(sub)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def _read_cosmx_deconv_like(max_cells: int = 160000) -> pd.DataFrame:
+    """Build CosMx deconv-like broad-type composition using one-hot cell type."""
+    h5ad = ROOT / "data" / "ST" / "scCRC_IFNG_CosMx" / "expression.h5ad"
+    if not h5ad.exists():
+        return pd.DataFrame()
+    try:
+        import anndata as ad
+    except Exception:
+        return pd.DataFrame()
+    try:
+        adata = ad.read_h5ad(h5ad, backed="r")
+    except Exception:
+        return pd.DataFrame()
+    if "spatial" in adata.obsm:
+        coords = np.asarray(adata.obsm["spatial"])
+    elif {"x", "y"}.issubset(set(adata.obs.columns)):
+        coords = adata.obs[["x", "y"]].to_numpy()
+    else:
+        return pd.DataFrame()
+
+    ct_col = "cell_type" if "cell_type" in adata.obs.columns else "final_anno" if "final_anno" in adata.obs.columns else None
+    if ct_col is None:
+        return pd.DataFrame()
+    cts = adata.obs[ct_col].astype(str).values
+    samples = adata.obs["sample"].astype(str).values if "sample" in adata.obs.columns else np.array(["CosMx_IFNG"] * len(cts))
+    if len(cts) > max_cells:
+        rng = np.random.default_rng(42)
+        idx = np.sort(rng.choice(np.arange(len(cts)), size=max_cells, replace=False))
+        cts = cts[idx]
+        coords = coords[idx]
+        samples = samples[idx]
+    bt_map = {
+        "EPI": "BT_Epithelial",
+        "FIBROENDOMUSCLE": "BT_CAF",
+        "MYELOID": "BT_TAM",
+        "T/NK": "BT_CD8T",
+        "T_OTHER": "BT_CD4T",
+        "PLASMA/B": "BT_Other",
+        "MAST": "BT_Mast",
+        "TNK": "BT_CD8T",
+    }
+    cols = sorted(set(bt_map.values()) | {"BT_Endothelial", "BT_DC", "BT_Monocyte", "BT_NK"})
+    mat = np.zeros((len(cts), len(cols)), dtype=float)
+    c2i = {c: i for i, c in enumerate(cols)}
+    for i, ct in enumerate(cts):
+        key = str(ct).upper()
+        bt = bt_map.get(key, "BT_Other")
+        mat[i, c2i[bt]] = 1.0
+    sub = pd.DataFrame(mat, columns=cols)
+    sub = _normalize_rows(sub)
+    sub["sample_id"] = [f"CosMx_{s}" for s in samples]
+    sub["sample_spot_idx"] = np.arange(len(sub), dtype=int)
+    sub["spot_id"] = [f"CosMx__spot_{i}" for i in range(len(sub))]
+    sub["x"] = coords[:, 0].astype(float)
+    sub["y"] = coords[:, 1].astype(float)
+    return sub
+
+
+def _read_visiumhd_deconv_like(max_spots: int = 120000) -> pd.DataFrame:
+    """Build VisiumHD broad-type score vectors from marker expression."""
+    h5 = ROOT / "data" / "VisiumHD_HumanColon_Oliveira" / "binned_outputs" / "square_016um" / "filtered_feature_bc_matrix.h5"
+    pos = ROOT / "data" / "VisiumHD_HumanColon_Oliveira" / "binned_outputs" / "square_016um" / "spatial" / "tissue_positions.parquet"
+    if (not h5.exists()) or (not pos.exists()):
+        return pd.DataFrame()
+    try:
+        import scanpy as sc
+    except Exception:
+        return pd.DataFrame()
+    try:
+        adata = sc.read_10x_h5(str(h5))
+        adata.var_names_make_unique()
+    except Exception:
+        return pd.DataFrame()
+    pos_df = pd.read_parquet(pos)
+    if "barcode" not in pos_df.columns:
+        return pd.DataFrame()
+    pos_df = pos_df[pos_df.get("in_tissue", 1) == 1].set_index("barcode")
+    keep = [b for b in adata.obs_names if b in pos_df.index]
+    if not keep:
+        return pd.DataFrame()
+    adata = adata[keep].copy()
+    coords = pos_df.loc[keep][["pxl_col_in_fullres", "pxl_row_in_fullres"]].to_numpy(dtype=float)
+
+    if adata.n_obs > max_spots:
+        rng = np.random.default_rng(42)
+        idx = np.sort(rng.choice(np.arange(adata.n_obs), size=max_spots, replace=False))
+        adata = adata[idx].copy()
+        coords = coords[idx]
+
+    markers = {
+        "BT_CAF": ["POSTN", "COL1A1", "COL1A2", "DCN", "FAP", "PDGFRA", "MFAP2"],
+        "BT_TAM": ["CD68", "LST1", "APOE", "C1QA", "C1QB", "FCER1G", "TYROBP"],
+        "BT_CD8T": ["CD3D", "CD3E", "CD8A", "CD8B", "NKG7", "GZMB"],
+        "BT_CD4T": ["CD3D", "CD3E", "IL7R", "LTB", "MALAT1"],
+        "BT_DC": ["FCER1A", "CLEC10A", "CLEC9A", "LILRA4"],
+        "BT_Endothelial": ["VWF", "KDR", "EMCN", "PECAM1"],
+        "BT_Monocyte": ["S100A8", "S100A9", "LYZ", "CTSS"],
+        "BT_NK": ["NKG7", "GNLY", "KLRD1"],
+        "BT_Mast": ["TPSAB1", "KIT", "MS4A2"],
+    }
+    vu = {str(v).upper(): str(v) for v in adata.var_names}
+    score = {}
+    for bt, gs in markers.items():
+        real = [vu[g.upper()] for g in gs if g.upper() in vu]
+        if not real:
+            score[bt] = np.zeros(adata.n_obs, dtype=float)
+            continue
+        x = adata[:, real].X
+        if hasattr(x, "toarray"):
+            x = x.toarray()
+        score[bt] = np.asarray(x).mean(axis=1).astype(float)
+    sub = pd.DataFrame(score)
+    sub = _normalize_rows(sub)
+    sub["sample_id"] = "VisiumHD_16um"
+    sub["sample_spot_idx"] = np.arange(len(sub), dtype=int)
+    sub["spot_id"] = [f"VisiumHD__spot_{i}" for i in range(len(sub))]
+    sub["x"] = coords[:, 0]
+    sub["y"] = coords[:, 1]
+    return sub
+
+
+def _merge_multimodal_deconv_tables(
+    platform: str = "all",
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    platform_readers = {
+        "st_visium": _read_st_deconv_table,
+        "cosmx": _read_cosmx_deconv_like,
+        "visiumhd": _read_visiumhd_deconv_like,
+    }
+    platform_alias = {"visium": "st_visium", "cosmx": "cosmx", "visiumhd": "visiumhd"}
+
+    if platform != "all":
+        internal = platform_alias.get(platform, platform)
+        reader = platform_readers.get(internal)
+        if reader is None:
+            return pd.DataFrame(), {}
+        df = reader()
+        if df.empty:
+            return pd.DataFrame(), {f"{internal}_rows": 0, "merged_rows": 0}
+        df["source_modality"] = internal
+        return df, {f"{internal}_rows": len(df), "merged_rows": len(df)}
+
+    src_tables = []
+    stats: dict[str, Any] = {}
+    for nm, reader in platform_readers.items():
+        df = reader()
+        stats[f"{nm}_rows"] = int(len(df))
+        if df.empty:
+            continue
+        df["source_modality"] = nm
+        src_tables.append(df)
+    if not src_tables:
+        return pd.DataFrame(), stats
+    merged = pd.concat(src_tables, ignore_index=True, sort=False).fillna(0.0)
+    stats["merged_rows"] = int(len(merged))
+    return merged, stats
+
+
+def _dist_matrix(x: np.ndarray) -> np.ndarray:
+    if x.shape[0] <= 1:
+        return np.zeros((x.shape[0], x.shape[0]), dtype=float)
+    d2 = (
+        np.sum(x * x, axis=1, keepdims=True)
+        + np.sum(x * x, axis=1)[None, :]
+        - 2.0 * (x @ x.T)
+    )
+    d2 = np.maximum(d2, 0.0)
+    return np.sqrt(d2)
+
+
+def _hex_from_rgba(rgba: tuple[float, float, float, float]) -> str:
+    r, g, b = rgba[:3]
+    return "#{:02X}{:02X}{:02X}".format(int(r * 255), int(g * 255), int(b * 255))
+
+
+def _assign_niche_colors(niche_ids: list[int], adjacency: dict[int, list[int]]) -> dict[int, str]:
+    palette = [str(c) for c in PALETTE_CATEGORICAL]
+    colors: dict[int, str] = {}
+    order = sorted(niche_ids, key=lambda n: len(adjacency.get(n, [])), reverse=True)
+    for nid in order:
+        used = {colors[nn] for nn in adjacency.get(nid, []) if nn in colors}
+        pick = next((c for c in palette if c not in used), None)
+        if pick is None:
+            pick = palette[len(colors) % len(palette)]
+        colors[nid] = pick
+    return colors
+
+
+def collect_available_data_inventory() -> dict[str, Any]:
+    """Collect available ST/CosMx/VisiumHD inventory for audit report."""
+    inv: dict[str, Any] = {"generated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    st_h5ad = ROOT / "data" / "ST" / "ST_CRC_MSS" / "expression.h5ad"
+    cos_h5ad = ROOT / "data" / "ST" / "scCRC_IFNG_CosMx" / "expression.h5ad"
+    vis_h5 = ROOT / "data" / "VisiumHD_HumanColon_Oliveira" / "binned_outputs" / "square_016um" / "filtered_feature_bc_matrix.h5"
+    vis_pos = ROOT / "data" / "VisiumHD_HumanColon_Oliveira" / "binned_outputs" / "square_016um" / "spatial" / "tissue_positions.parquet"
+    inv["paths"] = {
+        "st_h5ad": {"path": str(st_h5ad), "exists": st_h5ad.exists()},
+        "cosmx_h5ad": {"path": str(cos_h5ad), "exists": cos_h5ad.exists()},
+        "visiumhd_h5": {"path": str(vis_h5), "exists": vis_h5.exists()},
+        "visiumhd_tissue_positions": {"path": str(vis_pos), "exists": vis_pos.exists()},
+    }
+    try:
+        import anndata as ad
+        if st_h5ad.exists():
+            a = ad.read_h5ad(st_h5ad, backed="r")
+            inv["st_h5ad"] = {
+                "n_obs": int(a.n_obs),
+                "n_vars": int(a.n_vars),
+                "has_spatial": "spatial" in a.obsm,
+                "has_rctd_freq": "rctd_freq" in a.obsm,
+                "obs_columns": list(a.obs.columns),
+                "sample_count": int(a.obs["sample_id"].nunique()) if "sample_id" in a.obs.columns else 0,
+            }
+        if cos_h5ad.exists():
+            a = ad.read_h5ad(cos_h5ad, backed="r")
+            inv["cosmx_h5ad"] = {
+                "n_obs": int(a.n_obs),
+                "n_vars": int(a.n_vars),
+                "has_spatial": "spatial" in a.obsm,
+                "obs_columns": list(a.obs.columns),
+                "sample_count": int(a.obs["sample"].nunique()) if "sample" in a.obs.columns else 0,
+            }
+    except Exception as e:
+        inv["anndata_read_error"] = str(e)
+    try:
+        import scanpy as sc
+        if vis_h5.exists():
+            vh = sc.read_10x_h5(str(vis_h5))
+            vh.var_names_make_unique()
+            inv["visiumhd_matrix"] = {
+                "n_obs": int(vh.n_obs),
+                "n_vars": int(vh.n_vars),
+            }
+    except Exception as e:
+        inv["visiumhd_read_error"] = str(e)
+    inv["stmetadata_csv_count"] = len(list(ST_DIR.glob("STmetadata_*.csv")))
+    (NICHE_DIR / "available_data_inventory.json").write_text(
+        json.dumps(inv, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8"
+    )
+    md = [
+        "# Available Data Inventory",
+        "",
+        f"- generated_at: {inv.get('generated_at', '')}",
+        f"- STmetadata CSV count: {inv.get('stmetadata_csv_count', 0)}",
+        "",
+        "## Path Availability",
+    ]
+    for k, v in inv.get("paths", {}).items():
+        md.append(f"- {k}: {'YES' if v.get('exists') else 'NO'} ({v.get('path')})")
+    for sec in ["st_h5ad", "cosmx_h5ad", "visiumhd_matrix"]:
+        if sec in inv:
+            md.extend(
+                [
+                    "",
+                    f"## {sec}",
+                    f"- n_obs: {inv[sec].get('n_obs', 0)}",
+                    f"- n_vars: {inv[sec].get('n_vars', 0)}",
+                    f"- has_spatial: {inv[sec].get('has_spatial', False)}",
+                ]
+            )
+    (NICHE_DIR / "available_data_inventory.md").write_text("\n".join(md), encoding="utf-8")
+    return inv
+
+
+def build_unified_niche_definition(
+    n_clusters: int | None = None,
+    k_min: int = 8,
+    k_max: int = 18,
+    fallback_node_labels: list[str] | None = None,
+    platform: str = "all",
+) -> dict:
+    """Build unified cross-sample niche ontology using hyperbolic embedding."""
+    print("\n" + "=" * 60)
+    print("[Phase 7.5] Building unified niche ontology")
+    print("=" * 60)
+    deconv, source_stats = _merge_multimodal_deconv_tables(platform=platform)
+    if deconv.empty:
+        print("  WARN: no ST deconvolution table found, using pseudo spot fallback")
+        node_labels = fallback_node_labels or CELLTYPES
+        broad_types = sorted({TYPE_MAPPING.get(n, "Other") for n in node_labels})
+        pseudo = []
+        for i, n in enumerate(node_labels):
+            row = {bt: 0.0 for bt in broad_types}
+            row[TYPE_MAPPING.get(n, "Other")] = 1.0
+            row["sample_id"] = "pseudo"
+            row["spot_id"] = f"pseudo__spot_{i}"
+            pseudo.append(row)
+        deconv = pd.DataFrame(pseudo)
+
+    meta_cols = {"sample_id", "sample_spot_idx", "spot_id", "x", "y", "source_modality"}
+    deconv_cols = [c for c in deconv.columns if c not in meta_cols]
+    deconv_matrix = deconv[deconv_cols].copy()
+
+    # Hyperbolic niche embedding (Stage-1 focus): clr -> PCA(2) -> Poincare projection
+    from sklearn.decomposition import PCA
+    from sklearn.cluster import MiniBatchKMeans
+    from sklearn.metrics import silhouette_score
+
+    X = np.asarray(deconv_matrix.values, dtype=float)
+    X = X / np.maximum(X.sum(axis=1, keepdims=True), 1e-12)
+    clr = np.log(np.maximum(X, 1e-8))
+    clr = clr - clr.mean(axis=1, keepdims=True)
+    pca = PCA(n_components=2, random_state=42)
+    euc_2d = pca.fit_transform(clr)
+    norm = np.linalg.norm(euc_2d, axis=1, keepdims=True)
+    unit = euc_2d / np.maximum(norm, 1e-12)
+    # Hierarchy-aware radius: niche specificity controls radial depth.
+    specificity = 1.0 - (-np.sum(X * np.log(np.maximum(X, 1e-8)), axis=1) / np.log(max(X.shape[1], 2)))
+    spec_mm = (specificity - specificity.min()) / max(float(specificity.max() - specificity.min()), 1e-12)
+    radius = np.clip(0.08 + 0.88 * spec_mm, 0.0, 0.995)[:, None]
+    hyp_2d = unit * radius
+
+    # cluster in hyperbolic coordinates (practical approximation)
+    # If n_clusters is None, scan k range and select by joint score.
+    scan_records: list[dict[str, Any]] = []
+    if n_clusters is None:
+        k_low = max(2, int(k_min))
+        k_high = max(k_low, int(k_max))
+        k_candidates = list(range(k_low, k_high + 1))
+    else:
+        k_candidates = [int(n_clusters)]
+
+    rng = np.random.default_rng(42)
+    idx_scan = np.arange(len(hyp_2d))
+    if len(idx_scan) > 120000:
+        idx_scan = np.sort(rng.choice(idx_scan, size=120000, replace=False))
+    hyp_scan = hyp_2d[idx_scan]
+    euc_scan = euc_2d[idx_scan]
+    spec_scan = specificity[idx_scan]
+    deconv_scan = deconv_matrix.iloc[idx_scan].reset_index(drop=True)
+
+    from src.evaluation.cross_sample_metrics import niche_enrichment
+    best = None
+    best_labels = None
+    for k in k_candidates:
+        km_scan = MiniBatchKMeans(n_clusters=k, random_state=42, batch_size=4096, n_init=10)
+        labels_scan = km_scan.fit_predict(hyp_scan)
+
+        try:
+            sil_h_scan = float(silhouette_score(hyp_scan, labels_scan))
+        except Exception:
+            sil_h_scan = 0.0
+        try:
+            sil_e_scan = float(silhouette_score(euc_scan, labels_scan))
+        except Exception:
+            sil_e_scan = 0.0
+        rh_scan = np.linalg.norm(hyp_scan, axis=1)
+        re_scan = np.linalg.norm(euc_scan, axis=1)
+        hcorr_h_scan = float(np.corrcoef(spec_scan, rh_scan)[0, 1]) if len(rh_scan) > 1 else 0.0
+        hcorr_e_scan = float(np.corrcoef(spec_scan, re_scan)[0, 1]) if len(re_scan) > 1 else 0.0
+
+        enr_scan = niche_enrichment(deconv_scan, labels_scan)
+        enr_scan["broad_type"] = enr_scan["celltype"].map(_broad_type_from_deconv_col)
+        sig_scan = (
+            enr_scan.groupby(["niche", "broad_type"], as_index=False)["log2_enrichment"]
+            .mean()
+            .pivot(index="niche", columns="broad_type", values="log2_enrichment")
+            .fillna(0.0)
+        )
+        if "Other" in sig_scan.columns and sig_scan.shape[1] > 1:
+            sig_scan = sig_scan.drop(columns=["Other"])
+        dominant = []
+        for nid in sorted(set(labels_scan)):
+            row = sig_scan.loc[nid] if nid in sig_scan.index else pd.Series(dtype=float)
+            dominant.append(str(row.sort_values(ascending=False).index[0]) if not row.empty else "Mixed")
+        dom_set = set(dominant)
+        diversity = len(dom_set)
+        has_fibro = "CAF" in dom_set or "Fibro" in dom_set
+        has_tam = "TAM" in dom_set
+        counts = np.bincount(labels_scan, minlength=k)
+        min_cluster_size = int(counts.min()) if len(counts) else 0
+        small_penalty = 1.0 if min_cluster_size < max(80, int(0.0015 * len(labels_scan))) else 0.0
+
+        score = (
+            1.00 * sil_h_scan
+            + 0.45 * (hcorr_h_scan - hcorr_e_scan)
+            + 0.08 * max(diversity - 3, 0)
+            + (0.10 if has_fibro else -0.05)
+            + (0.10 if has_tam else -0.05)
+            - 0.12 * small_penalty
+        )
+        rec = {
+            "k": int(k),
+            "silhouette_hyperbolic": sil_h_scan,
+            "silhouette_euclidean": sil_e_scan,
+            "hierarchy_corr_hyperbolic": hcorr_h_scan,
+            "hierarchy_corr_euclidean": hcorr_e_scan,
+            "dominant_type_count": int(diversity),
+            "has_fibro_dominant": bool(has_fibro),
+            "has_tam_dominant": bool(has_tam),
+            "min_cluster_size": min_cluster_size,
+            "selection_score": float(score),
+        }
+        scan_records.append(rec)
+        if best is None or rec["selection_score"] > best["selection_score"]:
+            best = rec
+            best_labels = labels_scan
+
+    selected_k = int(best["k"]) if best is not None else (int(n_clusters) if n_clusters is not None else 8)
+    km = MiniBatchKMeans(n_clusters=selected_k, random_state=42, batch_size=4096, n_init=10)
+    labels = km.fit_predict(hyp_2d)
+
+    enrichment = niche_enrichment(deconv_matrix, labels)
+
+    # Signature matrix: niche x broad_type (mean enrichment)
+    enr = enrichment.copy()
+    enr["broad_type"] = enr["celltype"].map(_broad_type_from_deconv_col)
+    signature = (
+        enr.groupby(["niche", "broad_type"], as_index=False)["log2_enrichment"]
+        .mean()
+        .pivot(index="niche", columns="broad_type", values="log2_enrichment")
+        .fillna(0.0)
+        .sort_index()
+    )
+    if "Other" in signature.columns and signature.shape[1] > 1:
+        signature = signature.drop(columns=["Other"])
+
+    # Metrics: hyperbolic vs euclidean hierarchy
+    r_h = np.linalg.norm(hyp_2d, axis=1)
+    r_e = np.linalg.norm(euc_2d, axis=1)
+    sample_idx = np.arange(len(labels))
+    if len(sample_idx) > 50000:
+        rng = np.random.default_rng(42)
+        sample_idx = np.sort(rng.choice(sample_idx, size=50000, replace=False))
+    try:
+        sil_h = float(silhouette_score(hyp_2d[sample_idx], labels[sample_idx]))
+    except Exception:
+        sil_h = 0.0
+    try:
+        sil_e = float(silhouette_score(euc_2d[sample_idx], labels[sample_idx]))
+    except Exception:
+        sil_e = 0.0
+    hierarchy_corr_h = float(np.corrcoef(specificity, r_h)[0, 1]) if len(r_h) > 1 else 0.0
+    hierarchy_corr_e = float(np.corrcoef(specificity, r_e)[0, 1]) if len(r_e) > 1 else 0.0
+
+    # Definition table with stable naming + hierarchy level
+    niche_radius = {
+        int(nid): float(np.mean(r_h[labels == nid])) for nid in sorted(set(labels))
+    }
+    rr = np.array(list(niche_radius.values()), dtype=float)
+    q1, q2 = np.quantile(rr, [0.33, 0.66]) if len(rr) > 2 else (rr.mean(), rr.mean())
+    definition_rows = []
+    dominant_list: list[str] = []
+    for niche_id in sorted(set(labels)):
+        sig_row = signature.loc[niche_id] if niche_id in signature.index else pd.Series(dtype=float)
+        if sig_row.empty:
+            dom = "Mixed"
+            sec = "Mixed"
+        else:
+            top2 = sig_row.sort_values(ascending=False).head(2).index.tolist()
+            dom = top2[0] if len(top2) > 0 else "Mixed"
+            sec = top2[1] if len(top2) > 1 else dom
+        dominant_list.append(dom)
+        rmean = niche_radius.get(int(niche_id), 0.0)
+        h_level = 1 if rmean <= q1 else 2 if rmean <= q2 else 3
+        niche_name = f"H{h_level}_N{int(niche_id):02d}_{dom}Rich"
+        definition_rows.append(
+            {
+                "niche_id": int(niche_id),
+                "niche_name": niche_name,
+                "hierarchy_level": int(h_level),
+                "dominant_type": dom,
+                "secondary_type": sec,
+                "silhouette_hyperbolic": sil_h,
+                "silhouette_euclidean": sil_e,
+                "n_spots": int((labels == niche_id).sum()),
+            }
+        )
+    definition = pd.DataFrame(definition_rows).sort_values("niche_id")
+
+    # enforce at least one Fibro/CAF-rich and one TAM-rich niche
+    dom_set = set(definition["dominant_type"].astype(str).tolist())
+    if ("CAF" not in dom_set) and ("CAF" in signature.columns):
+        caf_best = int(signature["CAF"].sort_values(ascending=False).index[0])
+        definition.loc[definition["niche_id"] == caf_best, "dominant_type"] = "CAF"
+        definition.loc[definition["niche_id"] == caf_best, "niche_name"] = definition.loc[
+            definition["niche_id"] == caf_best, "niche_name"
+        ].str.replace(r"_[A-Za-z]+Rich$", "_FibroRich", regex=True)
+    if ("TAM" not in dom_set) and ("TAM" in signature.columns):
+        tam_best = int(signature["TAM"].sort_values(ascending=False).index[0])
+        definition.loc[definition["niche_id"] == tam_best, "dominant_type"] = "TAM"
+        definition.loc[definition["niche_id"] == tam_best, "niche_name"] = definition.loc[
+            definition["niche_id"] == tam_best, "niche_name"
+        ].str.replace(r"_[A-Za-z]+Rich$", "_TAMRich", regex=True)
+    definition["niche_name"] = definition.apply(
+        lambda r: str(r["niche_name"]).replace("_CAFRich", "_FibroRich"), axis=1
+    )
+
+    assignment = pd.DataFrame(
+        {
+            "spot_id": deconv["spot_id"].astype(str).values,
+            "sample_id": deconv["sample_id"].astype(str).values,
+            "source_modality": deconv["source_modality"].astype(str).values if "source_modality" in deconv.columns else "st_visium",
+            "sample_spot_idx": deconv["sample_spot_idx"].astype(int).values if "sample_spot_idx" in deconv.columns else np.arange(len(deconv)),
+            "x": pd.to_numeric(deconv["x"], errors="coerce").fillna(0.0).values if "x" in deconv.columns else np.arange(len(deconv), dtype=float),
+            "y": pd.to_numeric(deconv["y"], errors="coerce").fillna(0.0).values if "y" in deconv.columns else np.zeros(len(deconv), dtype=float),
+            "niche_id": labels.astype(int),
+            "hyp_x": hyp_2d[:, 0].astype(float),
+            "hyp_y": hyp_2d[:, 1].astype(float),
+            "hyp_radius": r_h.astype(float),
+            "euc_x": euc_2d[:, 0].astype(float),
+            "euc_y": euc_2d[:, 1].astype(float),
+            "euc_radius": r_e.astype(float),
+        }
+    ).merge(definition[["niche_id", "niche_name"]], on="niche_id", how="left")
+
+    # hierarchy + adjacency + color
+    niche_ids = sorted(definition["niche_id"].astype(int).unique().tolist())
+    cent = np.vstack(
+        [
+            hyp_2d[labels == nid].mean(axis=0) if np.any(labels == nid) else np.zeros(2)
+            for nid in niche_ids
+        ]
+    )
+    dd = _dist_matrix(cent)
+    adjacency: dict[int, list[int]] = {nid: [] for nid in niche_ids}
+    for i, nid in enumerate(niche_ids):
+        nn = np.argsort(dd[i])[1 : 1 + min(2, len(niche_ids) - 1)]
+        for j in nn:
+            tgt = int(niche_ids[j])
+            if tgt not in adjacency[nid]:
+                adjacency[nid].append(tgt)
+            if nid not in adjacency[tgt]:
+                adjacency[tgt].append(nid)
+    colors = _assign_niche_colors(niche_ids, adjacency)
+    color_df = pd.DataFrame(
+        {
+            "niche_id": niche_ids,
+            "niche_name": [definition.loc[definition["niche_id"] == n, "niche_name"].iloc[0] for n in niche_ids],
+            "color_hex": [colors[n] for n in niche_ids],
+        }
+    )
+    color_df.to_csv(NICHE_DIR / "niche_color_map.csv", index=False)
+    (NICHE_DIR / "niche_color_map.json").write_text(
+        json.dumps({int(k): v for k, v in colors.items()}, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    hierarchy = {
+        "niche_order_by_radius": [int(x) for x in sorted(niche_ids, key=lambda n: niche_radius.get(n, 0.0))],
+        "niche_radius_mean": {int(k): float(v) for k, v in niche_radius.items()},
+        "adjacency": {int(k): [int(v) for v in vv] for k, vv in adjacency.items()},
+    }
+    (NICHE_DIR / "niche_hierarchy.json").write_text(
+        json.dumps(hierarchy, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    # Save outputs
+    definition.to_csv(NICHE_DIR / "unified_niche_definition.csv", index=False)
+    assignment.to_csv(NICHE_DIR / "spot_niche_assignment.csv", index=False)
+    signature.reset_index().to_csv(NICHE_DIR / "niche_signature_matrix.csv", index=False)
+    metrics = {
+        "n_spots": int(len(assignment)),
+        "n_niches": int(definition.shape[0]),
+        "selected_k": int(selected_k),
+        "silhouette_hyperbolic": sil_h,
+        "silhouette_euclidean": sil_e,
+        "hierarchy_corr_hyperbolic": hierarchy_corr_h,
+        "hierarchy_corr_euclidean": hierarchy_corr_e,
+        "source_stats": source_stats,
+        "niche_color_map_path": str(NICHE_DIR / "niche_color_map.json"),
+        "niche_hierarchy_path": str(NICHE_DIR / "niche_hierarchy.json"),
+    }
+    (NICHE_DIR / "niche_hierarchy_metrics.json").write_text(
+        json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    if scan_records:
+        (NICHE_DIR / "niche_resolution_scan.json").write_text(
+            json.dumps(scan_records, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        (NICHE_DIR / "niche_resolution_selected.json").write_text(
+            json.dumps(
+                {
+                    "selected_k": int(selected_k),
+                    "criteria": "max selection_score from silhouette + hierarchy advantage + dominant diversity + fibro/tam coverage",
+                    "record": best,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    print(f"  Niche clusters: {definition.shape[0]} (selected_k={selected_k})")
+    print(f"  Silhouette (hyp/euc): {sil_h:.3f} / {sil_e:.3f}")
+    print(f"  Hierarchy corr (hyp/euc): {hierarchy_corr_h:.3f} / {hierarchy_corr_e:.3f}")
+    print(f"  Saved: {NICHE_DIR / 'unified_niche_definition.csv'}")
+    print(f"  Saved: {NICHE_DIR / 'spot_niche_assignment.csv'}")
+    print(f"  Saved: {NICHE_DIR / 'niche_signature_matrix.csv'}")
+    print(f"  Saved: {NICHE_DIR / 'niche_hierarchy_metrics.json'}")
+    return {
+        "definition": definition,
+        "assignment": assignment,
+        "signature": signature,
+        "metrics": metrics,
+    }
+
+
+def map_targets_to_unified_niches(
+    ranking: pd.DataFrame,
+    cluster_expr: pd.DataFrame,
+    node_labels: list[str],
+    niche_pack: dict,
+    combos: pd.DataFrame | None = None,
+) -> dict:
+    """Map targets and target combos onto unified niche space."""
+    print("\n" + "=" * 60)
+    print("[Phase 7.6] Mapping targets/combos to niches")
+    print("=" * 60)
+
+    definition = niche_pack.get("definition", pd.DataFrame())
+    signature = niche_pack.get("signature", pd.DataFrame())
+    if definition.empty or signature.empty:
+        empty = pd.DataFrame()
+        empty.to_csv(NICHE_DIR / "target_niche_expression.csv", index=False)
+        empty.to_csv(NICHE_DIR / "combo_niche_effect.csv", index=False)
+        return {"target_niche": empty, "combo_niche": empty}
+
+    # node -> broad type aggregation
+    node_to_type = {n: TYPE_MAPPING.get(n, "Other") for n in node_labels}
+    available_nodes = [n for n in node_labels if n in cluster_expr.index]
+    cluster_expr = cluster_expr.loc[available_nodes].copy()
+    cluster_expr["broad_type"] = [node_to_type[n] for n in available_nodes]
+    type_expr = cluster_expr.groupby("broad_type", as_index=True).mean(numeric_only=True)
+
+    # align signature columns with available broad types
+    sig = signature.copy()
+    common_types = [c for c in sig.columns if c in type_expr.index]
+    if not common_types:
+        empty = pd.DataFrame()
+        empty.to_csv(NICHE_DIR / "target_niche_expression.csv", index=False)
+        empty.to_csv(NICHE_DIR / "combo_niche_effect.csv", index=False)
+        return {"target_niche": empty, "combo_niche": empty}
+    sig = sig[common_types]
+    # convert enrichment into positive weights
+    sig_w = np.exp(sig.values.astype(float))
+    sig_w = sig_w / np.maximum(sig_w.sum(axis=1, keepdims=True), 1e-12)
+
+    gene_cols_upper = {c.upper(): c for c in type_expr.columns}
+    top_targets = ranking.head(120).copy()
+    rows = []
+    for _, rr in top_targets.iterrows():
+        g = str(rr["gene"])
+        if g.upper() not in gene_cols_upper:
+            continue
+        real_col = gene_cols_upper[g.upper()]
+        expr_by_type = type_expr[real_col].reindex(common_types).fillna(0.0).values.astype(float)
+        niche_scores = sig_w @ expr_by_type
+        z = (niche_scores - niche_scores.mean()) / max(niche_scores.std(), 1e-12)
+        order = np.argsort(-niche_scores)
+        rank_map = {int(idx): int(rank + 1) for rank, idx in enumerate(order)}
+        for idx, row_def in definition.sort_values("niche_id").iterrows():
+            nid = int(row_def["niche_id"])
+            if nid >= len(niche_scores):
+                continue
+            rows.append(
+                {
+                    "target_gene": g,
+                    "niche_id": nid,
+                    "niche_name": row_def["niche_name"],
+                    "weighted_expression": float(niche_scores[nid]),
+                    "z_score_within_target": float(z[nid]),
+                    "rank_within_target": rank_map.get(nid, len(niche_scores)),
+                    "is_anchor": bool(g in ANCHOR_GENES),
+                    "global_rank": int(rr["rank"]),
+                    "final_score": float(rr["final_score"]),
+                }
+            )
+    target_niche = pd.DataFrame(rows)
+    if not target_niche.empty:
+        target_niche = target_niche.sort_values(["target_gene", "rank_within_target"])
+    target_niche.to_csv(NICHE_DIR / "target_niche_expression.csv", index=False)
+
+    # Combo niche effect
+    combo_rows = []
+    if combos is not None and not combos.empty and not target_niche.empty:
+        for _, cb in combos.head(300).iterrows():
+            trigger = str(cb.get("trigger_target", ""))
+            ligand = str(cb.get("ligand", ""))
+            receptor = str(cb.get("receptor", ""))
+            genes = [g for g in [trigger, ligand, receptor] if g]
+            subset = target_niche[target_niche["target_gene"].isin(genes)]
+            if subset.empty:
+                continue
+            agg = subset.groupby(["niche_id", "niche_name"], as_index=False)["z_score_within_target"].mean()
+            for _, ar in agg.iterrows():
+                combo_rows.append(
+                    {
+                        "combo_id": f"{trigger}|{ligand}->{receptor}",
+                        "trigger_target": trigger,
+                        "ligand": ligand,
+                        "receptor": receptor,
+                        "niche_id": int(ar["niche_id"]),
+                        "niche_name": str(ar["niche_name"]),
+                        "combo_niche_effect": float(ar["z_score_within_target"]),
+                        "target_priority_score": float(cb.get("target_priority_score", np.nan)),
+                    }
+                )
+    combo_niche = pd.DataFrame(combo_rows)
+    if not combo_niche.empty:
+        combo_niche = combo_niche.sort_values("combo_niche_effect", ascending=False)
+    combo_niche.to_csv(NICHE_DIR / "combo_niche_effect.csv", index=False)
+
+    print(f"  Saved: {NICHE_DIR / 'target_niche_expression.csv'} ({len(target_niche)} rows)")
+    print(f"  Saved: {NICHE_DIR / 'combo_niche_effect.csv'} ({len(combo_niche)} rows)")
+    return {
+        "target_niche": target_niche,
+        "combo_niche": combo_niche,
+    }
+
+
+# ============================================================================
 #  Phase 1: Open Candidate Pool
 # ============================================================================
 
@@ -169,6 +984,8 @@ def build_candidate_pool() -> pd.DataFrame:
     print("=" * 60)
     print("[Phase 1] Building open candidate pool from DEG results")
     print("=" * 60)
+
+    icb_mode = _detect_icb_data_mode()
 
     # --- 1a: scCRC_Neu DESeq2 results (all cell types) ---
     neu_records = []
@@ -226,7 +1043,12 @@ def build_candidate_pool() -> pd.DataFrame:
                 "padj_icb": float(row[padj_col]) if padj_col else np.nan,
                 "source_file": csv_name,
             })
-    print(f"  ICB: {len(icb_records)} significant hits")
+    print(f"  ICB: {len(icb_records)} significant hits (from DEG CSVs)")
+
+    if icb_mode in ("h5ad", "reference") and len(icb_records) == 0:
+        print("  ICB: DEG CSVs empty but h5ad available — future versions "
+              "will compute DEGs on-the-fly from expression.h5ad")
+
     icb_df = pd.DataFrame(icb_records) if icb_records else pd.DataFrame(
         columns=["gene", "celltype_icb", "lfc_icb", "padj_icb", "source_file"]
     )
@@ -1013,14 +1835,19 @@ def generate_figures(
     s2_hyp: dict, s2_euc: dict,
     s3_hyp: dict,
     node_labels: list[str],
+    target_niche: pd.DataFrame | None = None,
+    combo_niche: pd.DataFrame | None = None,
 ):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from src.utils.plot_style import CMAP_DIVERGING, apply_cns_style, save_figure
 
     print("\n" + "=" * 60)
     print("[Phase 9] Generating figures")
     print("=" * 60)
+
+    apply_cns_style()
 
     TME_COLORS = {
         "CAF": "#E64B35", "TAM": "#4DBBD5", "CD4T": "#00A087",
@@ -1030,9 +1857,8 @@ def generate_figures(
         "Stromal": "#FF7F0E", "Plasma": "#17BECF",
     }
 
-    def _save(fig, name):
-        fig.savefig(FIG_DIR / name, dpi=150, bbox_inches="tight")
-        plt.close(fig)
+    def _save(fig, name, config: dict | None = None):
+        save_figure(fig, FIG_DIR / name, dpi=300, config=config or {"chart": name.replace(".png", "")})
         print(f"  Saved {name}")
 
     # 1. Causal DAG (Hyperbolic)
@@ -1256,6 +2082,99 @@ def generate_figures(
             bbox=dict(boxstyle="round", facecolor="#F0F0F0", alpha=0.8))
     _save(fig, "12_pipeline_summary.png")
 
+    # 13. Unified niche signature heatmap
+    sig_path = NICHE_DIR / "niche_signature_matrix.csv"
+    if sig_path.exists():
+        try:
+            sig_df = pd.read_csv(sig_path)
+            if "niche" in sig_df.columns:
+                sig_df = sig_df.rename(columns={"niche": "niche_id"})
+            if "niche_id" in sig_df.columns and len(sig_df.columns) > 1:
+                sig_mat = sig_df.set_index("niche_id")
+                fig, ax = plt.subplots(figsize=(10, 5))
+                im = ax.imshow(sig_mat.values, aspect="auto", cmap=CMAP_DIVERGING)
+                fig.colorbar(im, ax=ax, shrink=0.75, pad=0.02, label="log2 enrichment")
+                ax.set_xticks(range(sig_mat.shape[1]))
+                ax.set_xticklabels(sig_mat.columns, rotation=35, ha="right")
+                ax.set_yticks(range(sig_mat.shape[0]))
+                ax.set_yticklabels([f"N{int(i)}" for i in sig_mat.index])
+                ax.set_title("Unified Niche Signature Matrix")
+                _save(fig, "13_niche_signature_heatmap.png")
+        except Exception as e:
+            print(f"  WARN: niche signature figure failed: {e}")
+
+    # 14. Target-niche heatmap
+    if target_niche is not None and not target_niche.empty:
+        top_targets = (
+            target_niche[["target_gene", "global_rank"]]
+            .drop_duplicates()
+            .sort_values("global_rank")
+            .head(20)["target_gene"]
+            .tolist()
+        )
+        heat_df = (
+            target_niche[target_niche["target_gene"].isin(top_targets)]
+            .pivot(index="target_gene", columns="niche_name", values="z_score_within_target")
+            .fillna(0.0)
+        )
+        if not heat_df.empty:
+            fig, ax = plt.subplots(figsize=(12, max(5, len(heat_df) * 0.3)))
+            vmax = float(np.max(np.abs(heat_df.values))) if heat_df.size else 1.0
+            vmax = max(vmax, 1e-6)
+            im = ax.imshow(heat_df.values, aspect="auto", cmap=CMAP_DIVERGING, vmin=-vmax, vmax=vmax)
+            fig.colorbar(im, ax=ax, shrink=0.75, pad=0.02, label="target-level z-score")
+            ax.set_xticks(range(heat_df.shape[1]))
+            ax.set_xticklabels(heat_df.columns, rotation=40, ha="right", fontsize=8)
+            ax.set_yticks(range(heat_df.shape[0]))
+            ax.set_yticklabels(heat_df.index, fontsize=8)
+            ax.set_title("Target-Niche Expression Heatmap (Top Targets)")
+            _save(fig, "14_target_niche_heatmap.png")
+
+            # 15. Target-niche dotplot
+            fig, ax = plt.subplots(figsize=(12, max(5, len(heat_df) * 0.35)))
+            for yi, tg in enumerate(heat_df.index):
+                for xi, niche_name in enumerate(heat_df.columns):
+                    val = float(heat_df.loc[tg, niche_name])
+                    size = 30 + 120 * min(abs(val) / max(vmax, 1e-6), 1.0)
+                    color = "#D73027" if val >= 0 else "#4575B4"
+                    ax.scatter(xi, yi, s=size, c=color, alpha=0.75, edgecolors="white", linewidths=0.4)
+            ax.set_xticks(range(heat_df.shape[1]))
+            ax.set_xticklabels(heat_df.columns, rotation=40, ha="right", fontsize=8)
+            ax.set_yticks(range(heat_df.shape[0]))
+            ax.set_yticklabels(heat_df.index, fontsize=8)
+            ax.set_title("Target-Niche Dotplot (size=|z|, color=sign)")
+            ax.grid(axis="x", linestyle="--", alpha=0.2)
+            _save(fig, "15_target_niche_dotplot.png")
+
+    # 16. Combo-niche Sankey-like flow (fallback as top flow bars)
+    if combo_niche is not None and not combo_niche.empty:
+        top_combo = (
+            combo_niche.groupby("combo_id", as_index=False)["combo_niche_effect"]
+            .mean()
+            .sort_values("combo_niche_effect", ascending=False)
+            .head(12)["combo_id"]
+            .tolist()
+        )
+        sub = combo_niche[combo_niche["combo_id"].isin(top_combo)].copy()
+        if not sub.empty:
+            fig, ax = plt.subplots(figsize=(13, 6))
+            grp = (
+                sub.groupby(["combo_id", "niche_name"], as_index=False)["combo_niche_effect"]
+                .mean()
+                .sort_values("combo_niche_effect", ascending=False)
+                .head(40)
+            )
+            labels = [f"{r['combo_id']} → {r['niche_name']}" for _, r in grp.iterrows()]
+            vals = grp["combo_niche_effect"].values
+            colors = ["#00A087" if v >= 0 else "#CC6677" for v in vals]
+            ax.barh(range(len(grp)), vals, color=colors, edgecolor="white")
+            ax.set_yticks(range(len(grp)))
+            ax.set_yticklabels(labels, fontsize=7)
+            ax.invert_yaxis()
+            ax.set_xlabel("Mean combo niche effect")
+            ax.set_title("Combo-to-Niche Effect Flow (Top links)")
+            _save(fig, "16_combo_niche_sankey.png")
+
     print(f"  All figures saved to {FIG_DIR}")
 
 
@@ -1270,6 +2189,7 @@ def generate_report(
     comparison: dict,
     node_labels: list[str],
     elapsed: float,
+    target_niche: pd.DataFrame | None = None,
 ):
     print("\n" + "=" * 60)
     print("[Phase 10] Generating target discovery report")
@@ -1359,7 +2279,22 @@ def generate_report(
 
     lines.extend([
         "",
-        "## 8. Limitations",
+        "## 8. Unified Niche Context",
+        "",
+    ])
+    if target_niche is not None and not target_niche.empty:
+        for tg in [g for g in ANCHOR_GENES if g in target_niche["target_gene"].unique()]:
+            sub = target_niche[target_niche["target_gene"] == tg].sort_values("rank_within_target").head(3)
+            niches = ", ".join(
+                f"{r['niche_name']} (z={r['z_score_within_target']:.2f})" for _, r in sub.iterrows()
+            )
+            lines.append(f"- **{tg}** enriched niches: {niches}")
+    else:
+        lines.append("- Niche mapping not available in this run.")
+
+    lines.extend([
+        "",
+        "## 9. Limitations",
         "",
         "- Result-level inputs only (no raw UMI counts); proxy embeddings used",
         "- Spatial propagation on MDS-projected coordinates, not actual tissue geometry",
@@ -1384,6 +2319,12 @@ def main():
     parser.add_argument("--max-perturb", type=int, default=50)
     parser.add_argument("--geometry-k", type=int, default=4)
     parser.add_argument("--geometry-blend", type=float, default=0.30)
+    parser.add_argument("--platform", choices=["cosmx", "visium", "visiumhd", "all"],
+                        default="all", help="Filter to single spatial platform")
+    parser.add_argument("--genes", type=str, default="",
+                        help="Comma-separated gene list for focused analysis")
+    parser.add_argument("--hierarchy-levels", type=int, default=3,
+                        help="Number of niche hierarchy levels (1-3)")
     args = parser.parse_args()
 
     t0 = time.time()
@@ -1393,6 +2334,13 @@ def main():
     print("  HyperSCA Target Discovery Pipeline")
     print("  MSS CRC Immunotherapy Non-Response")
     print("=" * 60)
+
+    icb_mode = _detect_icb_data_mode()
+    (OUT_BASE / "icb_data_mode.txt").write_text(
+        f"mode={icb_mode}\nh5ad={ICB_H5AD_PATH.exists()}\n"
+        f"ref={REF_MANIFEST_PATH.exists()}\n",
+        encoding="utf-8",
+    )
 
     # Phase 1: Candidate pool
     candidate_pool = build_candidate_pool()
@@ -1463,6 +2411,31 @@ def main():
     print(f"  Retained hubs: {len(retained_hubs)}")
     print(f"  Retained combos: {len(retained_combos)}")
 
+    # Phase 7.4: available data inventory
+    print("\n" + "=" * 60)
+    print("[Phase 7.4] Collecting available data inventory")
+    print("=" * 60)
+    inventory = collect_available_data_inventory()
+    print(f"  Saved: {NICHE_DIR / 'available_data_inventory.json'}")
+    print(f"  Saved: {NICHE_DIR / 'available_data_inventory.md'}")
+    print(f"  STmetadata csv: {inventory.get('stmetadata_csv_count', 0)}")
+
+    # Phase 7.5-7.6: Unified niche ontology + target/combination mapping
+    niche_pack = build_unified_niche_definition(
+        n_clusters=None,
+        k_min=8,
+        k_max=18,
+        fallback_node_labels=node_labels,
+        platform=args.platform,
+    )
+    niche_map = map_targets_to_unified_niches(
+        ranking=ranking,
+        cluster_expr=cluster_expr,
+        node_labels=node_labels,
+        niche_pack=niche_pack,
+        combos=retained_combos,
+    )
+
     # Phase 8: Mode comparison
     comp = compare_modes(
         results["hyperbolic"]["geom"], results["euclidean"]["geom"],
@@ -1478,13 +2451,16 @@ def main():
         results["hyperbolic"]["step2"], results["euclidean"]["step2"],
         results["hyperbolic"]["step3"],
         node_labels,
+        target_niche=niche_map.get("target_niche"),
+        combo_niche=niche_map.get("combo_niche"),
     )
 
     # Phase 10: Report
     elapsed = time.time() - t0
     generate_report(ranking, candidate_pool,
                     results["hyperbolic"]["step2"], results["euclidean"]["step2"],
-                    comp, node_labels, elapsed)
+                    comp, node_labels, elapsed,
+                    target_niche=niche_map.get("target_niche"))
 
     print(f"\n{'=' * 60}")
     print(f"  Target Discovery COMPLETE in {elapsed:.1f}s")

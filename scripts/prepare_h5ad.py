@@ -68,6 +68,270 @@ def _find_first_h5ad(root: Path) -> Path | None:
     return None
 
 
+# =========================================================================
+# ICB full-data ingest helpers
+# =========================================================================
+
+def _extract_icb_metadata_via_r(
+    qs_path: Path, out_csv: Path, reports: list[str],
+) -> bool:
+    """Extract Seurat metadata from .qs file via Rscript (one-time)."""
+    import subprocess
+
+    qs_posix = str(qs_path).replace("\\", "/")
+    csv_posix = str(out_csv).replace("\\", "/")
+    r_code = (
+        'suppressMessages(library(qs)); '
+        f'obj <- qread("{qs_posix}"); '
+        'meta <- obj@meta.data; '
+        'meta$barcode <- rownames(meta); '
+        f'write.csv(meta, "{csv_posix}", row.names=FALSE); '
+        'cat("OK:", nrow(meta), "cells\\n")'
+    )
+    try:
+        proc = subprocess.run(
+            ["Rscript", "-e", r_code],
+            capture_output=True, text=True, timeout=900,
+        )
+        if proc.returncode == 0 and out_csv.exists():
+            reports.append(f"R_META: extracted → {out_csv}")
+            return True
+        reports.append(f"R_META FAIL (rc={proc.returncode}): {proc.stderr[:500]}")
+        return False
+    except FileNotFoundError:
+        reports.append("R_META SKIP: Rscript not found in PATH")
+        return False
+    except Exception as exc:
+        reports.append(f"R_META ERROR: {exc}")
+        return False
+
+
+def _read_mtx_subset(mtx_path: Path, keep_col_set: set[int],
+                     n_genes: int, n_keep: int) -> "scipy.sparse.csr_matrix":
+    """Stream-read MTX.gz, only keeping entries for selected columns.
+
+    This avoids loading the full 975K-cell matrix (~20GB) into memory.
+    Only the subset (~200K cells, ~3GB) is materialized.
+    """
+    import gzip
+    from scipy.sparse import coo_matrix
+
+    col_remap = {old: new for new, old in enumerate(sorted(keep_col_set))}
+    rows, cols, data = [], [], []
+    with gzip.open(str(mtx_path), "rt") as f:
+        for line in f:
+            if line.startswith("%"):
+                continue
+            parts = line.strip().split()
+            if len(parts) == 3 and not any(c.isalpha() for c in parts[0]):
+                r, c, v = int(parts[0]) - 1, int(parts[1]) - 1, float(parts[2])
+                if c in keep_col_set:
+                    rows.append(r)
+                    cols.append(col_remap[c])
+                    data.append(v)
+            elif len(parts) == 3:
+                continue
+    import numpy as np
+    mat = coo_matrix(
+        (np.array(data, dtype=np.float32),
+         (np.array(rows, dtype=np.int32), np.array(cols, dtype=np.int32))),
+        shape=(n_genes, n_keep),
+    )
+    return mat.tocsr().T
+
+
+def _stratified_subsample(meta: pd.DataFrame, barcodes: list[str],
+                          max_cells: int, rng_seed: int = 42) -> list[int]:
+    """Stratified subsample by MajorCellType, preserving SubCellType diversity."""
+    import numpy as np
+
+    bc_set = set(barcodes)
+    meta_matched = meta[meta.index.isin(bc_set)]
+    bc_to_idx = {b: i for i, b in enumerate(barcodes)}
+
+    if len(meta_matched) <= max_cells:
+        return [bc_to_idx[b] for b in meta_matched.index if b in bc_to_idx]
+
+    ct_col = "MajorCellType" if "MajorCellType" in meta_matched.columns else None
+    rng = np.random.default_rng(rng_seed)
+
+    if ct_col is None:
+        chosen = rng.choice(meta_matched.index, size=max_cells, replace=False)
+        return [bc_to_idx[b] for b in chosen]
+
+    groups = meta_matched.groupby(ct_col)
+    n_groups = len(groups)
+    per_group = max(100, max_cells // n_groups)
+    selected = []
+    for _name, grp in groups:
+        n_take = min(len(grp), per_group)
+        chosen = rng.choice(grp.index, size=n_take, replace=False)
+        selected.extend(chosen)
+
+    if len(selected) > max_cells:
+        selected = list(rng.choice(selected, size=max_cells, replace=False))
+    elif len(selected) < max_cells:
+        remaining = list(set(meta_matched.index) - set(selected))
+        n_extra = min(max_cells - len(selected), len(remaining))
+        if n_extra > 0:
+            selected.extend(rng.choice(remaining, size=n_extra, replace=False))
+
+    return sorted(bc_to_idx[b] for b in selected if b in bc_to_idx)
+
+
+def _build_icb_h5ad(
+    src_root: Path, out_dir: Path, reports: list[str],
+    max_cells: int = 200_000,
+) -> Path | None:
+    """Build ICB h5ad from 10x mtx + GEO metadata (memory-safe).
+
+    Strategy:
+      1. Read GEO cell-level metadata (lightweight, ~975K rows with
+         MajorCellType + SubCellType + Patient + Treatment + Tissue)
+      2. Read barcodes/features from 10x (no matrix)
+      3. Stratified subsample by MajorCellType → select column indices
+      4. Stream-read matrix.mtx.gz, only materializing selected columns
+      5. Build AnnData with both MajorCellType and SubCellType annotations
+      6. Save full 975K metadata as separate CSV for completeness
+
+    Peak memory: ~4GB for 200K cells (vs ~20GB+ for full 975K).
+    """
+    import gzip
+    from scipy.io import mminfo
+
+    input_dir = src_root / "input"
+    required_files = ["barcodes.tsv.gz", "features.tsv.gz", "matrix.mtx.gz"]
+    if not all((input_dir / f).exists() for f in required_files):
+        reports.append(f"MISSING: {input_dir} lacks 10x mtx files")
+        return None
+
+    # ---- Step 1: Load GEO metadata (lightweight, ~150MB) ----
+    geo_meta_path = src_root / "GSE236581_CRC-ICB_metadata.txt.gz"
+    patient_meta_path = src_root / "scCRC_ICB_patient meta.csv"
+    sample_meta_path = src_root / "scCRC_ICB_sample_meta.csv"
+    meta: pd.DataFrame | None = None
+
+    if geo_meta_path.exists():
+        print("  [ICB] Reading GEO cell metadata (975K cells) ...")
+        meta = pd.read_csv(geo_meta_path, sep=None, engine="python")
+        reports.append(
+            f"GEO_META: {len(meta)} cells, "
+            f"cols={list(meta.columns)}"
+        )
+    else:
+        cached_meta = out_dir / "_icb_seurat_metadata.csv"
+        if cached_meta.exists():
+            meta = pd.read_csv(cached_meta, index_col=0)
+        else:
+            qs_path = src_root / "data" / "scRNA.qs"
+            if qs_path.exists():
+                print("  [ICB] Extracting Seurat metadata via Rscript ...")
+                _extract_icb_metadata_via_r(qs_path, cached_meta, reports)
+                if cached_meta.exists():
+                    meta = pd.read_csv(cached_meta, index_col=0)
+        if meta is not None:
+            reports.append(f"CACHED_META: {len(meta)} cells")
+
+    if meta is None:
+        reports.append("FATAL: no metadata found (need GSE236581_CRC-ICB_metadata.txt.gz)")
+        return None
+
+    # ---- Step 2: Read barcodes & features (no matrix yet) ----
+    print("  [ICB] Reading barcodes and features ...")
+    with gzip.open(str(input_dir / "barcodes.tsv.gz"), "rt") as f:
+        barcodes = [line.strip() for line in f]
+    with gzip.open(str(input_dir / "features.tsv.gz"), "rt") as f:
+        features_raw = [line.strip().split("\t") for line in f]
+    gene_ids = [r[0] if r else f"gene_{i}" for i, r in enumerate(features_raw)]
+    gene_names = [r[1] if len(r) > 1 else gene_ids[i] for i, r in enumerate(features_raw)]
+    n_genes = len(gene_names)
+    reports.append(f"BARCODES: {len(barcodes)} | FEATURES: {n_genes}")
+
+    # ---- Step 3: Save FULL metadata as CSV (all 975K) ----
+    full_meta_path = out_dir / "full_cell_metadata.csv"
+    if not full_meta_path.exists():
+        print(f"  [ICB] Saving full metadata → {full_meta_path}")
+        meta.to_csv(full_meta_path)
+        reports.append(f"FULL_META_SAVED: {len(meta)} cells → {full_meta_path}")
+
+    # MajorCellType / SubCellType summary
+    if "MajorCellType" in meta.columns:
+        major_vc = meta["MajorCellType"].value_counts()
+        reports.append(f"MajorCellType distribution: {dict(major_vc)}")
+        print(f"  [ICB] MajorCellType: {len(major_vc)} types, top: "
+              f"{', '.join(f'{k}={v}' for k, v in major_vc.head(5).items())}")
+    if "SubCellType" in meta.columns:
+        sub_vc = meta["SubCellType"].value_counts()
+        reports.append(f"SubCellType: {len(sub_vc)} subtypes")
+        print(f"  [ICB] SubCellType: {len(sub_vc)} subtypes")
+
+    # ---- Step 4: Stratified subsample ----
+    keep_indices = _stratified_subsample(meta, barcodes, max_cells)
+    keep_col_set = set(keep_indices)
+    n_keep = len(keep_indices)
+    kept_barcodes = [barcodes[i] for i in keep_indices]
+    print(f"  [ICB] Stratified subsample: {n_keep}/{len(barcodes)} cells")
+    reports.append(f"SUBSAMPLE: {n_keep} cells (max_cells={max_cells})")
+
+    # Verify annotation coverage after subsample
+    if "MajorCellType" in meta.columns:
+        sub_meta = meta.loc[meta.index.isin(set(kept_barcodes))]
+        sub_major = sub_meta["MajorCellType"].value_counts()
+        reports.append(f"SUBSAMPLE_MajorCellType: {dict(sub_major)}")
+        if "SubCellType" in sub_meta.columns:
+            sub_sub = sub_meta["SubCellType"].nunique()
+            reports.append(f"SUBSAMPLE_SubCellType_unique: {sub_sub}")
+
+    # ---- Step 5: Stream-read matrix (only selected columns) ----
+    mtx_path = input_dir / "matrix.mtx.gz"
+    print(f"  [ICB] Stream-reading matrix.mtx.gz ({n_keep} columns) ...")
+    print("        This may take 5-10 minutes (streaming decompression) ...")
+    sub_mat = _read_mtx_subset(mtx_path, keep_col_set, n_genes, n_keep)
+    reports.append(f"MATRIX_SUBSET: {sub_mat.shape[0]} cells x {sub_mat.shape[1]} genes, "
+                   f"nnz={sub_mat.nnz}")
+
+    # ---- Step 6: Build AnnData ----
+    import anndata as ad
+    var_df = pd.DataFrame({"gene_ids": gene_ids, "gene_symbols": gene_names})
+    var_df.index = pd.Index(gene_names).astype(str)
+    var_df.index = var_df.index.where(~var_df.index.duplicated(), var_df.index + "_dup")
+    adata = ad.AnnData(X=sub_mat, obs=pd.DataFrame(index=kept_barcodes), var=var_df)
+    adata.var_names_make_unique()
+
+    # ---- Step 7: Merge annotations ----
+    anno_cols = [c for c in meta.columns
+                 if c.lower() not in {"ncount_rna", "nfeature_rna", "orig.ident"}]
+    common = adata.obs_names.intersection(meta.index)
+    if len(common) > 100:
+        for col in anno_cols:
+            adata.obs[col] = meta.loc[adata.obs_names, col].values
+        reports.append(
+            f"MERGED: {len(common)} cells × {len(anno_cols)} anno cols "
+            f"(MajorCellType, SubCellType, Patient, Treatment, Tissue, ...)"
+        )
+    else:
+        reports.append(f"WARN: only {len(common)} barcode matches, metadata not merged")
+
+    # ---- Step 8: Copy patient/sample meta ----
+    if patient_meta_path.exists():
+        _safe_copy(patient_meta_path, out_dir / "patient_meta.csv")
+        reports.append(f"PATIENT_META: copied → {out_dir / 'patient_meta.csv'}")
+    if sample_meta_path.exists():
+        _safe_copy(sample_meta_path, out_dir / "sample_meta.csv")
+        reports.append(f"SAMPLE_META: copied → {out_dir / 'sample_meta.csv'}")
+
+    adata.obs["platform"] = "10x_scRNA"
+    adata.obs["source_project"] = "scCRC_ICB"
+
+    out_path = out_dir / "expression.h5ad"
+    print(f"  [ICB] Writing {out_path} ({adata.n_obs} x {adata.n_vars}) ...")
+    adata.write(out_path)
+    reports.append(f"BUILT: {out_path} ({adata.n_obs} x {adata.n_vars})")
+    print(f"  [ICB] Done. Annotations: MajorCellType={adata.obs.get('MajorCellType', pd.Series()).nunique()}, "
+          f"SubCellType={adata.obs.get('SubCellType', pd.Series()).nunique()}")
+    return out_path
+
+
 def _find_ifng_h5ad(root: Path) -> Path | None:
     """为 IFNG 优先选择包含空间坐标的全量 h5ad。"""
     preferred = [
@@ -231,20 +495,25 @@ def _prepare_multisource(args) -> int:
         )
         results["scCRC_IFNG"] = "SUCCESS"
 
-    # scCRC_ICB
+    # scCRC_ICB — full data ingest (10x mtx + .qs metadata)
     icb_dir = sc_root / "scCRC_ICB"
     icb_dir.mkdir(parents=True, exist_ok=True)
+    icb_max_cells = getattr(args, "max_cells", 200_000)
+    icb_h5ad = _build_icb_h5ad(sources["scCRC_ICB"], icb_dir, report_lines,
+                                max_cells=icb_max_cells)
+    if icb_h5ad is not None:
+        results["scCRC_ICB"] = "SUCCESS"
+    else:
+        report_lines.append("WARN: ICB full h5ad build failed, falling back to DEG-only")
+        results["scCRC_ICB"] = "PARTIAL"
+
+    # Always copy DEG tables as auxiliary reference
     deg_dir = icb_dir / "deg_tables"
     deg_dir.mkdir(parents=True, exist_ok=True)
     icb_files = sorted((sources["scCRC_ICB"] / "output").glob("DEGs_MSS*.csv"))
-    if not icb_files:
-        report_lines.append("MISSING: scCRC_ICB/output/DEGs_MSS*.csv")
-        results["scCRC_ICB"] = "FAILED"
-    else:
-        for f in icb_files:
-            _safe_copy(f, deg_dir / f.name)
-            report_lines.append(f"COPIED: {f} -> {deg_dir / f.name}")
-        results["scCRC_ICB"] = "SUCCESS"
+    for f in icb_files:
+        _safe_copy(f, deg_dir / f.name)
+        report_lines.append(f"COPIED: {f} -> {deg_dir / f.name}")
 
     # ST_CRC_MSS
     st_dir = st_root / "ST_CRC_MSS"
@@ -346,6 +615,8 @@ def main():
     parser.add_argument("--neu-root", default=str(DEFAULT_SOURCES["scCRC_Neu"]))
     parser.add_argument("--st-root", default=str(DEFAULT_SOURCES["ST_CRC_MSS"]))
     parser.add_argument("--ifng-root", default=str(DEFAULT_SOURCES["scCRC_IFNG"]))
+    parser.add_argument("--max-cells", type=int, default=200_000,
+                        help="Max cells to keep for ICB h5ad (stratified by MajorCellType)")
     args = parser.parse_args()
 
     if args.mode == "research":
