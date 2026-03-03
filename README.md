@@ -16,7 +16,7 @@ HyperSCA 的研究完整版流程由五个连续阶段构成：
 
 ## Pipeline Flowchart
 
-![HyperSCA Overall Design](docs/Overall%20Design%202.png)
+![HyperSCA Overall Design](docs/Overall%20Design%203.png)
 
 ## Core Algorithms
 
