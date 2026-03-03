@@ -8,6 +8,7 @@ numpy
 scipy
 pandas
 scikit-learn
+scikit-misc
 matplotlib
 seaborn
 h5py
@@ -59,3 +60,4 @@ pyarrow
 openpyxl
 jupyter
 ipywidgets
+adjustText

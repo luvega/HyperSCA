@@ -18,8 +18,13 @@ dependencies:
   - r-arrow            # R <-> Python parquet 交互
   - r-devtools
   - r-ggplot2
+  - r-ggrepel
+  - r-patchwork
   - r-dplyr
+  - r-data.table
   - r-tidyverse
+  - bioconductor-singlecellexperiment
+  - bioconductor-complexheatmap
 
   # Bioconductor 包 (需在 R 中通过 BiocManager 安装)
   # BiocManager::install(c("CellChat", "nichenetr", "SingleCellExperiment", "ComplexHeatmap"))
