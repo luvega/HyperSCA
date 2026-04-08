@@ -91,14 +91,29 @@ python scripts/validate_env.py
 
 ## Quick Start
 
-### Notebook Entry (Step-by-step, scCRC_ICB)
+### Multi-omics Integration Example (推荐)
 
-如果希望在 Jupyter 中按主流程逐步运行示例，可直接使用：
+展示 HyperSCA **多组学整合分析**核心能力的完整示例（6 个 notebook，含嵌入图表）：
+
+- `notebooks/example_multiomics_integration/README.md`
+- `00_data_landscape` → `01_hyperbolic_vs_euclidean` → `02_multiscale_niche` → `03_causal_network` → `04_target_discovery` → `05_summary`
+
+核心对比结果：
+
+| 指标 | scRNA-only + Euclidean | Multi-omics + Hyperbolic | 提升 |
+|------|----------------------|-------------------------|------|
+| Niche Silhouette | 0.417 | **0.710** | **+70%** |
+| Hierarchy Correlation | −0.569 | **+1.000** | 反转→完美 |
+| 证据维度 | 3 | **5** (+spatial, +niche) | +2 独立维度 |
+
+数据规模：485K spots × 3 空间平台 + 3 scRNA-seq 队列，**靶点发现完全数据驱动**（无预设 anchor）。
+
+### Step-by-step scCRC_ICB (单细胞基础流程)
+
+如需仅基于 scRNA-seq 数据按主流程逐步运行：
 
 - `notebooks/example_sccrc_icb_step_by_step/README.md`
 - `notebooks/example_sccrc_icb_step_by_step/00_environment_and_data_check.ipynb` 到 `05_step4_dynamic_intervention_and_summary.ipynb`
-
-该示例采用 `scCRC_ICB` 数据路径，且靶点选择为纯数据驱动流程（不预设 anchor 基因）。
 
 ### A. Build Canonical Schema
 
