@@ -91,6 +91,15 @@ python scripts/validate_env.py
 
 ## Quick Start
 
+### Notebook Entry (Step-by-step, scCRC_ICB)
+
+如果希望在 Jupyter 中按主流程逐步运行示例，可直接使用：
+
+- `notebooks/example_sccrc_icb_step_by_step/README.md`
+- `notebooks/example_sccrc_icb_step_by_step/00_environment_and_data_check.ipynb` 到 `05_step4_dynamic_intervention_and_summary.ipynb`
+
+该示例采用 `scCRC_ICB` 数据路径，且靶点选择为纯数据驱动流程（不预设 anchor 基因）。
+
 ### A. Build Canonical Schema
 
 ```bash
