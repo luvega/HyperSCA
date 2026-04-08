@@ -1,6 +1,6 @@
 # scCRC_ICB Step-by-step Notebooks
 
-本目录提供 HyperSCA 主流程的分步 Notebook 示例，面向 `scCRC_ICB` 示例数据。
+本目录提供 HyperSCA 主流程的分步 Notebook 示例，面向 `CRC_ICB` 示例数据。
 
 ## 执行顺序
 
@@ -13,11 +13,6 @@
 5. `04_step3_counterfactual_from_data_driven_targets.ipynb`
 6. `05_step4_dynamic_intervention_and_summary.ipynb`
 
-## 设计原则
-
-- 不预设任何 anchor 靶点
-- 不硬编码 INHBA/POSTN/FN1/MFAP2 等历史候选
-- 靶点由 `03` 基于 DEG 统计量自动筛选，再传入 `04/05`
 
 ## 数据与输出路径
 
