@@ -77,7 +77,7 @@
 
 ### 1.1 生物学背景
 
-结直肠癌（Colorectal Cancer, CRC）免疫治疗的应答率受限于复杂的肿瘤免疫微环境（Tumor Microenvironment, TME）。TME 中多种细胞亚群——特别是肿瘤相关成纤维细胞（Cancer-Associated Fibroblasts, CAFs）、肿瘤相关巨噬细胞（Tumor-Associated Macrophages, TAMs）、调节性 T 细胞（Tregs）——形成免疫抑制生态位（immunosuppressive niche），通过配受体信号网络协同构建物理与化学屏障，阻碍效应 T 细胞浸润与功能。
+复杂疾病的组织微环境（Disease Microenvironment, DME）普遍存在多细胞群互作、空间异质性与状态转变并行的问题。无论是肿瘤免疫、自身免疫、慢性炎症还是感染相关病灶，均可能形成具有抑制或促炎特征的生态位（pathological niche），并通过配受体信号网络协同塑造局部细胞行为与组织功能。HyperSCA 的目标是在统一框架下解析这些时空信号网络并识别可干预节点。
 
 ### 1.2 计算学挑战
 
@@ -91,13 +91,15 @@ HyperSCA 旨在：
 
 - 在双曲流形上忠实表征细胞发育层级与空间拓扑；
 - 解缠（disentangle）细胞内源状态与外源微环境影响，构建定向因果通讯网络；
-- 实现基因级虚拟敲除与空间传播模拟，为免疫治疗靶点筛选提供计算证据。
+- 实现基因级虚拟敲除与空间传播模拟，为疾病干预靶点筛选提供计算证据。
 
 ---
 
 ## 2. 方法总览
 
 HyperSCA 框架分为 **Phase 0（数据底座）** 和 **三个递进算法阶段**，每一阶段的输出构成下一阶段的输入：
+
+> 说明：文中部分信号轴（如 POSTN/MFAP2/INHBA）用于肿瘤免疫场景示例说明，算法本身不依赖特定癌种，可迁移至其他具备空间组学与单细胞组学数据的疾病研究。
 
 ```
 Phase 0: 数据基线与可视化底座 ✅ 已完成
@@ -374,7 +376,7 @@ $$\text{配体 (Ligand)} \xrightarrow{\text{分泌}} \text{受体 (Receptor)} \x
 
 ### 5.2 目标与概述
 
-**目标**：利用训练好的模型进行虚拟敲除（Virtual Knockout），预测靶向干预后 TME 的动态重塑。
+**目标**：利用训练好的模型进行虚拟敲除（Virtual Knockout），预测靶向干预后组织微环境的动态重塑。
 
 **输入**：
 - 因果细胞图 $\mathcal{G}_{\text{causal}}$ 与多层信号流（来自阶段 2）
@@ -463,7 +465,7 @@ $$\hat{\mathbf{x}}^{\text{CF}}_i = \text{Decoder}(\mathbf{z}^{\text{pred}}_i)$$
 
 ### 6.2 局限与未来方向
 
-1. **因果可识别性假设**：SCM 的可识别性依赖于充分性假设（如 faithfulness、causal sufficiency），TME 中未观测的混杂因素可能违反这些假设——后续可引入 latent confounder 建模（如 DoWhy 的 IV 方法）。
+1. **因果可识别性假设**：SCM 的可识别性依赖于充分性假设（如 faithfulness、causal sufficiency），复杂组织微环境中未观测的混杂因素可能违反这些假设——后续可引入 latent confounder 建模（如 DoWhy 的 IV 方法）。
 2. **双曲空间数值稳定性**：高曲率区域的指数/对数映射可能出现数值溢出——需结合 `geoopt` 的数值截断策略。
 3. **训练数据依赖**：扰动预测的可靠性取决于训练数据是否覆盖足够的扰动条件多样性——纯观测数据的外推能力有限。
 4. **跨患者泛化**：当前框架在单患者数据上训练——多患者联合训练或 meta-learning 是重要扩展方向。

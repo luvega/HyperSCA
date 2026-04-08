@@ -2,11 +2,11 @@
   <img src="docs/Logo_high%20res.png" alt="HyperSCA Logo" width="280" />
 </p>
 
-HyperSCA (Hyperbolic Spatiotemporal Causal Analysis) 是一个面向结直肠癌免疫微环境研究的计算框架。该框架集成双曲几何嵌入、因果图发现和反事实扰动分析，支持 scRNA-seq、空间转录组和临床分层数据的联合分析，用于机制推断与可干预靶点评估。
+HyperSCA (Hyperbolic Spatiotemporal Causal Analysis) 是一个面向空间组学与单细胞组学联合分析的多组学计算框架。该框架集成双曲几何嵌入、因果图发现和反事实扰动分析，支持 scRNA-seq、空间转录组及临床/表型分层数据的联合建模，用于机制推断与可干预靶点评估。除肿瘤免疫场景外，也可用于自身免疫、慢性炎症、感染及组织损伤修复等疾病环境。
 
 ## Project and Algorithm Overview
 
-HyperSCA 的研究完整版流程由五个连续阶段构成：
+HyperSCA 的研究完整版流程由五个连续阶段构成，可按具体队列与研究问题灵活裁剪：
 
 - Phase D0（Data Onboarding）：四项目标准化入库与字段校验。
 - Stage 1（Embedding）：在 Lorentz/Poincare 双曲流形上学习细胞状态表示。
@@ -16,7 +16,7 @@ HyperSCA 的研究完整版流程由五个连续阶段构成：
 
 ## Pipeline Flowchart
 
-![HyperSCA Overall Design](docs/Overall%20Design%203.png)
+![HyperSCA Analysis Framework](docs/HyperSCA分析框架示意图.jpg)
 
 ## Core Algorithms
 
@@ -38,21 +38,21 @@ HyperSCA 的研究完整版流程由五个连续阶段构成：
 ### 4) Niche and Cross-sample Stratification
 
 - 关键模块：`src/evaluation/cross_sample_metrics.py`
-- 方法要点：生态位聚类（niche clustering）、跨样本边一致性、MMR 分层差异检验，纳入最终证据矩阵。
+- 方法要点：生态位聚类（niche clustering）、跨样本边一致性、临床/表型分层差异检验，纳入最终证据矩阵。
 
 ## Example Data Samples
 
 项目常用示例输入（路径为本地外部数据目录，不纳入版本控制；以下为脱敏占位路径）：
 
-- `<PATH_TO_scCRC_Neu>`  
-  - 代表文件：`*-NormalizedCounts.tsv`, `*-DESeq2_result.tsv`
-  - 用途：构建 cluster-level 表达矩阵、差异基因候选池。
-- `<PATH_TO_scCRC_IFNG>`  
-  - 代表文件：`results/tables/sample_clinical_mapping.csv`, `targets_shared_specific_by_mmr.csv`, `niche_shared_specific_by_mmr.csv`
-  - 用途：MSI/MMR 分层、IFNG 相关靶点补充、跨样本生态位分析。
-- `<PATH_TO_ST_CRC_MSS>`  
-  - 代表文件：`STmetadata_*.csv`
-  - 用途：空间反卷积、细胞共定位邻接、传播梯度评估。
+- `<PATH_TO_scRNA_REFERENCE>`  
+  - 代表文件：`*-NormalizedCounts.tsv`, `*-DE_result.tsv`
+  - 用途：构建 cluster-level 表达矩阵、候选差异基因池与细胞状态先验。
+- `<PATH_TO_SPATIAL_OMICS>`  
+  - 代表文件：`STmetadata_*.csv`, `spot_annotations.*`
+  - 用途：空间反卷积、细胞共定位邻接、传播梯度与生态位结构评估。
+- `<PATH_TO_CLINICAL_OR_PHENOTYPE>`  
+  - 代表文件：`sample_clinical_mapping.csv`, `group_labels.csv`
+  - 用途：临床/表型分层（如免疫亚型、疾病分期、治疗反应）及跨样本差异分析。
 
 统一标准化输出（示例）：
 
@@ -97,21 +97,23 @@ python scripts/validate_env.py
 python scripts/build_canonical_schema.py
 ```
 
-### A0. Onboard Four-project Data to `/data`
+### A0. Onboard Multi-cohort Data to `/data`
+
+说明：脚本参数名保留历史命名（`icb/neu/st/ifng`），但可映射到任意疾病场景的数据根目录。
 
 ```bash
 python scripts/run_data_onboarding.py \
-  --icb-root G:\scCRC_ICB \
-  --neu-root G:\scCRC_Neu \
-  --st-root G:\ST_CRC_MSS \
-  --ifng-root F:\scCRC_IFNG
+  --icb-root <PATH_TO_COHORT_A> \
+  --neu-root <PATH_TO_COHORT_B> \
+  --st-root <PATH_TO_SPATIAL_OMICS> \
+  --ifng-root <PATH_TO_COHORT_D>
 ```
 
 ### B. Run Step1 (Hyperbolic Embedding)
 
 ```bash
 python scripts/run_step1.py \
-  --data-dir data/ST/ST_CRC_MSS \
+  --data-dir data/ST/<YOUR_SPATIAL_PROJECT> \
   --modality visium \
   --output-dir results/step1
 ```
