@@ -227,6 +227,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Local git worktrees for agentic development
+.worktrees/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
