@@ -18,6 +18,26 @@ def default_icb_data_mode_detector(config: TargetDiscoveryConfig) -> str:
     return "deg_only"
 
 
+def default_target_discovery_stages():
+    from src.discovery.target_discovery.causal_stage import CausalDiscoveryStage
+    from src.discovery.target_discovery.heavy_stages import EvidenceScoringStage, GeometryComparisonStage, ReportAndFigureStage
+    from src.discovery.target_discovery.lightweight_stages import CandidateDiscoveryStage, ExpressionAssemblyStage, SpatialContextStage
+    from src.discovery.target_discovery.niche import UnifiedNicheStage
+    from src.discovery.target_discovery.perturbation_stage import PerturbationScreenStage
+
+    return [
+        CandidateDiscoveryStage(),
+        ExpressionAssemblyStage(),
+        SpatialContextStage(),
+        GeometryComparisonStage(),
+        CausalDiscoveryStage(),
+        PerturbationScreenStage(),
+        EvidenceScoringStage(),
+        UnifiedNicheStage(),
+        ReportAndFigureStage(),
+    ]
+
+
 class TargetDiscoveryPipeline:
     def __init__(
         self,
@@ -26,7 +46,7 @@ class TargetDiscoveryPipeline:
         icb_data_mode_detector: Callable[[TargetDiscoveryConfig], str] = default_icb_data_mode_detector,
     ):
         self.config = config
-        self.stages = list(stages or [])
+        self.stages = list(default_target_discovery_stages() if stages is None else stages)
         self.icb_data_mode_detector = icb_data_mode_detector
 
     def run(self) -> dict[str, Any]:
