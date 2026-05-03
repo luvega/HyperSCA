@@ -5,7 +5,7 @@
 *.tsv
 *.bam
 *.fastq.gz
-data/
+/data/
 
 # IDE / 编辑器
 .cursor/
