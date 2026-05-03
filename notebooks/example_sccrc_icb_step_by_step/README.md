@@ -1,6 +1,6 @@
 # scCRC_ICB Step-by-step Notebooks
 
-本目录提供 HyperSCA 主流程的分步 Notebook 示例，面向 `scCRC_ICB` 示例数据。
+本目录提供 HyperSCA 主流程的分步 Notebook 示例，面向 `CRC_ICB` 示例数据。
 
 ## 执行顺序
 
