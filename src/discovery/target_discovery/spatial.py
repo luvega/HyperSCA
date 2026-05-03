@@ -23,6 +23,8 @@ def read_st_metadata_tables(st_dir: Path) -> list[pd.DataFrame]:
 def build_spatial_adjacency_from_tables(tables: list[pd.DataFrame], node_labels: list[str]) -> np.ndarray:
     all_corr: list[np.ndarray] = []
     n_nodes = len(node_labels)
+    if n_nodes <= 1:
+        return np.zeros((n_nodes, n_nodes), dtype=float)
     for table in tables:
         scores = np.zeros((len(table), n_nodes), dtype=float)
         for i, celltype in enumerate(node_labels):
@@ -30,6 +32,8 @@ def build_spatial_adjacency_from_tables(tables: list[pd.DataFrame], node_labels:
             if cols:
                 scores[:, i] = table[cols].mean(axis=1).values
         corr = np.nan_to_num(np.corrcoef(scores.T), nan=0.0)
+        if corr.ndim == 0:
+            corr = np.zeros((n_nodes, n_nodes), dtype=float)
         all_corr.append(corr)
     if not all_corr:
         return np.eye(n_nodes)
