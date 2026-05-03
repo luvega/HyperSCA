@@ -21,7 +21,6 @@ from pathlib import Path
 import anndata as ad
 import numpy as np
 import pandas as pd
-import scanpy as sc
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
@@ -38,6 +37,12 @@ DEFAULT_SOURCES = {
     "ST_CRC_MSS": Path(r"G:\ST_CRC_MSS"),
     "scCRC_IFNG": Path(r"F:\scCRC_IFNG"),
 }
+
+
+def _get_scanpy():
+    """Import scanpy only for 10x readers that need it."""
+    import scanpy as sc
+    return sc
 
 
 def _save_manifest(items: list[dict]) -> Path:
@@ -558,6 +563,7 @@ def _prepare_multisource(args) -> int:
 # 旧版 demo: Chromium / Visium / Xenium
 # =========================================================================
 def prepare_chromium() -> Path:
+    sc = _get_scanpy()
     h5_path = CHROMIUM_DIR / "filtered_feature_bc_matrix.h5"
     meta_path = CHROMIUM_DIR / "cell_metadata.csv"
     out_path = CHROMIUM_DIR / "expression.h5ad"
@@ -577,6 +583,7 @@ def prepare_chromium() -> Path:
 
 
 def prepare_visium() -> Path:
+    sc = _get_scanpy()
     h5_path = VISIUM_DIR / "outs" / "filtered_feature_bc_matrix.h5"
     pos_path = VISIUM_DIR / "outs" / "spatial" / "tissue_positions.csv"
     out_path = VISIUM_DIR / "expression.h5ad"
@@ -597,6 +604,7 @@ def prepare_visium() -> Path:
 
 
 def prepare_xenium() -> Path:
+    sc = _get_scanpy()
     h5_path = XENIUM_DIR / "cell_feature_matrix.h5"
     out_path = XENIUM_DIR / "expression.h5ad"
     if not h5_path.exists():

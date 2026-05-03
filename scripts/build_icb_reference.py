@@ -25,7 +25,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import scanpy as sc
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -43,6 +42,12 @@ CANDIDATE_LABEL_KEYS = [
 ]
 
 
+def _get_scanpy():
+    """Import scanpy only when reference training actually needs it."""
+    import scanpy as sc
+    return sc
+
+
 def _resolve_label_key(adata, requested: str | None) -> str | None:
     """Find the best available cell-type label column."""
     if requested and requested in adata.obs.columns:
@@ -58,6 +63,7 @@ def _resolve_label_key(adata, requested: str | None) -> str | None:
 def preprocess_for_reference(adata, min_genes: int = 200, min_cells: int = 3,
                              n_top_genes: int = 3000):
     """Standard preprocessing for scVI/scANVI reference training."""
+    sc = _get_scanpy()
     print(f"  Raw: {adata.n_obs} cells x {adata.n_vars} genes")
     sc.pp.filter_cells(adata, min_genes=min_genes)
     sc.pp.filter_genes(adata, min_cells=min_cells)
@@ -220,6 +226,7 @@ def main() -> int:
         return 1
 
     print(f"[1/4] Loading {h5ad_path} ...")
+    sc = _get_scanpy()
     adata = sc.read_h5ad(str(h5ad_path))
     if adata.obs.get("label_original") is None and args.label_key:
         if args.label_key in adata.obs.columns:

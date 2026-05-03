@@ -40,6 +40,15 @@ HyperSCA 的研究完整版流程由五个连续阶段构成，可按具体队�
 - 关键模块：`src/evaluation/cross_sample_metrics.py`
 - 方法要点：生态位聚类（niche clustering）、跨样本边一致性、临床/表型分层差异检验，纳入最终证据矩阵。
 
+### 5) Modular Target Discovery
+
+- 入口脚本：`scripts/run_target_discovery.py` 现在是 thin CLI，只负责解析参数、构造 `TargetDiscoveryConfig` 并调用 pipeline。
+- 核心包：`src/discovery/target_discovery/`
+  - `config.py`、`pipeline.py`、`stage.py`、`artifacts.py` 定义配置、编排、stage 协议与 run manifest。
+  - `loaders.py`、`candidates.py`、`expression.py`、`spatial.py` 构建轻量数据输入。
+  - `geometry.py`、`causal_stage.py`、`perturbation_stage.py`、`scoring.py`、`niche.py`、`reporting.py`、`figures.py` 负责双几何比较、Step2/Step3 wrapper、证据排序、生态位映射、报告和图。
+- 输出根目录：默认写入 `results/discovery/target_discovery/<run_id>/`，按 `candidates/`、`expression/`、`spatial/`、`geometry/{mode}/`、`causal/{mode}/`、`perturbation/{mode}/`、`scoring/`、`niche/`、`reports/`、`figures/` 分区，并生成 `manifest.json` 与 `reports/migration_notes.md`。
+
 ## Example Data Samples
 
 项目常用示例输入（路径为本地外部数据目录，不纳入版本控制；以下为脱敏占位路径）：
@@ -162,8 +171,16 @@ python scripts/run_step3.py \
 ### E. Run Target Discovery and Hub Retention
 
 ```bash
-python scripts/run_target_discovery.py --max-perturb 10
+python scripts/run_target_discovery.py \
+  --run-id demo_target_discovery \
+  --max-perturb 10 \
+  --geometry-k 4 \
+  --geometry-blend 0.30 \
+  --platform all \
+  --skip-figures
 ```
+
+默认输出位于 `results/discovery/target_discovery/<run_id>/`。旧版展示口径中的预计算发现结果仍保留在 `results/integration/discovery/`，用于 notebook 和 README 中的历史图表展示。
 
 ### F. Run Dynamic Intervention (Step4) and Roundtrip Update
 
@@ -186,7 +203,8 @@ python scripts/generate_step3_figures.py
 - Step1 outputs: `results/step1/` (`adata_embedded.h5ad`, `embedding_benchmark.json`)
 - Step2 outputs: `results/step2/`（因果图、稳定性指标、baseline 对比）
 - Step3 outputs: `results/step3/`（扰动结果、去假阳性靶点与组合）
-- Discovery reports: `results/integration/discovery/`
+- Target discovery runs: `results/discovery/target_discovery/<run_id>/`（run manifest、候选池、几何比较、Step2/Step3 wrapper 产物、评分表、生态位映射、报告、迁移说明）
+- Legacy/precomputed discovery reports for notebooks: `results/integration/discovery/`
 - Step4 outputs: `results/step4/`（`pkpd_summary.json`, `combination_ranking.csv`, `roundtrip_update_report.json`）
 - CNS figure outputs: `results/figures/step1/`, `results/figures/step2/`, `results/figures/step3/`
 
@@ -194,6 +212,7 @@ python scripts/generate_step3_figures.py
 
 ```bash
 pytest tests/ -v
+pytest tests/discovery -q
 ```
 
 ## License

@@ -22,50 +22,52 @@ import matplotlib.colors as mcolors
 import numpy as np
 
 # =============================================================================
-# 色板定义（colorblind-friendly, 基于 Tol Bright + 自定义扩展）
+# 色板定义（按项目作图规范统一）
 # =============================================================================
 
-# 主色板 — 用于分类着色（细胞类型、患者、来源等）
-PALETTE_CATEGORICAL: list[str] = [
-    "#4477AA",  # blue
-    "#EE6677",  # rose
-    "#228833",  # green
-    "#CCBB44",  # yellow
-    "#66CCEE",  # cyan
-    "#AA3377",  # purple
-    "#BBBBBB",  # grey
-    "#EE8866",  # orange
-    "#44BB99",  # teal
-    "#FFAABB",  # pink
-    "#99DDFF",  # light blue
-    "#77AADD",  # slate
-    "#EEDD88",  # light yellow
-    "#CC6677",  # dark rose
-    "#882255",  # wine
-    "#44AA99",  # aqua
-    "#DDDDDD",  # light grey
-    "#332288",  # indigo
-    "#117733",  # dark green
-    "#88CCEE",  # sky
+# 离散高对比色板：用于单细胞降维散点、堆叠柱状图等分类任务
+PALETTE_DISCRETE_HIGH_CONTRAST: list[str] = [
+    "#E41A1C",  # red
+    "#377EB8",  # blue
+    "#4DAF4A",  # green
+    "#984EA3",  # purple
+    "#FF7F00",  # orange
+    "#FFFF33",  # yellow
+    "#A65628",  # brown
+    "#F781BF",  # pink
+    "#999999",  # gray
 ]
+PALETTE_CATEGORICAL: list[str] = PALETTE_DISCRETE_HIGH_CONTRAST
 
 # Level1 细胞群专用色板（可手动映射）
 PALETTE_CELLTYPE: dict[str, str] = {
-    "T cell":      "#4477AA",
-    "B cell":      "#EE6677",
-    "Myeloid":     "#228833",
-    "Stromal":     "#CCBB44",
-    "Epithelial":  "#66CCEE",
-    "NK":          "#AA3377",
-    "Mast":        "#EE8866",
-    "pDC":         "#44BB99",
-    "ILC":         "#FFAABB",
+    "T cell": "#377EB8",
+    "B cell": "#984EA3",
+    "Myeloid": "#A65628",
+    "Stromal": "#4DAF4A",
+    "Epithelial": "#E41A1C",
+    "NK": "#F781BF",
+    "Mast": "#999999",
+    "pDC": "#377EB8",
+    "ILC": "#984EA3",
+    "Neutrophil": "#A65628",
+    "Neutrophils": "#A65628",
 }
 
-# 连续色板（用于指标热图、空间热图）
-CMAP_SEQUENTIAL = "YlOrRd"
-CMAP_DIVERGING = "RdBu_r"
-CMAP_SPATIAL = "viridis"
+# 连续色板（语义化）
+# - 表达热图：白 -> 深红，确保 0 表达接近纯白
+# - 发散色板：用于 logFC / 预后正负向等对称统计量
+# - 拟时间：用于发育/轨迹梯度
+CMAP_EXPRESSION = mcolors.LinearSegmentedColormap.from_list(
+    "hypersca_expression_white_red",
+    ["#FFFFFF", "#FEE5D9", "#FCAE91", "#FB6A4A", "#CB181D", "#67000D"],
+)
+CMAP_SEQUENTIAL = CMAP_EXPRESSION
+CMAP_DIVERGING = "coolwarm"
+CMAP_SPATIAL = CMAP_EXPRESSION
+CMAP_SPATIAL_DIVERGING = "coolwarm"
+CMAP_PSEUDOTIME = "Spectral_r"
+CMAP_PSEUDOTIME_ALT = "turbo"
 
 # 语义颜色
 COLOR_GOOD = "#228833"
@@ -134,12 +136,22 @@ _CNS_FIGURE_RC: dict[str, Any] = {
 def apply_style() -> None:
     """应用 HyperSCA 全局 matplotlib 样式"""
     plt.rcParams.update(_HYPERSCA_RC)
+    try:
+        import seaborn as sns  # optional
+        sns.set_theme(style="white", rc={"axes.grid": False})
+    except Exception:
+        pass
 
 
 def apply_cns_style() -> None:
     """应用 CNS/Cell 风格绘图参数（细线、无网格、严格字号层级）"""
     plt.rcParams.update(_HYPERSCA_RC)
     plt.rcParams.update(_CNS_FIGURE_RC)
+    try:
+        import seaborn as sns  # optional
+        sns.set_theme(style="white", rc={"axes.grid": False, "axes.facecolor": "white"})
+    except Exception:
+        pass
 
 
 def reset_style() -> None:
@@ -178,6 +190,54 @@ def create_figure(
         figsize = (min(w, 20), min(h, 16))
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize, **kwargs)
     return fig, axes
+
+
+def get_dynamic_point_size(
+    n_obs: int,
+    *,
+    min_size: float = 2.0,
+    max_size: float = 14.0,
+    ref_n: int = 50000,
+) -> float:
+    """根据样本量自适应散点大小（大样本更小点径）"""
+    n = max(int(n_obs), 1)
+    ratio = min(max(float(ref_n) / float(n), 0.05), 1.0)
+    return float(min_size + (max_size - min_size) * ratio)
+
+
+def get_dynamic_alpha(
+    n_obs: int,
+    *,
+    min_alpha: float = 0.6,
+    max_alpha: float = 0.8,
+    ref_n: int = 50000,
+) -> float:
+    """根据样本量自适应透明度（大样本更低 alpha）"""
+    n = max(int(n_obs), 1)
+    ratio = min(max(float(ref_n) / float(n), 0.05), 1.0)
+    return float(min_alpha + (max_alpha - min_alpha) * ratio)
+
+
+def normalize_rowwise(arr: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """行归一化，常用于组分堆叠柱图前处理"""
+    x = np.asarray(arr, dtype=float)
+    if x.ndim == 1:
+        s = max(float(np.sum(x)), eps)
+        return x / s
+    rs = np.sum(x, axis=1, keepdims=True)
+    rs = np.maximum(rs, eps)
+    return x / rs
+
+
+def place_legend_outside(
+    ax: plt.Axes,
+    *,
+    loc: str = "upper left",
+    bbox_to_anchor: tuple[float, float] = (1.02, 1.0),
+    **kwargs,
+):
+    """统一外置图例位置，减少内部遮挡"""
+    return ax.legend(loc=loc, bbox_to_anchor=bbox_to_anchor, frameon=False, **kwargs)
 
 
 def save_figure(
@@ -246,6 +306,7 @@ def get_color_mapping(
     dict[str, str] : label -> hex color
     """
     unique = sorted(set(labels))
+
     if isinstance(palette, dict):
         # 用给定字典补齐缺失标签
         remaining = [c for c in PALETTE_CATEGORICAL if c not in palette.values()]

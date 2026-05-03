@@ -26,6 +26,8 @@ import numpy as np
 from src.utils.plot_style import (
     PALETTE_CATEGORICAL,
     PALETTE_CELLTYPE,
+    CMAP_PSEUDOTIME,
+    CMAP_PSEUDOTIME_ALT,
     CMAP_SEQUENTIAL,
     apply_style,
     create_figure,
@@ -86,9 +88,15 @@ def plot_poincare_disk(
                 ha="center", va="center", fontsize=16, color="#999999",
                 style="italic")
     elif radial_values is not None:
+        cmap_name = CMAP_SEQUENTIAL
+        rn = str(radial_name).lower()
+        if ("pseudo" in rn) or ("time" in rn) or ("trajectory" in rn):
+            cmap_name = CMAP_PSEUDOTIME
+            if len(np.unique(radial_values)) > 256:
+                cmap_name = CMAP_PSEUDOTIME_ALT
         sc = ax.scatter(
             embeddings[:, 0], embeddings[:, 1],
-            c=radial_values, cmap=CMAP_SEQUENTIAL,
+            c=radial_values, cmap=cmap_name,
             s=point_size, edgecolors="none", alpha=0.8, zorder=2,
         )
         cbar = fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.02)

@@ -192,6 +192,83 @@ def mmr_stratified_test(
     return pd.DataFrame(records)
 
 
+def niche_prototype_matching(
+    per_sample_prototypes: dict[str, pd.DataFrame],
+    method: str = "hungarian",
+) -> dict:
+    """Match niche prototypes across samples via Hungarian algorithm.
+
+    Parameters
+    ----------
+    per_sample_prototypes : dict
+        {sample_id: DataFrame(n_niches, n_celltypes)} – each row is a
+        niche prototype (mean composition vector).
+    method : str
+        Matching method; currently only ``"hungarian"`` is supported.
+
+    Returns
+    -------
+    dict with keys:
+        n_samples, pairwise_consistency (list of dicts),
+        mean_consistency, q25_consistency.
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    samples = sorted(per_sample_prototypes.keys())
+    if len(samples) < 2:
+        return {
+            "n_samples": len(samples),
+            "pairwise_consistency": [],
+            "mean_consistency": 0.0,
+            "q25_consistency": 0.0,
+        }
+
+    pairwise: list[dict] = []
+    for i in range(len(samples)):
+        for j in range(i + 1, len(samples)):
+            s1, s2 = samples[i], samples[j]
+            p1 = per_sample_prototypes[s1]
+            p2 = per_sample_prototypes[s2]
+            n1, n2 = p1.shape[0], p2.shape[0]
+
+            corr = np.zeros((n1, n2))
+            for a in range(n1):
+                for b in range(n2):
+                    v1 = p1.iloc[a].values.astype(float)
+                    v2 = p2.iloc[b].values.astype(float)
+                    sd1 = float(np.std(v1))
+                    sd2 = float(np.std(v2))
+                    if sd1 < 1e-12 or sd2 < 1e-12:
+                        corr[a, b] = 0.0
+                    else:
+                        r_val = float(np.corrcoef(v1, v2)[0, 1])
+                        corr[a, b] = r_val if np.isfinite(r_val) else 0.0
+
+            cost = 1.0 - corr
+            row_ind, col_ind = linear_sum_assignment(cost)
+            matched_corrs = [float(corr[r, c]) for r, c in zip(row_ind, col_ind)]
+
+            pairwise.append({
+                "sample_a": s1,
+                "sample_b": s2,
+                "matched_pairs": list(zip(row_ind.tolist(), col_ind.tolist())),
+                "matched_correlations": matched_corrs,
+                "mean_match_corr": float(np.mean(matched_corrs)) if matched_corrs else 0.0,
+                "q25_match_corr": (
+                    float(np.quantile(matched_corrs, 0.25))
+                    if matched_corrs else 0.0
+                ),
+            })
+
+    all_corrs = [p["mean_match_corr"] for p in pairwise]
+    return {
+        "n_samples": len(samples),
+        "pairwise_consistency": pairwise,
+        "mean_consistency": float(np.mean(all_corrs)) if all_corrs else 0.0,
+        "q25_consistency": float(np.quantile(all_corrs, 0.25)) if all_corrs else 0.0,
+    }
+
+
 def niche_target_score(
     niche_enrichment_df: pd.DataFrame,
     target_gene: str,
