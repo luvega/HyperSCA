@@ -192,6 +192,80 @@ def test_causal_graph_known_axes():
     assert results["n_axes_tested"] == 1  # NK/DC not found → not tested
 
 
+def test_causal_pipeline_records_proxy_observation_metadata(monkeypatch):
+    """Step2 should label gene-as-observation PC input as an explicit proxy."""
+    from src.pipeline.config import HyperSCAConfig
+    from src.pipeline.step2_causal import CausalPipeline
+    import src.causal.cmi_pruning as cmi_pruning
+
+    def fake_bootstrap_causal_discovery(**kwargs):
+        data = kwargs["data"]
+        assert data.shape == (5, 3)
+        return np.array(
+            [
+                [0.0, 0.8, 0.0],
+                [0.0, 0.0, 0.7],
+                [0.0, 0.0, 0.0],
+            ]
+        )
+
+    monkeypatch.setattr(
+        cmi_pruning,
+        "bootstrap_causal_discovery",
+        fake_bootstrap_causal_discovery,
+    )
+
+    pipeline = CausalPipeline.__new__(CausalPipeline)
+    pipeline.config = HyperSCAConfig(step2_bootstrap_threshold=0.5)
+    cluster_data = {
+        "cluster_expr": np.arange(15, dtype=float).reshape(3, 5),
+        "node_labels": ["CAF", "TAM", "Treg"],
+    }
+
+    _, freq = pipeline.build_causal_graph(cluster_data, {})
+
+    assert freq.shape == (3, 3)
+    assert cluster_data["causal_input_metadata"] == {
+        "observation_unit": "gene_proxy",
+        "bootstrap_unit": "gene",
+        "n_observations": 5,
+        "n_variables": 3,
+        "interpretation": "exploratory_cluster_graph_not_sample_level_causal_proof",
+    }
+
+
+def test_validate_with_dowhy_skips_proxy_inputs():
+    """Proxy-generated validation data must not be reported as causal proof."""
+    from src.pipeline.config import HyperSCAConfig
+    from src.pipeline.step2_causal import CausalPipeline
+
+    class DummyGraph:
+        def validate_structure(self, data_df):
+            raise AssertionError("proxy inputs should not call DoWhy")
+
+        def compute_arrow_strength(self, data_df):
+            raise AssertionError("proxy inputs should not compute arrow strength")
+
+    pipeline = CausalPipeline.__new__(CausalPipeline)
+    pipeline.config = HyperSCAConfig()
+    cluster_data = {
+        "node_labels": ["CAF", "TAM", "Treg"],
+        "z_ext": np.ones((3, 2)),
+        "causal_input_metadata": {
+            "observation_unit": "gene_proxy",
+            "bootstrap_unit": "gene",
+            "n_observations": 10,
+            "n_variables": 3,
+        },
+    }
+
+    result = pipeline.validate_with_dowhy(DummyGraph(), cluster_data)
+
+    assert result["validation_mode"] == "proxy_not_causal_proof"
+    assert result["result_str"].startswith("SKIPPED")
+    assert result["rejected"] is None
+
+
 # =========================================================================
 # 信号流
 # =========================================================================

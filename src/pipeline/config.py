@@ -77,8 +77,8 @@ class HyperSCAConfig:
     step3_input_step2_dir: str = "results/step2"
     step3_output_dir: str = "results/step3"
     step3_figures_dir: str = "results/figures/step3"
-    step3_target_genes: List[str] = field(default_factory=lambda: ["INHBA", "POSTN", "MFAP2"])
-    step3_method: str = "latent_arithmetic"      # latent_arithmetic / diffusion_cf
+    step3_target_genes: List[str] = field(default_factory=list)
+    step3_method: str = "expression_ko"          # expression_ko / hyperbolic_latent_ko / diffusion_cf
     step3_intervention_value: float = 0.0
     step3_latent_ko_scale: float = 0.5
     step3_enable_target_ranking: bool = True
@@ -94,7 +94,7 @@ class HyperSCAConfig:
     step4_input_step2_dir: str = "results/step2"
     step4_input_step3_dir: str = "results/step3"
     step4_output_dir: str = "results/step4"
-    step4_hub_genes: List[str] = field(default_factory=lambda: ["POSTN", "MFAP2", "INHBA"])
+    step4_hub_genes: List[str] = field(default_factory=list)
     step4_dose_grid: List[float] = field(default_factory=lambda: [0.1, 0.3, 1.0, 3.0, 10.0])
     step4_time_grid: List[float] = field(default_factory=lambda: [0.0, 6.0, 12.0, 24.0, 48.0, 72.0])
     step4_combo_max_size: int = 2

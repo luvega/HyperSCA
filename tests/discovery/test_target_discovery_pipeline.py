@@ -85,3 +85,31 @@ def test_lightweight_stages_can_run_on_synthetic_files(tmp_path):
     assert not out["candidate_pool"].empty
     assert out["cluster_expression"].shape[0] == 1
     assert out["spatial_adjacency"].shape == (1, 1)
+
+
+def test_candidate_discovery_does_not_seed_manual_focus_genes(tmp_path):
+    paths = DiscoveryPaths(
+        root=tmp_path,
+        data_dir=tmp_path / "data",
+        neu_dir=tmp_path / "neu",
+        ifng_dir=tmp_path / "ifng",
+        icb_dir=tmp_path / "icb",
+        st_dir=tmp_path / "st",
+        output_base=tmp_path / "runs",
+        icb_h5ad_path=tmp_path / "data" / "scRNA" / "scCRC_ICB" / "expression.h5ad",
+        reference_manifest_path=tmp_path / "data" / "ref" / "manifest" / "reference_manifest.json",
+    )
+    paths.neu_dir.mkdir(parents=True, exist_ok=True)
+    paths.icb_dir.mkdir(parents=True, exist_ok=True)
+    (paths.ifng_dir / "results" / "tables").mkdir(parents=True, exist_ok=True)
+
+    cfg = TargetDiscoveryConfig(paths=paths, run_id="no_manual_focus", device="cpu")
+    pipeline = TargetDiscoveryPipeline(
+        cfg,
+        stages=[CandidateDiscoveryStage()],
+        icb_data_mode_detector=lambda config: "deg_only",
+    )
+
+    out = pipeline.run()
+
+    assert out["candidate_pool"].empty

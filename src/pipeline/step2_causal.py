@@ -402,6 +402,13 @@ class CausalPipeline:
         # 这在方法学上等价于基于基因共表达模式推断 cluster 间调控关系
         cluster_expr = cluster_data["cluster_expr"]       # (K, G)
         data_for_pc = cluster_expr.T                       # (G, K)
+        cluster_data["causal_input_metadata"] = {
+            "observation_unit": "gene_proxy",
+            "bootstrap_unit": "gene",
+            "n_observations": int(data_for_pc.shape[0]),
+            "n_variables": int(data_for_pc.shape[1]),
+            "interpretation": "exploratory_cluster_graph_not_sample_level_causal_proof",
+        }
         print(f"  PC input: {data_for_pc.shape[0]} observations (genes) x "
               f"{data_for_pc.shape[1]} variables (clusters)")
 
@@ -451,6 +458,21 @@ class CausalPipeline:
         # 准备节点级数据 DataFrame
         node_labels = cluster_data["node_labels"]
         z_ext = cluster_data.get("z_ext")
+        input_meta = cluster_data.get("causal_input_metadata", {})
+        if input_meta.get("observation_unit") == "gene_proxy":
+            result = {
+                "result_str": "SKIPPED: gene-proxy causal input is not sample-level validation data",
+                "mean_pvalue": None,
+                "rejected": None,
+                "validation_mode": "proxy_not_causal_proof",
+                "reason": (
+                    "PC discovery used genes as proxy observations. "
+                    "DoWhy validation requires real sample/spot/cell observations."
+                ),
+                "causal_input_metadata": input_meta,
+            }
+            print(f"  Result: {result['result_str']}")
+            return result
 
         # 使用 z_ext 作为 DoWhy 的数据（每个维度作为一个变量）
         if z_ext is not None and z_ext.shape[0] > 3:
@@ -583,6 +605,17 @@ class CausalPipeline:
             falsification_results=falsification,
             signaling_flow_summary=flow_summary,
         )
+        input_meta = cluster_data.get("causal_input_metadata")
+        if input_meta is not None:
+            metrics.update(
+                {
+                    "causal_observation_unit": input_meta.get("observation_unit"),
+                    "causal_bootstrap_unit": input_meta.get("bootstrap_unit"),
+                    "causal_n_observations": input_meta.get("n_observations"),
+                    "causal_n_variables": input_meta.get("n_variables"),
+                    "causal_interpretation": input_meta.get("interpretation"),
+                }
+            )
 
         print("  Metrics summary:")
         for k, v in metrics.items():
@@ -696,6 +729,9 @@ class CausalPipeline:
         # Cluster 表达（用于后续可视化）
         np.save(out / "cluster_expr.npy", cluster_data["cluster_expr"])
         np.save(out / "cluster_adj.npy", cluster_data["cluster_adj"])
+        if "causal_input_metadata" in cluster_data:
+            with open(out / "causal_input_metadata.json", "w", encoding="utf-8") as f:
+                json.dump(cluster_data["causal_input_metadata"], f, indent=2, ensure_ascii=False)
 
         if baseline_compare is not None:
             np.save(out / "baseline_comm_adjacency.npy", baseline_compare["baseline_adj"])
@@ -764,7 +800,7 @@ class CausalPipeline:
             "",
             f"- **Falsification 结果**: {falsification.get('result_str', 'N/A')}",
             f"- **平均 p-value**: {falsification.get('mean_pvalue', 'N/A')}",
-            f"  - {'结构通过可证伪检验（p > 0.05），因果图与数据一致' if not falsification.get('rejected', True) else '结构被拒绝，需要检查混杂因素或调整图结构'}",
+            f"  - {self._format_falsification_interpretation(falsification)}",
             "",
             "---",
             "",
@@ -808,11 +844,11 @@ class CausalPipeline:
         lines.extend([
             "### 2.3 治疗意义与风险提示",
             "",
-            "1. **CAF→TAM 轴**: 如果 POSTN/MFAP2 → Integrin 信号通路被确认为因果，"
-            "则靶向 CAF 分泌的 POSTN 或 MFAP2 可能减弱 M2 TAM 极化，提升抗肿瘤免疫。",
+            "1. **CAF→TAM 轴**: 如果数据驱动的 ligand→receptor 信号通路被确认为因果，"
+            "则可优先评估该通路上游分泌因子对 TAM 极化与抗肿瘤免疫的影响。",
             "",
-            "2. **CAF→Treg 轴**: INHBA→SMAD→Foxp3 信号如果与因果图一致，"
-            "则抑制 Activin A 可能减少 Treg 分化，解除免疫抑制。",
+            "2. **CAF→Treg 轴**: 若数据驱动通路与因果图一致，"
+            "则可进一步验证对应扰动是否减少 Treg 分化并缓解免疫抑制。",
             "",
             "3. **风险假设**: 因果可识别性依赖充分性假设（faithfulness, causal sufficiency），"
             "TME 中未观测混杂因素可能导致伪因果边。建议后续引入工具变量或敏感性分析。",
@@ -827,6 +863,15 @@ class CausalPipeline:
             f.write("\n".join(lines))
 
         print(f"  Report saved to: {report_path}")
+
+    @staticmethod
+    def _format_falsification_interpretation(falsification: dict) -> str:
+        if falsification.get("validation_mode") == "proxy_not_causal_proof":
+            return "已跳过：当前输入是 gene-proxy 探索图，不能作为样本级因果验证。"
+        rejected = falsification.get("rejected", True)
+        if rejected is False:
+            return "结构通过可证伪检验（p > 0.05），因果图与数据一致。"
+        return "结构被拒绝，需要检查混杂因素或调整图结构。"
 
     # =================================================================
     # 端到端执行

@@ -6,7 +6,6 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from src.discovery.target_discovery.constants import ANCHOR_GENES
 from src.discovery.target_discovery.stage import TargetDiscoveryRunContext
 
 
@@ -14,9 +13,6 @@ def select_perturbation_targets(candidate_pool: pd.DataFrame, cluster_expr: pd.D
     gene_upper = {str(col).upper(): str(col) for col in cluster_expr.columns}
     available = [str(gene) for gene in candidate_pool["gene"] if str(gene).upper() in gene_upper]
     targets: list[str] = []
-    for anchor in ANCHOR_GENES:
-        if anchor in available and anchor not in targets:
-            targets.append(anchor)
     for gene in available:
         if gene not in targets and len(targets) < max_perturb:
             targets.append(gene)

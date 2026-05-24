@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from src.discovery.target_discovery.constants import ANCHOR_GENES, IFNG_FOCUS_GENES
+from src.discovery.target_discovery.constants import IFNG_FOCUS_GENES
 from src.discovery.target_discovery.utils import minmax
 
 
@@ -58,7 +58,7 @@ def aggregate_candidate_pool(
                 "direction_consistency": direction_consistency,
                 "min_padj": min_padj,
                 "neg_log10_padj": -float(np.log10(max(min_padj, 1e-300))),
-                "is_anchor": gene in ANCHOR_GENES,
+                "is_anchor": False,
                 "is_ifng_target": gene in IFNG_FOCUS_GENES,
                 "celltypes_neu": ";".join(sorted(n_sub["celltype_neu"].astype(str).unique())) if "celltype_neu" in n_sub else "",
                 "celltypes_icb": ";".join(sorted(i_sub["celltype_icb"].astype(str).unique())) if "celltype_icb" in i_sub else "",

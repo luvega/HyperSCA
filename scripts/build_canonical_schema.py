@@ -41,9 +41,9 @@ IFNG_DIR = Path(r"F:\scCRC_IFNG")
 ICB_DIR = Path(r"G:\scCRC_ICB\output")
 ST_DIR = Path(r"G:\ST_CRC_MSS")
 
-SEED_TARGETS = ["MFAP2", "POSTN", "INHBA"]
+SEED_TARGETS: list[str] = []
 
-IFNG_TARGETS = ["CD74", "INHBA", "CXCL10", "IFNG", "COL1A1", "MFAP5", "FN1"]
+IFNG_TARGETS: list[str] = []
 
 ALL_FOCUS_GENES = sorted(set(SEED_TARGETS + IFNG_TARGETS))
 
@@ -276,7 +276,17 @@ def build_feature_table(*, include_icb: bool = True) -> pd.DataFrame:
             "present_in_datasets": ";".join(present_in),
         })
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "gene_symbol",
+            "ensembl_id",
+            "feature_type",
+            "is_seed_target",
+            "is_ifng_target",
+            "present_in_datasets",
+        ],
+    )
     df.to_csv(OUT_DIR / "feature_table.csv", index=False)
     print(f"[feature_table] {len(df)} rows → {OUT_DIR / 'feature_table.csv'}")
     return df
@@ -556,10 +566,10 @@ def write_mapping_rules():
 - Values: pMMR (= MSS), dMMR (= MSI-H), or blank if unavailable
 - All ST_CRC_MSS patients assumed MSS
 
-## Focus Genes
-- Seed targets (from Neu): MFAP2, POSTN, INHBA
-- IFNG discovery targets: CD74, INHBA, CXCL10, IFNG, COL1A1, MFAP5, FN1
-- Union set used in measure_table; final prioritization via target_discovery pipeline
+## Candidate Genes
+- No manual seed or anchor genes are injected.
+- Feature and measure tables use genes observed in source result files.
+- Final prioritization is handled by the target_discovery pipeline.
 
 ## Cell-Type Alias Convention
 - See celltype_alias.json for original → canonical mapping

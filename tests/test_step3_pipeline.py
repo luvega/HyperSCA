@@ -355,8 +355,8 @@ def test_evaluate_spatial_all_keys():
 # Pipeline 内部方法
 # =========================================================================
 
-def test_pipeline_latent_arithmetic_cf_reduces_target():
-    """Pipeline latent KO: 靶基因表达下降。"""
+def test_pipeline_expression_ko_cf_reduces_target():
+    """Pipeline expression KO: 靶基因表达下降。"""
     from src.pipeline.config import HyperSCAConfig
     from src.pipeline.step3_perturbation import PerturbationPipeline
 
@@ -365,18 +365,138 @@ def test_pipeline_latent_arithmetic_cf_reduces_target():
     pipeline = PerturbationPipeline.__new__(PerturbationPipeline)
     pipeline.config = config
 
-    genes = ["POSTN", "ITGAV", "IL10"]
+    genes = ["GENE_A", "REC_A", "GENE_B"]
     obs = pd.DataFrame([[2.0, 1.5, 1.0], [1.8, 1.3, 0.9]], columns=genes, index=["n1", "n2"])
-    cf = pipeline._latent_arithmetic_cf(
+    cf = pipeline._expression_knockout_cf(
         observed_expr=obs,
-        target_gene="POSTN",
+        target_gene="GENE_A",
         flow_edges=[],
         node_to_type={},
     )
-    # POSTN 应被 KO 下调
-    assert cf["POSTN"].mean() < obs["POSTN"].mean()
+    assert cf["GENE_A"].mean() < obs["GENE_A"].mean()
     # 其他基因无 flow edge → 不变
-    assert cf["IL10"].equals(obs["IL10"])
+    assert cf["GENE_B"].equals(obs["GENE_B"])
+
+
+def test_pipeline_legacy_latent_arithmetic_name_is_rejected():
+    """The old latent_arithmetic label should not silently run expression KO."""
+    from src.pipeline.config import HyperSCAConfig
+    from src.pipeline.step3_perturbation import PerturbationPipeline
+
+    pipeline = PerturbationPipeline.__new__(PerturbationPipeline)
+    pipeline.config = HyperSCAConfig(step3_method="latent_arithmetic")
+    obs = pd.DataFrame([[2.0]], columns=["GENE_A"], index=["n1"])
+
+    with pytest.raises(ValueError, match="expression_ko"):
+        pipeline._counterfactual_for_method(
+            observed_expr=obs,
+            target_gene="GENE_A",
+            flow_edges=[],
+            node_to_type={},
+            gene_names=["GENE_A"],
+        )
+
+
+def test_pipeline_hyperbolic_latent_ko_requires_artifacts():
+    """Hyperbolic latent KO must fail explicitly when Step1 artifacts are missing."""
+    from src.pipeline.config import HyperSCAConfig
+    from src.pipeline.step3_perturbation import PerturbationPipeline
+
+    pipeline = PerturbationPipeline.__new__(PerturbationPipeline)
+    pipeline.config = HyperSCAConfig(step3_method="hyperbolic_latent_ko")
+    pipeline.step1_dir = Path("missing_step1")
+    obs = pd.DataFrame([[2.0]], columns=["GENE_A"], index=["n1"])
+
+    with pytest.raises(NotImplementedError, match="requires Step1 H-VAE"):
+        pipeline._counterfactual_for_method(
+            observed_expr=obs,
+            target_gene="GENE_A",
+            flow_edges=[],
+            node_to_type={},
+            gene_names=["GENE_A"],
+        )
+
+
+def test_pipeline_hyperbolic_latent_ko_loads_hvae_artifacts(tmp_path: Path):
+    """Hyperbolic latent KO should load Step1 H-VAE artifacts and decode CF expression."""
+    from src.models.hyperbolic.hvae import HyperbolicVAE
+    from src.models.hyperbolic.lorentz import exp_map, lorentz_origin
+    from src.pipeline.config import HyperSCAConfig
+    from src.pipeline.step3_perturbation import PerturbationPipeline
+
+    step1 = tmp_path / "step1"
+    step1.mkdir()
+
+    model = HyperbolicVAE(
+        input_dim=3,
+        latent_dim=2,
+        encoder_layers=[4],
+        decoder_layers=[4],
+        gcn_layers=1,
+        dropout=0.0,
+    )
+    torch.save(model.state_dict(), step1 / "hvae_model.pt")
+    (step1 / "config.json").write_text(
+        json.dumps(
+            {
+                "hvae_latent_dim": 2,
+                "hvae_encoder_layers": [4],
+                "hvae_decoder_layers": [4],
+                "hvae_gcn_layers": 1,
+                "hvae_use_zinb": False,
+                "hvae_dropout": 0.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    origin = lorentz_origin(2, batch_size=1)
+    tangent = torch.zeros(4, 3)
+    tangent[:, 1] = torch.tensor([0.1, 0.2, 0.8, 0.9])
+    z = exp_map(tangent, origin.expand(4, -1)).detach().numpy()
+    np.save(step1 / "embeddings_lorentz.npy", z)
+
+    obs = pd.DataFrame(
+        [[0.2, 1.0, 0.4], [0.3, 1.1, 0.5], [2.0, 1.2, 0.6], [2.2, 1.3, 0.7]],
+        columns=["GENE_A", "REC_A", "GENE_B"],
+        index=["n1", "n2", "n3", "n4"],
+    )
+    pipeline = PerturbationPipeline.__new__(PerturbationPipeline)
+    pipeline.config = HyperSCAConfig(step3_method="hyperbolic_latent_ko", device="cpu")
+    pipeline.step1_dir = step1
+
+    cf = pipeline._counterfactual_for_method(
+        observed_expr=obs,
+        target_gene="GENE_A",
+        flow_edges=[],
+        node_to_type={},
+        gene_names=list(obs.columns),
+    )
+
+    assert list(cf.columns) == list(obs.columns)
+    assert list(cf.index) == list(obs.index)
+    assert cf.shape == obs.shape
+    assert np.isfinite(cf.values).all()
+    assert pipeline._last_hyperbolic_latent_metadata["decoder_source"] == str(step1 / "hvae_model.pt")
+
+
+def test_pipeline_default_targets_are_data_driven_from_flow_edges():
+    from src.pipeline.config import HyperSCAConfig
+    from src.pipeline.step3_perturbation import PerturbationPipeline
+
+    pipeline = PerturbationPipeline.__new__(PerturbationPipeline)
+    pipeline.config = HyperSCAConfig(step3_target_top_k=3)
+    obs = pd.DataFrame(
+        [[1.0, 2.0, 5.0], [1.5, 2.2, 5.5]],
+        columns=["GENE_A", "REC_A", "GENE_BACKGROUND"],
+        index=["n1", "n2"],
+    )
+    flow_edges = [{"source": "GENE_A", "target": "REC_A", "weight": 0.9}]
+
+    targets = pipeline._resolve_target_genes(obs, flow_edges, list(obs.columns))
+
+    assert HyperSCAConfig().step3_target_genes == []
+    assert targets[:2] == ["GENE_A", "REC_A"]
 
 
 def test_pipeline_build_gene_causal_mask():

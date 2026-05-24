@@ -1,7 +1,7 @@
 """Constants for the target discovery workflow."""
 
-ANCHOR_GENES = ("MFAP2", "POSTN", "INHBA")
-IFNG_FOCUS_GENES = ("CD74", "INHBA", "CXCL10", "IFNG", "COL1A1", "MFAP5", "FN1")
+ANCHOR_GENES: tuple[str, ...] = ()
+IFNG_FOCUS_GENES: tuple[str, ...] = ()
 
 CELLTYPES = (
     "Fibroblast_S1", "Fibroblast_S2", "Fibroblast_S3",

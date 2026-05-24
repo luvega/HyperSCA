@@ -612,7 +612,7 @@ nb4.cells = [
        "2. 通过跨队列一致性、差异表达强度初筛\n"
        "3. 在多组学整合框架中计算 **5 维证据评分**：因果得分、空间得分、一致性、可操作性、niche 关联\n"
        "4. 最终排名 **完全不依赖任何预设基因**\n\n"
-       "⚠️ 本流程中 **没有预设 INHBA、POSTN、FN1、MFAP2 为 anchor** — 它们是否进入 top list 完全取决于数据。"),
+       "本流程不注入任何预设候选基因，所有 top list 均由输入数据和评分规则决定。"),
 ]
 
 # Figure 1: Candidate pool overview
@@ -628,9 +628,9 @@ axes[0].set_title("A. Candidate Pool: Cross-cohort Coverage")
 for i, (idx, v) in enumerate(queue_counts.items()):
     axes[0].text(idx, v+50, str(v), ha="center", fontsize=10, fontweight="bold")
 
-# Panel B: Top 20 by init_score (no anchor filter)
+# Panel B: Top 20 by init_score
 top20 = cand_pool.nlargest(20, "init_score")
-colors_bar = ["#EF4444" if a else "#3B82F6" for a in top20["is_anchor"]]
+colors_bar = ["#3B82F6" for _ in range(len(top20))]
 y_pos = range(len(top20))
 axes[1].barh(y_pos, top20["init_score"].values, color=colors_bar, edgecolor="white")
 axes[1].set_yticks(y_pos)
@@ -638,14 +638,12 @@ axes[1].set_yticklabels(top20["gene"].values, fontsize=8)
 axes[1].invert_yaxis()
 axes[1].set_xlabel("Initial Score (|logFC| × −log10(padj) × consistency)")
 axes[1].set_title("B. Top 20 Candidates — Init Score")
-legend_el = [Patch(facecolor="#3B82F6", label="Data-driven"),
-             Patch(facecolor="#EF4444", label="Happens to be prior anchor")]
+legend_el = [Patch(facecolor="#3B82F6", label="Data-driven")]
 axes[1].legend(handles=legend_el, fontsize=7, loc="lower right")
 
 # Panel C: Top 20 by final_score (multi-evidence)
 top20_final = hub_targets.head(20)
-is_anc = top20_final["is_anchor"]
-colors_final = ["#EF4444" if a else "#22C55E" for a in is_anc]
+colors_final = ["#22C55E" for _ in range(len(top20_final))]
 axes[2].barh(range(len(top20_final)), top20_final["final_score"].values,
              color=colors_final, edgecolor="white")
 axes[2].set_yticks(range(len(top20_final)))
@@ -653,8 +651,7 @@ axes[2].set_yticklabels(top20_final["gene"].values, fontsize=8)
 axes[2].invert_yaxis()
 axes[2].set_xlabel("Final Multi-evidence Score")
 axes[2].set_title("C. Top 20 — Multi-evidence Ranking")
-legend_el2 = [Patch(facecolor="#22C55E", label="Data-driven"),
-              Patch(facecolor="#EF4444", label="Prior anchor (emerged naturally)")]
+legend_el2 = [Patch(facecolor="#22C55E", label="Data-driven")]
 axes[2].legend(handles=legend_el2, fontsize=7, loc="lower right")
 
 fig.suptitle("Data-driven Target Discovery: 5,873 Candidates → Multi-evidence Ranking",
@@ -722,19 +719,17 @@ nb4.cells.append(code(
 ))
 
 # Key table
-top10_table = "| Rank | Gene | Final Score | Causal | Spatial | Niche | Is Anchor? |\n"
-top10_table += "|------|------|------------|--------|---------|-------|------------|\n"
+top10_table = "| Rank | Gene | Final Score | Causal | Spatial | Niche |\n"
+top10_table += "|------|------|------------|--------|---------|-------|\n"
 for _, r in hub_targets.head(10).iterrows():
-    anc = "⚠️ Yes" if r["is_anchor"] else "✓ No"
-    top10_table += f"| {int(r['rank'])} | **{r['gene']}** | {r['final_score']:.4f} | {r['s_causal']:.3f} | {r['s_spatial']:.3f} | {r['s_niche']:.1f} | {anc} |\n"
+    top10_table += f"| {int(r['rank'])} | **{r['gene']}** | {r['final_score']:.4f} | {r['s_causal']:.3f} | {r['s_spatial']:.3f} | {r['s_niche']:.1f} |\n"
 
 nb4.cells.append(md(
     "**Top 10 Data-driven Targets**\n\n" + top10_table + "\n\n"
     "**核心发现**：\n\n"
     "1. **FN1 位居第一**，且其 spatial score (0.842) 和 niche score (1.0) 非常高 — 这不是预设的，是数据驱动结果\n"
-    "2. 传统上被视为 anchor 的基因（如 INHBA, MFAP2, POSTN）也自然浮现在 top 5，验证了算法的可靠性\n"
-    "3. **空间得分 (s_spatial)** 作为独立证据轴，有效区分了「仅在表达上显著」和「在空间组织结构中也有功能意义」的靶点\n"
-    "4. **IFNG (rank 6)** 尽管 spatial 得分为 0（scRNA 来源），但因 niche 得分 1.0 和高一致性被保留 — 说明多证据整合的稳健性\n\n"
+    "2. **空间得分 (s_spatial)** 作为独立证据轴，有效区分了「仅在表达上显著」和「在空间组织结构中也有功能意义」的靶点\n"
+    "3. 多证据整合会保留跨队列一致、因果和空间证据更强的候选，而不依赖人工锚点。\n\n"
     "➡ 只有结合空间组学，才能获得 spatial 和 niche 两个独立证据维度"
 ))
 
@@ -906,7 +901,7 @@ nb5.cells.append(md(
     "1. **空间组学提供了不可替代的物理约束**：组织邻域、空间传播、niche 结构无法仅从基因表达推断\n"
     "2. **双曲几何优于欧氏几何**：在所有 k 值和所有指标上，Poincaré 嵌入均优于欧氏嵌入\n"
     "3. **多证据整合更稳健**：5 维评分系统可区分「表达显著但空间无意义」vs「多维度一致支持」的靶点\n"
-    "4. **全流程无预设 anchor**：所有靶点排名完全由数据驱动，传统 anchor 基因自然浮现验证了算法可靠性\n\n"
+    "4. **全流程无预设 anchor**：所有靶点排名完全由数据驱动，不注入人工候选锚点\n\n"
     "**HyperSCA = Hyperbolic Geometry × Spatial Multi-omics × Causal Inference → Data-driven Target Discovery**"
 ))
 
@@ -943,7 +938,7 @@ readme_text = """# HyperSCA Multi-omics Integration Example
 - **双曲嵌入** niche Silhouette 比欧氏提升 **70%**
 - **层级相关性** 1.0（双曲）vs −0.569（欧氏）
 - 空间约束增加了 **2 个独立证据维度**（spatial + niche）
-- 靶点排名完全数据驱动，传统 anchor 基因自然浮现
+- 靶点排名完全数据驱动，不注入人工候选锚点
 
 ## 运行环境
 

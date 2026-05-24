@@ -16,7 +16,7 @@ HyperSCA 的研究完整版流程由五个连续阶段构成，可按具体队�
 
 ## Pipeline Flowchart
 
-![HyperSCA Analysis Framework](docs/HyperSCA分析框架示意图.jpg)
+![HyperSCA Pipeline Flowchart v0.5](docs/hypersca_pipeline_flowchart_v0.5.png)
 
 ## Core Algorithms
 
@@ -215,6 +215,10 @@ python scripts/generate_step3_figures.py
 - Legacy/precomputed discovery reports for notebooks: `results/integration/discovery/`
 - Step4 outputs: `results/step4/`（`pkpd_summary.json`, `combination_ranking.csv`, `roundtrip_update_report.json`）
 - CNS figure outputs: `results/figures/step1/`, `results/figures/step2/`, `results/figures/step3/`
+
+## 项目目录说明
+
+完整的本地目录边界、提交文件说明、验证代码说明、结果目录说明、历次更新记录和当前项目进度见 [docs/project_inventory.md](docs/project_inventory.md)。
 
 ## Testing
 

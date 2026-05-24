@@ -39,6 +39,7 @@ def test_aggregate_candidate_pool_scores_multisource_genes():
     assert out.iloc[0]["gene"] == "A"
     assert int(out[out["gene"] == "A"].iloc[0]["cross_queue_count"]) == 2
     assert "init_score" in out.columns
+    assert out["is_anchor"].eq(False).all()
 
 
 def test_assemble_cluster_expression_log1p_means():

@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from src.discovery.target_discovery.candidates import aggregate_candidate_pool
-from src.discovery.target_discovery.constants import CELLTYPES, IFNG_FOCUS_GENES
+from src.discovery.target_discovery.constants import CELLTYPES
 from src.discovery.target_discovery.expression import assemble_cluster_expression, read_normalized_count_tables
 from src.discovery.target_discovery.loaders import read_icb_deg_tables, read_ifng_tables, read_neu_deg_tables
 from src.discovery.target_discovery.spatial import build_spatial_adjacency_from_tables, read_st_metadata_tables
@@ -20,7 +20,7 @@ class CandidateDiscoveryStage:
         pool = aggregate_candidate_pool(
             read_neu_deg_tables(paths.neu_dir),
             read_icb_deg_tables(paths.icb_dir),
-            read_ifng_tables(paths.ifng_dir, IFNG_FOCUS_GENES),
+            read_ifng_tables(paths.ifng_dir, context.config.focused_genes),
         )
         context.writer.write_table("candidate_pool.csv", pool, section="candidates")
         return {"candidate_pool": pool}

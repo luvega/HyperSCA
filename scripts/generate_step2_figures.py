@@ -279,7 +279,7 @@ def main():
     ax2.set_title("B. Directionality index (forward-reverse)")
     ax2.set_ylabel("index")
 
-    fig.suptitle("Directionality Evidence (CAF/POSTN-related axes)")
+    fig.suptitle("Directionality Evidence (Top Data-Driven Axes)")
     save_figure(fig, str(output_dir / "directionality_case_postn_myeloid.png"),
                 config={"chart": "directionality_case_postn_myeloid"})
 

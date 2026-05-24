@@ -25,11 +25,11 @@ def _prepare_minimal_step2_step3(tmp_path: Path) -> tuple[Path, Path, Path]:
         json.dumps({"node_labels": ["CAF", "TAM"], "type_mapping": {"CAF": "CAF", "TAM": "TAM"}}),
         encoding="utf-8",
     )
-    pd.DataFrame([[2.0, 1.0], [1.0, 0.5]], index=["CAF", "TAM"], columns=["POSTN", "INHBA"]).to_csv(
+    pd.DataFrame([[2.0, 1.0], [1.0, 0.5]], index=["CAF", "TAM"], columns=["GENE_A", "GENE_B"]).to_csv(
         step2 / "cluster_expr_df.csv"
     )
-    pd.DataFrame({"ligand": ["POSTN"], "receptor": ["ITGAV"], "target_priority_score": [0.4]}).to_csv(
-        step3 / "interaction_targets_POSTN.csv", index=False
+    pd.DataFrame({"ligand": ["GENE_A"], "receptor": ["REC_A"], "target_priority_score": [0.4]}).to_csv(
+        step3 / "interaction_targets_GENE_A.csv", index=False
     )
     return step2, step3, step4
 
@@ -41,7 +41,7 @@ def test_roundtrip_update_pipeline(tmp_path: Path):
             "sample_id": ["s1", "s1", "s2"],
             "timepoint": [24, 24, 48],
             "dose": [1.0, 3.0, 1.0],
-            "gene": ["POSTN", "INHBA", "POSTN"],
+            "gene": ["GENE_A", "GENE_B", "GENE_A"],
             "effect_size": [0.4, 0.6, 0.3],
         }
     )

@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.discovery.target_discovery.constants import ANCHOR_GENES, SCORE_WEIGHTS
+from src.discovery.target_discovery.constants import SCORE_WEIGHTS
 from src.discovery.target_discovery.utils import minmax
 
 
@@ -110,9 +110,7 @@ def retain_hubs_and_combos(
     ranking: pd.DataFrame,
     step3_results_hyp: dict,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    anchors_df = ranking[ranking["gene"].isin(ANCHOR_GENES)].copy() if "gene" in ranking else pd.DataFrame()
-    new_hubs = ranking[~ranking["gene"].isin(ANCHOR_GENES)].head(30).copy() if "gene" in ranking else pd.DataFrame()
-    retained = pd.concat([anchors_df, new_hubs], ignore_index=True)
+    retained = ranking.head(30).copy() if "gene" in ranking else pd.DataFrame()
     if not retained.empty:
         retained = retained.drop_duplicates(subset=["gene"])
         if "rank" in retained:

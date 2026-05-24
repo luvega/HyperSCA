@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 
 from src.pipeline.config import HyperSCAConfig
 
@@ -81,18 +82,14 @@ class PerturbationPipeline:
             "spatial_coords": spatial_coords,
         }
 
-    def _latent_arithmetic_cf(
+    def _expression_knockout_cf(
         self,
         observed_expr: pd.DataFrame,
         target_gene: str,
         flow_edges: list[dict],
         node_to_type: dict[str, str],
     ) -> pd.DataFrame:
-        """Latent KO：按 source/target 细胞类型差异化施加变化。
-
-        当阶段1嵌入可用时使用 LatentArithmetic（真正双曲空间扰动），
-        否则回退到表达空间简化版 KO。
-        """
+        """Expression-space KO with source/target cell-type propagation."""
         cf = observed_expr.copy()
         g = target_gene.upper()
         gene_cols = {c.upper(): c for c in observed_expr.columns}
@@ -131,6 +128,136 @@ class PerturbationPipeline:
                 cf.loc[rows, rec_col] = observed_expr.loc[rows, rec_col] * max(0.0, 1.0 - 0.5 * ko_scale)
 
         return cf
+
+    def _hyperbolic_latent_cf(
+        self,
+        observed_expr: pd.DataFrame,
+        target_gene: str,
+        flow_edges: list[dict],
+        node_to_type: dict[str, str],
+    ) -> pd.DataFrame:
+        """Decode a Lorentz latent-space KO from saved Step1 H-VAE artifacts."""
+        del flow_edges, node_to_type
+
+        model_path = self.step1_dir / "hvae_model.pt"
+        config_path = self.step1_dir / "config.json"
+        z_path = self.step1_dir / "embeddings_lorentz.npy"
+        required = [model_path, config_path, z_path]
+        if any(not path.exists() for path in required):
+            missing = [str(path) for path in required if not path.exists()]
+            raise NotImplementedError(
+                "hyperbolic_latent_ko requires Step1 H-VAE artifacts and decoder integration; "
+                f"missing: {missing}"
+            )
+
+        from src.models.hyperbolic.hvae import HyperbolicVAE
+        from src.models.hyperbolic.lorentz import exp_map, log_map, lorentz_origin, project_to_lorentz
+
+        requested_device = str(getattr(self.config, "device", "cpu"))
+        device = "cuda" if requested_device.startswith("cuda") and torch.cuda.is_available() else "cpu"
+        model_config = json.loads(config_path.read_text(encoding="utf-8"))
+        model = HyperbolicVAE(
+            input_dim=observed_expr.shape[1],
+            latent_dim=int(model_config.get("hvae_latent_dim", self.config.hvae_latent_dim)),
+            encoder_layers=list(model_config.get("hvae_encoder_layers", self.config.hvae_encoder_layers)),
+            decoder_layers=list(model_config.get("hvae_decoder_layers", self.config.hvae_decoder_layers)),
+            gcn_layers=int(model_config.get("hvae_gcn_layers", self.config.hvae_gcn_layers)),
+            beta=float(model_config.get("hvae_beta", self.config.hvae_beta)),
+            gamma=float(model_config.get("hvae_gamma", self.config.hvae_gamma)),
+            use_zinb=bool(model_config.get("hvae_use_zinb", self.config.hvae_use_zinb)),
+            dropout=float(model_config.get("hvae_dropout", 0.0)),
+        ).to(device)
+        try:
+            state_dict = torch.load(model_path, map_location=device, weights_only=True)
+        except TypeError:
+            state_dict = torch.load(model_path, map_location=device)
+        model.load_state_dict(state_dict)
+        model.eval()
+
+        z_np = np.load(z_path)
+        n_obs = observed_expr.shape[0]
+        if z_np.shape[0] < n_obs:
+            raise ValueError(
+                f"Step1 Lorentz embeddings have {z_np.shape[0]} rows, but Step3 observed expression has {n_obs} rows."
+            )
+        z = torch.as_tensor(z_np[:n_obs], dtype=torch.float32, device=device)
+        z = project_to_lorentz(z)
+
+        gene_cols = {str(col).upper(): str(col) for col in observed_expr.columns}
+        target_col = gene_cols.get(target_gene.upper())
+        if target_col is None:
+            return observed_expr.copy()
+
+        with torch.no_grad():
+            origin = lorentz_origin(model.latent_dim, batch_size=n_obs, device=device)
+            tangent = log_map(z, origin)
+
+            target_values = observed_expr[target_col].astype(float).to_numpy()
+            centered = target_values - float(np.mean(target_values))
+            denom = float(np.sum(np.abs(centered)))
+            if denom > 1e-12:
+                weights = torch.as_tensor(centered / denom, dtype=torch.float32, device=device).unsqueeze(1)
+                direction = torch.sum(weights * tangent, dim=0, keepdim=True)
+            else:
+                direction = torch.zeros((1, tangent.shape[1]), dtype=torch.float32, device=device)
+
+            ko_scale = max(0.0, float(self.config.step3_latent_ko_scale))
+            tangent_cf = tangent - ko_scale * direction
+            z_cf = exp_map(tangent_cf, origin)
+            recon_mean, _, _ = model.decode(z_cf)
+            recon_mean = torch.nan_to_num(recon_mean, nan=0.0, posinf=1e6, neginf=0.0)
+
+        cf = pd.DataFrame(
+            recon_mean.detach().cpu().numpy(),
+            index=observed_expr.index,
+            columns=observed_expr.columns,
+        )
+        self._last_hyperbolic_latent_metadata = {
+            "decoder_source": str(model_path),
+            "embedding_source": str(z_path),
+            "target_gene": target_col,
+            "n_observations": int(n_obs),
+            "latent_dim": int(model.latent_dim),
+        }
+        return cf
+
+    def _counterfactual_for_method(
+        self,
+        observed_expr: pd.DataFrame,
+        target_gene: str,
+        flow_edges: list[dict],
+        node_to_type: dict[str, str],
+        gene_names: list[str],
+    ) -> pd.DataFrame:
+        method = self.config.step3_method
+        if method == "expression_ko":
+            return self._expression_knockout_cf(
+                observed_expr=observed_expr,
+                target_gene=target_gene,
+                flow_edges=flow_edges,
+                node_to_type=node_to_type,
+            )
+        if method == "hyperbolic_latent_ko":
+            return self._hyperbolic_latent_cf(
+                observed_expr=observed_expr,
+                target_gene=target_gene,
+                flow_edges=flow_edges,
+                node_to_type=node_to_type,
+            )
+        if method == "diffusion_cf":
+            return self._diffusion_cf(
+                observed_expr=observed_expr,
+                target_gene=target_gene,
+                flow_edges=flow_edges,
+                gene_names=gene_names,
+            )
+        if method == "latent_arithmetic":
+            raise ValueError(
+                "step3_method='latent_arithmetic' used to run an expression-space KO. "
+                "Use 'expression_ko' for that behavior or 'hyperbolic_latent_ko' "
+                "for true H-VAE latent perturbation."
+            )
+        raise ValueError(f"Unknown step3_method: {method}")
 
     @staticmethod
     def _build_gene_causal_mask(flow_edges: list[dict], gene_names: list[str]) -> np.ndarray:
@@ -190,6 +317,53 @@ class PerturbationPipeline:
             top_k=self.config.step3_target_top_k,
         )
         return ranked
+
+    def _resolve_target_genes(
+        self,
+        obs_expr: pd.DataFrame,
+        flow_edges: list[dict],
+        gene_names: list[str],
+    ) -> list[str]:
+        """Resolve perturbation genes without preset anchors."""
+        top_k = max(1, int(self.config.step3_target_top_k or 1))
+        gene_cols = {str(col).upper(): str(col) for col in obs_expr.columns}
+
+        explicit_targets: list[str] = []
+        for gene in self.config.step3_target_genes:
+            col = gene_cols.get(str(gene).upper())
+            if col and col not in explicit_targets:
+                explicit_targets.append(col)
+        if explicit_targets:
+            return explicit_targets[:top_k]
+
+        edge_scores: dict[str, float] = {}
+        edge_order: dict[str, int] = {}
+
+        def add_edge_score(gene: object, score: float) -> None:
+            col = gene_cols.get(str(gene).upper())
+            if not col:
+                return
+            edge_scores[col] = edge_scores.get(col, 0.0) + float(score)
+            edge_order.setdefault(col, len(edge_order))
+
+        for edge in flow_edges:
+            try:
+                weight = abs(float(edge.get("weight", 1.0)))
+            except (TypeError, ValueError):
+                weight = 1.0
+            add_edge_score(edge.get("source", ""), weight)
+            add_edge_score(edge.get("target", ""), max(weight * 0.5, 1e-6))
+
+        if edge_scores:
+            ranked = sorted(edge_scores, key=lambda g: (-edge_scores[g], edge_order[g], g))
+            return ranked[:top_k]
+
+        numeric = obs_expr.apply(pd.to_numeric, errors="coerce")
+        if numeric.empty:
+            return [g for g in gene_names if str(g).upper() in gene_cols][:top_k]
+        scores = numeric.abs().mean(axis=0).fillna(0.0) + numeric.var(axis=0).fillna(0.0)
+        ranked = scores.sort_values(ascending=False).index.astype(str).tolist()
+        return ranked[:top_k]
 
     def _filter_false_positive(self, ranked: pd.DataFrame) -> pd.DataFrame:
         from src.perturbation.false_positive_filter import filter_false_positive_targets
@@ -482,25 +656,20 @@ class PerturbationPipeline:
         fold_change_rows = []
         fp_reduction_rows = []
 
-        for target_gene in self.config.step3_target_genes:
+        target_genes = self._resolve_target_genes(obs_expr, flow_edges, gene_names)
+
+        for target_gene in target_genes:
             print("=" * 60)
             print(f"[Step3] Target={target_gene} | method={self.config.step3_method}")
             print("=" * 60)
 
-            if self.config.step3_method == "diffusion_cf":
-                cf_expr = self._diffusion_cf(
-                    observed_expr=obs_expr,
-                    target_gene=target_gene,
-                    flow_edges=flow_edges,
-                    gene_names=gene_names,
-                )
-            else:
-                cf_expr = self._latent_arithmetic_cf(
-                    observed_expr=obs_expr,
-                    target_gene=target_gene,
-                    flow_edges=flow_edges,
-                    node_to_type=node_to_type,
-                )
+            cf_expr = self._counterfactual_for_method(
+                observed_expr=obs_expr,
+                target_gene=target_gene,
+                flow_edges=flow_edges,
+                node_to_type=node_to_type,
+                gene_names=gene_names,
+            )
 
             # 保存反事实表达
             cf_expr.to_csv(self.output_dir / f"cf_expression_{target_gene}.csv")
@@ -647,7 +816,7 @@ class PerturbationPipeline:
 
         summary = {
             "method": self.config.step3_method,
-            "targets": self.config.step3_target_genes,
+            "targets": target_genes,
             "per_target": all_metrics,
             "global": {
                 "n_total_candidates": int(sum(m.get("n_candidates", 0) for m in all_metrics.values())),
@@ -689,4 +858,3 @@ def _json_default(obj):
     if isinstance(obj, np.ndarray):
         return obj.tolist()
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
-

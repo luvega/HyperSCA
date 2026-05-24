@@ -13,8 +13,8 @@ def test_rank_counterfactual_interaction_targets_with_prior():
         {
             "source_layer": 0,
             "target_layer": 1,
-            "source": "POSTN",
-            "target": "ITGAV",
+            "source": "LIG_A",
+            "target": "REC_A",
             "weight": 0.9,
             "causal_edge": "CAF→TAM",
             "pathway": "Integrin-FAK",
@@ -22,21 +22,21 @@ def test_rank_counterfactual_interaction_targets_with_prior():
         {
             "source_layer": 0,
             "target_layer": 1,
-            "source": "IL10",
-            "target": "IL10RA",
+            "source": "LIG_B",
+            "target": "REC_B",
             "weight": 0.8,
             "causal_edge": "TAM→CD8T",
-            "pathway": "IL10-STAT3",
+            "pathway": "Pathway-B",
         },
     ]
-    genes = ["POSTN", "ITGAV", "IL10", "IL10RA"]
+    genes = ["LIG_A", "REC_A", "LIG_B", "REC_B"]
     obs = pd.DataFrame([[1.0, 1.2, 1.1, 0.9]], columns=genes, index=["node1"])
     cf = pd.DataFrame([[0.2, 0.3, 1.0, 0.85]], columns=genes, index=["node1"])
 
     prior = PriorKnowledge(
-        lr_pairs={("POSTN", "ITGAV")},
+        lr_pairs={("LIG_A", "REC_A")},
         tf_targets=set(),
-        sources={("POSTN", "ITGAV"): {"liana"}},
+        sources={("LIG_A", "REC_A"): {"liana"}},
     )
     ranked = rank_counterfactual_interaction_targets(
         flow_edges=flow_edges,
@@ -49,7 +49,7 @@ def test_rank_counterfactual_interaction_targets_with_prior():
     )
 
     assert not ranked.empty
-    assert ranked.iloc[0]["ligand"] == "POSTN"
+    assert ranked.iloc[0]["ligand"] == "LIG_A"
     assert bool(ranked.iloc[0]["prior_hit"]) is True
     assert ranked.iloc[0]["target_priority_score"] > 0
 
@@ -61,14 +61,14 @@ def test_rank_counterfactual_interaction_targets_grouped_delta():
         {
             "source_layer": 0,
             "target_layer": 1,
-            "source": "POSTN",
-            "target": "ITGAV",
+            "source": "LIG_A",
+            "target": "REC_A",
             "weight": 1.0,
             "causal_edge": "CAF->TAM",
             "pathway": "Integrin-FAK",
         }
     ]
-    genes = ["POSTN", "ITGAV"]
+    genes = ["LIG_A", "REC_A"]
     obs = pd.DataFrame(
         [[1.0, 1.0], [3.0, 3.0]],
         columns=genes,
@@ -141,26 +141,26 @@ def test_step3_target_metrics_contains_dashboard_metrics():
 
     obs = pd.DataFrame(
         [[1.0, 2.0, 3.0], [1.2, 2.1, 2.9]],
-        columns=["POSTN", "ITGAV", "GENE_X"],
+        columns=["LIG_A", "REC_A", "GENE_X"],
         index=["n1", "n2"],
     )
     cf = pd.DataFrame(
         [[0.6, 1.5, 3.1], [0.7, 1.6, 3.0]],
-        columns=["POSTN", "ITGAV", "GENE_X"],
+        columns=["LIG_A", "REC_A", "GENE_X"],
         index=["n1", "n2"],
     )
     ranked = pd.DataFrame(
         [
             {
-                "ligand": "POSTN",
-                "receptor": "ITGAV",
+                "ligand": "LIG_A",
+                "receptor": "REC_A",
                 "prior_hit": True,
                 "target_priority_score": 0.8,
                 "pathway": "Integrin-FAK",
             }
         ]
     )
-    m = PerturbationPipeline._compute_target_metrics("POSTN", ranked, obs, cf)
+    m = PerturbationPipeline._compute_target_metrics("LIG_A", ranked, obs, cf)
     assert "dashboard_metrics" in m
     for k in ("r2_mean", "pcc_median", "mse", "marker_direction_accuracy"):
         assert k in m["dashboard_metrics"]

@@ -43,9 +43,11 @@ class DynamicInterventionPipeline:
         if expr_df_path.exists():
             cluster_expr_df = pd.read_csv(expr_df_path, index_col=0)
         else:
-            # fallback generic gene names
-            cols = [f"GENE_{i}" for i in range(cluster_expr.shape[1])]
-            cluster_expr_df = pd.DataFrame(cluster_expr, index=node_labels, columns=cols)
+            raise FileNotFoundError(
+                f"Missing Step2 cluster expression gene names: {expr_df_path}. "
+                "Step4 requires a gene-labeled cluster_expr_df.csv so target profiles "
+                "are not silently replaced by generic GENE_0 columns."
+            )
 
         targets = list(self.config.step4_hub_genes)
         retained_hubs_path = self.step3_dir.parent / "integration" / "discovery" / "hub_targets_retained.csv"
@@ -62,12 +64,22 @@ class DynamicInterventionPipeline:
             g = p.stem.replace("interaction_targets_", "")
             if g and g not in targets:
                 targets.append(g)
+        if not targets:
+            targets = self._derive_targets_from_expression(cluster_expr_df)
         return {
             "cluster_adj": cluster_adj,
             "cluster_expr_df": cluster_expr_df,
             "node_labels": node_labels,
             "targets": targets,
         }
+
+    @staticmethod
+    def _derive_targets_from_expression(cluster_expr_df: pd.DataFrame, max_targets: int = 5) -> list[str]:
+        numeric = cluster_expr_df.apply(pd.to_numeric, errors="coerce")
+        if numeric.empty:
+            return []
+        scores = numeric.abs().mean(axis=0).fillna(0.0) + numeric.var(axis=0).fillna(0.0)
+        return scores.sort_values(ascending=False).index.astype(str).tolist()[:max_targets]
 
     def _target_node_profile(self, gene: str, cluster_expr_df: pd.DataFrame) -> np.ndarray:
         cols_up = {c.upper(): c for c in cluster_expr_df.columns}
@@ -155,6 +167,9 @@ class DynamicInterventionPipeline:
                 prod *= (1.0 - eg)
             combo_effects[combo] = float(np.clip(1.0 - prod, 0.0, 1.0))
         combo_ranked = rank_combinations(combo_effects, single_effect_final)
+        for row in combo_ranked:
+            row["model_type"] = "bliss_proxy"
+            row["calibrated_by_experiment"] = False
 
         # Temporal causal on averaged intervention response
         if temporal_stack:

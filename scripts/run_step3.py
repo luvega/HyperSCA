@@ -35,7 +35,7 @@ def main() -> int:
         "--method",
         type=str,
         default=None,
-        choices=["latent_arithmetic", "diffusion_cf"],
+        choices=["expression_ko", "hyperbolic_latent_ko", "diffusion_cf"],
         help="Counterfactual method",
     )
     parser.add_argument("--targets", type=str, default=None, help="Comma separated target genes")

@@ -40,7 +40,7 @@ import matplotlib.pyplot as plt
 
 GENE_ALIAS = {"COLA1": "COL1A1"}
 
-DEFAULT_GENES = ["FN1", "COL1A1", "CCL18", "CXCL8", "SPP1", "POSTN", "MFAP2", "INHBA"]
+DEFAULT_GENES = ["FN1", "COL1A1", "CCL18", "CXCL8", "SPP1"]
 
 PLATFORM_MAP = {
     "visium": "st_visium",
@@ -636,7 +636,7 @@ def _read_visiumhd(max_spots: int = 120000) -> pd.DataFrame:
         coords = coords[idx]
 
     markers = {
-        "BT_CAF": ["POSTN", "COL1A1", "COL1A2", "DCN", "FAP", "PDGFRA", "MFAP2"],
+        "BT_CAF": ["COL1A1", "COL1A2", "DCN", "FAP", "PDGFRA"],
         "BT_TAM": ["CD68", "LST1", "APOE", "C1QA", "C1QB", "FCER1G", "TYROBP"],
         "BT_CD8T": ["CD3D", "CD3E", "CD8A", "CD8B", "NKG7", "GZMB"],
         "BT_CD4T": ["CD3D", "CD3E", "IL7R", "LTB", "MALAT1"],

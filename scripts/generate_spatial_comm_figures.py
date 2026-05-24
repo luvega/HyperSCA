@@ -358,7 +358,7 @@ def _load_visiumhd_native_celltypes(
         coords = coords[idx]
 
     markers = {
-        "CAF": ["POSTN", "COL1A1", "COL1A2", "DCN", "FAP", "PDGFRA", "MFAP2"],
+        "CAF": ["COL1A1", "COL1A2", "DCN", "FAP", "PDGFRA"],
         "TAM": ["CD68", "LST1", "APOE", "C1QA", "C1QB", "FCER1G", "TYROBP"],
         "CD8T": ["CD3D", "CD3E", "CD8A", "CD8B", "NKG7", "GZMB"],
         "CD4T": ["CD3D", "CD3E", "IL7R", "LTB"],
@@ -461,7 +461,7 @@ def _build_native_celltype_spatial_pack(
     return {"native_celltype_maps": produced, "sample_stats": sample_stats}
 
 
-def _plot_anchor_coloc_tripanel(
+def _plot_target_coloc_tripanel(
     sample_id: str,
     x: np.ndarray,
     y: np.ndarray,
@@ -531,9 +531,8 @@ def _build_gene_celltype_colocalization_pack(
         .str.upper()
         .tolist()
     )
-    anchors = ["POSTN", "MFAP2", "INHBA"]
     genes = []
-    for g in top_genes + anchors:
+    for g in top_genes:
         if g not in genes and g in gene_to_idx:
             genes.append(g)
     if not genes:
@@ -605,10 +604,10 @@ def _build_gene_celltype_colocalization_pack(
                     }
                 )
                 sample_gene_corr[g][bt] = cc
-            if g in anchors:
+            if g in genes[:3]:
                 top_bt = sorted(sample_gene_corr[g].items(), key=lambda kv: kv[1], reverse=True)[0][0]
                 bt_idx = bt_types.index(top_bt)
-                _plot_anchor_coloc_tripanel(
+                _plot_target_coloc_tripanel(
                     sample_id=sid,
                     x=x_loc,
                     y=y_loc,
@@ -645,7 +644,7 @@ def _build_gene_celltype_colocalization_pack(
         save_figure(fig, out_dirs["root"] / "gene_celltype_colocalization_heatmap.png", dpi=300, config={"chart": "gene_celltype_colocalization_heatmap"})
 
     # violin: per gene, distribution of correlation across samples per celltype
-    violin_genes = anchors + [g for g in heat.index.tolist() if g not in anchors][:7]
+    violin_genes = heat.index.astype(str).tolist()[:10]
     for g in violin_genes:
         sub = corr_df[corr_df["gene"] == g].copy()
         if sub.empty:
@@ -839,10 +838,6 @@ def _top30_target_niche_panels(
     ax.set_xticklabels(mat.columns, rotation=40, ha="right", fontsize=8)
     ax.set_yticks(range(mat.shape[0]))
     ax.set_yticklabels(mat.index, fontsize=8)
-    for tick in ax.get_yticklabels():
-        if tick.get_text().upper() in {"POSTN", "MFAP2", "INHBA"}:
-            tick.set_color("#D55E00")
-            tick.set_fontweight("bold")
     ax.set_title("Top30 Target-Niche Enrichment (All Niches)")
     save_figure(fig, out_dir / "top30_target_niche_heatmap_all.png", dpi=300, config={"chart": "top30_target_niche_heatmap_all"})
 
@@ -865,10 +860,6 @@ def _top30_target_niche_panels(
     ax.set_xticklabels(hm.columns, rotation=40, ha="right", fontsize=8)
     ax.set_yticks(range(hm.shape[0]))
     ax.set_yticklabels(hm.index, fontsize=8)
-    for tick in ax.get_yticklabels():
-        if tick.get_text().upper() in {"POSTN", "MFAP2", "INHBA"}:
-            tick.set_color("#D55E00")
-            tick.set_fontweight("bold")
     ax.set_title("Top30 Target-Niche Enrichment (Hierarchy Ordered)")
     save_figure(fig, out_dir / "top30_target_niche_heatmap_hierarchy.png", dpi=300, config={"chart": "top30_target_niche_heatmap_hierarchy"})
 
@@ -879,21 +870,21 @@ def _top30_target_niche_panels(
             val = float(mat.loc[tg, niche_name])
             size = 24 + 140 * min(abs(val) / vmax, 1.0)
             color = "#D73027" if val >= 0 else "#4575B4"
-            edge = "#D55E00" if tg.upper() in {"POSTN", "MFAP2", "INHBA"} else "white"
-            lw = 0.8 if tg.upper() in {"POSTN", "MFAP2", "INHBA"} else 0.3
+            edge = "white"
+            lw = 0.3
             ax.scatter(xi, yi, s=size, c=color, alpha=0.8, edgecolors=edge, linewidths=lw)
     ax.set_xticks(range(mat.shape[1]))
     ax.set_xticklabels(mat.columns, rotation=40, ha="right", fontsize=8)
     ax.set_yticks(range(mat.shape[0]))
     ax.set_yticklabels(mat.index, fontsize=8)
     ax.grid(axis="x", linestyle="--", alpha=0.18)
-    ax.set_title("Top30 Target-Niche Dotplot (anchors highlighted)")
+    ax.set_title("Top30 Target-Niche Dotplot")
     save_figure(fig, out_dir / "top30_target_niche_dotplot_all.png", dpi=300, config={"chart": "top30_target_niche_dotplot_all"})
 
 
-def _load_step3_anchor_tables(step3_dir: Path, anchors: list[str]) -> dict[str, pd.DataFrame]:
+def _load_step3_target_tables(step3_dir: Path, targets: list[str]) -> dict[str, pd.DataFrame]:
     out: dict[str, pd.DataFrame] = {}
-    for g in anchors:
+    for g in targets:
         p = step3_dir / f"targets_{g.upper()}.csv"
         if not p.exists():
             p = step3_dir / f"targets_{g}.csv"
@@ -930,10 +921,10 @@ def _aggregate_type_flow_from_step3(step3_target_df: pd.DataFrame) -> dict[tuple
     }
 
 
-def _anchor_niche_score_map(target_niche: pd.DataFrame, anchor_gene: str) -> dict[int, float]:
+def _target_niche_score_map(target_niche: pd.DataFrame, target_gene: str) -> dict[int, float]:
     if target_niche.empty:
         return {}
-    sub = target_niche[target_niche["target_gene"].astype(str).str.upper() == anchor_gene.upper()].copy()
+    sub = target_niche[target_niche["target_gene"].astype(str).str.upper() == target_gene.upper()].copy()
     if sub.empty:
         return {}
     if "weighted_expression" in sub.columns:
@@ -978,7 +969,7 @@ def _render_perturbation_flow_map(
     definition: pd.DataFrame,
     target_niche: pd.DataFrame,
     niche_color_map: dict[int, str],
-    anchor_gene: str,
+    target_gene: str,
     step3_target_df: pd.DataFrame,
     out_path: Path,
 ) -> None:
@@ -993,7 +984,7 @@ def _render_perturbation_flow_map(
         for _, r in definition.iterrows()
     }
     niche_size = sample_df["niche_id"].astype(int).value_counts().to_dict()
-    score_map = _anchor_niche_score_map(target_niche, anchor_gene)
+    score_map = _target_niche_score_map(target_niche, target_gene)
     all_niches = sorted(cent["niche_id"].astype(int).tolist())
     score_order = sorted(all_niches, key=lambda n: float(score_map.get(int(n), 0.0)), reverse=True)
 
@@ -1055,7 +1046,7 @@ def _render_perturbation_flow_map(
         x, y, s=2.0, c=point_vals, cmap=CMAP_SPATIAL, alpha=0.65, edgecolors="none", zorder=0
     )
     cbar_bg = fig.colorbar(bg, ax=ax, shrink=0.72, pad=0.02)
-    cbar_bg.set_label(f"{anchor_gene} niche-expression (scaled)")
+    cbar_bg.set_label(f"{target_gene} niche-expression (scaled)")
     ax.contourf(
         Xg, Yg, speed,
         levels=8,
@@ -1112,11 +1103,11 @@ def _render_perturbation_flow_map(
             zorder=2,
         )
 
-    ax.set_title(f"{sample_id} perturbation-driven communication flow ({anchor_gene})")
+    ax.set_title(f"{sample_id} perturbation-driven communication flow ({target_gene})")
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.invert_yaxis()
-    save_figure(fig, out_path, dpi=300, config={"chart": "perturbation_flow_commot_style", "sample": sample_id, "anchor": anchor_gene})
+    save_figure(fig, out_path, dpi=300, config={"chart": "perturbation_flow_commot_style", "sample": sample_id, "target": target_gene})
 
 
 def _read_spot_expression_from_h5ad(
@@ -1245,8 +1236,7 @@ def _draw_single_gene_violin(
     ax.set_xticks(np.arange(1, len(available) + 1))
     ax.set_xticklabels(available, rotation=35, ha="right", fontsize=8)
     ax.set_ylabel("expression / niche score")
-    anchor_tag = " (anchor)" if gene.upper() in {"POSTN", "MFAP2", "INHBA"} else ""
-    ax.set_title(f"{gene.upper()} by niche{anchor_tag}")
+    ax.set_title(f"{gene.upper()} by niche")
     save_figure(fig, out_path, dpi=300, config={"chart": "violin_gene_by_niche", "gene": gene.upper()})
 
 
@@ -1268,9 +1258,8 @@ def _build_violin_pack(
         .str.upper()
         .tolist()
     )
-    anchors = ["POSTN", "MFAP2", "INHBA"]
     genes = []
-    for g in top30 + anchors:
+    for g in top30:
         if g not in genes:
             genes.append(g)
     order_df = definition.sort_values(["hierarchy_level", "niche_id"])[["niche_name"]].drop_duplicates()
@@ -1305,39 +1294,6 @@ def _build_violin_pack(
             niche_order=niche_order,
             out_path=out_dirs["violin"] / f"violin_{g.upper()}_by_niche.png",
         )
-
-    anchor_df = long_df[long_df["target_gene"].isin(anchors)].copy()
-    if not anchor_df.empty:
-        fig, axes = plt.subplots(1, 3, figsize=(max(13.5, 0.35 * len(niche_order) * 3), 4.2), sharey=True)
-        for ax, g in zip(axes, anchors):
-            sub = anchor_df[anchor_df["target_gene"] == g]
-            avail = [n for n in niche_order if n in set(sub["niche_name"].astype(str))]
-            groups = [
-                pd.to_numeric(sub[sub["niche_name"].astype(str) == n]["value"], errors="coerce").dropna().values
-                for n in avail
-            ]
-            if any(len(v) > 0 for v in groups):
-                parts = ax.violinplot(
-                    groups,
-                    positions=np.arange(1, len(avail) + 1),
-                    widths=0.8,
-                    showmeans=False,
-                    showextrema=False,
-                    showmedians=True,
-                )
-                for pc in parts["bodies"]:
-                    pc.set_facecolor("#7CAFD3")
-                    pc.set_edgecolor("#2A5CAA")
-                    pc.set_alpha(0.70)
-                if "cmedians" in parts:
-                    parts["cmedians"].set_color("#D95F0E")
-                    parts["cmedians"].set_linewidth(1.1)
-            ax.set_xticks(np.arange(1, len(avail) + 1))
-            ax.set_xticklabels(avail, rotation=35, ha="right", fontsize=7)
-            ax.set_title(g, color="#D95F0E", fontweight="bold")
-            if g == anchors[0]:
-                ax.set_ylabel("expression / niche score")
-        save_figure(fig, out_dirs["root"] / "anchor_violin_panel.png", dpi=300, config={"chart": "anchor_violin_panel"})
 
     return {
         "violin_gene_count": int(len(set(long_df["target_gene"].astype(str).tolist()))),
@@ -1417,10 +1373,17 @@ def main() -> int:
         hierarchy_json=hierarchy_json if isinstance(hierarchy_json, dict) else {},
     )
 
-    # fixed anchor targets for per-sample maps
-    selected_targets = ["POSTN", "MFAP2", "INHBA"]
+    selected_targets = (
+        target_niche[["target_gene", "global_rank"]]
+        .drop_duplicates()
+        .sort_values("global_rank")
+        .head(3)["target_gene"]
+        .astype(str)
+        .str.upper()
+        .tolist()
+    )
     type_flow = _type_flow_weights(flow_edges if isinstance(flow_edges, list) else [])
-    step3_anchor_tables = _load_step3_anchor_tables(ROOT / args.step3_target_dir, selected_targets)
+    step3_target_tables = _load_step3_target_tables(ROOT / args.step3_target_dir, selected_targets)
 
     # per-sample figures
     samples = sorted(assignment["sample_id"].astype(str).unique().tolist())
@@ -1451,8 +1414,8 @@ def main() -> int:
                 definition=definition,
                 target_niche=target_niche,
                 niche_color_map=niche_color_map,
-                anchor_gene=tg,
-                step3_target_df=step3_anchor_tables.get(tg.upper(), pd.DataFrame()),
+                target_gene=tg,
+                step3_target_df=step3_target_tables.get(tg.upper(), pd.DataFrame()),
                 out_path=out_dirs["perturb_flow"] / f"perturb_flow_{sid}_{tg}.png",
             )
 

@@ -128,7 +128,7 @@ class CausalDiffusionCF:
     ) -> np.ndarray:
         """生成反事实表达矩阵（最小原型）。
 
-        intervention 示例: {"POSTN": 0.0} 表示将该基因压到低表达。
+        intervention 示例: {"GENE_A": 0.0} 表示将该基因压到低表达。
         """
         if len(gene_names) != self.input_dim:
             raise ValueError("gene_names length mismatch with input_dim")
