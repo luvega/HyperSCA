@@ -1,0 +1,8 @@
+# Optional legacy baseline dependencies.
+#
+# scGen is not required by the HyperSCA pipeline. It is kept only for
+# reproducing historical perturbation baselines against CPA/scGen-style
+# methods. Keep it out of the core environment because current scgen releases
+# depend on scvi-tools internal APIs that are not compatible with modern
+# scvi-tools releases.
+scgen

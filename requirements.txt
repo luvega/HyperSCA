@@ -51,7 +51,6 @@ statsmodels
 pingouin
 
 # ---------- Perturbation and generation ----------
-scgen
 diffusers
 accelerate
 

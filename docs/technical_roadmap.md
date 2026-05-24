@@ -403,7 +403,7 @@ $$\mathbf{z}^{\text{pred}}_i = \text{Exp}_{\mathbf{z}^{\text{obs}}_i}\left(\text
 
 $$\hat{\mathbf{x}}^{\text{CF}}_i = \text{Decoder}(\mathbf{z}^{\text{pred}}_i)$$
 
-> **参考实现**（仅参考，不直接 import）：`references/CPA/` 中 `ComPertAPI.predict()` + `references/scgen/` 中 `SCGEN.predict()`。将通过 adapter 模式重写至 `src/perturbation/latent_arithmetic.py`。
+> **参考实现**（仅参考，不直接 import）：`references/CPA/` 中 `ComPertAPI.predict()` + `references/scgen/` 中 `SCGEN.predict()`。将通过 adapter 模式重写至 `src/perturbation/latent_arithmetic.py`。`scgen` 包本身不进入核心运行时，仅保留为复现历史 perturbation baseline 的可选依赖。
 
 ### 5.4 基于扩散模型的反事实生成 (Diffusion-based Counterfactual)（规划中）
 
@@ -444,12 +444,12 @@ $$\hat{\mathbf{x}}^{\text{CF}}_i = \text{Decoder}(\mathbf{z}^{\text{pred}}_i)$$
 | H3.1 | INHBA 虚拟敲除后，SPP1+ TAM 的 M2 标志物（CD163, MRC1）下调 | 反事实 vs 观测的 DEG 检验 + marker 方向一致性 | R² (mean), Marker Direction Acc |
 | H3.2 | POSTN 虚拟敲除后，空间上 T 细胞浸润深度增加（靠近肿瘤核心） | 反事实空间图中 T 细胞-肿瘤距离分布对比 | PCC, MSE |
 | H3.3 | 扰动效应沿因果图传播，且符合空间距离衰减规律 | Moran's I 变化 + 传播梯度分析 | Moran's I, Gradient Decay R² |
-| H3.4 | 扩散模型生成的反事实状态与 CPA/scGen 预测在关键 marker 方向上一致 | 跨方法 PCC/cosine similarity | PCC, DEG Overlap Jaccard |
+| H3.4 | 扩散模型生成的反事实状态与 CPA/scGen 类可选 baseline 在关键 marker 方向上一致 | 跨方法 PCC/cosine similarity | PCC, DEG Overlap Jaccard |
 
 ### 5.7 落地前置条件
 
 - **数据**: 阶段 1+2 完整输出 + 扰动相关先验或外部验证数据（文献 marker 集、公开 perturbation 结果）
-- **环境**: `scgen`, `diffusers` 已安装并验证
+- **环境**: `diffusers` 作为核心依赖安装并验证；`scgen` 仅作为可选历史 baseline，可通过 `requirements-optional-baselines.txt` 单独安装，缺失或兼容失败不阻断核心验证
 - **验收触发**: `scripts/run_step3.py` 对至少 3 个靶基因生成反事实预测，并通过 `evaluation/cf_metrics.py` + `evaluation/spatial_metrics.py` 最低阈值
 
 ---
@@ -511,9 +511,11 @@ $$\hat{\mathbf{x}}^{\text{CF}}_i = \text{Decoder}(\mathbf{z}^{\text{pred}}_i)$$
 | scvi-tools | 1.3.3 | 变分推断框架 | `validate_env.py` 通过 |
 | dowhy | 0.14 | 因果推断 | `validate_env.py` 通过 |
 | pgmpy | 1.0.0 | 概率图模型 | `validate_env.py` 通过 |
-| scgen | 2.1.1 | 扰动预测 | `validate_env.py` 通过 |
+| scgen | 2.1.x | 可选历史扰动 baseline | 非核心依赖；`validate_env.py` 仅 warning；Python 3.13 + scvi-tools 1.4.x 下存在 `scvi._compat` 兼容问题 |
 | diffusers | 0.36.0 | 扩散模型 | `validate_env.py` 通过 |
 | GPU | RTX 3070, CUDA 12.4 | 硬件加速 | `validate_env.py` 通过 |
+
+Python 3.13 实验环境记录（2026-05-24）：在 `.venv` 中验证 `torch 2.7.1+cu126`、`torch-geometric 2.7.0` 与 PyG CUDA 扩展可用，完整测试集通过；`scgen` 保持为可选 warning，不纳入主线环境要求。主线环境仍保留 Python 3.10。
 
 ## 附录 C：产物目录规范
 

@@ -92,11 +92,19 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 pip install torch-geometric -f https://data.pyg.org/whl/torch-2.6.0+cu124.html
 ```
 
+如需复现历史扰动 baseline，可额外安装可选依赖；核心流程不依赖 `scgen`：
+
+```bash
+pip install -r requirements-optional-baselines.txt
+```
+
 ### 3) Validate Runtime Environment
 
 ```bash
 python scripts/validate_env.py
 ```
+
+`scgen` 仅作为可选历史 baseline 检查；缺失或因 `scvi-tools` 版本不兼容导入失败时，验证脚本会报告 warning，但不会阻断 HyperSCA 核心环境。
 
 ## Quick Start
 
