@@ -1,53 +1,42 @@
 # HyperSCA 技术路线文档
 
 **Hyperbolic Spatiotemporal Causal Analysis (HyperSCA)**
-*版本: v2.0 | 日期: 2026-02-15 | 上次更新: 2026-02-15*
+*版本: v2.1 | 日期: 2026-06-12 | 上次更新: 2026-06-12*
 
 ---
 
 ## 当前实现状态
 
-> 本节基于仓库代码与数据事实，标注各组件的落地程度。文档后续章节中的算法描述为**设计路线**，不代表已全部实现。
+> 本节基于仓库代码与本轮验证结果，标注各组件的落地程度。后续章节中的数学公式和参考实现说明保留为**设计背景**；如出现早期“规划中”字样，以本节和 `docs/project_inventory.md` 为当前版本口径。
 
 ### 已完成（可运行并验证）
 
 | 组件 | 代码位置 | 验证方式 |
 |------|----------|----------|
-| 四模态数据加载与校验 | `src/data/loaders.py`, `src/data/validators.py` | 4/4 Example 脚本退出码 0 |
-| Chromium scRNA-seq 元数据 QC | `src/examples/metadata_qc.py` | `results/examples/example01/` |
-| Visium 空间 k-NN 图构建 | `src/examples/spatial_graph.py` | `results/examples/example02/` |
-| VisiumHD 细胞/核分割统计 | `src/examples/segmentation_stats.py` | `results/examples/example03/` |
-| Xenium 基因面板摘要 | `src/examples/gene_panel_summary.py` | `results/examples/example04/` |
-| 统一绘图风格系统 | `src/utils/plot_style.py` | 所有 `.png` 附带 `.meta.json` |
-| 增强可视化模板（14 种图型） | `src/examples/*.py` | 嵌套条形/Sunburst/空间着色/NC Ratio/面板 Dashboard 等 |
+| Data onboarding 与 schema | `src/data/`, `scripts/run_data_onboarding.py`, `scripts/build_canonical_schema.py` | 环境验证与相关单元测试 |
+| Stage 1 双曲嵌入 | `src/models/hyperbolic/`, `src/pipeline/step1_embedding.py` | Step1 / geometry / HVAE tests |
+| Stage 2 因果网络与信号流 | `src/causal/`, `src/pipeline/step2_causal.py` | Step2 pipeline / causal metrics tests |
+| Stage 3 反事实扰动 | `src/perturbation/`, `src/pipeline/step3_perturbation.py` | Step3 / perturbation tests |
+| Stage 4 动态干预与 roundtrip | `src/perturbation/`, `src/pipeline/step4_dynamic_intervention.py`, `src/pipeline/roundtrip_update.py` | Step4 / roundtrip tests |
+| 模块化靶点发现 | `src/discovery/target_discovery/`, `scripts/run_target_discovery.py` | `tests/discovery` |
+| Stage5 行为语法 sidecar | `src/behavior_grammar/`, `scripts/run_behavior_grammar_simulation.py` | `tests/behavior_grammar` |
 
-### 已有框架（Skeleton，可接入真实数据）
+### 兼容保留（可视化与展示）
 
-| 组件 | 代码位置 | 函数数量 | 当前行为 |
-|------|----------|----------|----------|
-| Phase 1 双曲嵌入可视化 | `src/visualization/hyperbolic.py` | 5 | 传入 None 时显示占位图 |
-| Phase 2 因果图可视化 | `src/visualization/causal.py` | 5 | 传入 None 时显示占位图 |
-| Phase 3 扰动可视化 | `src/visualization/perturbation.py` | 5 | 传入 None 时显示占位图 |
-
-### 待实现（规划中，无可运行代码）
-
-| 模块 | 规划位置 | 前置条件 |
+| 组件 | 代码位置 | 当前行为 |
 |------|----------|----------|
-| TopoLa 拓扑增强 | `src/data/spatial_graph.py` | 基础 k-NN 图已就绪（`src/examples/spatial_graph.py`） |
-| Hyperbolic VAE | `src/models/hyperbolic/` | 需表达矩阵 `.h5ad` + 空间坐标 |
-| 因果解缠 + CMI 剪枝 | `src/causal/` | 需阶段 1 双曲嵌入输出 |
-| 扰动算术 + 扩散反事实 | `src/perturbation/` | 需阶段 2 因果图 + 阶段 1 训练后解码器 |
-| 评估指标（全部） | `src/evaluation/` | 需对应阶段模型输出 |
-| 阶段流水线编排 | `src/pipeline/` | 需以上所有模块 |
+| 双曲嵌入可视化 | `src/visualization/hyperbolic.py` | 可接入真实 embedding，缺省输入时生成占位展示 |
+| 因果图可视化 | `src/visualization/causal.py` | 可接入真实 causal graph，缺省输入时生成占位展示 |
+| 扰动可视化 | `src/visualization/perturbation.py` | 可接入真实 perturbation artifacts，缺省输入时生成占位展示 |
 
 ### 数据现状
 
-| 数据集 | 当前可用文件 | 阶段 1-3 额外需求 |
-|--------|-------------|-------------------|
-| Chromium scRNA-seq | `cell_metadata.csv`（279,609 细胞） | 表达矩阵 `.h5ad`（含 raw counts） |
-| Visium ST | `tissue_positions.csv` + `scalefactors_json.json`（4,269 in-tissue spots） | 表达矩阵 `.h5ad` |
-| VisiumHD | `cell_segmentations.geojson` + `nucleus_segmentations.geojson`（220,704 细胞） | 表达矩阵 `.h5ad` |
-| Xenium | `experiment.xenium` + `gene_panel.json`（422 gene targets, 340,837 细胞） | 转录本矩阵 |
+| 数据层 | 当前状态 | 当前用途 |
+|--------|----------|----------|
+| 本地 `data/` | 忽略入库，按队列保存 scRNA/ST/metadata/reference assets | Step1-Step4、target discovery 与 notebook 复现 |
+| 本地 `results/` | 忽略入库，保存预计算和新运行产物 | README/notebook 展示、回归检查、Stage5 输入 |
+| Target discovery run manifest | `results/discovery/target_discovery/<run_id>/manifest.json` | Stage5 rule export 的主输入 |
+| Step4 context | `results/step4/` | Stage5 simulation summary 的可选上下文 |
 
 ---
 
@@ -97,47 +86,51 @@ HyperSCA 旨在：
 
 ## 2. 方法总览
 
-HyperSCA 框架分为 **Phase 0（数据底座）** 和 **三个递进算法阶段**，每一阶段的输出构成下一阶段的输入：
+HyperSCA 框架分为 **Phase D0（数据底座）**、**Stage 1-4 主算法链**、**模块化 target discovery** 和 **Stage5 行为语法 sidecar**。Stage1-4 负责从多组学数据到候选靶点、因果边、反事实和组合干预证据；Stage5 负责把这些证据翻译成可读细胞行为规则并运行轻量虚拟组织实验。
 
 > 说明：文中部分信号轴（如 POSTN/MFAP2/INHBA）用于肿瘤免疫场景示例说明，算法本身不依赖特定癌种，可迁移至其他具备空间组学与单细胞组学数据的疾病研究。
 
 ```
-Phase 0: 数据基线与可视化底座 ✅ 已完成
-  能力: 四模态数据加载 / 空间 k-NN 图 / 元数据 QC / 统一绘图风格
-  代码: src/data/, src/examples/, src/utils/plot_style.py
-  验收: scripts/run_examples_all.py → 4/4 通过
+Phase D0: 数据入库与标准化 ✅ 已完成
+  输入: scRNA/ST/临床或表型队列
+  输出: canonical schema、metadata、reference assets
 
-阶段 1: 双曲流形嵌入与多模态数据融合 ⏳ 规划中
-  输入: scRNA-seq (X) + ST 空间坐标 (S) + 基因表达 (X_st)
-  输出: 双曲潜变量 z ∈ H^d_K, 增强邻接矩阵 Ã
-  前置: 需补齐 .h5ad 表达矩阵
+Stage 1: 双曲流形嵌入与多模态融合 ✅ 已实现
+  输出: 双曲潜变量 z ∈ H^d_K、邻接矩阵、embedding metrics
 
-阶段 2: 空间约束下的因果通讯网络构建 ⏳ 规划中
-  输入: z, Ã, 配受体数据库 (CellChatDB / CellPhoneDB)
-  输出: 因果细胞图 G_causal, 多层信号流
-  前置: 需阶段 1 输出 + 配体-受体数据库版本冻结
+Stage 2: 空间约束因果通讯网络 ✅ 已实现
+  输出: 因果细胞图 G_causal、多层信号流、稳定性与可信度指标
 
-阶段 3: 微环境演化的扰动模拟与反事实预测 ⏳ 规划中
-  输入: G_causal, 训练后的 H-VAE 或 Diffusion 模型, 靶基因列表
-  输出: 反事实基因表达谱, 空间传播预测图
-  前置: 需阶段 1+2 完整输出
+Stage 3: 反事实扰动与空间传播 ✅ 已实现
+  输出: 反事实表达、传播 summary、target ranking 与质量指标
+
+Stage 4: 动态干预与 roundtrip 更新 ✅ 已实现
+  输出: PK/PD summary、组合排序、时序传播、实验回写对比
+
+Target discovery: 多源 CRC 证据整合 ✅ 已实现
+  输出: run-scoped manifest、候选池、几何比较、评分、niche mapping、报告和图
+
+Stage5: 行为语法与虚拟组织 sidecar ✅ 已实现
+  输出: rules.json/rules.md、population trajectories、simulation summary、QoI sensitivity
 ```
 
 ### 当前可运行范围
 
-Phase 0 已通过验收（`results/examples/run_log.txt` 显示 Passed: 4/4），提供以下可复用能力：
+当前主线已通过 `C:\h\python.exe` 环境验证和轻量测试回归，提供以下可复用能力：
 
-- **数据加载**: `load_chromium_meta()`, `load_visium_spatial()`, `load_visiumhd_geojson()`, `load_xenium_meta()`
-- **空间图构建**: `build_knn_edges(coords, k=6)` 基于 scipy KDTree，输出 `(source, target, distance)` 边表
-- **统一绘图**: `src/utils/plot_style.py` 提供 colorblind-friendly 色板、`save_figure()` 自动生成 `.meta.json`
-- **可视化模板**: 14 种图型覆盖细胞类型层级、空间着色、分割质量、面板组成等
-- **可视化 Skeleton**: `src/visualization/` 下 15 个占位函数，接口固定，数据就绪后直接填充
+- **双曲嵌入与因果推断**: `src/models/hyperbolic/`, `src/causal/`, `src/pipeline/step1_embedding.py`, `src/pipeline/step2_causal.py`
+- **反事实与动态干预**: `src/perturbation/`, `src/pipeline/step3_perturbation.py`, `src/pipeline/step4_dynamic_intervention.py`, `src/pipeline/roundtrip_update.py`
+- **多源靶点发现**: `src/discovery/target_discovery/`, `scripts/run_target_discovery.py`
+- **行为语法 sidecar**: `src/behavior_grammar/`, `scripts/run_behavior_grammar_simulation.py`
+- **可视化与报告**: `src/visualization/`, `scripts/generate_*_figures.py`, run-scoped manifests 和 `.meta.json`
 
 ---
 
 ## 3. 阶段 1：双曲流形嵌入与多模态数据融合
 
-### 3.1 当前仓库状态
+### 3.1 历史设计快照
+
+> 本小节保留早期实现计划中的组件拆分与目标位置，用于追溯设计来源；表中 `待实现` / `Skeleton` 是历史规划状态，不代表当前仓库实现状态。当前实现状态以本文顶部“当前实现状态”、`README.md` 和 `docs/project_inventory.md` 为准。
 
 | 子组件 | 状态 | 代码位置 |
 |--------|------|----------|
@@ -259,7 +252,9 @@ $$\mathcal{L}_{\text{H-VAE}} = \underbrace{-\mathbb{E}_{q(\mathbf{z}|\mathbf{X})
 
 ## 4. 阶段 2：空间约束下的因果通讯网络构建
 
-### 4.1 当前仓库状态
+### 4.1 历史设计快照
+
+> 本小节保留早期实现计划中的组件拆分与目标位置，用于追溯设计来源；表中 `待实现` / `Skeleton` 是历史规划状态，不代表当前仓库实现状态。当前实现状态以本文顶部“当前实现状态”、`README.md` 和 `docs/project_inventory.md` 为准。
 
 | 子组件 | 状态 | 代码位置 |
 |--------|------|----------|
@@ -362,7 +357,9 @@ $$\text{配体 (Ligand)} \xrightarrow{\text{分泌}} \text{受体 (Receptor)} \x
 
 ## 5. 阶段 3：微环境演化的扰动模拟与反事实预测
 
-### 5.1 当前仓库状态
+### 5.1 历史设计快照
+
+> 本小节保留早期实现计划中的组件拆分与目标位置，用于追溯设计来源；表中 `待实现` / `Skeleton` 是历史规划状态，不代表当前仓库实现状态。当前实现状态以本文顶部“当前实现状态”、`README.md` 和 `docs/project_inventory.md` 为准。
 
 | 子组件 | 状态 | 代码位置 |
 |--------|------|----------|
@@ -473,9 +470,10 @@ $$\hat{\mathbf{x}}^{\text{CF}}_i = \text{Decoder}(\mathbf{z}^{\text{pred}}_i)$$
 
 ---
 
-## 附录 A：参考框架映射表
+## 附录 A：历史参考框架映射表
 
 > `references/` 目录下的仓库**仅供参考**，代码通过 adapter 模式重写至 `src/`，禁止直接 `import`。
+> 本表是早期参考实现迁移计划，`当前状态` 列保留当时的历史规划语境；当前实现状态以本文顶部、`README.md` 和 `docs/project_inventory.md` 为准。
 
 | 阶段 | 组件 | 主要参考 | 参考仓库路径 | 目标实现位置 | 当前状态 |
 |------|------|----------|-------------|-------------|----------|
@@ -502,20 +500,20 @@ $$\hat{\mathbf{x}}^{\text{CF}}_i = \text{Decoder}(\mathbf{z}^{\text{pred}}_i)$$
 
 | 包 | 版本 | 用途 | 安装验证 |
 |---|------|------|---------|
-| Python | 3.10.19 | 运行环境 | `E:\ProgramData\Anaconda3\envs\hypersca\python.exe` |
+| Python | 3.10.20 | 运行环境 | `C:\h\python.exe` |
 | PyTorch | 2.6.0+cu124 | 深度学习框架 | `validate_env.py` 通过 |
-| torch-geometric | 2.7.0 | 图神经网络 | `validate_env.py` 通过 |
+| torch-geometric | 2.8.0 | 图神经网络 | `validate_env.py` 通过 |
 | geoopt | 0.5.1 | 双曲几何优化 | `validate_env.py` 通过 |
 | scanpy | 1.11.5 | 单细胞分析 | `validate_env.py` 通过 |
 | squidpy | 1.6.5 | 空间转录组工具 | `validate_env.py` 通过 |
 | scvi-tools | 1.3.3 | 变分推断框架 | `validate_env.py` 通过 |
 | dowhy | 0.14 | 因果推断 | `validate_env.py` 通过 |
-| pgmpy | 1.0.0 | 概率图模型 | `validate_env.py` 通过 |
-| scgen | 2.1.x | 可选历史扰动 baseline | 非核心依赖；`validate_env.py` 仅 warning；Python 3.13 + scvi-tools 1.4.x 下存在 `scvi._compat` 兼容问题 |
-| diffusers | 0.36.0 | 扩散模型 | `validate_env.py` 通过 |
+| pgmpy | 1.1.2 | 概率图模型 | `validate_env.py` 通过 |
+| scgen | 未安装 | 可选历史扰动 baseline | 非核心依赖；`validate_env.py` 仅 warning；Python 3.13 + scvi-tools 1.4.x 下存在 `scvi._compat` 兼容问题 |
+| diffusers | 0.38.0 | 扩散模型 | `validate_env.py` 通过 |
 | GPU | RTX 3070, CUDA 12.4 | 硬件加速 | `validate_env.py` 通过 |
 
-Python 3.13 实验环境记录（2026-05-24）：在 `.venv` 中验证 `torch 2.7.1+cu126`、`torch-geometric 2.7.0` 与 PyG CUDA 扩展可用，完整测试集通过；`scgen` 保持为可选 warning，不纳入主线环境要求。主线环境仍保留 Python 3.10。
+Python 3.13 实验环境记录（2026-05-24）：曾在 `.venv` 中验证 `torch 2.7.1+cu126`、`torch-geometric 2.7.0` 与 PyG CUDA 扩展可用；该环境已在 2026-06-12 清理，不作为当前主线入口。当前主线环境固定为 Python 3.10，以兼容 COMMOT、scvi-tools、DoWhy、pgmpy 与 PyG Windows wheel。
 
 ## 附录 C：产物目录规范
 

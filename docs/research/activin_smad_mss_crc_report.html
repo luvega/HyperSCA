@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HyperSCA MSS 型结肠癌 Activin-SMAD 通路研究报告</title>
+  <style>
+    :root {
+      --bg: #f7f8fa;
+      --panel: #ffffff;
+      --ink: #1f2430;
+      --muted: #626b7d;
+      --line: #dde2eb;
+      --blue: #2e4780;
+      --blue-soft: #eaf1fe;
+      --orange: #804126;
+      --orange-soft: #ffedde;
+      --olive: #386411;
+      --olive-soft: #eaf7df;
+      --gold-soft: #fff4c2;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif; line-height: 1.68; }
+    main { max-width: 1120px; margin: 0 auto; padding: 36px 24px 64px; }
+    header { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 32px; }
+    h1 { margin: 0 0 12px; font-size: 30px; line-height: 1.25; letter-spacing: 0; }
+    .subtitle { margin: 0; color: var(--muted); font-size: 15px; }
+    section { margin-top: 28px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 28px; }
+    h2 { margin: 0 0 14px; font-size: 22px; line-height: 1.32; letter-spacing: 0; }
+    h3 { margin: 22px 0 10px; font-size: 17px; letter-spacing: 0; }
+    p { margin: 10px 0; }
+    ul { margin: 10px 0 0 22px; padding: 0; }
+    li { margin: 7px 0; }
+    code { font-family: Consolas, "SF Mono", monospace; background: #f1f3f7; padding: 1px 5px; border-radius: 4px; }
+    .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 22px; }
+    .metric { border: 1px solid var(--line); border-radius: 8px; background: #fcfcfd; padding: 14px; min-height: 112px; }
+    .metric span { display: block; color: var(--muted); font-size: 13px; }
+    .metric strong { display: block; font-size: 26px; margin-top: 8px; }
+    .metric em { display: block; color: var(--muted); font-style: normal; font-size: 13px; margin-top: 4px; }
+    .callout { border-left: 4px solid var(--blue); background: var(--blue-soft); padding: 14px 16px; border-radius: 6px; margin: 16px 0; }
+    .warning { border-left-color: var(--orange); background: var(--orange-soft); }
+    .positive { border-left-color: var(--olive); background: var(--olive-soft); }
+    .two-col { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+    figure { margin: 18px 0; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fcfcfd; }
+    figure img { display: block; width: 100%; height: auto; border-radius: 4px; }
+    figcaption { margin-top: 10px; color: var(--muted); font-size: 13px; }
+    table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 14px; }
+    th, td { border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; padding: 9px 8px; }
+    th { background: #f3f5f8; font-weight: 650; }
+    .small { color: var(--muted); font-size: 13px; }
+    .tag { display: inline-block; border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px; margin: 2px 4px 2px 0; background: #fcfcfd; font-size: 12px; color: var(--muted); }
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .source-link { font-family: Consolas, monospace; font-size: 12px; }
+    footer { margin-top: 28px; color: var(--muted); font-size: 13px; }
+    @media (max-width: 820px) {
+      main { padding: 20px 12px 44px; }
+      header, section { padding: 20px; }
+      .metric-grid, .two-col { grid-template-columns: 1fr; }
+      h1 { font-size: 25px; }
+      table { font-size: 13px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+<header>
+  <h1>HyperSCA MSS 型结肠癌 Activin-SMAD 通路研究报告</h1>
+  <p class="subtitle">基于当前本地 HyperSCA integration/MVP discovery、OT flow 复现、Step3/Step4 与 root pipeline 输出的证据汇总。生成时间: 2026-06-12T20:54:44。</p>
+  <div class="metric-grid">
+    <div class="metric"><span>INHBA discovery rank</span><strong>#2</strong><em>score 0.792</em></div>
+<div class="metric"><span>Activin-SMAD flow</span><strong>6 edges</strong><em>complete, 4 layers</em></div>
+<div class="metric"><span>OT direction consistency</span><strong>1.000</strong><em>hyperbolic mode</em></div>
+<div class="metric"><span>Niche silhouette</span><strong>0.710</strong><em>+70.1% vs Euclidean</em></div>
+  </div>
+</header>
+
+<section>
+  <h2>技术摘要: INHBA-Activin A 轴在整合发现层面成立，但不能写成湿实验因果结论</h2>
+  <p><strong>当前最稳妥的结论是:</strong> HyperSCA 的整合/MVP discovery 结果支持一条 CAF-derived <code>INHBA</code>/Activin A → <code>ACVR1B</code>/<code>ACVR2A</code> → <code>SMAD2</code>/<code>SMAD3</code> → <code>FOXP3</code> 的 CAF→Treg Activin-SMAD 轴。该轴在 Step2 signaling flow 中为 complete pathway，包含 6 条边，覆盖 ligand、receptor、TF、target 四层；在 known-axis 检查中方向为 CAF→Treg，found_forward=true，found_reverse=false。</p>
+  <p><strong>INHBA 的靶点发现优先级较高:</strong> 在 5,873 个候选基因、20 个细胞类型的整合 discovery 报告中，<code>INHBA</code> 排名 #2，总分 0.792，其中 causal=1.000、spatial=0.860、actionability=1.000。Step3 receptor-level ranking 中，<code>INHBA→ACVR2A</code> priority=0.856，<code>INHBA→ACVR1B</code> priority=0.658。</p>
+  <p><strong>证据需要分层解释:</strong> OT flow 复现给出方向一致的空间通信支持，但 Hyperbolic 与 Euclidean 的 Activin-SMAD flow 非常接近；root 标准 Step2 因节点类型缺失未找到 CAF→Treg(INHBA) 轴，root Step3 在当前阈值下无候选。因此报告结论应写为“integration/MVP 层面支持、需要 spot/cell-level 与 wet-lab 验证”，而不是“已证明 Activin-SMAD 驱动 MSS 型 CRC 免疫抑制”。</p>
+</section>
+
+<section>
+  <h2>数据边界: 本报告总结当前本地结果，不做外部文献扩展</h2>
+  <div class="two-col">
+    <div>
+      <h3>主要本地证据</h3>
+      <ul>
+        <li>整合 discovery 主报告: <a class="source-link" href="../../results/integration/discovery/target_discovery_report.md">target_discovery_report.md</a>。</li>
+        <li>Hyperbolic Step2 flow: <a class="source-link" href="../../results/integration/discovery/hyperbolic/step2/flow_summary.json">flow_summary.json</a> 与 <a class="source-link" href="../../results/integration/discovery/hyperbolic/step2/flow_edges.json">flow_edges.json</a>。</li>
+        <li>INHBA Step3 扰动优先级: <a class="source-link" href="../../results/integration/discovery/hyperbolic/step3/targets_INHBA.csv">targets_INHBA.csv</a> 与 <a class="source-link" href="../../results/integration/discovery/hyperbolic/step3/step3_metrics.json">step3_metrics.json</a>。</li>
+        <li>空间通信复现: <a class="source-link" href="../../results/integration/discovery/communication_ot_reproduction/pathway_summary_all_modes.csv">pathway_summary_all_modes.csv</a> 与 <a class="source-link" href="../../docs/research/spatial_communication_ot_reproduction_summary.md">复现说明</a>。</li>
+        <li>不一致证据: <a class="source-link" href="../../results/step2/key_axes_evidence.json">root Step2 key_axes_evidence.json</a> 与 <a class="source-link" href="../../results/step3/step3_metrics.json">root Step3 metrics</a>。</li>
+      </ul>
+    </div>
+    <div>
+      <h3>队列和上下文</h3>
+      <p>候选池来自 scCRC_Neu 和 scCRC_ICB，cross-queue genes 为 704。ST_CRC_MSS 的 MSI inference 给出 inferred_status=MSS、confidence=medium、score=-0.686，且 MSS marker gene list 中包含 <code>INHBA</code>。这只支持“样本背景偏 MSS”，不能单独证明 Activin-SMAD 活性。</p>
+      <p><span class="tag">scCRC_Neu MSS vs MSI</span><span class="tag">scCRC_ICB response</span><span class="tag">ST_CRC_MSS</span><span class="tag">result-level MVP</span></p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>通路重建: CAF-derived INHBA 连接到 Treg FOXP3 程序</h2>
+  <p>Step2 signaling flow 将 Activin-SMAD 解析为两条 receptor 分支: <code>INHBA→ACVR1B→SMAD2→FOXP3</code> 和 <code>INHBA→ACVR2A→SMAD3→FOXP3</code>。两条分支共享 causal edge <code>CAF→Treg</code>，并共同指向 Treg 转录程序中的 <code>FOXP3</code>。</p>
+
+    <figure>
+      <img src="activin_smad_mss_crc_assets/signaling_flow.png" alt="HyperSCA signaling flow plot showing Activin-SMAD edges" loading="lazy">
+      <figcaption>Figure 1. 现有 signaling flow 图显示 Activin-SMAD 作为四层完整通路嵌入整体 CRC TME 机制网络。</figcaption>
+    </figure>
+
+  <p>结构化 flow edges 如下。注意 <code>ACVR1B</code> receptor_expr=0.000，而 <code>ACVR2A</code> receptor_expr=0.620；因此 receptor-level 干预优先级更偏向 <code>ACVR2A</code>，但 <code>ACVR1B</code> 仍被 prior-guided flow 保留。</p>
+  <table>
+    <thead><tr><th>层级</th><th>边</th><th>weight</th><th>causal edge</th><th>表达/活性字段</th></tr></thead>
+    <tbody>
+        <tr>
+          <td>0→1</td>
+          <td><code>INHBA</code> → <code>ACVR1B</code></td>
+          <td>0.247</td>
+          <td>CAF→Treg</td>
+          <td>ligand=5.077; receptor=0.000</td>
+        </tr>
+
+        <tr>
+          <td>1→2</td>
+          <td><code>ACVR1B</code> → <code>SMAD2</code></td>
+          <td>0.198</td>
+          <td>CAF→Treg</td>
+          <td>TF=2.851</td>
+        </tr>
+
+        <tr>
+          <td>2→3</td>
+          <td><code>SMAD2</code> → <code>FOXP3</code></td>
+          <td>0.148</td>
+          <td>CAF→Treg</td>
+          <td>target=5.056</td>
+        </tr>
+
+        <tr>
+          <td>0→1</td>
+          <td><code>INHBA</code> → <code>ACVR2A</code></td>
+          <td>0.300</td>
+          <td>CAF→Treg</td>
+          <td>ligand=5.077; receptor=0.620</td>
+        </tr>
+
+        <tr>
+          <td>1→2</td>
+          <td><code>ACVR2A</code> → <code>SMAD3</code></td>
+          <td>0.240</td>
+          <td>CAF→Treg</td>
+          <td>TF=2.413</td>
+        </tr>
+
+        <tr>
+          <td>2→3</td>
+          <td><code>SMAD3</code> → <code>FOXP3</code></td>
+          <td>0.180</td>
+          <td>CAF→Treg</td>
+          <td>target=5.056</td>
+        </tr></tbody>
+  </table>
+
+    <figure>
+      <img src="activin_smad_mss_crc_assets/chart_activin_smad_flow_edges.png" alt="Activin-SMAD flow edge weights chart" loading="lazy">
+      <figcaption>Figure 2. 报告专用小图按边权展示六条 Activin-SMAD flow edges，便于审阅权重和层级覆盖。</figcaption>
+    </figure>
+
+  <div class="callout positive">
+    <strong>解释:</strong> 这组结果支持“模型重建到完整 Activin-SMAD 轴”。但 known-axis 的 max_freq_forward、max_freq_reverse 和 arrow_strength 均为 0.0，提示该轴更像是 prior-guided/规则约束下的机制恢复，而不是由 bootstrap edge strength 独立支撑的强因果边。
+  </div>
+</section>
+
+<section>
+  <h2>表达和队列背景: INHBA 的 ICB response 信号强于单纯 MSS-vs-MSI 差异</h2>
+  <p>dataset audit 中，scCRC_ICB response 层面给出更强的 <code>INHBA</code> 变化: Fibroblast response Mid LFC=3.580、padj=1.10e-71；Macrophage response Mid LFC=2.450、padj=1.10e-16。相对地，scCRC_Neu MSS-vs-MSI 中 Macrophage LFC=-0.750、p=0.006、padj=0.068，更适合写为接近显著或上下文提示。</p>
+  <p>因此，INHBA 在本地结果中的主要叙事不是“泛 MSS 上调”，而是“在 MSS 型 CRC 的免疫治疗 response/non-response 与 CAF/TME 交互背景中，被整合 discovery 选为高优先级 anchor/pathway gene”。</p>
+</section>
+
+<section>
+  <h2>空间通信复现: Activin-SMAD 方向一致，但几何模式差异很小</h2>
+  <p>OT flow 复现将 Activin-SMAD 识别为 6 条 LR/TF/target flow edge。Hyperbolic 模式 total_flow=2.652、mean_flow=0.442、max_flow=0.524，top_source=Fibroblast_S1、top_target=T_cell_regulatory、direction_consistency_rate=1.000。Euclidean 模式 total_flow=2.653，与 Hyperbolic 基本相当。</p>
+  <table>
+    <thead><tr><th>mode</th><th>n_edges</th><th>total_flow</th><th>mean_flow</th><th>max_flow</th><th>top_source</th><th>top_target</th><th>direction consistency</th></tr></thead>
+    <tbody>
+        <tr>
+          <td>hyperbolic</td>
+          <td>6</td>
+          <td>2.652</td>
+          <td>0.442</td>
+          <td>0.524</td>
+          <td>Fibroblast_S1</td>
+          <td>T_cell_regulatory</td>
+          <td>1.000</td>
+        </tr>
+
+        <tr>
+          <td>euclidean</td>
+          <td>6</td>
+          <td>2.653</td>
+          <td>0.442</td>
+          <td>0.522</td>
+          <td>Fibroblast_S1</td>
+          <td>T_cell_regulatory</td>
+          <td>1.000</td>
+        </tr></tbody>
+  </table>
+
+    <figure>
+      <img src="activin_smad_mss_crc_assets/spatial_communication_ot_reproduction.png" alt="Spatial communication OT reproduction plot" loading="lazy">
+      <figcaption>Figure 3. 空间通信复现图作为 direction-constrained LR flow proxy，支持 Fibroblast 到 T_cell_regulatory 的方向一致性。</figcaption>
+    </figure>
+
+  <div class="callout warning">
+    <strong>方法边界:</strong> 当前复现是 distance-constrained LR communication flow proxy，不是严格 COMMOT；空间约束来自 blended geometry，而非原始 spot/cell-level 坐标和完整 mass/cost schema。direction forward 只能解释为空间通信方向一致，不能独立证明因果。
+  </div>
+</section>
+
+<section>
+  <h2>反事实扰动: receptor-level ranking 支持 ACVR2A 优先，但 root Step3 没有候选</h2>
+  <p>整合 discovery 的 Step3 对 <code>INHBA</code> 给出 2 个 receptor-level ranked candidates。<code>INHBA→ACVR2A</code> 的 combined_abs_delta=2.283、target_priority_score=0.856，高于 <code>INHBA→ACVR1B</code> 的 0.658。两个候选均记录 prior_hit=True，prior_sources=omnipath。</p>
+  <table>
+    <thead><tr><th>interaction</th><th>flow weight</th><th>delta ligand</th><th>delta receptor</th><th>combined abs delta</th><th>prior</th><th>priority</th></tr></thead>
+    <tbody>
+        <tr>
+          <td><code>INHBA</code> → <code>ACVR2A</code></td>
+          <td>0.300</td>
+          <td>-2.128</td>
+          <td>-0.155</td>
+          <td>2.283</td>
+          <td>omnipath</td>
+          <td>0.856</td>
+        </tr>
+
+        <tr>
+          <td><code>INHBA</code> → <code>ACVR1B</code></td>
+          <td>0.247</td>
+          <td>-2.128</td>
+          <td>0.000</td>
+          <td>2.128</td>
+          <td>omnipath</td>
+          <td>0.658</td>
+        </tr></tbody>
+  </table>
+
+    <figure>
+      <img src="activin_smad_mss_crc_assets/chart_inhba_target_priority.png" alt="INHBA receptor target priority chart" loading="lazy">
+      <figcaption>Figure 4. ACVR2A 分支在 Step3 ranking 中优先级最高，适合作为后续验证的第一 receptor branch。</figcaption>
+    </figure>
+
+  <p>INHBA 反事实质量指标显示 r2_mean=0.999953、r2_var=0.999078、MSE=1.12e-04、marker_direction_accuracy=1.000。空间传播方面，gradient_decay_r2=0.594，propagation_depth=2，spatial_causal_correlation=-0.406。</p>
+  <div class="callout warning">
+    <strong>冲突证据:</strong> root Step2 的 CAF→Treg(INHBA) axis found=false，原因是“Missing node type: src=CAF, tgt=Treg”；root Step3 中 INHBA n_candidates=0、top_score=0.000，解释文件也提示当前阈值下无候选。这说明报告主结论应限定在 integration/MVP discovery 层面。
+  </div>
+
+    <figure>
+      <img src="activin_smad_mss_crc_assets/chart_evidence_status.png" alt="Evidence status chart" loading="lazy">
+      <figcaption>Figure 5. 证据状态图将阳性整合结果和 root pipeline 阴性/缺失结果并列呈现。</figcaption>
+    </figure>
+
+</section>
+
+<section>
+  <h2>生态位和空间定位: INHBA 更接近 MonocyteRich/FibroRich 生态位背景</h2>
+  <p>统一 niche 结果显示 <code>INHBA</code> enriched niches 为 H3_N07_MonocyteRich (z=2.30), H2_N11_MonocyteRich (z=1.76), H2_N13_FibroRich (z=0.66)。多平台 niche metrics 中，Hyperbolic silhouette=0.710，Euclidean silhouette=0.417，相对提升约 70.1%；hierarchy correlation 为 Hyperbolic 1.000 vs Euclidean -0.569。这支持 Hyperbolic geometry 在统一生态位定义中更稳定，但不是 Activin-SMAD 特异性证明。</p>
+
+    <figure>
+      <img src="activin_smad_mss_crc_assets/chart_geometry_niche_metrics.png" alt="Geometry niche metrics chart" loading="lazy">
+      <figcaption>Figure 6. 双曲生态位指标优于欧氏指标，作为通路解释的空间生态位背景。</figcaption>
+    </figure>
+
+
+    <figure>
+      <img src="activin_smad_mss_crc_assets/visiumhd_gene_spatial_INHBA_all.png" alt="VisiumHD INHBA spatial plot" loading="lazy">
+      <figcaption>Figure 7. VisiumHD INHBA 空间图可作为定位背景；由于平台 gene coverage 与部分 meta 文件存在不一致，报告只把它用作可视化线索。</figcaption>
+    </figure>
+
+</section>
+
+<section>
+  <h2>动态干预: Step4 支持把 INHBA 纳入干预候选，但分辨率不足</h2>
+  <p>Step4 summary 包含 POSTN、MFAP2、INHBA 三个 targets，组合数 n_combo=6；top_combo 为 POSTN，不是 INHBA。dynamic_target_effects 中 INHBA final_mean_effect=1.000，active_nodes 为空列表。因此 Step4 只能说明 INHBA 已进入动态干预候选集合，不能据此判断 INHBA 是最优组合或具备明确节点级动态传播优势。</p>
+</section>
+
+<section>
+  <h2>结论和下一步验证</h2>
+  <div class="callout positive">
+    <strong>工作结论:</strong> 当前 HyperSCA 本地结果最支持的写法是: 在 result-level 多源整合和 prior-guided signaling flow 框架下，CAF-derived INHBA/Activin A 通过 ACVR2A/ACVR1B-SMAD3/SMAD2-FOXP3 分支连接到 Treg 免疫抑制程序；ACVR2A 分支是更优先的 receptor-level 验证对象。
+  </div>
+  <ul>
+    <li><strong>优先 wet-lab/空间验证:</strong> 在 MSS CRC 空间样本中联合检测 INHBA、ACVR2A、SMAD3、FOXP3 与 CAF/Treg 标记，确认空间邻近和细胞类型来源。</li>
+    <li><strong>优先计算复核:</strong> 在 spot/cell-level 表达矩阵和真实空间坐标上重跑严格 COMMOT 或等价 OT schema，避免 blended geometry proxy 带来的方向偏差。</li>
+    <li><strong>优先模型稳健性:</strong> 修复 root Step2 节点类型映射，使 CAF/Treg/TAM/CD8T 轴在标准 pipeline 与 integration pipeline 中可比。</li>
+    <li><strong>优先机制区分:</strong> 分开测试 ACVR2A-SMAD3 与 ACVR1B-SMAD2 两条分支，因为现有 receptor expression 和 Step3 priority 更支持 ACVR2A 分支。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>限制和审计记录</h2>
+  <ul>
+    <li>当前主证据来自 result-level MVP integration，不使用 raw UMI counts；表达和空间传播存在 proxy 依赖。</li>
+    <li>空间传播使用 MDS/blended geometry 相关坐标，不等同于真实组织空间几何。</li>
+    <li>Activin-SMAD 是 prior-guided pathway flow，axis evidence 中 bootstrap arrow strength 为 0.0，应避免过强因果措辞。</li>
+    <li>root Step2/Step3 未独立复现 CAF→Treg(INHBA) 阳性结果，这是报告中保留的主要反证/缺口。</li>
+    <li>本报告没有进行外部文献系统综述；任何与已发表文献的一致性都需要单独检索和引用。</li>
+  </ul>
+  <p><strong>AI Disclosure:</strong> 本报告由 AI 辅助研究工具根据本地 HyperSCA 输出生成。关键数值来自本地 JSON、CSV、Markdown 和 PNG 资产，未加入未经验证的外部文献结论；最终科学解释仍需人工审阅和实验验证。</p>
+</section>
+
+<section>
+  <h2>本地来源索引</h2>
+  <p class="small">完整证据快照: <a class="source-link" href="activin_smad_mss_crc_assets/source_inventory.csv">source_inventory.csv</a>，结构化 JSON: <a class="source-link" href="activin_smad_mss_crc_assets/evidence_snapshot.json">evidence_snapshot.json</a>。</p>
+  <table>
+    <thead><tr><th>证据角色</th><th>本地文件</th></tr></thead>
+    <tbody><tr><td>Discovery 主报告</td><td><a class="source-link" href="../../results/integration/discovery/target_discovery_report.md">target_report</a></td></tr>
+<tr><td>Step2 flow summary</td><td><a class="source-link" href="../../results/integration/discovery/hyperbolic/step2/flow_summary.json">flow_summary</a></td></tr>
+<tr><td>Step2 flow edges</td><td><a class="source-link" href="../../results/integration/discovery/hyperbolic/step2/flow_edges.json">flow_edges</a></td></tr>
+<tr><td>known-axis evidence</td><td><a class="source-link" href="../../results/integration/discovery/hyperbolic/step2/axis_results.json">axis_results</a></td></tr>
+<tr><td>INHBA Step3 priorities</td><td><a class="source-link" href="../../results/integration/discovery/hyperbolic/step3/targets_INHBA.csv">step3_targets</a></td></tr>
+<tr><td>INHBA CF/spatial metrics</td><td><a class="source-link" href="../../results/integration/discovery/hyperbolic/step3/step3_metrics.json">step3_metrics</a></td></tr>
+<tr><td>OT pathway summary</td><td><a class="source-link" href="../../results/integration/discovery/communication_ot_reproduction/pathway_summary_all_modes.csv">ot_pathway_summary</a></td></tr>
+<tr><td>dataset audit</td><td><a class="source-link" href="../../results/integration/audit/dataset_audit.md">dataset_audit</a></td></tr>
+<tr><td>ST_CRC_MSS MSI inference</td><td><a class="source-link" href="../../results/integration/msi_inference/ST_CRC_MSS_msi_inference.json">msi_inference</a></td></tr>
+<tr><td>niche metrics</td><td><a class="source-link" href="../../results/integration/discovery/niche/niche_hierarchy_metrics.json">niche_metrics</a></td></tr>
+<tr><td>root Step2 caveat</td><td><a class="source-link" href="../../results/step2/key_axes_evidence.json">root_axis</a></td></tr>
+<tr><td>root Step3 caveat</td><td><a class="source-link" href="../../results/step3/step3_metrics.json">root_step3_metrics</a></td></tr>
+<tr><td>dynamic intervention summary</td><td><a class="source-link" href="../../results/step4/step4_summary.json">step4_summary</a></td></tr></tbody>
+  </table>
+</section>
+
+<footer>
+  <p>Generated from local HyperSCA artifacts in <code>E:\Codex_Projects\HyperSCA</code>. This report is a static HTML artifact and does not depend on live notebooks or ignored <code>results/</code> images for embedded figures.</p>
+</footer>
+</main>
+</body>
+</html>

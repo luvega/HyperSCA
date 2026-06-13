@@ -1,0 +1,13 @@
+{
+  "generated": [
+    "docs\\research\\hypersca_update_result_comparison_plan.md",
+    "docs\\research\\hypersca_update_comparison_matrix.csv",
+    "docs\\research\\hypersca_update_capability_scores.csv",
+    "docs\\research\\hypersca_update_output_coverage.csv",
+    "docs\\research\\figures\\hypersca_update_capability_scores.png",
+    "docs\\research\\figures\\hypersca_update_output_coverage.png"
+  ],
+  "baseline": "current branch HEAD",
+  "current": "working tree update",
+  "comparison_type": "contract-level readiness and output coverage; not biological efficacy"
+}

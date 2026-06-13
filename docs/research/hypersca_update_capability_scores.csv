@@ -1,0 +1,13 @@
+﻿capability,version,score
+因果图稳定性与负控审计,previous_HEAD,0.35
+LR→TF→target 机制证据分解,previous_HEAD,0.4
+空间通信 OT/flow 对照,previous_HEAD,0.3
+target discovery 默认流程可见性,previous_HEAD,0.55
+文档状态一致性,previous_HEAD,0.45
+测试与可复现性护栏,previous_HEAD,0.5
+因果图稳定性与负控审计,current_update,0.9
+LR→TF→target 机制证据分解,current_update,0.88
+空间通信 OT/flow 对照,current_update,0.82
+target discovery 默认流程可见性,current_update,0.9
+文档状态一致性,current_update,0.88
+测试与可复现性护栏,current_update,0.92

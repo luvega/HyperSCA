@@ -1,0 +1,519 @@
+{
+  "generated_at": "2026-06-12T20:54:44",
+  "report_title": "Activin-SMAD 通路在 MSS 型结肠癌 HyperSCA 分析中的证据汇总",
+  "scope": {
+    "primary_question": "当前 HyperSCA 本地结果对 MSS 型结肠癌中 Activin-SMAD 通路给出了哪些证据、限制与后续验证方向？",
+    "evidence_policy": "local HyperSCA outputs first; no external literature expansion",
+    "delivery": "static HTML technical report"
+  },
+  "source_inventory": [
+    {
+      "id": "target_report",
+      "path": "results/integration/discovery/target_discovery_report.md",
+      "role": "local evidence source"
+    },
+    {
+      "id": "comparison_report",
+      "path": "results/integration/comparison_report.md",
+      "role": "local evidence source"
+    },
+    {
+      "id": "ot_summary_md",
+      "path": "docs/research/spatial_communication_ot_reproduction_summary.md",
+      "role": "local evidence source"
+    },
+    {
+      "id": "flow_summary",
+      "path": "results/integration/discovery/hyperbolic/step2/flow_summary.json",
+      "role": "local evidence source"
+    },
+    {
+      "id": "flow_edges",
+      "path": "results/integration/discovery/hyperbolic/step2/flow_edges.json",
+      "role": "local evidence source"
+    },
+    {
+      "id": "axis_results",
+      "path": "results/integration/discovery/hyperbolic/step2/axis_results.json",
+      "role": "local evidence source"
+    },
+    {
+      "id": "step3_targets",
+      "path": "results/integration/discovery/hyperbolic/step3/targets_INHBA.csv",
+      "role": "local evidence source"
+    },
+    {
+      "id": "step3_metrics",
+      "path": "results/integration/discovery/hyperbolic/step3/step3_metrics.json",
+      "role": "local evidence source"
+    },
+    {
+      "id": "ot_pathway_summary",
+      "path": "results/integration/discovery/communication_ot_reproduction/pathway_summary_all_modes.csv",
+      "role": "local evidence source"
+    },
+    {
+      "id": "ot_top_edges",
+      "path": "results/integration/discovery/communication_ot_reproduction/top_lr_flow_edges_all_modes.csv",
+      "role": "local evidence source"
+    },
+    {
+      "id": "dataset_audit",
+      "path": "results/integration/audit/dataset_audit.md",
+      "role": "local evidence source"
+    },
+    {
+      "id": "msi_inference",
+      "path": "results/integration/msi_inference/ST_CRC_MSS_msi_inference.json",
+      "role": "local evidence source"
+    },
+    {
+      "id": "niche_metrics",
+      "path": "results/integration/discovery/niche/niche_hierarchy_metrics.json",
+      "role": "local evidence source"
+    },
+    {
+      "id": "root_axis",
+      "path": "results/step2/key_axes_evidence.json",
+      "role": "local evidence source"
+    },
+    {
+      "id": "root_step3_metrics",
+      "path": "results/step3/step3_metrics.json",
+      "role": "local evidence source"
+    },
+    {
+      "id": "root_step3_interpretation",
+      "path": "results/step3/interpretation_targets_INHBA.md",
+      "role": "local evidence source"
+    },
+    {
+      "id": "step4_dynamic",
+      "path": "results/step4/dynamic_target_effects.json",
+      "role": "local evidence source"
+    },
+    {
+      "id": "step4_summary",
+      "path": "results/step4/step4_summary.json",
+      "role": "local evidence source"
+    }
+  ],
+  "discovery_overview": {
+    "candidate_pool_genes": 5873,
+    "cell_types": 20,
+    "anchor_genes": [
+      "MFAP2",
+      "POSTN",
+      "INHBA"
+    ],
+    "runtime_seconds": 6235.5,
+    "cross_queue_genes": 704,
+    "inhba": {
+      "rank": 2,
+      "score": 0.792,
+      "causal": 1.0,
+      "spatial": 0.86,
+      "consistency": 0.49,
+      "actionability": 1.0,
+      "niche": 0.7,
+      "anchor": true,
+      "ifng_context": true
+    },
+    "inhba_enriched_niches": "H3_N07_MonocyteRich (z=2.30), H2_N11_MonocyteRich (z=1.76), H2_N13_FibroRich (z=0.66)"
+  },
+  "pathway_reconstruction": {
+    "activin_smad_summary": {
+      "pathway": "Activin-SMAD",
+      "n_edges": 6,
+      "complete": true,
+      "avg_weight": 0.21899999999999997,
+      "layers_covered": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    "axis_evidence": {
+      "name": "CAF→Treg (INHBA)",
+      "source_type": "CAF",
+      "target_type": "Treg",
+      "found": true,
+      "found_forward": true,
+      "found_reverse": false,
+      "correct_direction": true,
+      "max_freq_forward": 0.0,
+      "max_freq_reverse": 0.0,
+      "arrow_strength": 0.0,
+      "evidence": "INHBA→ACVR1B/2A→SMAD2/3→Foxp3 axis: CAF-derived activin A promotes regulatory T cell differentiation and immunosuppression in CRC."
+    },
+    "flow_edges": [
+      {
+        "source_layer": 0,
+        "source": "INHBA",
+        "target_layer": 1,
+        "target": "ACVR1B",
+        "weight": 0.24749999999999997,
+        "causal_edge": "CAF→Treg",
+        "pathway": "Activin-SMAD",
+        "ligand_expr": 5.077175380634054,
+        "receptor_expr": 0.0
+      },
+      {
+        "source_layer": 1,
+        "source": "ACVR1B",
+        "target_layer": 2,
+        "target": "SMAD2",
+        "weight": 0.19799999999999998,
+        "causal_edge": "CAF→Treg",
+        "pathway": "Activin-SMAD",
+        "tf_expr": 2.8508003014277783
+      },
+      {
+        "source_layer": 2,
+        "source": "SMAD2",
+        "target_layer": 3,
+        "target": "FOXP3",
+        "weight": 0.14849999999999997,
+        "causal_edge": "CAF→Treg",
+        "pathway": "Activin-SMAD",
+        "target_expr": 5.055903367181155
+      },
+      {
+        "source_layer": 0,
+        "source": "INHBA",
+        "target_layer": 1,
+        "target": "ACVR2A",
+        "weight": 0.3,
+        "causal_edge": "CAF→Treg",
+        "pathway": "Activin-SMAD",
+        "ligand_expr": 5.077175380634054,
+        "receptor_expr": 0.6202168802549918
+      },
+      {
+        "source_layer": 1,
+        "source": "ACVR2A",
+        "target_layer": 2,
+        "target": "SMAD3",
+        "weight": 0.24,
+        "causal_edge": "CAF→Treg",
+        "pathway": "Activin-SMAD",
+        "tf_expr": 2.4129513462056598
+      },
+      {
+        "source_layer": 2,
+        "source": "SMAD3",
+        "target_layer": 3,
+        "target": "FOXP3",
+        "weight": 0.18,
+        "causal_edge": "CAF→Treg",
+        "pathway": "Activin-SMAD",
+        "target_expr": 5.055903367181155
+      }
+    ]
+  },
+  "counterfactual_step3": {
+    "target_priorities": [
+      {
+        "ligand": "INHBA",
+        "receptor": "ACVR2A",
+        "causal_edge": "CAF→Treg",
+        "source_type": "CAF",
+        "target_type": "Treg",
+        "pathway": "Activin-SMAD",
+        "flow_weight": 0.3,
+        "delta_ligand": -2.1281215086993988,
+        "delta_receptor": -0.1550542200637479,
+        "combined_abs_delta": 2.2831757287631467,
+        "prior_hit": true,
+        "prior_sources": "omnipath",
+        "target_priority_score": 0.85619089828618
+      },
+      {
+        "ligand": "INHBA",
+        "receptor": "ACVR1B",
+        "causal_edge": "CAF→Treg",
+        "source_type": "CAF",
+        "target_type": "Treg",
+        "pathway": "Activin-SMAD",
+        "flow_weight": 0.2474999999999999,
+        "delta_ligand": -2.1281215086993988,
+        "delta_receptor": 0.0,
+        "combined_abs_delta": 2.1281215086993988,
+        "prior_hit": true,
+        "prior_sources": "omnipath",
+        "target_priority_score": 0.6583875917538764
+      }
+    ],
+    "inhba_metrics": {
+      "n_ranked": 2,
+      "cf_quality": {
+        "r2_mean": 0.9999531404777487,
+        "r2_var": 0.9990781247778948,
+        "pcc_median": 1.0,
+        "mse": 0.00011151735601063954,
+        "marker_direction_accuracy": 1.0
+      },
+      "spatial_quality": {
+        "morans_i_obs": 0.055166719808379186,
+        "morans_i_cf": 0.055166719808379186,
+        "delta_morans_i": 0.0,
+        "gradient_decay_r2": 0.5935694496672123,
+        "characteristic_length": 0.303741532607676,
+        "propagation_depth": 2,
+        "spatial_causal_correlation": -0.40588311382234715
+      },
+      "propagation": {
+        "n_layers": 3,
+        "fit_params": {
+          "ell": 1.0,
+          "r2": 0.5935694496672123
+        }
+      }
+    }
+  },
+  "spatial_communication_ot": {
+    "pathway_summary_all_modes": [
+      {
+        "mode": "hyperbolic",
+        "pathway": "Activin-SMAD",
+        "n_edges": 6,
+        "total_flow": 2.6516964735765343,
+        "mean_flow": 0.4419494122627557,
+        "max_flow": 0.5235563360094343,
+        "top_source": "Fibroblast_S1",
+        "top_target": "T_cell_regulatory",
+        "causal_forward_count": 6,
+        "causal_reverse_count": 0,
+        "ambiguous_count": 0,
+        "unresolved_count": 0,
+        "direction_consistency_rate": 1.0
+      },
+      {
+        "mode": "euclidean",
+        "pathway": "Activin-SMAD",
+        "n_edges": 6,
+        "total_flow": 2.653050016574035,
+        "mean_flow": 0.4421750027623392,
+        "max_flow": 0.5223323575624643,
+        "top_source": "Fibroblast_S1",
+        "top_target": "T_cell_regulatory",
+        "causal_forward_count": 6,
+        "causal_reverse_count": 0,
+        "ambiguous_count": 0,
+        "unresolved_count": 0,
+        "direction_consistency_rate": 1.0
+      }
+    ],
+    "hyperbolic_top_edges": [
+      {
+        "rank_in_mode": 18,
+        "mode": "hyperbolic",
+        "pathway": "Activin-SMAD",
+        "ligand": "INHBA",
+        "receptor": "ACVR2A",
+        "tf": "SMAD3",
+        "target_gene": "FOXP3",
+        "source_type": "CAF",
+        "target_type": "Treg",
+        "source_node": "Fibroblast_S1",
+        "target_node": "T_cell_regulatory",
+        "ligand_expr": 3.130204470517434,
+        "receptor_expr": 0.6202168802549918,
+        "tf_expr": 2.41295134620566,
+        "target_expr": 5.055903367181155,
+        "missing_genes": NaN,
+        "spatial_weight": 0.1080527839445394,
+        "geometry_distance": 0.4022740645603113,
+        "geometry_weight": 0.6687974268981619,
+        "blended_weight": 0.5235563360094343,
+        "flow_score": 0.5235563360094343,
+        "normalized_flow": 0.8281137346569832,
+        "causal_forward": true,
+        "causal_reverse": false,
+        "direction_status": "forward"
+      },
+      {
+        "rank_in_mode": 21,
+        "mode": "hyperbolic",
+        "pathway": "Activin-SMAD",
+        "ligand": "INHBA",
+        "receptor": "ACVR2A",
+        "tf": "SMAD3",
+        "target_gene": "FOXP3",
+        "source_type": "CAF",
+        "target_type": "Treg",
+        "source_node": "Fibroblast_S2",
+        "target_node": "T_cell_regulatory",
+        "ligand_expr": 4.561349201044903,
+        "receptor_expr": 0.6202168802549918,
+        "tf_expr": 2.41295134620566,
+        "target_expr": 5.055903367181155,
+        "missing_genes": NaN,
+        "spatial_weight": 0.0,
+        "geometry_distance": 0.4012481130712987,
+        "geometry_weight": 0.6694839327147516,
+        "blended_weight": 0.4962755031636785,
+        "flow_score": 0.4962755031636785,
+        "normalized_flow": 0.7849633975898284,
+        "causal_forward": true,
+        "causal_reverse": false,
+        "direction_status": "forward"
+      },
+      {
+        "rank_in_mode": 22,
+        "mode": "hyperbolic",
+        "pathway": "Activin-SMAD",
+        "ligand": "INHBA",
+        "receptor": "ACVR2A",
+        "tf": "SMAD3",
+        "target_gene": "FOXP3",
+        "source_type": "CAF",
+        "target_type": "Treg",
+        "source_node": "Fibroblast_S3",
+        "target_node": "T_cell_regulatory",
+        "ligand_expr": 5.077175380634054,
+        "receptor_expr": 0.6202168802549918,
+        "tf_expr": 2.41295134620566,
+        "target_expr": 5.055903367181155,
+        "missing_genes": NaN,
+        "spatial_weight": 0.0452425597305047,
+        "geometry_distance": 0.4499280664767531,
+        "geometry_weight": 0.6376740201109621,
+        "blended_weight": 0.4954232885849066,
+        "flow_score": 0.4954232885849066,
+        "normalized_flow": 0.7836154421760232,
+        "causal_forward": true,
+        "causal_reverse": false,
+        "direction_status": "forward"
+      }
+    ]
+  },
+  "niche_and_msi_context": {
+    "niche_metrics": {
+      "n_spots": 485362,
+      "n_niches": 18,
+      "selected_k": 18,
+      "silhouette_hyperbolic": 0.7101950278792976,
+      "silhouette_euclidean": 0.4174363523000069,
+      "hierarchy_corr_hyperbolic": 1.0,
+      "hierarchy_corr_euclidean": -0.5686193658265504,
+      "source_stats": {
+        "st_visium_rows": 205362,
+        "cosmx_rows": 160000,
+        "visiumhd_rows": 120000,
+        "merged_rows": 485362
+      },
+      "niche_color_map_path": "E:\\HyperSCA\\results\\integration\\discovery\\niche\\niche_color_map.json",
+      "niche_hierarchy_path": "E:\\HyperSCA\\results\\integration\\discovery\\niche\\niche_hierarchy.json"
+    },
+    "msi_inference": {
+      "inferred_status": "MSS",
+      "confidence": "medium",
+      "score": -0.6855390808965885,
+      "gene_coverage": 1.0,
+      "mss_genes_found_includes_INHBA": true
+    }
+  },
+  "dataset_audit_inhba": {
+    "scCRC_Neu_MSS_vs_MSI": {
+      "macrophage_lfc": -0.75,
+      "macrophage_p": 0.006,
+      "macrophage_padj": 0.068,
+      "fibroblast_s1_lfc": -0.53,
+      "fibroblast_s2_lfc": 0.14,
+      "fibroblast_s3_lfc": 0.005
+    },
+    "scCRC_ICB_response": {
+      "DEGs_MSS_Mid_Fibro_lfc": -0.73,
+      "DEGs_MSS_Mid_Fibro_padj": 3.5e-67,
+      "DEGs_response_Mid_Fibro_lfc": 3.58,
+      "DEGs_response_Mid_Fibro_padj": 1.1e-71,
+      "DEGs_response_Mid_Mph_lfc": 2.45,
+      "DEGs_response_Mid_Mph_padj": 1.1e-16
+    }
+  },
+  "root_pipeline_caveats": {
+    "root_step2_known_axis_recall": 0.0,
+    "root_step2_inhba_axis": {
+      "name": "CAF→Treg (INHBA)",
+      "found": false,
+      "correct_direction": false,
+      "reason": "Missing node type: src=CAF, tgt=Treg"
+    },
+    "root_step3_inhba": {
+      "n_candidates": 0,
+      "top_score": 0.0,
+      "prior_hit_rate": 0.0,
+      "score_p95": 0.0,
+      "score_median": 0.0,
+      "top_pathway": "",
+      "delta_target_gene_mean_expr": -0.3596099301108292,
+      "dashboard_metrics": {
+        "r2_mean": 0.9995460777674191,
+        "pcc_median": 0.9997731068061663,
+        "mse": 4.310643394477182e-05,
+        "marker_direction_accuracy": 1.0
+      },
+      "n_candidates_raw": 0,
+      "n_candidates_filtered": 0,
+      "false_positive_reduction_rate": 0.0,
+      "method": "latent_arithmetic",
+      "cf_quality": {
+        "r2_mean": 0.9995460777674191,
+        "r2_var": 0.9977747827309668,
+        "pcc_median": 1.0,
+        "mse": 8.29329066459382e-05,
+        "marker_direction_accuracy": 1.0
+      },
+      "spatial_quality": {
+        "morans_i_obs": -0.06199422393448653,
+        "morans_i_cf": -0.06199422393448653,
+        "delta_morans_i": 0.0,
+        "gradient_decay_r2": 0.0,
+        "characteristic_length": 0.0,
+        "propagation_depth": 0,
+        "spatial_causal_correlation": 0.0
+      },
+      "propagation_fit_params": {
+        "ell": 150.0,
+        "r2": 0.0
+      }
+    },
+    "root_step3_interpretation_contains_no_candidates": true
+  },
+  "dynamic_step4": {
+    "summary": {
+      "targets": [
+        "POSTN",
+        "MFAP2",
+        "INHBA"
+      ],
+      "n_targets": 3,
+      "top_combo": {
+        "combo": "POSTN",
+        "size": 1,
+        "effect": 1.0,
+        "synergy_bliss": 0.0
+      },
+      "n_combo": 6,
+      "elapsed_seconds": 0.25
+    },
+    "inhba_final_mean_effect": 1.0,
+    "inhba_active_nodes": []
+  },
+  "asset_paths": {
+    "signaling_flow": "activin_smad_mss_crc_assets/signaling_flow.png",
+    "ot_reproduction": "activin_smad_mss_crc_assets/spatial_communication_ot_reproduction.png",
+    "visiumhd_inhba_spatial": "activin_smad_mss_crc_assets/visiumhd_gene_spatial_INHBA_all.png",
+    "causal_dag": "activin_smad_mss_crc_assets/causal_dag.png",
+    "flow_edges_chart": "activin_smad_mss_crc_assets/chart_activin_smad_flow_edges.png",
+    "target_priority_chart": "activin_smad_mss_crc_assets/chart_inhba_target_priority.png",
+    "geometry_niche_chart": "activin_smad_mss_crc_assets/chart_geometry_niche_metrics.png",
+    "evidence_status_chart": "activin_smad_mss_crc_assets/chart_evidence_status.png",
+    "activin_edges_csv": "activin_smad_mss_crc_assets/activin_smad_flow_edges.csv",
+    "step3_targets_csv": "activin_smad_mss_crc_assets/inhba_step3_target_priorities.csv",
+    "ot_edges_csv": "activin_smad_mss_crc_assets/activin_smad_ot_hyperbolic_edges.csv",
+    "source_inventory_csv": "activin_smad_mss_crc_assets/source_inventory.csv"
+  }
+}

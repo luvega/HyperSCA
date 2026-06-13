@@ -112,6 +112,14 @@ class TestPolarProject:
         inner = lorentzian_inner(z, z, keepdim=False)
         assert torch.allclose(inner, torch.tensor(-1.0).expand(16), atol=5e-4)
 
+    def test_large_float32_input_on_manifold(self):
+        """大半径 float32 输入仍需保持可验证的流形约束"""
+        torch.manual_seed(75)
+        x = torch.randn(16, 8) * 1.0
+        z = polar_project(x)
+        inner = lorentzian_inner(z, z, keepdim=False)
+        assert torch.allclose(inner, torch.tensor(-1.0).expand(16), atol=5e-4)
+
     def test_output_dimension(self):
         """输出维度 = 输入维度 + 1"""
         x = torch.randn(4, 10)

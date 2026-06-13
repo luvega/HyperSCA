@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 EPS = 1e-7
 MAX_NORM = 50.0  # 防止 cosh/sinh 溢出的最大范数
+FLOAT32_POLAR_MAX_NORM = 4.0  # 避免 Lorentz 大数相减导致 float32 流形约束漂移
 
 
 # =========================================================================
@@ -269,7 +270,8 @@ def polar_project(x: torch.Tensor) -> torch.Tensor:
     """
     x_norm = torch.norm(x, p=2, dim=-1, keepdim=True)
     x_unit = x / torch.clamp(x_norm, min=EPS)
-    x_norm = torch.clamp(x_norm, max=MAX_NORM)
+    max_norm = FLOAT32_POLAR_MAX_NORM if x.dtype == torch.float32 else MAX_NORM
+    x_norm = torch.clamp(x_norm, max=max_norm)
 
     time = torch.cosh(x_norm)
     spatial = torch.sinh(x_norm) * x_unit

@@ -20,8 +20,10 @@ def default_icb_data_mode_detector(config: TargetDiscoveryConfig) -> str:
 
 def default_target_discovery_stages():
     from src.discovery.target_discovery.causal_stage import CausalDiscoveryStage
+    from src.discovery.target_discovery.communication_flow import CommunicationFlowStage
     from src.discovery.target_discovery.heavy_stages import EvidenceScoringStage, GeometryComparisonStage, ReportAndFigureStage
     from src.discovery.target_discovery.lightweight_stages import CandidateDiscoveryStage, ExpressionAssemblyStage, SpatialContextStage
+    from src.discovery.target_discovery.mechanism_evidence import MechanismEvidenceStage
     from src.discovery.target_discovery.niche import UnifiedNicheStage
     from src.discovery.target_discovery.perturbation_stage import PerturbationScreenStage
 
@@ -31,8 +33,10 @@ def default_target_discovery_stages():
         SpatialContextStage(),
         GeometryComparisonStage(),
         CausalDiscoveryStage(),
+        CommunicationFlowStage(),
         PerturbationScreenStage(),
         EvidenceScoringStage(),
+        MechanismEvidenceStage(),
         UnifiedNicheStage(),
         ReportAndFigureStage(),
     ]
