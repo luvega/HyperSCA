@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Activin / INHBA 靶点机制论证报告</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #1f2933;
+      --muted: #5f6b7a;
+      --line: #d9e2ec;
+      --band: #f6f8fb;
+      --accent: #0b5cad;
+      --accent-soft: #e7f0fb;
+      --warn: #7a4b00;
+      --warn-soft: #fff4d6;
+      --good: #126c43;
+      --good-soft: #e7f6ee;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+      color: var(--ink);
+      background: #ffffff;
+      line-height: 1.68;
+    }
+    main {
+      width: min(1160px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 34px 0 56px;
+    }
+    header {
+      border-bottom: 2px solid var(--line);
+      padding-bottom: 18px;
+      margin-bottom: 26px;
+    }
+    h1 {
+      font-size: 30px;
+      line-height: 1.25;
+      margin: 0 0 12px;
+      letter-spacing: 0;
+    }
+    h2 {
+      font-size: 22px;
+      margin: 34px 0 12px;
+      border-left: 5px solid var(--accent);
+      padding-left: 10px;
+    }
+    h3 {
+      font-size: 17px;
+      margin: 22px 0 8px;
+    }
+    p { margin: 8px 0 12px; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .meta {
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .abstract, .callout, .caveat {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px 18px;
+      background: var(--band);
+      margin: 18px 0;
+    }
+    .callout {
+      border-color: #bdd7f0;
+      background: var(--accent-soft);
+    }
+    .caveat {
+      border-color: #f0d38a;
+      background: var(--warn-soft);
+      color: #3d2c0a;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+      gap: 14px;
+      margin: 18px 0;
+    }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px 16px;
+      background: #fff;
+      min-height: 126px;
+    }
+    .panel strong {
+      display: block;
+      font-size: 15px;
+      margin-bottom: 4px;
+    }
+    .metric {
+      font-size: 28px;
+      font-weight: 700;
+      color: var(--accent);
+      line-height: 1.1;
+      margin: 2px 0 6px;
+    }
+    .small {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0 22px;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 8px 10px;
+      vertical-align: top;
+    }
+    th {
+      text-align: left;
+      background: var(--band);
+      font-weight: 650;
+    }
+    figure {
+      margin: 20px 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #fff;
+    }
+    figure img {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      margin: 0 auto;
+    }
+    figcaption {
+      padding: 10px 12px;
+      color: var(--muted);
+      font-size: 13px;
+      border-top: 1px solid var(--line);
+      background: var(--band);
+    }
+    .evidence-tag {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 2px 8px;
+      margin: 0 4px 4px 0;
+      font-size: 12px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--muted);
+    }
+    .tag-strong { background: var(--good-soft); color: var(--good); border-color: #b9e4ce; }
+    .tag-model { background: var(--accent-soft); color: var(--accent); border-color: #bdd7f0; }
+    .tag-caveat { background: var(--warn-soft); color: var(--warn); border-color: #f0d38a; }
+    code {
+      font-family: Consolas, "Cascadia Mono", monospace;
+      font-size: 0.94em;
+      background: #eef2f6;
+      border-radius: 4px;
+      padding: 1px 4px;
+    }
+    ol, ul { padding-left: 22px; }
+    li { margin: 5px 0; }
+    .refs li { margin-bottom: 9px; }
+    .footer {
+      margin-top: 36px;
+      border-top: 1px solid var(--line);
+      padding-top: 14px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Activin / INHBA 靶点机制论证报告：结合 HyperSCA MSS 型结肠癌计算结果、本地 Zotero 文献与网络证据</h1>
+    <div class="meta">
+      生成日期：2026-06-12 ｜ 项目：HyperSCA ｜ 主要本地证据：
+      <a href="activin_smad_mss_crc_assets/evidence_snapshot.json">activin_smad_mss_crc_assets/evidence_snapshot.json</a>
+    </div>
+  </header>
+
+  <section class="abstract">
+    <h2>摘要</h2>
+    <p>
+      本报告围绕 “Activin / INHBA 是否可作为 MSS 型结肠癌免疫抑制生态位中的候选干预靶点” 建立机制论证。证据层级以本地 HyperSCA 计算结果为主：整合 discovery/MVP 输出将 INHBA 排在候选靶点第 2 位，综合评分 0.792；Activin-SMAD 被重建为覆盖 ligand-receptor-TF-target 四层的 complete pathway，共 6 条 flow edges；反事实靶点排序中 INHBA→ACVR2A priority 为 0.856，INHBA→ACVR1B priority 为 0.658；空间通信 OT 复现显示 CAF/Fibroblast→Treg 的方向一致性为 1.0。文献层面，本地 Zotero 库与公开网络资料共同支持 INHBA/Activin A 在 CRC 进展、SMAD2/3 信号、Treg/FOXP3 免疫抑制和 PD-L1 阻断耐药中的生物学可解释性。但该证据链仍不能证明真实因果或湿实验有效，尤其需保留 root Step2/Step3 阴性结果、ACVR1B 表达缺失、Activin 通路在部分 MSS 肿瘤中可被遗传/表观遗传机制破坏等限制。
+    </p>
+  </section>
+
+  <section>
+    <h2>研究问题与证据边界</h2>
+    <p>
+      本报告回答三个层次的问题：第一，HyperSCA 刚才的计算结果是否支持 CAF-derived INHBA/Activin A → ACVR1B/ACVR2A → SMAD2/SMAD3 → FOXP3 的 CAF→Treg 轴；第二，本地 Zotero 文献库中是否存在与该轴一致的 CRC 或跨癌种机制证据；第三，网络公开文献是否补足 Activin 靶点在 MSS 型结肠癌中的受体、免疫抑制和可干预性论证。
+    </p>
+    <div class="caveat">
+      <strong>边界声明。</strong>
+      HyperSCA 结果提供的是计算发现、空间流方向一致性、反事实扰动模拟和生态位定位证据；文献证据提供机制可解释性与外部一致性。二者合并后仍属于“优先级与机制假说”，不是临床疗效、真实因果或湿实验验证结论。
+    </div>
+  </section>
+
+  <section>
+    <h2>检索与资料来源</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>来源层</th>
+          <th>检索/读取内容</th>
+          <th>用于本报告的角色</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>HyperSCA 本地结果</td>
+          <td>读取 <code>evidence_snapshot.json</code>、flow edges、Step3 target priorities、OT reproduction、niche metrics、root Step2/Step3 caveats、Step4 summary。</td>
+          <td>主证据层；决定报告结论强弱和限制边界。</td>
+        </tr>
+        <tr>
+          <td>Zotero 本地库</td>
+          <td>检索词包括 <code>activin</code>、<code>INHBA</code>、<code>SMAD3 FOXP3</code>、<code>regulatory T colorectal cancer TGF beta</code>。</td>
+          <td>本地文献库证据；确认用户已有文献中与 INHBA/Activin 相关的 CRC 和免疫机制论文。</td>
+        </tr>
+        <tr>
+          <td>AnySearch</td>
+          <td>可用子域识别成功；内容检索触发匿名配额耗尽。</td>
+          <td>记录为检索限制；没有保存新 API key，也没有将其作为证据来源。</td>
+        </tr>
+        <tr>
+          <td>网络公开来源</td>
+          <td>通过 PubMed/PLOS/Nature/Frontiers/Pathology & Oncology Research 等页面核查 Activin、INHBA、ACVR2A、FOXP3/Treg 与 ICB 相关证据。</td>
+          <td>外部机制一致性和反证补充。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>HyperSCA 计算结果摘要</h2>
+    <div class="grid">
+      <div class="panel">
+        <strong>INHBA discovery 优先级</strong>
+        <div class="metric">#2 / 0.792</div>
+        <div class="small">candidate pool 5,873 genes；INHBA 同时带有 causal=1.0、spatial=0.86、actionability=1.0。</div>
+      </div>
+      <div class="panel">
+        <strong>Activin-SMAD pathway 重建</strong>
+        <div class="metric">6 edges</div>
+        <div class="small">complete pathway；覆盖 ligand、receptor、TF、target 四层。</div>
+      </div>
+      <div class="panel">
+        <strong>反事实靶点排序</strong>
+        <div class="metric">0.856 / 0.658</div>
+        <div class="small">INHBA→ACVR2A priority 0.856；INHBA→ACVR1B priority 0.658。</div>
+      </div>
+      <div class="panel">
+        <strong>OT 方向一致性</strong>
+        <div class="metric">1.0</div>
+        <div class="small">hyperbolic 与 euclidean 模式均显示 Activin-SMAD 六条边 forward，reverse=0。</div>
+      </div>
+      <div class="panel">
+        <strong>空间生态位几何</strong>
+        <div class="metric">0.710 vs 0.417</div>
+        <div class="small">Hyperbolic niche silhouette 0.710；Euclidean 0.417；约 485,362 spots。</div>
+      </div>
+      <div class="panel">
+        <strong>关键限制</strong>
+        <div class="metric">root 阴性</div>
+        <div class="small">标准 root Step2 未找回 CAF→Treg(INHBA)，root Step3 INHBA n_candidates=0。</div>
+      </div>
+    </div>
+
+    <figure>
+      <img src="activin_smad_mss_crc_assets/chart_inhba_target_priority.png" alt="INHBA target priority chart">
+      <figcaption>图 1. INHBA→ACVR2A 与 INHBA→ACVR1B 在本地 Step3 反事实靶点排序中的优先级。数据来自 <a href="activin_smad_mss_crc_assets/inhba_step3_target_priorities.csv">inhba_step3_target_priorities.csv</a>。</figcaption>
+    </figure>
+
+    <figure>
+      <img src="activin_smad_mss_crc_assets/chart_activin_smad_flow_edges.png" alt="Activin-SMAD flow edge chart">
+      <figcaption>图 2. HyperSCA 重建的 Activin-SMAD 四层信号流。INHBA→ACVR2A→SMAD3→FOXP3 与 INHBA→ACVR1B→SMAD2→FOXP3 两条分支构成 complete pathway。</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2>机制模型</h2>
+    <p>
+      综合本地计算和文献，当前最稳妥的机制表述为：
+    </p>
+    <div class="callout">
+      <strong>CAF-derived INHBA/Activin A → ACVR2A/ACVR1B → SMAD3/SMAD2 → FOXP3/Treg immunosuppression</strong>
+      <p>
+        在 MSS 型 CRC 的整合空间生态位中，HyperSCA 将 INHBA 标记为高优先级候选靶点，并在 CAF/Fibroblast 到 Treg 的空间通信中复现了 Activin-SMAD 的正向流。该轴在文献上与 Activin A 的 TGF-β superfamily 身份、SMAD2/3 信号、FOXP3+ Treg 诱导、晚期 CRC 免疫抑制和 ICB 抵抗具有一致性。
+      </p>
+    </div>
+
+    <h3>1. 配体层：INHBA/Activin A 是可解释的上游信号源</h3>
+    <p>
+      本地 HyperSCA discovery 结果将 INHBA 排在第 2 位，score=0.792，并显示其富集生态位包括 MonocyteRich 与 FibroRich niche。flow edges 中 CAF→Treg 轴的 INHBA ligand expression 在本地整合表中为 5.077；OT 复现的高分边来自 Fibroblast_S1/S2/S3 到 T_cell_regulatory，提示该配体信号在 fibroblast-rich 空间结构中具有方向一致性。
+    </p>
+    <p>
+      文献层面，本地 Zotero 库中多条 CRC 记录支持 INHBA 在结肠癌中的高表达、预后关联或促增殖/迁移作用。Xiao 等 2022 的 Cell Death & Disease 论文显示 INHBA 是 CRC 细胞增殖相关的 metformin 靶点，并把 INHBA 放在 TGF-β/PI3K/AKT 信号解释框架内；该网页摘要还明确说明 INHBA 是 TGF-β superfamily 成员，两份 INHBA subunits 形成 activin A，并可经 serine/threonine kinase receptors 激活 SMAD2/SMAD3。公开页面还显示，敲低 INHBA 可降低 Smad2 磷酸化，过表达则相反，metformin 可降低 pSmad2/3 染色强度。
+    </p>
+
+    <h3>2. 受体层：ACVR2A/ACVR1B 是机制通路的必要但需分型核查节点</h3>
+    <p>
+      HyperSCA 结果中，INHBA→ACVR2A 的 flow_weight 为 0.300，Step3 target_priority_score 为 0.856，是本通路最强的配受体边；INHBA→ACVR1B 的 flow_weight 为 0.2475，priority 为 0.658。该结果支持将 ACVR2A 作为首选受体检查点，将 ACVR1B 作为并列但更需表达确认的 receptor node。
+    </p>
+    <p>
+      受体层的主要反证来自 MSS 结肠癌本身的异质性。Jung 等 2009 的 PLOS ONE 研究检测 51 个 MSS colon cancers，发现 7/51 失去 ACVR2、2/51 失去 ACVR1、5/51 失去 pSMAD2，且 ACVR2 loss 与 LOH 和 promoter hypermethylation 相关；结论是只有小比例 MSS 肿瘤失去 Activin signaling member 表达，但 ACVR2/ACVR1/pSMAD2 的缺失确实构成通路破坏机制。这意味着 HyperSCA 的 MSS 样本背景不能自动等同于“Activin 通路完整”，需要以样本级 ACVR2A/ACVR1B/pSMAD2 或空间 protein/RNA 检测补证。
+    </p>
+
+    <h3>3. 转录调控层：SMAD2/3→FOXP3 是 Treg 机制的可解释桥梁</h3>
+    <p>
+      HyperSCA 的完整流包括 ACVR1B→SMAD2→FOXP3 和 ACVR2A→SMAD3→FOXP3；其中 FOXP3 target expression 为 5.056，SMAD2/SMAD3 分支都在 CAF→Treg forward edge 中出现。PubMed 检索到的 Huber 等 2009 J Immunol 论文题名和摘要记录支持 Activin A 能促进 TGF-β induced conversion of CD4+CD25- T cells into Foxp3+ induced Treg；Tone 等 2008 Nat Immunol 题名记录支持 Smad3 与 NFAT 协同诱导 Foxp3 enhancer 活性。Frontiers 的 Activin A 免疫综述还概述了 Activin A 在适应性免疫中可类似 TGF-β 影响 T 细胞，并涉及 Activin A-iTreg 与 CD8 T cell 抑制等机制。
+    </p>
+    <p>
+      在 CRC 语境中，Frontiers 2022 的 CRC-infiltrating Treg 综述指出 CRC 肿瘤中 Treg 增多与肿瘤进展、免疫治疗失败和较差预后相关，但也强调 FOXP3+ T cells 在 CRC 中具有异质性，FOXP3lo non-Treg 与 FOXP3hi suppressive eTreg 的预后意义不同。因此，本报告不把 FOXP3 单一表达当作免疫抑制的充分证明，而将其作为需要联合 CD25、CTLA4、IL10/TGFB、TSDR demethylation 或功能抑制实验确认的 Treg 端点。
+    </p>
+
+    <h3>4. 空间生态位层：HyperSCA 支持 CAF/Fibroblast→Treg 的空间方向一致性</h3>
+    <p>
+      OT reproduction 是本报告中最重要的空间证据：hyperbolic mode 下 Activin-SMAD 的 n_edges=6，total_flow=2.652，top_source=Fibroblast_S1，top_target=T_cell_regulatory，causal_forward_count=6，direction_consistency_rate=1.0；euclidean mode 中同一路径的 direction consistency 也为 1.0。三条高分 hyperbolic top edges 均为 INHBA/ACVR2A/SMAD3/FOXP3 从 Fibroblast_S1/S2/S3 指向 T_cell_regulatory。
+    </p>
+    <figure>
+      <img src="activin_smad_mss_crc_assets/spatial_communication_ot_reproduction.png" alt="spatial communication OT reproduction">
+      <figcaption>图 3. 空间通信 OT 复现图。该图支持方向一致性，但不等同于配体扩散、受体激活或细胞接触的直接观测。</figcaption>
+    </figure>
+    <p>
+      公开 CRC 空间证据与该方向一致。Wiley 等 2025 的 Scientific Reports 研究使用 DSP 分析 stage II/III CRC，报告 stage III activin-positive AOIs 与 mitogenic signaling、proliferation、immunosuppression 相关，并显示 activin-positive stage III 区域中 CD25、FOXP3、PD-1、CD163、FAP-α 等标记升高。该证据不能证明 CAF→Treg 因果，但支持 “activin-rich tissue area 与免疫抑制/Treg 标志物共定位” 这一空间解释。
+    </p>
+
+    <h3>5. 免疫治疗层：Activin/INHBA 有 ICB 抵抗与可干预性的外部支持</h3>
+    <p>
+      本地 Zotero 和网络均检索到 Li 等 2025 Acta Pharmacologica Sinica 论文。该研究显示 INHBA/activin A 与抗肿瘤免疫和 PD-L1 blockade 反应相关：在 CT26 等小鼠肿瘤模型中，INHBA 过表达削弱 atezolizumab 抗肿瘤效果，INHBA 缺失增强疗效；机制上，INHBA 下调 IFN-γ signaling、降低 CXCL9/CXCL10 分泌并削弱效应 T 细胞浸润；Activin A 特异性抗体 garetosmab 与抗 PD-L1 联用优于单药。这为 Activin/INHBA 作为 ICB 增敏靶点提供了较直接的前临床支持。
+    </p>
+    <p>
+      跨癌种的 CAF-Treg 机制支持来自 Hu 等 2024 npj Precision Oncology：INHBA+ CAFs 在卵巢癌中与 Tregs 富集相关，Activin A 中和抗体减少肿瘤进展与促肿瘤基质/巨噬细胞浸润；人 CAF 与 T 细胞共培养显示 Treg differentiation 依赖 INHBA+ CAF 直接接触，且 INHBA/recombinant Activin A 通过 SMAD2-dependent signaling 诱导 CAF autocrine PD-L1 并促进 Treg differentiation。该证据与 HyperSCA 的 CAF-derived INHBA→Treg 轴高度同构，但属于跨癌种证据，不能直接替代 CRC 湿实验。
+    </p>
+  </section>
+
+  <section>
+    <h2>证据强度矩阵</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>命题</th>
+          <th>HyperSCA 证据</th>
+          <th>本地/网络文献证据</th>
+          <th>强度判断</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>INHBA 是 MSS CRC 整合分析中的高优先级候选靶点</td>
+          <td>rank #2；score=0.792；causal=1.0；spatial=0.86；niche=0.7。</td>
+          <td>本地 Zotero 中 Li 2020、Guo 2021、Wang 2022、Xiao 2022 均支持 INHBA 与 colon/CRC 进展或预后相关。</td>
+          <td><span class="evidence-tag tag-strong">强</span> 作为计算优先级和 CRC 生物学候选。</td>
+        </tr>
+        <tr>
+          <td>INHBA/Activin A 可通过 ACVR2A/ACVR1B 激活 SMAD2/3</td>
+          <td>complete Activin-SMAD；6 edges；ACVR2A priority=0.856；ACVR1B priority=0.658。</td>
+          <td>Xiao 2022 页面说明 INHBA forms activin A 并激活 SMAD2/3；PLOS 2009 支持 ACVR2/ACVR1/pSMAD2 是 MSS CRC 中需核查的通路节点。</td>
+          <td><span class="evidence-tag tag-strong">强</span> 作为通路可解释性；<span class="evidence-tag tag-caveat">需样本级受体确认</span>。</td>
+        </tr>
+        <tr>
+          <td>CAF/Fibroblast→Treg 方向成立</td>
+          <td>OT reproduction direction_consistency_rate=1.0；top_source Fibroblast_S1；top_target T_cell_regulatory。</td>
+          <td>CRC DSP 显示 activin+ stage III 区域与 FOXP3/CD25/PD-1/FAP-α 等免疫抑制标记共定位；卵巢癌 INHBA+ CAF 研究提供直接 CAF-Treg 机制类比。</td>
+          <td><span class="evidence-tag tag-model">中-强</span> 空间方向支持较强；真实细胞间因果仍待实验。</td>
+        </tr>
+        <tr>
+          <td>FOXP3 是 Activin-SMAD 轴的 Treg 端点</td>
+          <td>SMAD2/3→FOXP3 两条分支均出现；FOXP3 target expression=5.056。</td>
+          <td>Huber 2009 支持 Activin A 增强 TGF-β 诱导 Foxp3+ iTreg；Smad3/NFAT 文献支持 Foxp3 enhancer 调控；CRC Treg 综述支持 Treg/FOXP3 与免疫逃逸关系但强调异质性。</td>
+          <td><span class="evidence-tag tag-model">中</span> 机制合理；FOXP3 单标志物不足。</td>
+        </tr>
+        <tr>
+          <td>Activin/INHBA 是 ICB 增敏靶点</td>
+          <td>HyperSCA 提供 IFNG context 与 ICB-related discovery 背景，但不是疗效证明。</td>
+          <td>Li 2025 在 CT26/MC38 等模型中支持 INHBA/Activin A 抑制 IFN-γ signaling 并诱导 anti-PD-L1 resistance，garetosmab 联用 anti-PD-L1 有前临床效果。</td>
+          <td><span class="evidence-tag tag-model">中</span> 前临床支持明确；MSS CRC 临床转化仍未知。</td>
+        </tr>
+        <tr>
+          <td>当前本地结果已经证明 Activin 是湿实验有效靶点</td>
+          <td>没有。root Step2 未找回 CAF→Treg(INHBA)，root Step3 INHBA n_candidates=0；Step4 INHBA active_nodes 为空。</td>
+          <td>文献也主要支持机制和前临床可能性。</td>
+          <td><span class="evidence-tag tag-caveat">不成立</span> 只能作为优先验证靶点。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>冲突证据与限制</h2>
+    <ol>
+      <li>
+        <strong>root Step2/Step3 与 integration discovery 不一致。</strong>
+        标准 root Step2 的 known_axis_recall=0.0，CAF→Treg(INHBA) 未找回，原因是缺失 CAF/Treg node type；root Step3 INHBA 没有候选配受体结果。报告结论应以 integration/MVP discovery 为主，但必须把 root 输出作为不一致证据。
+      </li>
+      <li>
+        <strong>ACVR1B 表达需要重点确认。</strong>
+        flow edge 中 INHBA→ACVR1B 的 receptor_expr 为 0.0，而 ACVR2A receptor_expr 为 0.620。因而现阶段 ACVR2A 分支比 ACVR1B 分支更稳健。
+      </li>
+      <li>
+        <strong>MSS 状态不保证 Activin signaling 完整。</strong>
+        PLOS 2009 显示小比例 MSS 肿瘤也会因 ACVR2/ACVR1/pSMAD2 loss、LOH 或 promoter hypermethylation 发生 Activin signaling disruption。因此需要在当前样本中做 ACVR2A/ACVR1B/pSMAD2 的表达和空间定位确认。
+      </li>
+      <li>
+        <strong>FOXP3/Treg 表型存在 CRC 特异异质性。</strong>
+        CRC 中 FOXP3+ 细胞可包含非抑制性 FOXP3lo non-Treg 与 suppressive FOXP3hi eTreg，单独 FOXP3 表达不能证明功能性免疫抑制。
+      </li>
+      <li>
+        <strong>跨癌种 CAF-Treg 机制不能直接外推。</strong>
+        INHBA+ CAF 直接促进 Treg differentiation 的最强机制证据来自卵巢癌模型；其与 CRC 的共同点是 CAF/ECM-rich TME 和 Activin/SMAD2/3，但仍需 CRC 样本验证。
+      </li>
+      <li>
+        <strong>反事实与动态干预是模型模拟。</strong>
+        Step3 的 cf_quality 很高，但其含义是反事实输出的数值质量和传播拟合，并非真实药物扰动；Step4 中 INHBA final_mean_effect=1.0 但 active_nodes 为空，不能解读为动态治疗效果已被证明。
+      </li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>实验验证建议</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>优先级</th>
+          <th>实验问题</th>
+          <th>推荐验证</th>
+          <th>判读标准</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>P0</td>
+          <td>当前 MSS CRC 样本中 CAF 是否为 INHBA 主要来源，且邻近 Treg？</td>
+          <td>RNAscope/ISH 或 spatial transcript/protein 共染：INHBA + CAF markers(FAP/ACTA2/COL1A1) + FOXP3/CD25/CTLA4。</td>
+          <td>INHBA+ CAF 区域与 FOXP3hi/CD25+ Treg 富集或邻近；最好做距离/邻域统计。</td>
+        </tr>
+        <tr>
+          <td>P0</td>
+          <td>ACVR2A/ACVR1B/SMAD2/3 分支是否可用？</td>
+          <td>检测 Treg 或 CD4 T cell compartment 中 ACVR2A/ACVR1B RNA/protein，刺激 Activin A 后测 pSMAD2/3。</td>
+          <td>ACVR2A 阳性且 pSMAD2/3 响应可被 Activin neutralization 或 receptor inhibitor 阻断。</td>
+        </tr>
+        <tr>
+          <td>P1</td>
+          <td>INHBA/Activin 是否促进 Treg differentiation 或 suppressive phenotype？</td>
+          <td>CAF-T cell 共培养，干预 INHBA knockdown、Activin A neutralizing antibody、recombinant Activin A，检测 FOXP3hi/CD25/CTLA4/IL10/TGFB 与 suppression assay。</td>
+          <td>阻断 INHBA/Activin 后 Treg differentiation 或抑制功能下降；外源 Activin A 可部分救援。</td>
+        </tr>
+        <tr>
+          <td>P1</td>
+          <td>Activin 靶向是否提高 ICB 反应？</td>
+          <td>MSS CRC organoid-immune co-culture 或 syngeneic mouse model，anti-Activin A ± anti-PD-1/PD-L1。</td>
+          <td>组合治疗提高 CD8 infiltration、IFN-γ/CXCL9/CXCL10，并降低 Treg/CAF immunosuppressive markers。</td>
+        </tr>
+        <tr>
+          <td>P2</td>
+          <td>HyperSCA 预测边是否稳定？</td>
+          <td>对 Visium/CosMx/VisiumHD 分平台重复 flow/OT/niche 分析，按 stage、MSS/MSI、CAF subtype 分层。</td>
+          <td>INHBA→ACVR2A→SMAD3→FOXP3 方向一致性在多个平台和样本中保留。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>结论</h2>
+    <p>
+      结合刚才的 HyperSCA 计算结果，Activin/INHBA 是当前 MSS 型结肠癌分析中最值得优先推进的机制靶点之一。其理由不是单一文献或单一模型分数，而是多层证据一致：INHBA 在 integration discovery 中排名第 2 且得分 0.792；Activin-SMAD 被重建为 complete pathway；INHBA→ACVR2A 是最强配受体优先边；空间 OT 复现支持 Fibroblast/CAF→Treg 正向流；公开 CRC DSP 和 ICB 前临床研究支持 Activin/INHBA 与免疫抑制、FOXP3/CD25、PD-1/PD-L1 和 IFN-γ axis 相关。
+    </p>
+    <p>
+      最稳健的靶点推进口径应为：“INHBA/Activin A 是 HyperSCA 在 MSS CRC fibroblast-rich / monocyte-rich 生态位中优先提出的 CAF→Treg 免疫抑制轴候选干预节点，首选验证分支为 INHBA→ACVR2A→SMAD3→FOXP3。” 目前不应写成“已经证明 Activin 是 MSS CRC 有效治疗靶点”；下一步必须用样本级 ACVR2A/ACVR1B/pSMAD2、INHBA+ CAF 与 FOXP3hi Treg 空间邻近、以及 Activin neutralization 功能实验来闭环。
+    </p>
+  </section>
+
+  <section>
+    <h2>本地 Zotero 文献库证据</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Zotero key</th>
+          <th>文献</th>
+          <th>与本报告的关系</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>7CJRJQDE</td>
+          <td>Li et al., 2020, <em>BMC Cancer</em>, DOI: <a href="https://doi.org/10.1186/s12885-020-06743-2">10.1186/s12885-020-06743-2</a></td>
+          <td>INHBA 是 colon adenocarcinoma 预后预测因子。</td>
+        </tr>
+        <tr>
+          <td>9S3RNAJX</td>
+          <td>Guo & Liu, 2021, <em>J Int Med Res</em>, DOI: <a href="https://doi.org/10.1177/03000605211014998">10.1177/03000605211014998</a></td>
+          <td>INHBA 促进 colon cancer cell proliferation/migration/invasion，经 VCAN 相关机制。</td>
+        </tr>
+        <tr>
+          <td>Z4UTTIC8</td>
+          <td>Xiao et al., 2022, <em>Cell Death & Disease</em>, DOI: <a href="https://doi.org/10.1038/s41419-022-04649-4">10.1038/s41419-022-04649-4</a></td>
+          <td>INHBA 是 CRC 中 metformin 抗增殖效应的靶点，并连接 TGF-β/SMAD 与 PI3K/AKT。</td>
+        </tr>
+        <tr>
+          <td>IT7IMHLH</td>
+          <td>Wang et al., 2022, <em>J Clin Lab Anal</em>, DOI: <a href="https://doi.org/10.1002/jcla.24539">10.1002/jcla.24539</a></td>
+          <td>BHLHE40 介导 INHBA 上调并促进 colon cancer proliferation/migration。</td>
+        </tr>
+        <tr>
+          <td>SWJNUJ5H</td>
+          <td>Li et al., 2025, <em>Acta Pharmacologica Sinica</em>, DOI: <a href="https://doi.org/10.1038/s41401-024-01381-x">10.1038/s41401-024-01381-x</a></td>
+          <td>INHBA/Activin A 抑制 IFN-γ signaling 并诱导 anti-PD-L1 resistance；支持可干预性。</td>
+        </tr>
+        <tr>
+          <td>5VQJTJEW</td>
+          <td>Pinjusic et al., 2022, <em>Journal for ImmunoTherapy of Cancer</em>, DOI: <a href="https://doi.org/10.1136/jitc-2022-004533">10.1136/jitc-2022-004533</a></td>
+          <td>跨癌种支持 Activin-A 抑制 CD8 T cell-mediated immunity 和 ICI response。</td>
+        </tr>
+        <tr>
+          <td>FKNQKECQ</td>
+          <td>Hu et al., 2024, <em>npj Precision Oncology</em>, DOI: <a href="https://doi.org/10.1038/s41698-024-00523-y">10.1038/s41698-024-00523-y</a></td>
+          <td>跨癌种直接支持 INHBA+ CAF、SMAD2-dependent signaling、PD-L1 与 Treg differentiation。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>网络来源</h2>
+    <ol class="refs">
+      <li>Xiao Q. et al. Metformin suppresses the growth of colorectal cancer by targeting INHBA to inhibit TGF-β/PI3K/AKT signaling transduction. <em>Cell Death & Disease</em>, 2022. <a href="https://www.nature.com/articles/s41419-022-04649-4">https://www.nature.com/articles/s41419-022-04649-4</a></li>
+      <li>Li F-l. et al. INHBA promotes tumor growth and induces resistance to PD-L1 blockade by suppressing IFN-γ signaling. <em>Acta Pharmacologica Sinica</em>, 2025. <a href="https://www.nature.com/articles/s41401-024-01381-x">https://www.nature.com/articles/s41401-024-01381-x</a></li>
+      <li>Wiley M.B. et al. Activin A affects colorectal cancer progression and immunomodulation in a stage dependent manner. <em>Scientific Reports</em>, 2025. <a href="https://www.nature.com/articles/s41598-025-91853-9">https://www.nature.com/articles/s41598-025-91853-9</a></li>
+      <li>Jung B. et al. Activin Signaling in Microsatellite Stable Colon Cancers Is Disrupted by a Combination of Genetic and Epigenetic Mechanisms. <em>PLOS ONE</em>, 2009. <a href="https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0008308">https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0008308</a></li>
+      <li>Refaat B. et al. Profiling Activins and Follistatin in Colorectal Cancer According to Clinical Stage, Tumour Sidedness and Smad4 Status. <em>Pathology & Oncology Research</em>, 2021. <a href="https://www.por-journal.com/journals/pathology-and-oncology-research/articles/10.3389/pore.2021.1610032/full">https://www.por-journal.com/journals/pathology-and-oncology-research/articles/10.3389/pore.2021.1610032/full</a></li>
+      <li>Hu Y. et al. INHBA(+) cancer-associated fibroblasts generate an immunosuppressive tumor microenvironment in ovarian cancer. <em>npj Precision Oncology</em>, 2024. <a href="https://www.nature.com/articles/s41698-024-00523-y">https://www.nature.com/articles/s41698-024-00523-y</a></li>
+      <li>Frontiers review: Colorectal Cancer-Infiltrating Regulatory T Cells. <a href="https://www.frontiersin.org/journals/immunology/articles/10.3389/fimmu.2022.903564/full">https://www.frontiersin.org/journals/immunology/articles/10.3389/fimmu.2022.903564/full</a></li>
+      <li>Frontiers review: Different Immunoregulation Roles of Activin A Compared With TGF-β. <a href="https://www.frontiersin.org/journals/immunology/articles/10.3389/fimmu.2022.921366/full">https://www.frontiersin.org/journals/immunology/articles/10.3389/fimmu.2022.921366/full</a></li>
+      <li>Huber S. et al. Activin A promotes the TGF-beta-induced conversion of CD4+CD25- T cells into Foxp3+ induced regulatory T cells. <em>J Immunol</em>, 2009. PubMed: <a href="https://pubmed.ncbi.nlm.nih.gov/19342638/">https://pubmed.ncbi.nlm.nih.gov/19342638/</a></li>
+      <li>Tone Y. et al. Smad3 and NFAT cooperate to induce Foxp3 expression through its enhancer. <em>Nature Immunology</em>, 2008. PubMed: <a href="https://pubmed.ncbi.nlm.nih.gov/18157133/">https://pubmed.ncbi.nlm.nih.gov/18157133/</a></li>
+    </ol>
+  </section>
+
+  <div class="footer">
+    注：本报告未重跑 HyperSCA pipeline；所有 HyperSCA 数值均来自 2026-06-12 已生成的本地 evidence snapshot 与配套 CSV/PNG。AnySearch 匿名内容检索配额耗尽，因此网络资料核查使用公开网页和 DOI/PubMed/PLOS/Nature/Frontiers 页面完成。
+  </div>
+</main>
+</body>
+</html>

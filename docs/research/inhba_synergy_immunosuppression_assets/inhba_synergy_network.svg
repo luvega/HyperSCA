@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="620" viewBox="0 0 1100 620" role="img" aria-label="INHBA cooperative immunosuppressive niche model">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#34495e"/>
+    </marker>
+    <marker id="block" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 0 10" stroke="#8a2f2f" stroke-width="3"/>
+    </marker>
+    <style>
+      .bg{fill:#ffffff}
+      .cell{fill:#f6f8fb;stroke:#b8c4d1;stroke-width:1.5}
+      .caf{fill:#e7f0fb;stroke:#0b5cad}
+      .tam{fill:#e9f6ee;stroke:#1f7a4d}
+      .tcell{fill:#fff4d6;stroke:#8a5f00}
+      .ecm{fill:#f2edf8;stroke:#6a4c93}
+      .title{font-family:Segoe UI,Microsoft YaHei,Arial,sans-serif;font-size:24px;font-weight:700;fill:#1f2933}
+      .label{font-family:Segoe UI,Microsoft YaHei,Arial,sans-serif;font-size:15px;font-weight:700;fill:#1f2933}
+      .small{font-family:Segoe UI,Microsoft YaHei,Arial,sans-serif;font-size:12px;fill:#34495e}
+      .edge{fill:none;stroke:#34495e;stroke-width:2.2;marker-end:url(#arrow)}
+      .edge2{fill:none;stroke:#6a4c93;stroke-width:2.2;stroke-dasharray:7 5;marker-end:url(#arrow)}
+      .block{fill:none;stroke:#8a2f2f;stroke-width:2.2;stroke-dasharray:6 4;marker-end:url(#block)}
+      .note{font-family:Segoe UI,Microsoft YaHei,Arial,sans-serif;font-size:12px;fill:#5f6b7a}
+    </style>
+  </defs>
+  <rect class="bg" width="1100" height="620"/>
+  <text x="40" y="42" class="title">INHBA-centered immune suppression / exclusion niche model</text>
+  <text x="40" y="66" class="note">Solid arrows: local HyperSCA flow or target priority support. Dashed arrows: co-niche / literature-supported ecological coupling. Red dashed line: counter-axis suppression hypothesis.</text>
+
+  <rect x="55" y="125" rx="8" ry="8" width="270" height="125" class="cell caf"/>
+  <text x="75" y="153" class="label">CAF / Fibroblast_S1-S3</text>
+  <text x="75" y="180" class="small">INHBA / Activin A</text>
+  <text x="75" y="202" class="small">POSTN, MFAP2, FN1, COL1A1</text>
+  <text x="75" y="224" class="small">HyperSCA: INHBA rank #2, FN1 #1, COL1A1 #3</text>
+
+  <rect x="440" y="90" rx="8" ry="8" width="250" height="130" class="cell tcell"/>
+  <text x="462" y="120" class="label">T_cell_regulatory / Treg</text>
+  <text x="462" y="148" class="small">ACVR2A / ACVR1B</text>
+  <text x="462" y="170" class="small">SMAD2/3 -> FOXP3</text>
+  <text x="462" y="192" class="small">ACVR2A priority 0.856</text>
+
+  <rect x="438" y="302" rx="8" ry="8" width="254" height="132" class="cell tam"/>
+  <text x="460" y="332" class="label">TAM / Macrophage_cycling</text>
+  <text x="460" y="360" class="small">ITGAV/ITGA5 -> SRC/FAK</text>
+  <text x="460" y="382" class="small">CD163 / MRC1, CCL18</text>
+  <text x="460" y="404" class="small">POSTN/MFAP2 flow 0.609</text>
+
+  <rect x="795" y="285" rx="8" ry="8" width="250" height="142" class="cell tcell"/>
+  <text x="817" y="315" class="label">CD8 T / CD8 cycling</text>
+  <text x="817" y="343" class="small">TGFBR1/2 -> HAVCR2/LAG3</text>
+  <text x="817" y="365" class="small">IL10RA -> STAT3 -> PDCD1</text>
+  <text x="817" y="387" class="small">TGFb / IL10 flow 0.632</text>
+
+  <rect x="75" y="400" rx="8" ry="8" width="250" height="112" class="cell ecm"/>
+  <text x="96" y="430" class="label">ECM barrier niche</text>
+  <text x="96" y="458" class="small">FN1 / COL1A1 / collagen</text>
+  <text x="96" y="480" class="small">Integrin-FAK total flow 11.31</text>
+
+  <rect x="794" y="90" rx="8" ry="8" width="250" height="118" class="cell"/>
+  <text x="816" y="120" class="label">IFN-gamma recruitment axis</text>
+  <text x="816" y="148" class="small">IFNG -> CXCL9/CXCL10</text>
+  <text x="816" y="170" class="small">effector T-cell infiltration</text>
+  <text x="816" y="192" class="small">treated as counter-axis</text>
+
+  <path class="edge" d="M325 165 C370 142, 395 135, 440 140"/>
+  <text x="344" y="130" class="small">INHBA -> ACVR2A/ACVR1B</text>
+  <path class="edge2" d="M320 210 C376 258, 395 300, 438 345"/>
+  <text x="332" y="275" class="small">POSTN/MFAP2/integrin</text>
+  <path class="edge2" d="M305 430 C360 414, 394 390, 438 374"/>
+  <text x="318" y="410" class="small">ECM supports TAM niche</text>
+  <path class="edge" d="M692 345 C740 338, 765 338, 795 340"/>
+  <text x="707" y="318" class="small">TGFB1 / IL10</text>
+  <path class="edge2" d="M560 302 C540 255, 540 235, 555 220"/>
+  <text x="570" y="266" class="small">Treg-TAM feedback context</text>
+  <path class="block" d="M690 150 C735 145, 760 145, 794 145"/>
+  <text x="692" y="129" class="small">INHBA may suppress IFN-gamma chemokines</text>
+
+  <rect x="55" y="545" rx="6" ry="6" width="990" height="44" fill="#f6f8fb" stroke="#d9e2ec"/>
+  <text x="75" y="572" class="note">Interpretation boundary: HyperSCA supports spatial flow, target priority and co-niche enrichment; this figure is a mechanism hypothesis requiring perturbation and multiplex validation.</text>
+</svg>

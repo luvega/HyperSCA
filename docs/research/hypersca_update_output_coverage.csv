@@ -1,0 +1,7 @@
+﻿metric,previous_HEAD,current_update,note
+Sidecar modules,0,3,"stability_audit, mechanism_evidence, communication_flow"
+CLI entrypoints,0,1,run_causal_stability_audit.py
+Default pipeline sidecar stages,0,2,communication_flow + mechanism_evidence
+New output artifact families,0,13,4 causal audit + 4 mechanism + 5 communication artifacts
+Targeted tests collected,0,8,new sidecar and stage-order tests
+Relevant regression tests passed,0,52,tests/discovery + causal audit + causal metrics + Step2

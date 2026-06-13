@@ -1,0 +1,3 @@
+﻿ligand,receptor,causal_edge,source_type,target_type,pathway,flow_weight,delta_ligand,delta_receptor,combined_abs_delta,prior_hit,prior_sources,target_priority_score
+INHBA,ACVR2A,CAF→Treg,CAF,Treg,Activin-SMAD,0.3,-2.1281215086993988,-0.1550542200637479,2.2831757287631467,True,omnipath,0.85619089828618
+INHBA,ACVR1B,CAF→Treg,CAF,Treg,Activin-SMAD,0.2474999999999999,-2.1281215086993988,0.0,2.1281215086993988,True,omnipath,0.6583875917538764

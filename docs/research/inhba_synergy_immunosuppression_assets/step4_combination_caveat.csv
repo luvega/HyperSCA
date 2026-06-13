@@ -1,0 +1,7 @@
+combo,size,effect,synergy_bliss,rank
+POSTN,1,1.0,0.0,1
+MFAP2,1,1.0,0.0,2
+INHBA,1,1.0,0.0,3
+POSTN+MFAP2,2,1.0,0.0,4
+POSTN+INHBA,2,1.0,0.0,5
+MFAP2+INHBA,2,1.0,0.0,6

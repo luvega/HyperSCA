@@ -1,0 +1,49 @@
+{
+  "comparison_scope": "HEAD versus current working-tree update; contract-level differences plus existing local result metrics",
+  "source_files": {
+    "step1_metrics": "results\\figures\\step1\\compare\\cns_step1_metrics.json",
+    "step2_metrics": "results\\step2\\step2_metrics.json",
+    "step3_metrics": "results\\step3\\step3_metrics.json",
+    "step4_summary": "results\\step4\\step4_summary.json",
+    "step5_summary": "results\\behavior_grammar\\demo_behavior_grammar\\simulation\\simulation_summary.json",
+    "step5_trajectory": "results\\behavior_grammar\\demo_behavior_grammar\\simulation\\population_trajectory.csv",
+    "step5_sensitivity": "results\\behavior_grammar\\demo_behavior_grammar\\simulation\\qoi_sensitivity.csv",
+    "comparison_matrix": "docs\\research\\hypersca_update_comparison_matrix.csv"
+  },
+  "figures": {
+    "overview": [
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step1_to_step5_academic_overview.png",
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step1_to_step5_academic_overview.pdf",
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step1_to_step5_academic_overview.svg"
+    ],
+    "step1": [
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step1_embedding_before_after.png",
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step1_embedding_before_after.pdf",
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step1_embedding_before_after.svg"
+    ],
+    "step2": [
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step2_causal_audit_before_after.png",
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step2_causal_audit_before_after.pdf",
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step2_causal_audit_before_after.svg"
+    ],
+    "step3": [
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step3_perturbation_mechanism_before_after.png",
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step3_perturbation_mechanism_before_after.pdf",
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step3_perturbation_mechanism_before_after.svg"
+    ],
+    "step4": [
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step4_dynamic_context_before_after.png",
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step4_dynamic_context_before_after.pdf",
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step4_dynamic_context_before_after.svg"
+    ],
+    "step5": [
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step5_behavior_grammar_before_after.png",
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step5_behavior_grammar_before_after.pdf",
+      "docs\\research\\figures\\step1_step5_comparison\\fig_step5_behavior_grammar_before_after.svg"
+    ]
+  },
+  "tables": [
+    "docs\\research\\hypersca_step1_step5_output_difference_table.csv"
+  ],
+  "interpretation_boundary": "No wet-lab efficacy claim; added outputs are audit, evidence decomposition, communication contrast, and behavior simulation contracts."
+}

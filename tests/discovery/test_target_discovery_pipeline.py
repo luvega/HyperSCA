@@ -50,6 +50,17 @@ def test_pipeline_runs_fake_stages_and_writes_manifest(tmp_path):
     assert (tmp_path / "runs" / "smoke" / "fake" / "one.json").exists()
 
 
+def test_default_target_discovery_stages_include_append_only_sidecars():
+    from src.discovery.target_discovery.pipeline import default_target_discovery_stages
+
+    names = [stage.name for stage in default_target_discovery_stages()]
+
+    assert "communication_flow" in names
+    assert names.index("communication_flow") == names.index("causal_discovery") + 1
+    assert "mechanism_evidence" in names
+    assert names.index("mechanism_evidence") == names.index("evidence_scoring") + 1
+
+
 def test_lightweight_stages_can_run_on_synthetic_files(tmp_path):
     paths = DiscoveryPaths(
         root=tmp_path,

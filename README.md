@@ -6,13 +6,14 @@ HyperSCA (Hyperbolic Spatiotemporal Causal Analysis) 是一个面向空间组学
 
 ## Project and Algorithm Overview
 
-HyperSCA 的研究完整版流程由五个连续阶段构成，可按具体队列与研究问题灵活裁剪：
+HyperSCA 的研究完整版流程由六个连续阶段构成，可按具体队列与研究问题灵活裁剪：
 
 - Phase D0（Data Onboarding）：四项目标准化入库与字段校验。
 - Stage 1（Embedding）：在 Lorentz/Poincare 双曲流形上学习细胞状态表示。
 - Stage 2（Causal）：在去缠结潜变量上执行因果结构发现与信号流推断。
 - Stage 3（Counterfactual）：在潜空间做基因扰动并模拟空间传播，完成靶点排序与去假阳性过滤。
 - Stage 4（Dynamic Intervention）：在 PK/PD 约束下执行时序传播与联靶组合干预评估，并支持实验回写后的 roundtrip 更新。
+- Stage 5（Behavior Grammar / Virtual Tissue）：将 target discovery 与 Step4 证据翻译为可读细胞行为规则，并运行轻量虚拟组织模拟；该层为可选 sidecar，不替换 Step1-Step4。
 
 ## Pipeline Flowchart
 
@@ -49,17 +50,27 @@ HyperSCA 的研究完整版流程由五个连续阶段构成，可按具体队�
   - `geometry.py`、`causal_stage.py`、`perturbation_stage.py`、`scoring.py`、`niche.py`、`reporting.py`、`figures.py` 负责双几何比较、Step2/Step3 wrapper、证据排序、生态位映射、报告和图。
 - 输出根目录：默认写入 `results/discovery/target_discovery/<run_id>/`，按 `candidates/`、`expression/`、`spatial/`、`geometry/{mode}/`、`causal/{mode}/`、`perturbation/{mode}/`、`scoring/`、`niche/`、`reports/`、`figures/` 分区，并生成 `manifest.json` 与 `reports/migration_notes.md`。
 
+### 6) Behavior Grammar and Virtual Tissue Simulation
+
+- 入口脚本：`scripts/run_behavior_grammar_simulation.py`
+- 核心包：`src/behavior_grammar/`
+  - `rules.py` 定义 `BehaviorRule`, `SignalDictionary`, `BehaviorDictionary`, `RuleSet` 与 Hill/linear/step response。
+  - `rule_builder.py` 从 `results/discovery/target_discovery/<run_id>/manifest.json`、评分表、因果边、生态位映射和表达矩阵生成数据驱动规则。
+  - `simulation.py` 运行确定性 toy virtual tissue simulation，并输出 QoI sensitivity 与组合干预场景比较。
+  - `pipeline.py` 复用 run-scoped artifact manifest，写入规则、轨迹、summary、敏感性表和动态图。
+- 输出根目录：默认写入 `results/behavior_grammar/<run_id>/`，包含 `rules/rules.json`、`rules/rules.md`、`simulation/population_trajectory.csv`、`simulation/simulation_summary.json`、`simulation/qoi_sensitivity.csv` 与 `figures/population_trajectories.png`。
+
 ## Example Data Samples
 
 项目常用示例输入（路径为本地外部数据目录，不纳入版本控制；以下为脱敏占位路径）：
 
-- `<PATH_TO_scRNA_REFERENCE>`  
+- `<PATH_TO_scRNA_REFERENCE>`
   - 代表文件：`*-NormalizedCounts.tsv`, `*-DE_result.tsv`
   - 用途：构建 cluster-level 表达矩阵、候选差异基因池与细胞状态先验。
-- `<PATH_TO_SPATIAL_OMICS>`  
+- `<PATH_TO_SPATIAL_OMICS>`
   - 代表文件：`STmetadata_*.csv`, `spot_annotations.*`
   - 用途：空间反卷积、细胞共定位邻接、传播梯度与生态位结构评估。
-- `<PATH_TO_CLINICAL_OR_PHENOTYPE>`  
+- `<PATH_TO_CLINICAL_OR_PHENOTYPE>`
   - 代表文件：`sample_clinical_mapping.csv`, `group_labels.csv`
   - 用途：临床/表型分层（如免疫亚型、疾病分期、治疗反应）及跨样本差异分析。
 
@@ -105,6 +116,13 @@ python scripts/validate_env.py
 ```
 
 `scgen` 仅作为可选历史 baseline 检查；缺失或因 `scvi-tools` 版本不兼容导入失败时，验证脚本会报告 warning，但不会阻断 HyperSCA 核心环境。
+
+当前本地开发快照使用外部短路径 conda 环境 `C:\h` 通过环境验证和测试回归；若使用 Windows PowerShell，可直接运行：
+
+```powershell
+C:\h\python.exe scripts\validate_env.py
+C:\h\python.exe -m pytest tests -q -p no:cacheprovider
+```
 
 ## Quick Start
 
@@ -197,7 +215,29 @@ python scripts/run_step4.py --with-roundtrip \
   --experiment-file data/metadata/experiment_roundtrip.csv
 ```
 
-### G. Generate CNS-style Figures (Step1/2/3)
+### G. Run Behavior Grammar Sidecar (Stage5)
+
+无需真实 discovery manifest、只想查看行为语法模拟产物时，可先运行 demo：
+
+```bash
+python scripts/run_behavior_grammar_simulation.py \
+  --demo \
+  --run-id demo_behavior_grammar \
+  --time-steps 8
+```
+
+真实 target discovery run 则指定 manifest：
+
+```bash
+python scripts/run_behavior_grammar_simulation.py \
+  --discovery-manifest results/discovery/target_discovery/<run_id>/manifest.json \
+  --step4-dir results/step4 \
+  --run-id <run_id>
+```
+
+该 sidecar 读取 target discovery run manifest 和可选 Step4 context，生成可读规则、虚拟组织轨迹、QoI sensitivity 与动态图。它不改变 Step1-Step4 CLI 输出契约。
+
+### H. Generate CNS-style Figures (Step1/2/3)
 
 ```bash
 python scripts/generate_step1_figures.py
@@ -214,6 +254,7 @@ python scripts/generate_step3_figures.py
 - Target discovery runs: `results/discovery/target_discovery/<run_id>/`（run manifest、候选池、几何比较、Step2/Step3 wrapper 产物、评分表、生态位映射、报告、迁移说明）
 - Legacy/precomputed discovery reports for notebooks: `results/integration/discovery/`
 - Step4 outputs: `results/step4/`（`pkpd_summary.json`, `combination_ranking.csv`, `roundtrip_update_report.json`）
+- Behavior grammar outputs: `results/behavior_grammar/<run_id>/`（可读规则、simulation summary、QoI sensitivity、虚拟组织轨迹图）
 - CNS figure outputs: `results/figures/step1/`, `results/figures/step2/`, `results/figures/step3/`
 
 ## 项目目录说明
@@ -223,8 +264,9 @@ python scripts/generate_step3_figures.py
 ## Testing
 
 ```bash
-pytest tests/ -v
+pytest tests -q -p no:cacheprovider
 pytest tests/discovery -q
+pytest tests/behavior_grammar -q
 ```
 
 ## License

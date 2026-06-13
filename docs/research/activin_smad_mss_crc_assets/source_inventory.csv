@@ -1,0 +1,19 @@
+﻿id,path,role
+target_report,results/integration/discovery/target_discovery_report.md,local evidence source
+comparison_report,results/integration/comparison_report.md,local evidence source
+ot_summary_md,docs/research/spatial_communication_ot_reproduction_summary.md,local evidence source
+flow_summary,results/integration/discovery/hyperbolic/step2/flow_summary.json,local evidence source
+flow_edges,results/integration/discovery/hyperbolic/step2/flow_edges.json,local evidence source
+axis_results,results/integration/discovery/hyperbolic/step2/axis_results.json,local evidence source
+step3_targets,results/integration/discovery/hyperbolic/step3/targets_INHBA.csv,local evidence source
+step3_metrics,results/integration/discovery/hyperbolic/step3/step3_metrics.json,local evidence source
+ot_pathway_summary,results/integration/discovery/communication_ot_reproduction/pathway_summary_all_modes.csv,local evidence source
+ot_top_edges,results/integration/discovery/communication_ot_reproduction/top_lr_flow_edges_all_modes.csv,local evidence source
+dataset_audit,results/integration/audit/dataset_audit.md,local evidence source
+msi_inference,results/integration/msi_inference/ST_CRC_MSS_msi_inference.json,local evidence source
+niche_metrics,results/integration/discovery/niche/niche_hierarchy_metrics.json,local evidence source
+root_axis,results/step2/key_axes_evidence.json,local evidence source
+root_step3_metrics,results/step3/step3_metrics.json,local evidence source
+root_step3_interpretation,results/step3/interpretation_targets_INHBA.md,local evidence source
+step4_dynamic,results/step4/dynamic_target_effects.json,local evidence source
+step4_summary,results/step4/step4_summary.json,local evidence source

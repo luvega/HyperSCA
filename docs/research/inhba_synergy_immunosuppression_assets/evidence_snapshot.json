@@ -1,0 +1,663 @@
+{
+  "generated_at": "2026-06-12T22:04:27",
+  "scope": "INHBA cooperative target/cell modules contributing to immunosuppressive or immune-excluded niches, integrating local HyperSCA outputs with Zotero/web literature.",
+  "source_files": {
+    "target_ranking": "results/integration/discovery/target_ranking.csv",
+    "combo_niche_effect": "results/integration/discovery/niche/combo_niche_effect.csv",
+    "target_niche_expression": "results/integration/discovery/niche/target_niche_expression.csv",
+    "unified_niche_definition": "results/integration/discovery/niche/unified_niche_definition.csv",
+    "ot_flow_edges": "results/integration/discovery/communication_ot_reproduction/top_lr_flow_edges_all_modes.csv",
+    "ot_pathway_summary": "results/integration/discovery/communication_ot_reproduction/pathway_summary_all_modes.csv",
+    "step4_combination": "results/step4/combination_ranking.csv",
+    "dataset_audit": "results/integration/audit/dataset_audit.md"
+  },
+  "key_local_findings": {
+    "inhba_rank": [
+      {
+        "rank": 2,
+        "final_score": 0.7924363934259198,
+        "s_causal": 1.0,
+        "s_spatial": 0.8637465153145962,
+        "s_actionability": 1.0,
+        "s_niche": 0.7,
+        "celltypes_icb": "Fibro;Mph",
+        "is_ifng_target": true
+      }
+    ],
+    "selected_target_ranking": [
+      {
+        "gene": "FN1",
+        "rank": 1,
+        "final_score": 0.8235809525145522,
+        "s_causal": 0.7403189066059225,
+        "s_spatial": 0.8423979779142399,
+        "s_niche": 1.0,
+        "celltypes_icb": "Pericyte;SMC",
+        "celltypes_neu": "Cancer_Colonocyte_like;Cancer_Crypt_like;Cancer_Goblet_like;Cancer_TA_like",
+        "is_ifng_target": true
+      },
+      {
+        "gene": "INHBA",
+        "rank": 2,
+        "final_score": 0.7924363934259198,
+        "s_causal": 1.0,
+        "s_spatial": 0.8637465153145962,
+        "s_niche": 0.7,
+        "celltypes_icb": "Fibro;Mph",
+        "celltypes_neu": NaN,
+        "is_ifng_target": true
+      },
+      {
+        "gene": "COL1A1",
+        "rank": 3,
+        "final_score": 0.7441053063640777,
+        "s_causal": 0.7403189066059225,
+        "s_spatial": 0.4804147054523135,
+        "s_niche": 1.0,
+        "celltypes_icb": "Fibro;Pericyte;Stromal",
+        "celltypes_neu": "Cancer_Crypt_like;Cancer_Goblet_like",
+        "is_ifng_target": true
+      },
+      {
+        "gene": "MFAP2",
+        "rank": 4,
+        "final_score": 0.7247170150600168,
+        "s_causal": 1.0,
+        "s_spatial": 0.9812398318205684,
+        "s_niche": 0.0,
+        "celltypes_icb": "Fibro;Pericyte;Stromal",
+        "celltypes_neu": "Cancer_Colonocyte_like;Cancer_Crypt_like;Cancer_Goblet_like;Cancer_TA_like",
+        "is_ifng_target": false
+      },
+      {
+        "gene": "POSTN",
+        "rank": 5,
+        "final_score": 0.6358245591284393,
+        "s_causal": 1.0,
+        "s_spatial": 0.9899354897161668,
+        "s_niche": 0.0,
+        "celltypes_icb": "Pericyte",
+        "celltypes_neu": NaN,
+        "is_ifng_target": false
+      },
+      {
+        "gene": "IFNG",
+        "rank": 6,
+        "final_score": 0.582369020501139,
+        "s_causal": 0.5694760820045558,
+        "s_spatial": 0.0,
+        "s_niche": 1.0,
+        "celltypes_icb": "T",
+        "celltypes_neu": "Plasma_IgA;T_cell_CD4;T_cell_CD8;T_cell_CD8_cycling;T_cell_regulatory",
+        "is_ifng_target": true
+      },
+      {
+        "gene": "CXCL10",
+        "rank": 9,
+        "final_score": 0.4614097413078684,
+        "s_causal": 0.7403189066059225,
+        "s_spatial": 0.0,
+        "s_niche": 0.7,
+        "celltypes_icb": NaN,
+        "celltypes_neu": "Cancer_Colonocyte_like;Cancer_TA_like",
+        "is_ifng_target": true
+      },
+      {
+        "gene": "CD74",
+        "rank": 10,
+        "final_score": 0.459221130258175,
+        "s_causal": 0.1138952164009111,
+        "s_spatial": 0.0,
+        "s_niche": 1.0,
+        "celltypes_icb": "B;Coloncyte;Epi;Glia;Mph;PlasmaB",
+        "celltypes_neu": "Cancer_Colonocyte_like;Cancer_Crypt_like;Cancer_Goblet_like;Cancer_TA_like;Endothelial_arterial;Mast_cell",
+        "is_ifng_target": true
+      },
+      {
+        "gene": "TGFB1",
+        "rank": 11,
+        "final_score": 0.4197336847607336,
+        "s_causal": 0.7403189066059225,
+        "s_spatial": 0.0,
+        "s_niche": 0.0,
+        "celltypes_icb": "CD8;PlasmaB;T",
+        "celltypes_neu": "Cancer_Crypt_like;Cancer_TA_like",
+        "is_ifng_target": false
+      },
+      {
+        "gene": "TGFBR2",
+        "rank": 12,
+        "final_score": 0.4186242687770097,
+        "s_causal": 0.7403189066059225,
+        "s_spatial": 0.0,
+        "s_niche": 0.0,
+        "celltypes_icb": "Endo",
+        "celltypes_neu": "Cancer_Colonocyte_like;Cancer_Crypt_like;Cancer_Goblet_like;Cancer_TA_like",
+        "is_ifng_target": false
+      },
+      {
+        "gene": "CCL18",
+        "rank": 18,
+        "final_score": 0.3756219443242317,
+        "s_causal": 0.7403189066059225,
+        "s_spatial": 0.0,
+        "s_niche": 0.0,
+        "celltypes_icb": "Mph",
+        "celltypes_neu": "Cancer_Crypt_like;Macrophage_cycling",
+        "is_ifng_target": false
+      }
+    ],
+    "selected_flow_edges": [
+      {
+        "module_label": "INHBA-ACVR2A-SMAD3-FOXP3",
+        "source_node": "Fibroblast_S1",
+        "target_node": "T_cell_regulatory",
+        "flow_score": 0.5235563360094343,
+        "direction_status": "forward",
+        "missing_genes": NaN
+      },
+      {
+        "module_label": "POSTN-ITGAV-SRC-CD163",
+        "source_node": "Fibroblast_S1",
+        "target_node": "Macrophage_cycling",
+        "flow_score": 0.6091112768479034,
+        "direction_status": "forward",
+        "missing_genes": NaN
+      },
+      {
+        "module_label": "MFAP2-ITGA5-SRC-CD163",
+        "source_node": "Fibroblast_S1",
+        "target_node": "Macrophage_cycling",
+        "flow_score": 0.6091112768479034,
+        "direction_status": "forward",
+        "missing_genes": NaN
+      },
+      {
+        "module_label": "TGFB1-TGFBR2-SMAD2-LAG3",
+        "source_node": "Macrophage_cycling",
+        "target_node": "T_cell_CD8_cycling",
+        "flow_score": 0.6322275722504457,
+        "direction_status": "forward",
+        "missing_genes": NaN
+      },
+      {
+        "module_label": "TGFB1-TGFBR1-SMAD3-HAVCR2",
+        "source_node": "Macrophage_cycling",
+        "target_node": "T_cell_CD8_cycling",
+        "flow_score": 0.6322275722504457,
+        "direction_status": "forward",
+        "missing_genes": NaN
+      },
+      {
+        "module_label": "IL10-IL10RA-STAT3-PDCD1",
+        "source_node": "Macrophage_cycling",
+        "target_node": "T_cell_CD8_cycling",
+        "flow_score": 0.6322275722504457,
+        "direction_status": "forward",
+        "missing_genes": NaN
+      }
+    ],
+    "pathway_summary_hyperbolic": [
+      {
+        "mode": "hyperbolic",
+        "pathway": "Activin-SMAD",
+        "n_edges": 6,
+        "total_flow": 2.6516964735765343,
+        "mean_flow": 0.4419494122627557,
+        "max_flow": 0.5235563360094343,
+        "top_source": "Fibroblast_S1",
+        "top_target": "T_cell_regulatory",
+        "causal_forward_count": 6,
+        "causal_reverse_count": 0,
+        "ambiguous_count": 0,
+        "unresolved_count": 0,
+        "direction_consistency_rate": 1.0
+      },
+      {
+        "mode": "hyperbolic",
+        "pathway": "IL10-STAT3",
+        "n_edges": 4,
+        "total_flow": 2.237430521482115,
+        "mean_flow": 0.5593576303705288,
+        "max_flow": 0.6322275722504457,
+        "top_source": "Macrophage_cycling",
+        "top_target": "T_cell_CD8_cycling",
+        "causal_forward_count": 4,
+        "causal_reverse_count": 0,
+        "ambiguous_count": 0,
+        "unresolved_count": 0,
+        "direction_consistency_rate": 1.0
+      },
+      {
+        "mode": "hyperbolic",
+        "pathway": "Integrin-FAK",
+        "n_edges": 24,
+        "total_flow": 11.310137983624497,
+        "mean_flow": 0.4712557493176874,
+        "max_flow": 0.6091112768479034,
+        "top_source": "Fibroblast_S1",
+        "top_target": "Macrophage_cycling",
+        "causal_forward_count": 24,
+        "causal_reverse_count": 0,
+        "ambiguous_count": 0,
+        "unresolved_count": 0,
+        "direction_consistency_rate": 1.0
+      },
+      {
+        "mode": "hyperbolic",
+        "pathway": "TGFb-SMAD",
+        "n_edges": 8,
+        "total_flow": 4.47486104296423,
+        "mean_flow": 0.5593576303705288,
+        "max_flow": 0.6322275722504457,
+        "top_source": "Macrophage_cycling",
+        "top_target": "T_cell_CD8_cycling",
+        "causal_forward_count": 8,
+        "causal_reverse_count": 0,
+        "ambiguous_count": 0,
+        "unresolved_count": 0,
+        "direction_consistency_rate": 1.0
+      }
+    ],
+    "top_inhba_combo_niches": [
+      {
+        "combo_id": "INHBA|INHBA->ACVR2A",
+        "trigger_target": "INHBA",
+        "ligand": "INHBA",
+        "receptor": "ACVR2A",
+        "niche_id": 7,
+        "niche_name": "H3_N07_MonocyteRich",
+        "combo_niche_effect": 2.295891208896896,
+        "target_priority_score": 0.85619089828618
+      },
+      {
+        "combo_id": "INHBA|INHBA->ACVR1B",
+        "trigger_target": "INHBA",
+        "ligand": "INHBA",
+        "receptor": "ACVR1B",
+        "niche_id": 7,
+        "niche_name": "H3_N07_MonocyteRich",
+        "combo_niche_effect": 2.295891208896896,
+        "target_priority_score": 0.6583875917538764
+      },
+      {
+        "combo_id": "INHBA|INHBA->ACVR1B",
+        "trigger_target": "INHBA",
+        "ligand": "INHBA",
+        "receptor": "ACVR1B",
+        "niche_id": 11,
+        "niche_name": "H2_N11_MonocyteRich",
+        "combo_niche_effect": 1.7623732272090236,
+        "target_priority_score": 0.6583875917538764
+      },
+      {
+        "combo_id": "INHBA|INHBA->ACVR2A",
+        "trigger_target": "INHBA",
+        "ligand": "INHBA",
+        "receptor": "ACVR2A",
+        "niche_id": 11,
+        "niche_name": "H2_N11_MonocyteRich",
+        "combo_niche_effect": 1.7623732272090236,
+        "target_priority_score": 0.85619089828618
+      },
+      {
+        "combo_id": "INHBA|INHBA->ACVR1B",
+        "trigger_target": "INHBA",
+        "ligand": "INHBA",
+        "receptor": "ACVR1B",
+        "niche_id": 13,
+        "niche_name": "H2_N13_FibroRich",
+        "combo_niche_effect": 0.6598680975464705,
+        "target_priority_score": 0.6583875917538764
+      },
+      {
+        "combo_id": "INHBA|INHBA->ACVR2A",
+        "trigger_target": "INHBA",
+        "ligand": "INHBA",
+        "receptor": "ACVR2A",
+        "niche_id": 13,
+        "niche_name": "H2_N13_FibroRich",
+        "combo_niche_effect": 0.6598680975464705,
+        "target_priority_score": 0.85619089828618
+      },
+      {
+        "combo_id": "INHBA|INHBA->ACVR2A",
+        "trigger_target": "INHBA",
+        "ligand": "INHBA",
+        "receptor": "ACVR2A",
+        "niche_id": 8,
+        "niche_name": "H2_N08_FibroRich",
+        "combo_niche_effect": 0.6148448262667356,
+        "target_priority_score": 0.85619089828618
+      },
+      {
+        "combo_id": "INHBA|INHBA->ACVR1B",
+        "trigger_target": "INHBA",
+        "ligand": "INHBA",
+        "receptor": "ACVR1B",
+        "niche_id": 8,
+        "niche_name": "H2_N08_FibroRich",
+        "combo_niche_effect": 0.6148448262667356,
+        "target_priority_score": 0.6583875917538764
+      },
+      {
+        "combo_id": "INHBA|INHBA->ACVR2A",
+        "trigger_target": "INHBA",
+        "ligand": "INHBA",
+        "receptor": "ACVR2A",
+        "niche_id": 14,
+        "niche_name": "H1_N14_FibroRich",
+        "combo_niche_effect": 0.6117464505380172,
+        "target_priority_score": 0.85619089828618
+      },
+      {
+        "combo_id": "INHBA|INHBA->ACVR1B",
+        "trigger_target": "INHBA",
+        "ligand": "INHBA",
+        "receptor": "ACVR1B",
+        "niche_id": 14,
+        "niche_name": "H1_N14_FibroRich",
+        "combo_niche_effect": 0.6117464505380172,
+        "target_priority_score": 0.6583875917538764
+      },
+      {
+        "combo_id": "INHBA|INHBA->ACVR1B",
+        "trigger_target": "INHBA",
+        "ligand": "INHBA",
+        "receptor": "ACVR1B",
+        "niche_id": 4,
+        "niche_name": "H1_N04_FibroRich",
+        "combo_niche_effect": 0.4986619635456075,
+        "target_priority_score": 0.6583875917538764
+      },
+      {
+        "combo_id": "INHBA|INHBA->ACVR2A",
+        "trigger_target": "INHBA",
+        "ligand": "INHBA",
+        "receptor": "ACVR2A",
+        "niche_id": 4,
+        "niche_name": "H1_N04_FibroRich",
+        "combo_niche_effect": 0.4986619635456075,
+        "target_priority_score": 0.85619089828618
+      }
+    ],
+    "niche_metrics": [
+      {
+        "niche_name": "H1_N00_FibroRich",
+        "dominant_type": "CAF",
+        "secondary_type": "CD8T",
+        "n_spots": 27426,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H2_N01_NKRich",
+        "dominant_type": "NK",
+        "secondary_type": "Monocyte",
+        "n_spots": 18016,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H3_N02_MASTRich",
+        "dominant_type": "MAST",
+        "secondary_type": "DC",
+        "n_spots": 99669,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H3_N03_EndothelialRich",
+        "dominant_type": "Endothelial",
+        "secondary_type": "MAST",
+        "n_spots": 14115,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H1_N04_FibroRich",
+        "dominant_type": "CAF",
+        "secondary_type": "DC",
+        "n_spots": 39158,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H3_N05_NKRich",
+        "dominant_type": "NK",
+        "secondary_type": "Monocyte",
+        "n_spots": 44370,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H1_N06_TAMRich",
+        "dominant_type": "TAM",
+        "secondary_type": "DC",
+        "n_spots": 51992,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H3_N07_MonocyteRich",
+        "dominant_type": "Monocyte",
+        "secondary_type": "NK",
+        "n_spots": 30926,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H2_N08_FibroRich",
+        "dominant_type": "CAF",
+        "secondary_type": "DC",
+        "n_spots": 4369,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H1_N09_NKRich",
+        "dominant_type": "NK",
+        "secondary_type": "MAST",
+        "n_spots": 12035,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H3_N10_MASTRich",
+        "dominant_type": "MAST",
+        "secondary_type": "NK",
+        "n_spots": 7990,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H2_N11_MonocyteRich",
+        "dominant_type": "Monocyte",
+        "secondary_type": "Endothelial",
+        "n_spots": 14204,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H2_N12_NKRich",
+        "dominant_type": "NK",
+        "secondary_type": "MAST",
+        "n_spots": 6907,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H2_N13_FibroRich",
+        "dominant_type": "CAF",
+        "secondary_type": "DC",
+        "n_spots": 12025,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H1_N14_FibroRich",
+        "dominant_type": "CAF",
+        "secondary_type": "DC",
+        "n_spots": 22772,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H1_N15_FibroRich",
+        "dominant_type": "CAF",
+        "secondary_type": "CD8T",
+        "n_spots": 47620,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H2_N16_NKRich",
+        "dominant_type": "NK",
+        "secondary_type": "MAST",
+        "n_spots": 10231,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      },
+      {
+        "niche_name": "H3_N17_NKRich",
+        "dominant_type": "NK",
+        "secondary_type": "MAST",
+        "n_spots": 21537,
+        "silhouette_hyperbolic": 0.7101950278792976,
+        "silhouette_euclidean": 0.4174363523000069
+      }
+    ],
+    "step4_combination_caveat": [
+      {
+        "combo": "POSTN",
+        "effect": 1.0,
+        "synergy_bliss": 0.0,
+        "rank": 1
+      },
+      {
+        "combo": "MFAP2",
+        "effect": 1.0,
+        "synergy_bliss": 0.0,
+        "rank": 2
+      },
+      {
+        "combo": "INHBA",
+        "effect": 1.0,
+        "synergy_bliss": 0.0,
+        "rank": 3
+      },
+      {
+        "combo": "POSTN+MFAP2",
+        "effect": 1.0,
+        "synergy_bliss": 0.0,
+        "rank": 4
+      },
+      {
+        "combo": "POSTN+INHBA",
+        "effect": 1.0,
+        "synergy_bliss": 0.0,
+        "rank": 5
+      },
+      {
+        "combo": "MFAP2+INHBA",
+        "effect": 1.0,
+        "synergy_bliss": 0.0,
+        "rank": 6
+      }
+    ]
+  },
+  "literature_seed_records_from_zotero": [
+    {
+      "key": "li_inhba_2025",
+      "title": "INHBA promotes tumor growth and induces resistance to PD-L1 blockade by suppressing IFN-gamma signaling",
+      "doi": "10.1038/s41401-024-01381-x",
+      "url": "https://pubmed.ncbi.nlm.nih.gov/39223366/"
+    },
+    {
+      "key": "hu_inhba_2024",
+      "title": "INHBA(+) cancer-associated fibroblasts generate an immunosuppressive tumor microenvironment in ovarian cancer",
+      "doi": "10.1038/s41698-024-00523-y",
+      "url": "https://www.nature.com/articles/s41698-024-00523-y"
+    },
+    {
+      "key": "tingting_you_postn_2023",
+      "title": "POSTN secretion by extracellular matrix CAFs correlates with poor ICB response via macrophage chemotaxis/Akt",
+      "doi": "10.14336/AD.2023.0503",
+      "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC10676785/"
+    },
+    {
+      "key": "pinto_decellularized_2017",
+      "title": "Decellularized human colorectal cancer matrices polarize macrophages towards an anti-inflammatory phenotype via CCL18",
+      "doi": "10.1016/j.biomaterials.2017.02.004",
+      "url": "https://pubmed.ncbi.nlm.nih.gov/28209528/"
+    }
+  ],
+  "modules": [
+    {
+      "module": "INHBA-Activin-SMAD-Treg",
+      "partners": "ACVR2A; ACVR1B; SMAD2/3; FOXP3",
+      "primary_cells": "Fibroblast_S1/S2/S3 or CAF -> T_cell_regulatory/Treg",
+      "immune_phenotype": "Treg induction / immunosuppressive licensing",
+      "hypersca_support": "Direct Activin-SMAD flow; INHBA discovery rank #2; ACVR2A priority 0.856; ACVR1B priority 0.658; top niche MonocyteRich z=2.296",
+      "literature_support": "INHBA/Activin A suppresses IFN-gamma signaling and anti-PD-L1 response; INHBA+ CAFs promote Treg differentiation via SMAD2/PD-L1; Activin A supports Foxp3 iTreg induction",
+      "evidence_level": "A: local direct pathway + external mechanism",
+      "caveat": "HyperSCA supports axis direction and niche context; it does not prove wet-lab causality."
+    },
+    {
+      "module": "CAF POSTN/MFAP2-integrin-TAM",
+      "partners": "POSTN; MFAP2; ITGAV/ITGA5/ITGB1/ITGB5; SRC/FAK; CD163/MRC1",
+      "primary_cells": "Fibroblast/CAF -> Macrophage/TAM/Macrophage_cycling",
+      "immune_phenotype": "TAM recruitment / M2-like macrophage niche",
+      "hypersca_support": "POSTN/MFAP2 edges are among top hyperbolic OT flows; POSTN->ITGAV flow 0.609; MFAP2->ITGA5 flow 0.609; high co-niche effects in EndothelialRich/FibroRich/TAMRich contexts",
+      "literature_support": "POSTN+ eCAFs correlate with CD163+ macrophages, macrophage chemotaxis and poor ICB response; CRC matrices induce anti-inflammatory macrophages via CCL18",
+      "evidence_level": "A-/B+: local flow + cross-cancer/post-ECM literature",
+      "caveat": "Cross-cancer POSTN literature supports mechanism but not CRC-specific INHBA combination efficacy."
+    },
+    {
+      "module": "TAM TGFB1-SMAD-CD8 exhaustion/exclusion",
+      "partners": "TGFB1; TGFBR1/2; SMAD2/3; HAVCR2; LAG3",
+      "primary_cells": "Macrophage/TAM -> T_cell_CD8/CD8_cycling",
+      "immune_phenotype": "CD8 T-cell exclusion / exhaustion marker induction",
+      "hypersca_support": "TGFb-SMAD pathway has 8 edges, total flow 4.475, direction consistency 1.0; top edges flow 0.632 from Macrophage_cycling to CD8 cycling",
+      "literature_support": "TGF-beta enables T-cell exclusion in colorectal cancer and can build a dual immune barrier by impairing T-cell recruitment and instructing suppressive macrophages",
+      "evidence_level": "A: local flow + CRC literature",
+      "caveat": "This is a co-module around INHBA-rich niches, not a direct INHBA ligand-receptor edge."
+    },
+    {
+      "module": "TAM IL10-STAT3-PDCD1 CD8 exhaustion",
+      "partners": "IL10; IL10RA; STAT3; PDCD1",
+      "primary_cells": "Macrophage/TAM -> T_cell_CD8/CD8_cycling",
+      "immune_phenotype": "checkpoint/exhaustion maintenance",
+      "hypersca_support": "IL10-STAT3 has 4 edges, total flow 2.237, direction consistency 1.0; top flow 0.632 from Macrophage_cycling to CD8 cycling",
+      "literature_support": "IL-10/PD-1 cooperation limits tumor-specific CD8 activity; STAT3 is activated by IL-10-family cytokines in the TME",
+      "evidence_level": "B+: local flow + general tumor immunology literature",
+      "caveat": "IL-10 biology is context-dependent; this is a mechanistic hypothesis requiring perturbation validation."
+    },
+    {
+      "module": "ECM FN1/COL1A1 barrier with integrin/FAK support",
+      "partners": "FN1; COL1A1; integrins; FAK/SRC; collagen/fibronectin ECM",
+      "primary_cells": "CAF/pericyte/stromal ECM -> T cell/TAM spatial access",
+      "immune_phenotype": "physical immune exclusion and stromal shielding",
+      "hypersca_support": "FN1 rank #1 score 0.824 and COL1A1 rank #3 score 0.744; both enrich in FibroRich/MonocyteRich niches overlapping INHBA; Integrin-FAK pathway total flow 11.31",
+      "literature_support": "Dense collagen/ECM suppresses T-cell activity and collagen can drive anti-PD-1/PD-L1 resistance through LAIR1-dependent CD8 exhaustion",
+      "evidence_level": "B+: strong co-niche/model support + ECM literature",
+      "caveat": "Barrier effect is inferred from ECM programs and literature; HyperSCA does not measure physical matrix stiffness directly."
+    },
+    {
+      "module": "MonocyteRich CCL18/CD74/CXCL10 context",
+      "partners": "CCL18; CD74; CXCL10; IFNG-related chemokines",
+      "primary_cells": "Monocyte/Macrophage-rich niches with adjacent CAF/INHBA signal",
+      "immune_phenotype": "M2-like macrophage polarization plus suppressed IFN-gamma recruitment axis",
+      "hypersca_support": "CCL18 z=2.906, CD74 z=2.115, CXCL10 z=2.418 in H3_N07_MonocyteRich; INHBA top niche is the same MonocyteRich compartment",
+      "literature_support": "CRC tumor ECM can polarize macrophages toward anti-inflammatory CCL18-high phenotype; INHBA/Activin A literature reports reduced CXCL9/CXCL10 and effector T infiltration",
+      "evidence_level": "B: co-niche context + CRC ECM literature",
+      "caveat": "CXCL10 is best treated as a counter-axis that may be suppressed by INHBA, not as a positive immunosuppressive synergist."
+    }
+  ],
+  "interpretation_policy": [
+    "Direct Activin-SMAD support is distinguished from co-niche ecological support.",
+    "OT direction consistency and target ranking are model evidence, not wet-lab causality.",
+    "Step4 Bliss synergy is not positive for INHBA combinations in the current run and is reported as a limitation.",
+    "CXCL10 is interpreted as an IFN-gamma recruitment/counter-axis potentially suppressed by INHBA, not as a positive suppressive partner."
+  ]
+}
