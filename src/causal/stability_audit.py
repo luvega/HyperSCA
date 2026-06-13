@@ -167,9 +167,11 @@ def build_edge_stability_table(
                     "edge_jaccard_vs_base": _jaccard(base_mask, edge_mask),
                     "null_mean_freq": null_mean,
                     "null_p95_freq": null_p95,
+                    "null_control_count": len(nulls),
                     "empirical_pvalue": empirical_p,
                     "fdr_qvalue": 1.0,
                     "negative_control_pass": False,
+                    "negative_control_status": "not_run" if not nulls else "pending",
                     "stability_class": "unstable_candidate",
                     "evidence_level": (
                         "exploratory_cluster_graph"
@@ -182,13 +184,25 @@ def build_edge_stability_table(
     qvalues = _bh_qvalues(pvalues)
     for row, qvalue in zip(rows, qvalues):
         row["fdr_qvalue"] = float(qvalue)
+        has_null_controls = len(nulls) > 0
         enough_nulls_for_fdr = len(nulls) >= 10
         row["negative_control_pass"] = bool(
-            row["mean_freq"] > row["null_p95_freq"]
+            has_null_controls
+            and row["mean_freq"] > row["null_p95_freq"]
             and (row["fdr_qvalue"] <= fdr_alpha or not enough_nulls_for_fdr)
         )
+        if not has_null_controls:
+            row["negative_control_status"] = "not_run"
+        elif row["negative_control_pass"]:
+            row["negative_control_status"] = "passed"
+        elif not enough_nulls_for_fdr:
+            row["negative_control_status"] = "failed_insufficient_nulls_for_fdr"
+        else:
+            row["negative_control_status"] = "failed"
         if row["negative_control_pass"] and row["seed_support"] >= 0.8:
             row["stability_class"] = "stable_candidate"
+        elif not has_null_controls and (row["seed_support"] >= 0.5 or row["base_edge"]):
+            row["stability_class"] = "not_controlled_candidate"
         elif row["mean_freq"] <= row["null_p95_freq"]:
             row["stability_class"] = "null_like_edge"
         elif row["seed_support"] >= 0.5 or row["group_support_rate"] > 0:
@@ -204,16 +218,25 @@ def build_negative_control_report(edge_stability: pd.DataFrame, metadata: Mappin
     metadata = dict(metadata or {})
     n_edges = int(edge_stability["base_edge"].sum()) if "base_edge" in edge_stability else 0
     n_pass = int(edge_stability["negative_control_pass"].sum()) if "negative_control_pass" in edge_stability else 0
+    n_null_controls = int(edge_stability["null_control_count"].max()) if "null_control_count" in edge_stability else 0
     level = metadata.get("interpretation", "exploratory causal-candidate audit")
     lines = [
         "# Causal Stability and Negative Control Audit",
         "",
         f"- Evidence level: `{level}`",
         f"- Base directed edges: {n_edges}",
+        f"- Null control matrices: {n_null_controls}",
         f"- Edges passing negative controls: {n_pass}",
         "",
         "These results are stability diagnostics for mechanism hypotheses and computational priorities; they are not treatment conclusions or sample-level causal proof.",
     ]
+    if n_null_controls == 0:
+        lines.extend(
+            [
+                "",
+                "No null controls were supplied; `negative_control_pass` is kept false for all edges.",
+            ]
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -268,6 +291,9 @@ def write_causal_stability_outputs(
     group_path.write_text(json.dumps(group_consistency, indent=2, ensure_ascii=False), encoding="utf-8")
     summary = {
         "n_edges": int(edge_stability["base_edge"].sum()) if "base_edge" in edge_stability else 0,
+        "n_null_control_matrices": int(edge_stability["null_control_count"].max())
+        if "null_control_count" in edge_stability
+        else 0,
         "n_negative_control_pass": int(edge_stability["negative_control_pass"].sum())
         if "negative_control_pass" in edge_stability
         else 0,

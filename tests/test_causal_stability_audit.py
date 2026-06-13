@@ -51,6 +51,27 @@ def test_edge_stability_table_marks_proxy_edges_conservatively():
     assert ab["evidence_level"] == "exploratory_cluster_graph"
 
 
+def test_edge_stability_requires_null_controls_to_pass_negative_control():
+    from src.causal.stability_audit import build_edge_stability_table, build_negative_control_report
+
+    adjacency = np.array([[0.0, 1.0], [0.0, 0.0]])
+    bootstrap = np.array([[0.0, 0.9], [0.1, 0.0]])
+
+    table = build_edge_stability_table(
+        adjacency=adjacency,
+        bootstrap_freq=bootstrap,
+        node_labels=["CAF", "TAM"],
+        threshold=0.5,
+    )
+    edge = table[(table["source_node"] == "CAF") & (table["target_node"] == "TAM")].iloc[0]
+    report = build_negative_control_report(table)
+
+    assert edge["negative_control_pass"] is False
+    assert edge["negative_control_status"] == "not_run"
+    assert edge["stability_class"] == "not_controlled_candidate"
+    assert "No null controls were supplied" in report
+
+
 def test_group_consistency_summary_separates_consensus_and_specific_edges():
     from src.causal.stability_audit import summarize_group_consistency
 

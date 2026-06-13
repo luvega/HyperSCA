@@ -21,45 +21,69 @@ def _component_score(value: Any) -> float:
         return 0.0
 
 
+def _split_causal_edge(causal_edge: str) -> tuple[str, str]:
+    if "->" in causal_edge:
+        source_type, target_type = causal_edge.split("->", 1)
+    elif "→" in causal_edge:
+        source_type, target_type = causal_edge.split("→", 1)
+    else:
+        return causal_edge, ""
+    return source_type, target_type
+
+
 def _extract_chains(flow_edges: Sequence[Mapping[str, Any]], relaxed_mode: bool = False) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, str], dict[str, Mapping[str, Any]]] = {}
+    keyed: dict[tuple[str, str], dict[str, list[Mapping[str, Any]]]] = {}
     for edge in flow_edges:
         key = (str(edge.get("pathway", "")), str(edge.get("causal_edge", "")))
+        parts = keyed.setdefault(key, {"lr": [], "rtf": [], "tf_target": []})
         if edge.get("source_layer") == 0 and edge.get("target_layer") == 1:
-            grouped.setdefault(key, {})["lr"] = edge
+            parts["lr"].append(edge)
         elif edge.get("source_layer") == 1 and edge.get("target_layer") == 2:
-            grouped.setdefault(key, {})["rtf"] = edge
+            parts["rtf"].append(edge)
         elif edge.get("source_layer") == 2 and edge.get("target_layer") == 3:
-            grouped.setdefault(key, {})["tf_target"] = edge
+            parts["tf_target"].append(edge)
 
     chains: list[dict[str, Any]] = []
-    for (pathway, causal_edge), parts in grouped.items():
-        lr = parts.get("lr", {})
-        rtf = parts.get("rtf", {})
-        tf_target = parts.get("tf_target", {})
-        ligand = str(lr.get("source", ""))
-        receptor = str(lr.get("target", ""))
-        tf = str(rtf.get("target", tf_target.get("source", "")))
-        downstream = str(tf_target.get("target", ""))
-        if not (ligand or receptor or tf or downstream):
-            continue
-        chains.append(
-            {
-                "pathway": pathway,
-                "causal_edge": causal_edge,
-                "ligand": ligand,
-                "receptor": receptor,
-                "tf": tf,
-                "downstream_target": downstream,
-                "source_type": causal_edge.split("->")[0] if "->" in causal_edge else causal_edge.split("→")[0] if "→" in causal_edge else "",
-                "target_type": causal_edge.split("->")[1] if "->" in causal_edge else causal_edge.split("→")[1] if "→" in causal_edge else "",
-                "relaxed_mode": bool(relaxed_mode),
-                "ligand_expr": float(lr.get("ligand_expr", 0.0) or 0.0),
-                "receptor_expr": float(lr.get("receptor_expr", 0.0) or 0.0),
-                "target_expr": float(tf_target.get("target_expr", 0.0) or 0.0),
-                "edge_weight": float(np.mean([float(part.get("weight", 0.0) or 0.0) for part in parts.values()])),
-            }
-        )
+    for (pathway, causal_edge), parts in keyed.items():
+        source_type, target_type = _split_causal_edge(causal_edge)
+        rtf_by_receptor: dict[str, list[Mapping[str, Any]]] = {}
+        for edge in parts["rtf"]:
+            rtf_by_receptor.setdefault(str(edge.get("source", "")), []).append(edge)
+        tf_target_by_tf: dict[str, list[Mapping[str, Any]]] = {}
+        for edge in parts["tf_target"]:
+            tf_target_by_tf.setdefault(str(edge.get("source", "")), []).append(edge)
+
+        for lr in parts["lr"]:
+            ligand = str(lr.get("source", ""))
+            receptor = str(lr.get("target", ""))
+            rtf_candidates = rtf_by_receptor.get(receptor, [{}])
+            for rtf in rtf_candidates:
+                tf = str(rtf.get("target", ""))
+                tf_target_candidates = tf_target_by_tf.get(tf, [{}]) if tf else [{}]
+                for tf_target in tf_target_candidates:
+                    downstream = str(tf_target.get("target", ""))
+                    if not (ligand or receptor or tf or downstream):
+                        continue
+                    chain_parts = [part for part in (lr, rtf, tf_target) if part]
+                    chains.append(
+                        {
+                            "pathway": pathway,
+                            "causal_edge": causal_edge,
+                            "ligand": ligand,
+                            "receptor": receptor,
+                            "tf": tf,
+                            "downstream_target": downstream,
+                            "source_type": source_type,
+                            "target_type": target_type,
+                            "relaxed_mode": bool(relaxed_mode),
+                            "ligand_expr": float(lr.get("ligand_expr", 0.0) or 0.0),
+                            "receptor_expr": float(lr.get("receptor_expr", 0.0) or 0.0),
+                            "target_expr": float(tf_target.get("target_expr", 0.0) or 0.0),
+                            "edge_weight": float(
+                                np.mean([float(part.get("weight", 0.0) or 0.0) for part in chain_parts])
+                            ),
+                        }
+                    )
     return chains
 
 
