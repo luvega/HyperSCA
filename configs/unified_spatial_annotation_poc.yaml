@@ -1,0 +1,72 @@
+run_id: unified_spatial_annotation_rctd_poc
+output_dir: results/benchmarks/unified_spatial_annotation_rctd_poc
+random_seed: 42
+max_cells_per_label: 1000
+max_query_cells: 5000
+max_genes: 2000
+hvae_epochs: 5
+device: cuda
+gpu_required_for_cell2location: true
+cell2location_reference_epochs: 250
+cell2location_mapping_epochs: 30000
+cell2location_n_cells_per_location: 30
+cell2location_detection_alpha: 20
+rctd_max_cores: 4
+rctd_test_mode: false
+rctd_doublet_mode: doublet
+rctd_reference_min_umi: 100
+rctd_umi_min: 100
+rctd_counts_min: 10
+rctd_umi_min_sigma: 300
+rctd_cell_min_instance: 25
+methods:
+  - cell2location
+  - rctd
+  - hvae
+references:
+  - name: scCRC_ICB
+    source: sccrc_icb_raw
+    raw_icb_dir: /home/a/Data/scCRC_ICB/input
+    metadata_path: /home/a/Data/scCRC_ICB/input/GSE236581_CRC-ICB_metadata.txt.gz
+    source_system: sccrc_icb
+    label_key: MajorCellType
+    fine_label_key: SubCellType
+    major_label_key: MajorCellType
+  - name: osta_chromium
+    source: h5ad
+    h5ad_path: /home/a/Data/OSTA/benchmark_cache/Chromium_HumanColon_Oliveira/benchmark.h5ad
+    source_system: osta
+    label_key: Level1
+    fine_label_key: Level2
+    filter_column: QCFilter
+    filter_value: Keep
+datasets:
+  - dataset_id: osta_visium_humancolon_oliveira
+    h5ad_path: /home/a/Data/OSTA/benchmark_cache/Visium_HumanColon_Oliveira/benchmark.h5ad
+    assay_type: whole_transcriptome
+    truth_label_key: label
+    truth_source_system: osta
+    rctd_mode: spacexr_deconvolution
+    rctd_label_key: DeconLabel1
+  - dataset_id: osta_visiumhd_humancolon_oliveira
+    h5ad_path: /home/a/Data/OSTA/benchmark_cache/VisiumHD_HumanColon_Oliveira/benchmark.h5ad
+    assay_type: whole_transcriptome
+    truth_label_key: DeconLabel1
+    truth_source_system: osta
+    rctd_label_key: DeconLabel1
+    rctd_secondary_label_key: DeconLabel2
+    rctd_class_key: DeconClass
+  - dataset_id: osta_visiumhd_segmented_humancolon_oliveira
+    h5ad_path: /home/a/Data/OSTA/benchmark_cache/VisiumHD_HumanColon_Oliveira_segmented/benchmark.h5ad
+    assay_type: visiumhd_segmented_cell
+    truth_label_key: null
+    truth_source_system: osta
+    rctd_mode: spacexr_doublet
+    rctd_label_key: DeconLabel1
+    rctd_secondary_label_key: DeconLabel2
+    rctd_class_key: DeconClass
+  - dataset_id: osta_xenium_humancolon_oliveira
+    h5ad_path: /home/a/Data/OSTA/benchmark_cache/Xenium_HumanColon_Oliveira/benchmark.h5ad
+    assay_type: targeted_panel
+    truth_label_key: null
+    truth_source_system: osta
