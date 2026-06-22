@@ -1,0 +1,23 @@
+{
+  "generated_at": "2026-06-22T16:52:33+08:00",
+  "source_run_dir": "results/benchmarks/hyperbolic_spatial_crc_v3_two_candidate_downstream_20260622",
+  "quality_gate": "audit_only_no_promotion",
+  "main_ranking_modified": false,
+  "promotion_recommended": false,
+  "candidate_metrics": {
+    "Full v3 product": {
+      "knn_label_purity": 0.6706333333333333,
+      "distance_label_auc": 0.7459926939025912,
+      "heldout_context_edge_auc": 0.6535762381898035,
+      "celcomen_interaction_energy_auc": 0.7156734275339219,
+      "target_rank_delta_nonzero": 0.0
+    },
+    "Without radial-depth loss": {
+      "knn_label_purity": 0.6728,
+      "distance_label_auc": 0.7538009803225859,
+      "heldout_context_edge_auc": 0.6480465143880992,
+      "celcomen_interaction_energy_auc": 0.7100747118299958,
+      "target_rank_delta_nonzero": 0.0
+    }
+  }
+}
