@@ -2,131 +2,296 @@
   <img src="docs/Logo_high%20res.png" alt="HyperSCA Logo" width="280" />
 </p>
 
-# HyperSCA
+HyperSCA (Hyperbolic Spatiotemporal Causal Analysis) 是一个面向空间组学与单细胞组学联合分析的多组学计算框架。该框架集成双曲几何嵌入、因果图发现和反事实扰动分析，支持 scRNA-seq、空间转录组及临床/表型分层数据的联合建模，用于机制推断与可干预靶点评估。除肿瘤免疫场景外，也可用于自身免疫、慢性炎症、感染及组织损伤修复等疾病环境。
 
-HyperSCA (Hyperbolic Spatiotemporal Causal Analysis) is a Python/R research pipeline for integrating single-cell RNA-seq, spatial transcriptomics, hyperbolic representation learning, causal inference, perturbation analysis, and target discovery. The current development focus is colorectal cancer spatial-immune benchmarking with unified cell annotation and spatial niche interpretation.
+HyperSCA is a multi-omics research pipeline for joint single-cell and spatial omics modeling, combining hyperbolic representation learning, causal graph inference, counterfactual perturbation, and spatially aware target prioritization.
 
-![HyperSCA concept overview](docs/research/figures/hypersca_current_pipeline_overview_imagegen_20260622.png)
+## Project and Algorithm Overview
 
-![HyperSCA current workflow](docs/research/figures/hypersca_current_pipeline_flowchart_20260622.png)
+HyperSCA 的研究完整版流程由六个连续阶段构成，可按具体队列与研究问题灵活裁剪：
 
-## Current Benchmark Snapshot
+- Phase D0（Data Onboarding）：四项目标准化入库与字段校验。
+- Stage 1（Embedding）：在 Lorentz/Poincare 双曲流形上学习细胞状态表示。
+- Stage 2（Causal）：在去缠结潜变量上执行因果结构发现与信号流推断。
+- Stage 3（Counterfactual）：在潜空间做基因扰动并模拟空间传播，完成靶点排序与去假阳性过滤。
+- Stage 4（Dynamic Intervention）：在 PK/PD 约束下执行时序传播与联靶组合干预评估，并支持实验回写后的 roundtrip 更新。
+- Stage 5（Behavior Grammar / Virtual Tissue）：将 target discovery 与 Step4 证据翻译为可读细胞行为规则，并运行轻量虚拟组织模拟；该层为可选 sidecar，不替换 Step1-Step4。
 
-The 2026-06-22 benchmark update keeps the active target ranking unchanged and evaluates only two internally trained v3 hyperbolic-spatial candidates in the main comparison:
+## Pipeline Flowchart
 
-- `hvae_hierarchy_spatial_v3_product`
-- `hvae_hierarchy_spatial_v3_product__without_radial_depth_loss`
+![HyperSCA Pipeline Flowchart v0.5](docs/hypersca_pipeline_flowchart_v0.5.png)
 
-SCimilarity is kept as an external pretrained appendix reference, not a main competitor. Both v3 candidates remain `audit_only_no_promotion`: target rank delta is still zero, target enrichment does not improve, and prototype/radial hierarchy supervision remains near chance. VisiumHD full cell2location passed the expected 545,913-row abundance check, and RCTD/cell2location dominant grid concordance is 0.827.
+## Benchmark Sidecar and Module Selection
 
-Primary summary artifacts:
+Benchmark 是 HyperSCA 的方法筛选和模块准入旁支，用于比较候选空间注释、空间反卷积、双曲嵌入和下游靶点发现模块是否值得进入主流程。它不替代 Phase D0 到 Stage 5 的主框架，也不应直接改写 active target ranking；只有在出现非零 target rank delta、target enrichment 改善，或可复查的空间生态位生物学收益时，候选模块才进入后续 promotion 评估。
 
-- Progress report: `docs/research/hypersca_benchmark_progress_20260622.md`
-- Reproducible snapshot: `docs/research/hypersca_benchmark_progress_20260622.json`
-- Local progress inventory: `docs/research/hypersca_project_progress_inventory_20260622.md`
-- Two-candidate figure: `docs/research/figures/hypersca_two_candidate_downstream_summary_20260622.png`
-- GitHub submission notes: `docs/github_submission_20260622.md`
+2026-06-22 阶段性 benchmark 保持保守结论：
 
-## Project Structure
+- 主比较只纳入两个内部训练的 v3 分支：`hvae_hierarchy_spatial_v3_product` 与 `hvae_hierarchy_spatial_v3_product__without_radial_depth_loss`。
+- SCimilarity 仅作为 external pretrained appendix reference，不作为主排名竞争对象。
+- 两个 v3 分支仍为 `audit_only_no_promotion`：target rank delta 仍为 0，target enrichment 尚未改善，prototype/radial hierarchy 监督仍接近 chance。
+- VisiumHD full cell2location 已通过 545,913 行 abundance 输出校验；VisiumHD segmented RCTD 作为近单细胞分辨率空间对照。
+- Xenium 保持 panel-aware 分支；targeted panel 数据不运行 whole-transcriptome RCTD/cell2location 假设。
 
-| Path | Purpose |
-| --- | --- |
-| `src/` | Reusable Python packages for models, causal inference, perturbation, discovery, evaluation, and data handling. |
-| `src/models/hyperbolic/` | Lorentz/Poincare geometry, HVAE components, hierarchy losses, and hyperbolic utilities. |
-| `src/discovery/target_discovery/` | Modular target discovery pipeline, scoring, spatial context, guardrails, and benchmark helpers. |
-| `scripts/` | CLI entrypoints for data onboarding, spatial annotation, benchmark generation, reports, and figures. |
-| `tests/` | Pytest suites mirroring the main packages and benchmark scripts. |
-| `docs/` | GitHub-friendly documentation, figures, reports, and project inventories. |
-| `reports/` | Local methodology notes and compact review artifacts. |
-| `results/` | Large generated benchmark outputs; intentionally ignored by Git. |
+当前阶段性审计材料保留为 compact reports 和 figures：
 
-## Installation
+- [Benchmark progress report](docs/research/hypersca_benchmark_progress_20260622.md)
+- [Benchmark JSON snapshot](docs/research/hypersca_benchmark_progress_20260622.json)
+- [Project progress inventory](docs/research/hypersca_project_progress_inventory_20260622.md)
+- [GitHub submission notes](docs/github_submission_20260622.md)
+- [Current workflow figure](docs/research/figures/hypersca_current_pipeline_flowchart_20260622.png)
+- [Two-candidate downstream summary figure](docs/research/figures/hypersca_two_candidate_downstream_summary_20260622.png)
 
-Create the main environment:
+## Core Algorithms
+
+### 1) Hyperbolic Embedding
+
+- 关键模块：`src/models/hyperbolic/lorentz.py`, `src/models/hyperbolic/poincare.py`, `src/models/hyperbolic/wrapped_normal.py`, `src/models/hyperbolic/hvae.py`
+- 目的：在双曲空间中更好地保持细胞层级结构与远近关系，降低欧氏空间下的几何失真。
+
+### 2) Causal Discovery and Signaling Flow
+
+- 关键模块：`src/causal/disentangle.py`, `src/causal/cmi_pruning.py`, `src/causal/causal_graph.py`, `src/causal/signaling_flow.py`
+- 方法要点：`z_int/z_ext` 去缠结 + PC 条件独立检验 + bootstrap 稳定性 + DoWhy 结构验证 + L-R-TF-Target 多层流。
+
+### 3) Counterfactual Perturbation and Spatial Propagation
+
+- 关键模块：`src/perturbation/latent_arithmetic.py`, `src/perturbation/spatial_propagation.py`, `src/perturbation/diffusion_cf.py`, `src/perturbation/target_ranking.py`
+- 方法要点：潜空间虚拟敲除、因果图约束扩散、空间梯度衰减拟合、靶点可干预性排序。
+
+### 4) Niche and Cross-sample Stratification
+
+- 关键模块：`src/evaluation/cross_sample_metrics.py`
+- 方法要点：生态位聚类（niche clustering）、跨样本边一致性、临床/表型分层差异检验，纳入最终证据矩阵。
+
+### 5) Modular Target Discovery
+
+- 入口脚本：`scripts/run_target_discovery.py` 现在是 thin CLI，只负责解析参数、构造 `TargetDiscoveryConfig` 并调用 pipeline。
+- 核心包：`src/discovery/target_discovery/`
+  - `config.py`、`pipeline.py`、`stage.py`、`artifacts.py` 定义配置、编排、stage 协议与 run manifest。
+  - `loaders.py`、`candidates.py`、`expression.py`、`spatial.py` 构建轻量数据输入。
+  - `geometry.py`、`causal_stage.py`、`perturbation_stage.py`、`scoring.py`、`niche.py`、`reporting.py`、`figures.py` 负责双几何比较、Step2/Step3 wrapper、证据排序、生态位映射、报告和图。
+- 输出根目录：默认写入 `results/discovery/target_discovery/<run_id>/`，按 `candidates/`、`expression/`、`spatial/`、`geometry/{mode}/`、`causal/{mode}/`、`perturbation/{mode}/`、`scoring/`、`niche/`、`reports/`、`figures/` 分区，并生成 `manifest.json` 与 `reports/migration_notes.md`。
+
+### 6) Behavior Grammar and Virtual Tissue Simulation
+
+- 入口脚本：`scripts/run_behavior_grammar_simulation.py`
+- 核心包：`src/behavior_grammar/`
+  - `rules.py` 定义 `BehaviorRule`, `SignalDictionary`, `BehaviorDictionary`, `RuleSet` 与 Hill/linear/step response。
+  - `rule_builder.py` 从 `results/discovery/target_discovery/<run_id>/manifest.json`、评分表、因果边、生态位映射和表达矩阵生成数据驱动规则。
+  - `simulation.py` 运行确定性 toy virtual tissue simulation，并输出 QoI sensitivity 与组合干预场景比较。
+  - `pipeline.py` 复用 run-scoped artifact manifest，写入规则、轨迹、summary、敏感性表和动态图。
+- 输出根目录：默认写入 `results/behavior_grammar/<run_id>/`，包含 `rules/rules.json`、`rules/rules.md`、`simulation/population_trajectory.csv`、`simulation/simulation_summary.json`、`simulation/qoi_sensitivity.csv` 与 `figures/population_trajectories.png`。
+
+## Example Data Samples
+
+项目常用示例输入（路径为本地外部数据目录，不纳入版本控制；以下为脱敏占位路径）：
+
+- `<PATH_TO_scRNA_REFERENCE>`
+  - 代表文件：`*-NormalizedCounts.tsv`, `*-DE_result.tsv`
+  - 用途：构建 cluster-level 表达矩阵、候选差异基因池与细胞状态先验。
+- `<PATH_TO_SPATIAL_OMICS>`
+  - 代表文件：`STmetadata_*.csv`, `spot_annotations.*`
+  - 用途：空间反卷积、细胞共定位邻接、传播梯度与生态位结构评估。
+- `<PATH_TO_CLINICAL_OR_PHENOTYPE>`
+  - 代表文件：`sample_clinical_mapping.csv`, `group_labels.csv`
+  - 用途：临床/表型分层（如免疫亚型、疾病分期、治疗反应）及跨样本差异分析。
+
+统一标准化输出（示例）：
+
+- `results/integration/schema/sample_table.csv`
+- `results/integration/schema/entity_table.csv`
+- `results/integration/schema/feature_table.csv`
+- `results/integration/schema/measure_table.csv`
+
+## Installation Guide
+
+### 1) Create Conda Environment
 
 ```bash
 conda create -n hypersca python=3.10 -y
 conda activate hypersca
+```
+
+### 2) Install Dependencies
+
+```bash
 pip install -r requirements.txt
 ```
 
-For GPU workloads, install a CUDA-compatible PyTorch build before running full cell2location or v3 HVAE jobs. Confirm GPU visibility:
+CUDA 12.4 推荐安装：
 
 ```bash
-python - <<'PY'
-import torch
-print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu")
-PY
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip install torch-geometric -f https://data.pyg.org/whl/torch-2.6.0+cu124.html
 ```
 
-Validate the runtime:
+如需复现历史扰动 baseline，可额外安装可选依赖；核心流程不依赖 `scgen`：
+
+```bash
+pip install -r requirements-optional-baselines.txt
+```
+
+### 3) Validate Runtime Environment
 
 ```bash
 python scripts/validate_env.py
 ```
 
-## Development Commands
+`scgen` 仅作为可选历史 baseline 检查；缺失或因 `scvi-tools` 版本不兼容导入失败时，验证脚本会报告 warning，但不会阻断 HyperSCA 核心环境。
 
-Run the full test suite:
+当前本地开发快照使用外部短路径 conda 环境 `C:\h` 通过环境验证和测试回归；若使用 Windows PowerShell，可直接运行：
 
-```bash
-PYTHONPATH=. pytest tests -q -p no:cacheprovider
+```powershell
+C:\h\python.exe scripts\validate_env.py
+C:\h\python.exe -m pytest tests -q -p no:cacheprovider
 ```
 
-Run focused discovery tests:
+## Quick Start
+
+### Multi-omics Integration Example (推荐)
+
+展示 HyperSCA **多组学整合分析**核心能力的完整示例（6 个 notebook，含嵌入图表）：
+
+- `notebooks/example_multiomics_integration/README.md`
+- `00_data_landscape` → `01_hyperbolic_vs_euclidean` → `02_multiscale_niche` → `03_causal_network` → `04_target_discovery` → `05_summary`
+
+核心对比结果：
+
+| 指标 | scRNA-only + Euclidean | Multi-omics + Hyperbolic | 提升 |
+|------|----------------------|-------------------------|------|
+| Niche Silhouette | 0.417 | **0.710** | **+70%** |
+| Hierarchy Correlation | −0.569 | **+1.000** | 反转→完美 |
+| 证据维度 | 3 | **5** (+spatial, +niche) | +2 独立维度 |
+
+数据规模：485K spots × 3 空间平台 + 3 scRNA-seq 队列，**靶点发现完全数据驱动**（无预设 anchor）。
+
+### Step-by-step scCRC_ICB (单细胞基础流程)
+
+如需仅基于 scRNA-seq 数据按主流程逐步运行：
+
+- `notebooks/example_sccrc_icb_step_by_step/README.md`
+- `notebooks/example_sccrc_icb_step_by_step/00_environment_and_data_check.ipynb` 到 `05_step4_dynamic_intervention_and_summary.ipynb`
+
+### A. Build Canonical Schema
 
 ```bash
-PYTHONPATH=. pytest tests/discovery -q -p no:cacheprovider
+python scripts/build_canonical_schema.py
 ```
 
-Run a small target-discovery demo:
+### A0. Onboard Multi-cohort Data to `/data`
+
+说明：脚本参数名保留历史命名（`icb/neu/st/ifng`），但可映射到任意疾病场景的数据根目录。
+
+```bash
+python scripts/run_data_onboarding.py \
+  --icb-root <PATH_TO_COHORT_A> \
+  --neu-root <PATH_TO_COHORT_B> \
+  --st-root <PATH_TO_SPATIAL_OMICS> \
+  --ifng-root <PATH_TO_COHORT_D>
+```
+
+### B. Run Step1 (Hyperbolic Embedding)
+
+```bash
+python scripts/run_step1.py \
+  --data-dir data/ST/<YOUR_SPATIAL_PROJECT> \
+  --modality visium \
+  --output-dir results/step1
+```
+
+### C. Run Step2 (Spatial Causal Inference)
+
+```bash
+python scripts/run_step2.py \
+  --input-dir results/step1 \
+  --output-dir results/step2
+```
+
+### D. Run Step3 (Counterfactual Perturbation)
+
+```bash
+python scripts/run_step3.py \
+  --input-step1 results/step1 \
+  --input-step2 results/step2 \
+  --output-dir results/step3
+```
+
+### E. Run Target Discovery and Hub Retention
 
 ```bash
 python scripts/run_target_discovery.py \
   --run-id demo_target_discovery \
   --max-perturb 10 \
+  --geometry-k 4 \
+  --geometry-blend 0.30 \
+  --platform all \
   --skip-figures
 ```
 
-Regenerate the current benchmark documentation from local artifacts:
+默认输出位于 `results/discovery/target_discovery/<run_id>/`。旧版展示口径中的预计算发现结果仍保留在 `results/integration/discovery/`，用于 notebook 和 README 中的历史图表展示。
+
+### F. Run Dynamic Intervention (Step4) and Roundtrip Update
 
 ```bash
-python scripts/generate_current_pipeline_docs.py
+python scripts/run_step4.py --with-roundtrip \
+  --experiment-file data/metadata/experiment_roundtrip.csv
 ```
 
-## Current Analysis Workflow
+### G. Run Behavior Grammar Sidecar (Stage5)
 
-1. Build or load the scCRC_ICB reference with unified broad/fine cell annotation.
-2. Map spatial datasets with platform-aware methods:
-   - Visium/VisiumHD: RCTD via SpaceXR and GPU cell2location.
-   - VisiumHD segmented workflow: preferred for near single-cell spatial resolution.
-   - Xenium: panel-aware branch only; do not run whole-transcriptome RCTD/cell2location assumptions on targeted-panel data.
-3. Train and audit hyperbolic-spatial v3 candidates with the 5k-cell, 6k-gene, 3-seed protocol.
-4. Evaluate target ranking, target enrichment, context enrichment, spatial block holdout, and VisiumHD niche visualizations.
-5. Promote no method unless at least one internal functional gate is met: non-zero target rank delta, improved target enrichment, or reviewable spatial niche biological gain.
+无需真实 discovery manifest、只想查看行为语法模拟产物时，可先运行 demo：
 
-## Benchmark and Report Assets
-
-Raw benchmark outputs remain local under ignored `results/` directories. Commit compact summaries instead:
-
-```text
-docs/research/hypersca_benchmark_progress_20260622.md
-docs/research/hypersca_benchmark_progress_20260622.json
-docs/research/hypersca_project_progress_inventory_20260622.md
-docs/research/figures/hypersca_current_pipeline_flowchart_20260622.png
-docs/research/figures/hypersca_current_pipeline_flowchart_20260622.svg
-docs/research/figures/hypersca_two_candidate_downstream_summary_20260622.png
-docs/research/figures/hypersca_current_pipeline_overview_imagegen_20260622.png
+```bash
+python scripts/run_behavior_grammar_simulation.py \
+  --demo \
+  --run-id demo_behavior_grammar \
+  --time-steps 8
 ```
 
-## Coding Style
+真实 target discovery run 则指定 manifest：
 
-Use Python 3.10-compatible code, 4-space indentation, descriptive `snake_case` function and module names, and `PascalCase` classes. Keep scripts thin: argument parsing belongs in `scripts/`, reusable logic belongs in `src/`. Prefer explicit artifact paths and manifest-style outputs for long-running analyses.
+```bash
+python scripts/run_behavior_grammar_simulation.py \
+  --discovery-manifest results/discovery/target_discovery/<run_id>/manifest.json \
+  --step4-dir results/step4 \
+  --run-id <run_id>
+```
 
-## Testing Guidelines
+该 sidecar 读取 target discovery run manifest 和可选 Step4 context，生成可读规则、虚拟组织轨迹、QoI sensitivity 与动态图。它不改变 Step1-Step4 CLI 输出契约。
 
-Use `pytest` with small synthetic fixtures when private data are unavailable. Add tests close to the affected subsystem and name them `test_*.py`. For benchmark scripts, test CLI behavior, manifest contents, and artifact contracts rather than full private-data runs.
+### H. Generate CNS-style Figures (Step1/2/3)
 
-## Git and Data Policy
+```bash
+python scripts/generate_step1_figures.py
+python scripts/generate_step2_figures.py
+python scripts/generate_step3_figures.py
+```
 
-Do not commit patient-level data, local dataset roots, credentials, full `.h5ad` files, large CSV/TSV outputs, model weights, or raw `results/` folders. Before opening a PR, stage only reviewed files and include the exact tests run. Use concise Conventional Commit-style messages such as `feat: ...`, `fix: ...`, `docs: ...`, or `refactor: ...`.
+## Key Outputs
+
+- Canonical schema and metadata: `data/metadata/`, `results/integration/schema/`
+- Step1 outputs: `results/step1/` (`adata_embedded.h5ad`, `embedding_benchmark.json`)
+- Step2 outputs: `results/step2/`（因果图、稳定性指标、baseline 对比）
+- Step3 outputs: `results/step3/`（扰动结果、去假阳性靶点与组合）
+- Target discovery runs: `results/discovery/target_discovery/<run_id>/`（run manifest、候选池、几何比较、Step2/Step3 wrapper 产物、评分表、生态位映射、报告、迁移说明）
+- Legacy/precomputed discovery reports for notebooks: `results/integration/discovery/`
+- Step4 outputs: `results/step4/`（`pkpd_summary.json`, `combination_ranking.csv`, `roundtrip_update_report.json`）
+- Behavior grammar outputs: `results/behavior_grammar/<run_id>/`（可读规则、simulation summary、QoI sensitivity、虚拟组织轨迹图）
+- CNS figure outputs: `results/figures/step1/`, `results/figures/step2/`, `results/figures/step3/`
+
+## 项目目录说明
+
+完整的本地目录边界、提交文件说明、验证代码说明、结果目录说明、历次更新记录和当前项目进度见 [docs/project_inventory.md](docs/project_inventory.md)。
+
+## Testing
+
+```bash
+pytest tests -q -p no:cacheprovider
+pytest tests/discovery -q
+pytest tests/behavior_grammar -q
+```
+
+## License
+
+MIT License.
