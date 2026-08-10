@@ -11,6 +11,7 @@
 1. HyperSCA 核心研究构想与既有工作的撞车程度；
 2. 相对安静方向是否存在可独立支撑的文献基础；
 3. 对相对安静方向最有威胁的反证、边界条件和方法批评。
+4. 用同一证据把“下一步升级什么”和“如何与现有方法公平比较”连接起来，在创新性与可靠性之间保持可审计的表述边界。
 
 完善后的报告仍是定向范围综述与项目审计，不升级为系统综述，也不把计算候选解释为已验证药物机制。
 
@@ -41,6 +42,8 @@ Bear 检索使用以下压缩构想作为统一语义锚点：
 - 将新文献按直接撞车、方法孪生、问题孪生、邻近工作四层归类；
 - 只围绕安静区增加支撑证据和方法挑战，不对整个项目做泛化式正反文献堆砌；
 - 将高威胁挑战转译为可执行的 benchmark、negative control 或 promotion gate；
+- 建立“升级方向—比较方法—主终点—可靠性门槛”矩阵，避免先升级模型、后寻找有利指标；
+- 建立创新主张登记表，把框架创新、评价创新和算法创新分开陈述；
 - 更新摘要、结论、主张—证据映射、限制、检索透明度和参考文献。
 
 ### 3.3 明确排除
@@ -97,7 +100,9 @@ reports/research/bear_hypersca_spatial_causal_20260810/
 ├── report.md             # Bear 综合证据附件
 ├── report.html           # 自包含、可视化综合附件
 ├── references.bib        # 正文实际引用文献的去重 BibTeX
-└── query_manifest.tsv    # phase、模式、查询词、命中数、输出文件
+├── query_manifest.tsv    # phase、模式、查询词、命中数、输出文件
+├── comparison_matrix.tsv # 升级方向、比较器、数据切分、主终点与门槛
+└── innovation_claim_register.tsv # 创新类型、证据要求、状态与允许措辞
 ```
 
 主报告仍位于原路径。数据流为：查询清单 → SciMaster JSON/BibTeX → DOI/标题去重 → 证据分层 → Bear 附件 → 主报告定向改写。原始结果不因最终未引用而删除，以便审计检索选择。
@@ -116,7 +121,41 @@ reports/research/bear_hypersca_spatial_causal_20260810/
 | 12 主张—证据映射 | 为新增主要主张补充状态与证据来源 |
 | 参考文献 | 仅加入正文实际使用且元数据可核验的来源 |
 
-## 7. 证据与写作规则
+## 7. 升级—比较双轨与“火候”控制
+
+### 7.1 升级轨道
+
+每项建议升级必须由同一个外部证据缺口触发，并明确回答四个问题：
+
+1. 现有 HyperSCA 模块在哪个外部任务上失败或尚未评估；
+2. 建议增加的是数据适配、评价协议、模型组件还是机制验证；
+3. 升级是否能被独立 artifact 和 ablation 隔离验证；
+4. 如果主终点不改善，是否能够撤回而不影响主流程。
+
+优先级遵循“先真实干预 benchmark，再比较模型，最后升级复杂模型”。不得因某篇新论文与项目概念接近就直接把其模块并入主排名。
+
+### 7.2 比较轨道
+
+比较矩阵至少覆盖四组：
+
+| HyperSCA 任务 | 必须比较的现有方法 | 公平性约束 | 主可靠性终点 |
+|---|---|---|---|
+| Task C：干预因果网络 | Mean Difference、Guanlab、GRNBoost、PC/DoWhy | 同一基因集、干预集合、edge budget 与跨细胞系切分 | PR-AUC/precision-recall、干预利用率、跨细胞系稳健性 |
+| 单细胞反事实 | CINEMA-OT/Pertpy、简单 mean/nearest-neighbor、可运行的 scGen/CPA 类基线 | 同一训练/未见条件切分、相同输入特征与调参预算 | per-cell effect、population distance、coverage、calibration |
+| Task S：空间传播 | own-only/null、距离衰减基线、Celcomen、SpatialProp/CONCERT（可运行时） | 同一 section/animal holdout、cell type 与 panel gate | own/neighbor effect、distance-bin、niche、校准与外部切片 |
+| Task D：空间药物机制 | signature reversal、SOAR/STDrug 类候选层、真实 pharmacotranscriptomics 正控 | 遗传与药物扰动分层；同剂量/时间与毒性过滤 | 已知 MOA、target engagement、dose-time、外部药物响应 |
+
+所有模型共享预处理、切分、特征面板、随机种子数、调参预算和缺失数据规则。结果必须同时报告简单基线、效应量与置信区间、负控、失败案例和计算成本；单一最优点估计不足以支持 superiority。
+
+### 7.3 创新主张分级
+
+- **框架创新：** 任务契约、证据分层和 promotion gate 的新组合。只需证明与既有工具的边界和可执行性，不宣称预测更优。
+- **评价创新：** 将 own/neighbor、距离、niche、药理证据和可靠性门控放入统一外部评估。需要证明指标有效、无泄漏且能区分简单基线。
+- **算法创新：** 新模型组件在预注册主终点上超过强基线。必须具有多 seed 置信区间、外部 holdout、消融、负控、校准和失败分析。
+
+允许措辞随证据升级：`候选设计` → `框架/评价贡献` → `在指定任务上优于比较方法`。在没有同任务公平比较前，不使用“state of the art”“显著优于现有方法”或“证明药物作用机制”。
+
+## 8. 证据与写作规则
 
 - 每条新增论文信息必须能回溯到本次 SciMaster JSON 和 BibTeX；
 - DOI 页面、PubMed 或出版社页面用于复核关键元数据，但不能用未检索来源悄悄补足 Bear 结果；
@@ -127,7 +166,7 @@ reports/research/bear_hypersca_spatial_causal_20260810/
 - 每段第一句给出段落主旨，段内只承载一个中心消息；
 - 新增结论必须进入主张—证据映射，未充分支持的结论降级或删除。
 
-## 8. 验证与验收
+## 9. 验证与验收
 
 完成条件如下：
 
@@ -135,16 +174,17 @@ reports/research/bear_hypersca_spatial_causal_20260810/
 2. 查询清单约 15 条，且没有使用 `high`；
 3. 每个 JSON 可解析，每个被引用来源在去重 BibTeX 中存在；
 4. `report.md`、`report.html`、`references.bib`、`query_manifest.tsv` 均存在且非空；
-5. 主报告中的本地相对链接有效，Markdown code fence 配对；
-6. 新增主张与证据映射无空锚点，参考文献无重复 DOI；
-7. `git diff --check` 通过；
-8. 对摘要、综合判断和结论执行反向提纲与五维对抗性自审；
-9. 最终报告明确披露 Bear/SciMaster 的查询模式、检索日期、范围限制和 AI 辅助过程。
+5. `comparison_matrix.tsv` 覆盖 Task C、单细胞反事实、Task S 与 Task D，且每行包含比较器、公平性约束、主终点和状态；
+6. `innovation_claim_register.tsv` 中每条算法创新均有明确 comparator、主终点和证据状态，证据不足时措辞降级；
+7. 主报告中的本地相对链接有效，Markdown code fence 配对；
+8. 新增主张与证据映射无空锚点，参考文献无重复 DOI；
+9. `git diff --check` 通过；
+10. 对摘要、综合判断和结论执行反向提纲与五维对抗性自审；
+11. 最终报告明确披露 Bear/SciMaster 的查询模式、检索日期、范围限制和 AI 辅助过程。
 
-## 9. 安全与版本控制
+## 10. 安全与版本控制
 
 - 只编辑目标报告、Bear 附件目录和本设计/实施计划；
 - 不覆盖或清理用户已有未提交改动；
 - 设计提交只包含本文件；后续报告变更单独呈现，不自动提交，除非用户另行要求；
 - 若检索额度不足、认证失效或返回结果无法支撑核心主张，保留原报告结论并如实记录负结果。
-
