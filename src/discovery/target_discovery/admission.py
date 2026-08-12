@@ -28,10 +28,10 @@ def _bool_series(frame: pd.DataFrame, column: str) -> pd.Series:
 def _has_ordinal_rank_display(ranking: pd.DataFrame) -> bool:
     if ranking.empty:
         return False
-    basis_ok = "ranking_basis" in ranking and ranking["ranking_basis"].astype(str).eq("tiered_unweighted_evidence").any()
+    basis_ok = "ranking_basis" in ranking and ranking["ranking_basis"].astype(str).eq("tiered_unweighted_evidence").all()
     score_ok = (
         "final_score_method" in ranking
-        and ranking["final_score_method"].astype(str).eq("ordinal_rank_display_not_weighted_sum").any()
+        and ranking["final_score_method"].astype(str).eq("ordinal_rank_display_not_weighted_sum").all()
     )
     return bool(basis_ok and score_ok)
 

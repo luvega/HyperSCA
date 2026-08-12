@@ -32,12 +32,17 @@ def _has_forbidden_result_file(path: Path) -> bool:
     return False
 
 
+def validate_no_manual_target_lists(config: TargetDiscoveryConfig) -> None:
+    """Reject manual target seeds in every target-discovery mode."""
+    if getattr(config, "focused_genes", ()):
+        raise ValueError("target discovery forbids focused_genes or manual target lists")
+
+
 def validate_from_scratch_config(config: TargetDiscoveryConfig) -> None:
     """Reject prior-target or legacy-result inputs in from-scratch mode."""
+    validate_no_manual_target_lists(config)
     if not config.from_scratch:
         return
-    if getattr(config, "focused_genes", ()):
-        raise ValueError("from-scratch discovery forbids focused_genes or manual target lists")
 
     paths = config.paths
     required = {

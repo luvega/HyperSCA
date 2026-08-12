@@ -246,10 +246,18 @@ python scripts/run_target_discovery.py \
   --geometry-k 4 \
   --geometry-blend 0.30 \
   --platform all \
+  --score-profile evidence_gated \
   --skip-figures
 ```
 
 默认输出位于 `results/discovery/target_discovery/<run_id>/`。旧版展示口径中的预计算发现结果仍保留在 `results/integration/discovery/`，用于 notebook 和 README 中的历史图表展示。
+
+`evidence_gated` 是默认且唯一允许进入主排名解释的策略：先按独立 DE
+来源数分层，再依次比较方向一致性、显著性和效应量；`final_score` 仅用于显示
+顺序，不是加权证据分数。因果图、空间传播代理和机制先验会写入审计列，但不
+改变排名。每次运行都会生成 `scoring/ranking_policy.json` 和
+`scoring/module_admission.csv`。`legacy_full` 仅用于历史加权排名复现，不能用于
+promotion。CLI 不接受人工基因/靶点种子。
 
 ### F. Run Dynamic Intervention (Step4) and Roundtrip Update
 

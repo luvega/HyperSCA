@@ -20,7 +20,7 @@ class CandidateDiscoveryStage:
         pool = aggregate_candidate_pool(
             read_neu_deg_tables(paths.neu_dir),
             read_icb_deg_tables(paths.icb_dir),
-            read_ifng_tables(paths.ifng_dir, context.config.focused_genes),
+            read_ifng_tables(paths.ifng_dir, ()),
         )
         context.writer.write_table("candidate_pool.csv", pool, section="candidates")
         return {"candidate_pool": pool}

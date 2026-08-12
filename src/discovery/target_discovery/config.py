@@ -62,6 +62,7 @@ class TargetDiscoveryConfig:
     random_seed: int = 42
     device: str = "cuda"
     skip_figures: bool = False
+    score_profile: str = "evidence_gated"
 
     @classmethod
     def default(cls) -> "TargetDiscoveryConfig":
