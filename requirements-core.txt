@@ -11,6 +11,7 @@ h5py>=3.10,<4
 pyyaml>=6,<7
 tqdm>=4.66,<5
 requests>=2.31,<3
+tabulate>=0.9,<1
 
 anndata>=0.10,<0.13
 scanpy>=1.9.6,<1.12

@@ -39,7 +39,14 @@ def test_dependency_profiles_keep_compiled_gpu_extensions_out_of_core() -> None:
     core = _requirement_names(ROOT / "requirements-core.txt")
     gpu = _requirement_names(ROOT / "requirements-gpu.txt")
 
-    assert {"scanpy", "torch", "torch-geometric", "geoopt", "dowhy"} <= core
+    assert {
+        "scanpy",
+        "torch",
+        "torch-geometric",
+        "geoopt",
+        "dowhy",
+        "tabulate",
+    } <= core
     assert {
         "torch-scatter",
         "torch-sparse",
