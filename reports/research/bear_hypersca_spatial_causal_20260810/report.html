@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bear-propose · HyperSCA</title>
+<style>
+*,*::before,*::after{box-sizing:border-box}:root{--bg:#f7f8fa;--paper:#fff;--surface:#f3f4f6;--border:#d9dee7;--text:#111827;--muted:#667085;--accent:#d97706;--blue:#2563eb;--green:#16a34a;--danger:#dc2626;--radius:8px;--shadow:0 18px 45px rgba(15,23,42,.08)}
+@media(prefers-color-scheme:dark){:root{--bg:#111827;--paper:#1f2937;--surface:#263244;--border:#374151;--text:#f9fafb;--muted:#b6c0cf;--shadow:0 18px 45px rgba(0,0,0,.28)}}
+html{background:var(--bg)}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.68 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:32px 18px 56px}.container{max-width:1040px;margin:auto}.report-header,.panel,.card,.verdict-box,.metric-strip{background:var(--paper);border:1px solid var(--border);border-radius:var(--radius)}.report-header{padding:28px 32px;box-shadow:var(--shadow)}.tagline,.pill-row,.tab-controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.skill-tag,.pill{display:inline-flex;align-items:center;min-height:28px;padding:3px 10px;border-radius:999px;font-size:13px}.skill-tag{background:var(--accent);color:#fff;font-weight:700}.pill{border:1px solid var(--border);background:var(--surface);color:var(--muted)}.meta,.card-sub,.response,.boundary,.footer{color:var(--muted)}h1{margin:8px 0 0;font-size:clamp(26px,3.4vw,38px);line-height:1.14;font-weight:700}.boundary{max-width:780px}.verdict{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-top:22px}.verdict-box{padding:20px;border-top:4px solid var(--accent)}.verdict-box.collision{border-color:var(--blue)}.verdict-box.challenge{border-color:var(--danger)}.eyebrow{font-size:13px;font-weight:800;text-transform:uppercase;color:var(--accent)}.verdict-box.collision .eyebrow{color:var(--blue)}.verdict-box.challenge .eyebrow{color:var(--danger)}.verdict-title{font-size:20px;font-weight:700;line-height:1.35;margin-top:8px}.metric-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));margin-top:14px;overflow:hidden}.metric{padding:16px;border-right:1px solid var(--border)}.metric:last-child{border:0}.metric-value{font-size:23px;font-weight:700;color:var(--accent)}.metric-label{font-size:13px;color:var(--muted)}.section{margin-top:26px}.section-title{font-size:14px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}.panel{padding:22px}.radar-wrap{display:grid;grid-template-columns:360px 1fr;gap:22px;align-items:center}.radar{width:340px;height:340px;display:block}.radar text{fill:var(--text);font:13px system-ui}.rdot{cursor:pointer}.radar-note{display:grid;gap:10px}.radar-note div{padding:12px;border-left:4px solid var(--accent);background:var(--surface)}.tab-controls button{border:1px solid var(--border);border-radius:999px;padding:7px 12px;background:var(--paper);color:var(--text);font:600 14px system-ui;cursor:pointer}.tab-controls button[aria-selected="true"]{border-color:var(--accent);color:var(--accent)}.tab-panel{margin-top:14px}.tab-panel[hidden]{display:none}.card{padding:20px 22px;margin-bottom:14px}.card-primary{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 4%,var(--paper))}.card-title{font-size:17px;font-weight:700;line-height:1.38}.doi-link{color:var(--accent);text-decoration:none}.doi-link:hover{text-decoration:underline}.insight{margin-top:12px;padding-left:14px;border-left:3px solid var(--accent)}details.abstract,details.query-log{margin-top:12px;border-top:1px dashed var(--border);padding-top:10px;color:var(--muted);font-size:14px}details summary{cursor:pointer;color:var(--accent);font-weight:700}code{white-space:normal;color:var(--muted)}li{margin:8px 0}.tooltip{position:fixed;display:none;z-index:10;max-width:280px;background:var(--text);color:var(--paper);padding:7px 10px;border-radius:6px;font-size:13px;pointer-events:none}.footer{margin-top:38px;border-top:1px solid var(--border);padding-top:16px;font-size:13px}
+@media(max-width:800px){body{padding:18px 12px 40px}.verdict,.radar-wrap{grid-template-columns:1fr}.metric-strip{grid-template-columns:repeat(2,1fr)}.metric{border-bottom:1px solid var(--border)}.radar{max-width:100%;height:auto}}
+@media print{body{background:#fff;color:#111827;padding:0}.tab-controls{display:none}.tab-panel[hidden]{display:block}.card,.panel,.report-header{break-inside:avoid;box-shadow:none}}
+</style>
+</head>
+<body><div class="container">
+<header class="report-header"><div class="tagline"><span class="skill-tag">bear-propose</span><span class="meta">2026-08-10 · 15 次真实检索 · 255 条返回</span></div><h1>HyperSCA：证据门控的单细胞—空间因果药物机制平台</h1><p class="boundary">所有论文、作者与证据判断来自本次 sci search；“相对安静区”不等于不存在相关工作。</p></header>
+<section class="verdict"><div class="verdict-box collision"><div class="eyebrow">撞车风险</div><div class="verdict-title">完整平台无直接撞车，但方法层高度拥挤</div><p>空间反事实、传播和药物排序已有强邻近工作。</p></div><div class="verdict-box"><div class="eyebrow">证据格局</div><div class="verdict-title">可主张候选框架/评价贡献</div><p>Task C/S/D 与 promotion gate 的统一契约仍相对稀疏。</p></div><div class="verdict-box challenge"><div class="eyebrow">最高威胁</div><div class="verdict-title">复杂表示未必超过简单基线</div><p>泛化、空间混杂和不确定性校准决定可靠性。</p></div></section>
+<div class="metric-strip"><div class="metric"><div class="metric-value">0</div><div class="metric-label">直接撞车</div></div><div class="metric"><div class="metric-value">3 / 6</div><div class="metric-label">方法 / 问题孪生</div></div><div class="metric"><div class="metric-value">8</div><div class="metric-label">安静区支撑</div></div><div class="metric"><div class="metric-value">5</div><div class="metric-label">强挑战</div></div></div>
+<section class="section"><h2 class="section-title">撞车雷达与空间判断</h2><div class="panel radar-wrap"><svg class="radar" viewBox="0 0 340 340" role="img" aria-label="HyperSCA 撞车分层"><circle cx="170" cy="170" r="145" fill="none" stroke="var(--border)"/><circle cx="170" cy="170" r="105" fill="none" stroke="var(--border)"/><circle cx="170" cy="170" r="65" fill="none" stroke="var(--border)"/><circle cx="170" cy="170" r="28" fill="var(--accent)"/><text x="170" y="175" text-anchor="middle" fill="#fff">HyperSCA</text><text x="170" y="18" text-anchor="middle">邻近工作</text><text x="170" y="58" text-anchor="middle">问题孪生</text><text x="170" y="98" text-anchor="middle">方法孪生</text><circle class="rdot" data-tip="E1 Counterfactual Diffusion" cx="154" cy="115" r="6" fill="#d97706"/><circle class="rdot" data-tip="E2 Celcomen" cx="194" cy="120" r="6" fill="#d97706"/><circle class="rdot" data-tip="E5 DynPerturb" cx="178" cy="102" r="6" fill="#d97706"/><circle class="rdot" data-tip="E3 SpatialProp" cx="120" cy="92" r="6" fill="#2563eb"/><circle class="rdot" data-tip="E4 CONCERT" cx="230" cy="96" r="6" fill="#2563eb"/><circle class="rdot" data-tip="E7 STDrug" cx="92" cy="160" r="6" fill="#2563eb"/><circle class="rdot" data-tip="E11 Spatial pharmaco-multiomics" cx="248" cy="170" r="6" fill="#16a34a"/></svg><div class="radar-note"><div><strong>拥挤区</strong><br>空间反事实、GNN 传播、niche response、空间药物排序。</div><div><strong>安静区 A</strong><br>Task C/S/D 与证据门控的统一可撤回契约。</div><div><strong>安静区 B</strong><br>同一组织内剂量、药物分布、target engagement 与 neighbor effect 的闭环。</div><div><strong>允许措辞</strong><br>候选框架/评价创新；算法 superiority 尚未证明。</div></div></div></section>
+<section class="section"><h2 class="section-title">三阶段详细证据</h2><div class="tab-controls"><button aria-selected="true" data-tab="collision">撞车检测</button><button aria-selected="false" data-tab="quiet">安静区支撑</button><button aria-selected="false" data-tab="challenge">潜在挑战</button></div><div id="collision" class="tab-panel"><article class="card card-primary evidence-card">
+      <div class="card-title">Wenhui Ding et al., 2026 · <a class="doi-link" href="https://doi.org/10.3390/biology15141097">Counterfactual Diffusion Modeling Enables Spatially Targeted Reprogramming of Tissue Microenvironments</a></div>
+      <div class="card-sub">Biology</div>
+      <div class="pill-row"><span class="pill">版图证据</span><span class="pill">方法孪生</span><span class="pill">强</span></div>
+      <div class="insight">最接近 HyperSCA 空间反事实生成主线，但未覆盖真实药物暴露与分层 promotion。</div>
+      <div class="response"><strong>设计响应：</strong>在共同空间切分上比较，并要求真实干预、消融和外部 holdout。</div>
+      <details class="abstract" open><summary>中文学术摘要</summary><div class="abstract-text">该研究提出空间条件反事实扩散框架，通过组织图上的生成建模预测局部干预后的微环境重编程。其贡献与 HyperSCA 的空间反事实主线高度接近，但论文层面的预测仍需真实药物暴露、跨组织外推和机制测量验证。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">Stathis Megas et al., 2024 · <a class="doi-link" href="https://doi.org/10.48550/arXiv.2409.05804">Celcomen: spatial causal disentanglement for single-cell and tissue perturbation modeling</a></div>
+      <div class="card-sub">arxiv</div>
+      <div class="pill-row"><span class="pill">版图证据</span><span class="pill">方法孪生</span><span class="pill">强</span></div>
+      <div class="insight">Celcomen 与空间因果解耦和组织扰动高度重叠，是 Task S 的关键方法比较器。</div>
+      <div class="response"><strong>设计响应：</strong>复现完整模型并与本地 energy proxy 分离报告。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">Celcomen 以空间单细胞数据学习细胞内和细胞间基因作用，并生成组织扰动反事实。它为 Task S 提供重要方法比较，但观察数据可识别性、无隐藏混杂和无反馈等假设限制了因果措辞。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">Eric D. Sun et al., 2025 · <a class="doi-link" href="https://doi.org/10.64898/2025.11.30.691355">SpatialProp: tissue perturbation modeling with spatially resolved single-cell transcriptomics</a></div>
+      <div class="card-sub">bioRxiv-Bioinformatics</div>
+      <div class="pill-row"><span class="pill">安静区支撑</span><span class="pill">问题孪生</span><span class="pill">强</span></div>
+      <div class="insight">SpatialProp 直接覆盖组织尺度扰动传播，但不包含 HyperSCA 的跨任务证据门控。</div>
+      <div class="response"><strong>设计响应：</strong>作为 Task S 主要比较器并检查校准、own/neighbor 与外部切片。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">SpatialProp 使用空间解析单细胞转录组预测多基因、多细胞类型的组织扰动传播，并强调不确定性校准。该任务与 HyperSCA 的 own/neighbor 传播最同构，但当前仍是预印本，不能充当真实干预真值。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">Xiang Lin et al., 2025 · <a class="doi-link" href="https://doi.org/10.1101/2025.11.08.686890">CONCERT predicts niche-aware perturbation responses in spatial transcriptomics</a></div>
+      <div class="card-sub">bioRxiv-Bioinformatics</div>
+      <div class="pill-row"><span class="pill">版图证据</span><span class="pill">问题孪生</span><span class="pill">强</span></div>
+      <div class="insight">CONCERT 覆盖 niche-aware 反事实，是空间传播和未见 niche 外推的重要比较器。</div>
+      <div class="response"><strong>设计响应：</strong>固定数据切分和调参预算，与简单 kNN/mean 基线共同评估。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">CONCERT 学习空间 niche 与扰动背景，预测已见和未见位置的反事实响应。其 niche-aware 设计适合比较 HyperSCA 的空间传播和扩散模块，但应在统一切分下与简单 kNN、均值和非空间模型共同评估。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">Hua Qin et al., 2025 · <a class="doi-link" href="https://doi.org/10.1101/2025.09.15.676236">DynPerturb:Dynamic Perturbation Modeling for Spatiotemporal Single-Cell Systems</a></div>
+      <div class="card-sub">bioRxiv-Bioinformatics</div>
+      <div class="pill-row"><span class="pill">版图证据</span><span class="pill">方法孪生</span><span class="pill">中</span></div>
+      <div class="insight">DynPerturb 表明时空扰动动态建模已拥挤，HyperSCA 不能仅凭加入时间模块主张创新。</div>
+      <div class="response"><strong>设计响应：</strong>只有在预注册时空外推终点超过强基线后才升级算法措辞。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">DynPerturb 面向时空单细胞系统学习动态扰动响应，显示时间和状态转移建模已成为活跃方向。它压缩了单纯增加时间模块的创新空间，并要求 HyperSCA 用未见时间点和跨系统外推证明增益。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">Ziyang Tang et al., 2023 · <a class="doi-link" href="https://doi.org/10.1093/bib/bbad338">SpaRx: elucidate single-cell spatial heterogeneity of drug responses for personalized treatment</a></div>
+      <div class="card-sub">Briefings in Bioinformatics</div>
+      <div class="pill-row"><span class="pill">版图证据</span><span class="pill">问题孪生</span><span class="pill">强</span></div>
+      <div class="insight">SpaRx 已直接研究空间异质性药物响应，压缩了单纯空间药物预测的创新空间。</div>
+      <div class="response"><strong>设计响应：</strong>将其作为 Task D 候选层比较器，不把预测响应当作机制真值。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">SpaRx 从单细胞和空间信息推断药物响应的空间异质性，为个体化治疗提供候选。它证明空间药物响应预测并非空白，但其输出主要是预测和分层，不能替代剂量、target engagement 与干预验证。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">Yiwen Yang et al., 2026 · <a class="doi-link" href="https://doi.org/10.64898/2026.04.03.715101">STDrug enables spatially informed personalized drug repurposing from spatial transcriptomics</a></div>
+      <div class="card-sub">bioRxiv-Bioinformatics</div>
+      <div class="pill-row"><span class="pill">版图证据</span><span class="pill">问题孪生</span><span class="pill">中</span></div>
+      <div class="insight">STDrug 已覆盖空间药物重定位与候选排序，但属于预印本和候选生成层。</div>
+      <div class="response"><strong>设计响应：</strong>比较排序、毒性和外部响应；禁止用文献命中做循环验证。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">STDrug 将疾病空间域与药物签名、毒性和反应资源结合进行个体化重定位。该方法与 Task D 的候选排序重叠，但预印本状态和知识/文献权重带来可复现性与循环验证风险。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">Linan Zhang et al., 2025 · <a class="doi-link" href="https://doi.org/10.1101/2025.09.27.674707">A Multi-Layered Atlas of Spatial Regulatory Programs and Therapeutic Vulnerabilities in Glioblastoma</a></div>
+      <div class="card-sub">bioRxiv-Bioinformatics</div>
+      <div class="pill-row"><span class="pill">安静区支撑</span><span class="pill">问题孪生</span><span class="pill">中</span></div>
+      <div class="insight">该图谱把空间调控程序连接到 niche-specific 治疗脆弱性，支持 Task D 的空间生态位表达。</div>
+      <div class="response"><strong>设计响应：</strong>作为候选先验，必须增加真实药物扰动与 target engagement。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">该研究在 26 个胶质母细胞瘤中整合空间转录因子、通路、配体受体和药物靶点，提出 niche-specific 治疗脆弱性。它支持从空间调控程序生成治疗假设，但没有直接证明候选药物在相同组织生态位中的因果效应。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">Tuan Vo et al., 2026 · <a class="doi-link" href="https://doi.org/10.64898/2026.01.25.701559">Spatial pharmaco-multiomics reveals drug distribution, metabolic niches, and spatially constrained resistance in medulloblastoma</a></div>
+      <div class="card-sub">bioRxiv-Cancer Biology</div>
+      <div class="pill-row"><span class="pill">安静区支撑</span><span class="pill">问题孪生</span><span class="pill">强</span></div>
+      <div class="insight">空间药理多组学同时观察药物分布、代谢 niche 与空间受限耐药，最接近真实空间药理验证链。</div>
+      <div class="response"><strong>设计响应：</strong>优先核验预印本数据可得性，并据此设计剂量—空间—耐药终点。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">该空间药理多组学研究同时解析药物在组织中的分布、代谢生态位和空间受限耐药。它是本次检索中最接近“暴露—空间—机制”验证链的证据，但仍为预印本，数据可得性和跨肿瘤泛化需要另行核验。</div></details>
+    </article></div><div id="quiet" class="tab-panel" hidden><article class="card evidence-card">
+      <div class="card-title">Eric D. Sun et al., 2025 · <a class="doi-link" href="https://doi.org/10.64898/2025.11.30.691355">SpatialProp: tissue perturbation modeling with spatially resolved single-cell transcriptomics</a></div>
+      <div class="card-sub">bioRxiv-Bioinformatics</div>
+      <div class="pill-row"><span class="pill">安静区支撑</span><span class="pill">问题孪生</span><span class="pill">强</span></div>
+      <div class="insight">SpatialProp 直接覆盖组织尺度扰动传播，但不包含 HyperSCA 的跨任务证据门控。</div>
+      <div class="response"><strong>设计响应：</strong>作为 Task S 主要比较器并检查校准、own/neighbor 与外部切片。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">SpatialProp 使用空间解析单细胞转录组预测多基因、多细胞类型的组织扰动传播，并强调不确定性校准。该任务与 HyperSCA 的 own/neighbor 传播最同构，但当前仍是预印本，不能充当真实干预真值。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">Linan Zhang et al., 2025 · <a class="doi-link" href="https://doi.org/10.1101/2025.09.27.674707">A Multi-Layered Atlas of Spatial Regulatory Programs and Therapeutic Vulnerabilities in Glioblastoma</a></div>
+      <div class="card-sub">bioRxiv-Bioinformatics</div>
+      <div class="pill-row"><span class="pill">安静区支撑</span><span class="pill">问题孪生</span><span class="pill">中</span></div>
+      <div class="insight">该图谱把空间调控程序连接到 niche-specific 治疗脆弱性，支持 Task D 的空间生态位表达。</div>
+      <div class="response"><strong>设计响应：</strong>作为候选先验，必须增加真实药物扰动与 target engagement。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">该研究在 26 个胶质母细胞瘤中整合空间转录因子、通路、配体受体和药物靶点，提出 niche-specific 治疗脆弱性。它支持从空间调控程序生成治疗假设，但没有直接证明候选药物在相同组织生态位中的因果效应。</div></details>
+    </article>
+<article class="card card-primary evidence-card">
+      <div class="card-title">Tuan Vo et al., 2026 · <a class="doi-link" href="https://doi.org/10.64898/2026.01.25.701559">Spatial pharmaco-multiomics reveals drug distribution, metabolic niches, and spatially constrained resistance in medulloblastoma</a></div>
+      <div class="card-sub">bioRxiv-Cancer Biology</div>
+      <div class="pill-row"><span class="pill">安静区支撑</span><span class="pill">问题孪生</span><span class="pill">强</span></div>
+      <div class="insight">空间药理多组学同时观察药物分布、代谢 niche 与空间受限耐药，最接近真实空间药理验证链。</div>
+      <div class="response"><strong>设计响应：</strong>优先核验预印本数据可得性，并据此设计剂量—空间—耐药终点。</div>
+      <details class="abstract" open><summary>中文学术摘要</summary><div class="abstract-text">该空间药理多组学研究同时解析药物在组织中的分布、代谢生态位和空间受限耐药。它是本次检索中最接近“暴露—空间—机制”验证链的证据，但仍为预印本，数据可得性和跨肿瘤泛化需要另行核验。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">Zhengyuan Pang et al., 2024 · <a class="doi-link" href="https://doi.org/10.1146/annurev-pharmtox-033123-123610">Deciphering Drug Targets and Actions with Single-Cell and Spatial Resolution</a></div>
+      <div class="card-sub">The Annual Review of Pharmacology and Toxicology</div>
+      <div class="pill-row"><span class="pill">安静区支撑</span><span class="pill">邻近工作</span><span class="pill">中</span></div>
+      <div class="insight">综述支持单细胞和空间分辨率对药物靶点与作用解析的必要性，但不是直接验证。</div>
+      <div class="response"><strong>设计响应：</strong>仅用于研究动机和证据链定义。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">该综述总结单细胞和空间技术在药物靶点发现与作用机制解析中的用途，强调细胞异质性和组织位置的重要性。它能支撑研究动机和证据链设计，但不构成 HyperSCA 性能或机制有效性的直接证据。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">James M. McFarland et al., 2020 · <a class="doi-link" href="https://doi.org/10.1038/s41467-020-17440-w">Multiplexed single-cell transcriptional response profiling to define cancer vulnerabilities and therapeutic mechanism of action</a></div>
+      <div class="card-sub">Nature Communications</div>
+      <div class="pill-row"><span class="pill">安静区支撑</span><span class="pill">邻近工作</span><span class="pill">强</span></div>
+      <div class="insight">多重单细胞药物转录响应提供真实药物 MOA 与异质性正控。</div>
+      <div class="response"><strong>设计响应：</strong>作为非空间药理正控，不能替代空间邻域验证。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">该研究以多重单细胞转录响应分析癌细胞对药物的异质反应，识别治疗脆弱性与作用机制。它提供真实药理正控和 MOA 评价资源，但缺少空间邻域维度。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">J Matthew Dubach et al., 2016 · <a class="doi-link" href="https://doi.org/10.1038/nchembio.2248">Quantitating drug-target engagement in single cells in vitro and in vivo</a></div>
+      <div class="card-sub">Nature Chemical Biology</div>
+      <div class="pill-row"><span class="pill">安静区支撑</span><span class="pill">邻近工作</span><span class="pill">中</span></div>
+      <div class="insight">单细胞体内外 target engagement 定量支持机制验证必须测量暴露与靶标结合。</div>
+      <div class="response"><strong>设计响应：</strong>把 target engagement 设为 Task D promotion 必需字段。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">该研究建立单细胞尺度的体内外 drug-target engagement 定量方法，显示药物暴露与靶标结合可以直接测量。它支持把 target engagement 设为 Task D 的独立证据面，而不是从表达反转间接推断。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">Stephan Eckert et al., 2024 · <a class="doi-link" href="https://doi.org/10.1038/s41587-024-02218-y">Decrypting the molecular basis of cellular drug phenotypes by dose-resolved expression proteomics</a></div>
+      <div class="card-sub">Nature Biotechnology</div>
+      <div class="pill-row"><span class="pill">安静区支撑</span><span class="pill">邻近工作</span><span class="pill">强</span></div>
+      <div class="insight">剂量分辨表达蛋白组学表明药物表型需要剂量维度和直接分子读出。</div>
+      <div class="response"><strong>设计响应：</strong>新增 dose-time surface 和靶标/通路一致性检查。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">剂量分辨表达蛋白组学连接药物浓度、蛋白表达与细胞表型，揭示剂量依赖的机制差异。它支持 HyperSCA 把 dose-time surface 和直接分子读出加入可靠性门槛。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">Hyobin Kim et al., 2023 · <a class="doi-link" href="https://doi.org/10.15252/msb.202311670">CellNeighborEX: deciphering neighbor‐dependent gene expression from spatial transcriptomics data</a></div>
+      <div class="card-sub">Molecular Systems Biology</div>
+      <div class="pill-row"><span class="pill">安静区支撑</span><span class="pill">邻近工作</span><span class="pill">中</span></div>
+      <div class="insight">CellNeighborEX 支持邻域依赖表达是可测量对象，但主体仍是观察关联。</div>
+      <div class="response"><strong>设计响应：</strong>作为 neighbor-association 基线，不提升因果证据等级。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">CellNeighborEX 从空间转录组中识别邻域依赖表达，表明 neighbor effect 可以被独立量化。由于主体仍是观察关联，它适合作为 Task S 的关联基线，不应提升因果证据等级。</div></details>
+    </article></div><div id="challenge" class="tab-panel" hidden><article class="card evidence-card">
+      <div class="card-title">Yan Wu et al., 2024 · <a class="doi-link" href="https://doi.org/10.48550/arXiv.2408.10609">PerturBench: Benchmarking Machine Learning Models for Cellular Perturbation Analysis</a></div>
+      <div class="card-sub">arxiv</div>
+      <div class="pill-row"><span class="pill">挑战</span><span class="pill">邻近工作</span><span class="pill">强</span></div>
+      <div class="insight">PerturBench 说明扰动模型比较需要统一数据与指标，支持先建立 benchmark contract。</div>
+      <div class="response"><strong>设计响应：</strong>采用同切分、同特征、同预算和多指标比较。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">PerturBench 以统一数据与指标比较细胞扰动模型，指出评价设计会显著改变模型排序。它支持 HyperSCA 先固定任务、切分和主终点，再讨论模型复杂化和算法创新。</div></details>
+    </article>
+<article class="card card-primary evidence-card">
+      <div class="card-title">Ihab Bendidi et al., 2024 · <a class="doi-link" href="https://doi.org/10.48550/arXiv.2410.13956">Benchmarking Transcriptomics Foundation Models for Perturbation Analysis : one PCA still rules them all</a></div>
+      <div class="card-sub">arxiv</div>
+      <div class="pill-row"><span class="pill">挑战</span><span class="pill">邻近工作</span><span class="pill">强</span></div>
+      <div class="insight">简单 PCA 在扰动分析 benchmark 中仍具竞争力，直接挑战复杂表示等同于创新。</div>
+      <div class="response"><strong>设计响应：</strong>所有升级必须包含 PCA/mean/nearest 等简单基线。</div>
+      <details class="abstract" open><summary>中文学术摘要</summary><div class="abstract-text">该 benchmark 报告在多种扰动分析任务中，PCA 等简单表示仍可匹配或超过复杂基础模型。其核心威胁是复杂模型的表示能力不自动转化为干预预测增益，因此简单基线必须进入预注册比较。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">William G. Herbert et al., 2025 · <a class="doi-link" href="https://doi.org/10.1101/2025.06.16.659838">Monotherapy cancer drug-blind response prediction is limited to intraclass generalization</a></div>
+      <div class="card-sub">bioRxiv-Bioinformatics</div>
+      <div class="pill-row"><span class="pill">挑战</span><span class="pill">不参与撞车分层</span><span class="pill">强</span></div>
+      <div class="insight">药物盲预测可能只在同类内泛化，威胁未见药物或跨机制外推。</div>
+      <div class="response"><strong>设计响应：</strong>采用 drug-class holdout、scaffold/MOA 分层和域外校准。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">该研究指出药物盲癌症响应预测的泛化主要局限于同类药物内部，跨药物类别外推明显受限。它直接威胁未见药物预测，要求使用 drug-class、MOA 或 scaffold holdout。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">Shi-ang Qi et al., 2026 · <a class="doi-link" href="https://doi.org/10.64898/2026.05.08.723625">Mechanisms Matter: Transportability of Cellular Perturbation Effects</a></div>
+      <div class="card-sub">bioRxiv-Bioinformatics</div>
+      <div class="pill-row"><span class="pill">挑战</span><span class="pill">不参与撞车分层</span><span class="pill">中</span></div>
+      <div class="insight">细胞扰动效应的可迁移性取决于机制稳定性，威胁跨细胞系和跨组织结论。</div>
+      <div class="response"><strong>设计响应：</strong>要求跨细胞系/组织外部 holdout，并报告 transportability failure。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">该预印本强调细胞扰动效应能否迁移取决于底层机制在环境间是否稳定。对 HyperSCA 而言，跨细胞系或跨组织性能不能只由随机切分支持，而需显式的 transportability 评估。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">Mauricio Tec et al., 2023 · <a class="doi-link" href="https://doi.org/10.48550/arXiv.2312.00710">SpaCE: The Spatial Confounding Environment</a></div>
+      <div class="card-sub">arxiv</div>
+      <div class="pill-row"><span class="pill">挑战</span><span class="pill">邻近工作</span><span class="pill">强</span></div>
+      <div class="insight">空间混杂环境表明位置相关暴露与结局可制造伪空间因果关系。</div>
+      <div class="response"><strong>设计响应：</strong>加入空间负控、环境分层、敏感性分析和坐标置换。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">SpaCE 将空间位置视为同时影响暴露与结局的混杂环境，展示空间结构可能造成伪因果关联。它要求 HyperSCA 增加坐标置换、环境分层、负控和敏感性分析。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">Eric D. Sun et al., 2024 · <a class="doi-link" href="https://doi.org/10.1038/s41592-024-02184-y">TISSUE: uncertainty-calibrated prediction of single-cell spatial transcriptomics improves downstream analyses</a></div>
+      <div class="card-sub">Nature Methods</div>
+      <div class="pill-row"><span class="pill">挑战</span><span class="pill">邻近工作</span><span class="pill">中</span></div>
+      <div class="insight">TISSUE 强调空间单细胞预测必须显式校准不确定性。</div>
+      <div class="response"><strong>设计响应：</strong>把 coverage、calibration error 和拒判率设为主可靠性终点。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">TISSUE 为单细胞空间表达预测提供不确定性校准，并展示校准可改善下游分析。它支持把 coverage、校准误差和拒判率设为可靠性主终点，而非只报告平均预测误差。</div></details>
+    </article>
+<article class="card evidence-card">
+      <div class="card-title">Mathieu Chevalley et al., 2023 · <a class="doi-link" href="https://doi.org/10.48550/arXiv.2308.15395">The CausalBench challenge: A machine learning contest for gene network inference from single-cell perturbation data</a></div>
+      <div class="card-sub">arxiv</div>
+      <div class="pill-row"><span class="pill">挑战</span><span class="pill">邻近工作</span><span class="pill">强</span></div>
+      <div class="insight">CausalBench 提供干预网络基准并显示真实干预利用率比模型复杂度更关键。</div>
+      <div class="response"><strong>设计响应：</strong>Task C 必须与简单干预基线共同评估。</div>
+      <details class="abstract"><summary>中文学术摘要</summary><div class="abstract-text">CausalBench 使用单细胞干预数据评估因果网络推断，强调模型是否真正利用干预信息。它支持 Task C 采用简单干预基线、跨细胞系验证和精确率—召回率，而不是以复杂度代表因果质量。</div></details>
+    </article></div></section>
+<section class="section"><h2 class="section-title">检索透明度</h2><div class="panel"><details class="query-log" open><summary>查看全部查询、模式与采用数</summary><ol><li><strong>q01 · literal</strong> · <code>single-cell spatial transcriptomics causal inference counterfactual drug target discovery integrated platform</code> · ultra_low · 返回 20 / 采用 5</li>
+<li><strong>q02 · method</strong> · <code>causal graph counterfactual spatial propagation perturbation modeling single-cell transcriptomics</code> · ultra_low · 返回 20 / 采用 7</li>
+<li><strong>q03 · problem</strong> · <code>predict cell-autonomous and neighborhood perturbation effects spatial transcriptomics</code> · ultra_low · 返回 20 / 采用 5</li>
+<li><strong>q04 · conclusion</strong> · <code>spatial niche specific drug mechanism target prioritization transcriptomics</code> · ultra_low · 返回 20 / 采用 2</li>
+<li><strong>q05 · adjacent</strong> · <code>virtual tissue digital twin multicellular response drug perturbation spatial omics</code> · ultra_low · 返回 20 / 采用 2</li>
+<li><strong>q06 · frontier</strong> · <code>2025 2026 spatial perturbation causal single-cell drug response preprint</code> · ultra_low · 返回 20 / 采用 4</li>
+<li><strong>q07 · literal-ranked</strong> · <code>single-cell spatial transcriptomics causal inference counterfactual drug target discovery integrated platform</code> · low · 返回 15 / 采用 3</li>
+<li><strong>q08 · method-ranked</strong> · <code>causal graph counterfactual spatial propagation perturbation modeling single-cell transcriptomics</code> · low · 返回 15 / 采用 6</li>
+<li><strong>q09 · problem-ranked</strong> · <code>predict cell-autonomous and neighborhood perturbation effects spatial transcriptomics</code> · low · 返回 15 / 采用 5</li>
+<li><strong>q10 · conclusion-ranked</strong> · <code>spatial niche specific drug mechanism target prioritization transcriptomics</code> · low · 返回 15 / 采用 3</li>
+<li><strong>q11 · frontier-ranked</strong> · <code>2025 2026 spatial perturbation causal single-cell drug response preprint</code> · low · 返回 15 / 采用 5</li>
+<li><strong>q12 · evidence-gate</strong> · <code>evidence-gated benchmarking joint cell-autonomous neighborhood perturbation effects target prioritization spatial single-cell</code> · low · 返回 15 / 采用 3</li>
+<li><strong>q13 · pharmacology</strong> · <code>spatially resolved pharmacological perturbation dose time target engagement neighborhood drug mechanism transcriptomics</code> · low · 返回 15 / 采用 4</li>
+<li><strong>q14 · contradiction</strong> · <code>failure poor generalization spatial transcriptomics drug response prediction causal mechanism perturbation</code> · low · 返回 15 / 采用 8</li>
+<li><strong>q15 · method-criticism</strong> · <code>identifiability confounding data leakage benchmark criticism causal inference counterfactual single-cell perturbation spatial transcriptomics</code> · low · 返回 15 / 采用 4</li></ol><p>检索前后余额：9582.00 → 9488.44。15 条查询均有返回；q12/q13 的缺口体现为缺少完整任务证据，而非查询级空结果。</p></details></div></section>
+<footer class="footer">由 bear-propose 生成 · 底层检索：scimaster-cli 0.3.15 · 真实检索优先于完整叙事</footer></div><div class="tooltip" id="tip"></div>
+<script>const buttons=[...document.querySelectorAll('[data-tab]')],panels=[...document.querySelectorAll('.tab-panel')];buttons.forEach(b=>b.addEventListener('click',()=>{buttons.forEach(x=>x.setAttribute('aria-selected','false'));b.setAttribute('aria-selected','true');panels.forEach(p=>p.hidden=p.id!==b.dataset.tab)}));const tip=document.getElementById('tip');document.querySelectorAll('.rdot').forEach(d=>{d.addEventListener('mousemove',e=>{tip.textContent=d.dataset.tip;tip.style.display='block';tip.style.left=(e.clientX+12)+'px';tip.style.top=(e.clientY+12)+'px'});d.addEventListener('mouseleave',()=>tip.style.display='none')});</script>
+</body></html>
