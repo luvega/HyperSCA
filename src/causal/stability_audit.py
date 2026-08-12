@@ -1,6 +1,7 @@
 """Sidecar audit utilities for causal graph stability and negative controls."""
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -8,6 +9,14 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
+
+SUPPORTED_NULL_MODES = (
+    "matrix_permutation",
+    "node_label_shuffle",
+    "outgoing_weight_permutation",
+)
+NULL_MODE_ALIASES = {"degree_preserving": "outgoing_weight_permutation"}
 
 
 def _as_square_matrix(value: np.ndarray, name: str) -> np.ndarray:
@@ -47,6 +56,110 @@ def _bh_qvalues(pvalues: Sequence[float]) -> list[float]:
     q = np.empty(n, dtype=float)
     q[order] = np.clip(q_ranked, 0.0, 1.0)
     return q.tolist()
+
+
+def _zero_diagonal(matrix: np.ndarray) -> np.ndarray:
+    out = np.asarray(matrix, dtype=float).copy()
+    np.fill_diagonal(out, 0.0)
+    return out
+
+
+def _canonical_null_modes(null_modes: Sequence[str]) -> tuple[str, ...]:
+    modes = tuple(NULL_MODE_ALIASES.get(str(mode), str(mode)) for mode in null_modes)
+    if not modes:
+        raise ValueError("null_modes must contain at least one mode when controls are requested")
+    unsupported = sorted(set(modes) - set(SUPPORTED_NULL_MODES))
+    if unsupported:
+        raise ValueError(f"unsupported causal null mode: {unsupported[0]}")
+    return modes
+
+
+def build_null_frequency_matrices(
+    bootstrap_freq: np.ndarray,
+    *,
+    n_controls: int,
+    null_modes: Sequence[str] = SUPPORTED_NULL_MODES,
+    random_seed: int = 42,
+) -> list[np.ndarray]:
+    """Generate reproducible surrogate nulls from a bootstrap-frequency matrix.
+
+    These matrices test frequency/topology sensitivity. They do not replace
+    data-level negative controls that rerun causal discovery after shuffling
+    treatments, observations, coordinates, or priors.
+    """
+    if n_controls < 0:
+        raise ValueError("n_controls must be non-negative")
+    if n_controls == 0:
+        return []
+    modes = _canonical_null_modes(null_modes)
+    base = _zero_diagonal(_as_square_matrix(bootstrap_freq, "bootstrap_freq"))
+    if not np.isfinite(base).all():
+        raise ValueError("bootstrap_freq must contain only finite values")
+    if np.any((base < 0.0) | (base > 1.0)):
+        raise ValueError("bootstrap_freq values must be between 0 and 1")
+    n_nodes = base.shape[0]
+    if n_nodes <= 1:
+        return []
+
+    rng = np.random.default_rng(random_seed)
+    off_diagonal = ~np.eye(n_nodes, dtype=bool)
+    off_diagonal_values = base[off_diagonal]
+    controls: list[np.ndarray] = []
+    for index in range(n_controls):
+        mode = modes[index % len(modes)]
+        if mode == "matrix_permutation":
+            matrix = np.zeros_like(base)
+            matrix[off_diagonal] = rng.permutation(off_diagonal_values)
+        elif mode == "node_label_shuffle":
+            order = rng.permutation(n_nodes)
+            matrix = base[np.ix_(order, order)]
+        else:  # outgoing_weight_permutation
+            matrix = np.zeros_like(base)
+            for row in range(n_nodes):
+                columns = np.arange(n_nodes) != row
+                matrix[row, columns] = rng.permutation(base[row, columns])
+        controls.append(_zero_diagonal(matrix))
+    return controls
+
+
+def _null_control_manifest(
+    null_freqs: Sequence[np.ndarray],
+    *,
+    n_requested: int,
+    null_modes: Sequence[str],
+    random_seed: int,
+) -> dict[str, Any]:
+    if n_requested > 0:
+        canonical_modes = list(_canonical_null_modes(null_modes))
+    else:
+        canonical_modes = [
+            NULL_MODE_ALIASES.get(str(mode), str(mode)) for mode in null_modes
+        ]
+    mode_counts = {mode: 0 for mode in canonical_modes}
+    for index in range(len(null_freqs)):
+        mode = canonical_modes[index % len(canonical_modes)]
+        mode_counts[mode] += 1
+    digest = hashlib.sha256()
+    for matrix in null_freqs:
+        array = np.asarray(matrix, dtype="<f8")
+        digest.update(np.asarray(array.shape, dtype="<i8").tobytes())
+        digest.update(array.tobytes(order="C"))
+    return {
+        "schema_version": "1.0",
+        "scope": "bootstrap_frequency_matrix_surrogate",
+        "n_requested": int(n_requested),
+        "n_generated": int(len(null_freqs)),
+        "null_modes": canonical_modes,
+        "mode_counts": mode_counts,
+        "random_seed": int(random_seed),
+        "minimum_controls_for_fdr": 10,
+        "null_control_sha256": digest.hexdigest(),
+        "promotion_status": "sidecar_only",
+        "interpretation": (
+            "Frequency/topology sensitivity audit only; not a data-level "
+            "interventional or confounder negative control."
+        ),
+    }
 
 
 def summarize_group_consistency(
@@ -130,6 +243,9 @@ def build_edge_stability_table(
     stability = [_as_square_matrix(m, "stability_freq") for m in (stability_freqs or [freq])]
     nulls = [_as_square_matrix(m, "null_freq") for m in (null_freqs or [])]
     groups = {str(name): _as_square_matrix(m, f"group_freqs[{name}]") for name, m in (group_freqs or {}).items()}
+    audit_matrices = [*stability, *nulls, *groups.values()]
+    if any(matrix.shape != adj.shape for matrix in audit_matrices):
+        raise ValueError("stability, null, and group matrices must have the same shape as adjacency")
     base_mask = (adj > 0).astype(float)
     np.fill_diagonal(base_mask, 0.0)
 
@@ -187,16 +303,16 @@ def build_edge_stability_table(
         has_null_controls = len(nulls) > 0
         enough_nulls_for_fdr = len(nulls) >= 10
         row["negative_control_pass"] = bool(
-            has_null_controls
+            enough_nulls_for_fdr
             and row["mean_freq"] > row["null_p95_freq"]
-            and (row["fdr_qvalue"] <= fdr_alpha or not enough_nulls_for_fdr)
+            and row["fdr_qvalue"] <= fdr_alpha
         )
         if not has_null_controls:
             row["negative_control_status"] = "not_run"
-        elif row["negative_control_pass"]:
-            row["negative_control_status"] = "passed"
         elif not enough_nulls_for_fdr:
             row["negative_control_status"] = "failed_insufficient_nulls_for_fdr"
+        elif row["negative_control_pass"]:
+            row["negative_control_status"] = "passed"
         else:
             row["negative_control_status"] = "failed"
         if row["negative_control_pass"] and row["seed_support"] >= 0.8:
@@ -235,6 +351,14 @@ def build_negative_control_report(edge_stability: pd.DataFrame, metadata: Mappin
             [
                 "",
                 "No null controls were supplied; `negative_control_pass` is kept false for all edges.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                f"Null scope: `{metadata.get('scope', 'externally_supplied_frequency_matrices')}`.",
+                "Frequency-matrix surrogate nulls do not replace data-level treatment, label, coordinate, or prior shuffles followed by full model refitting.",
             ]
         )
     return "\n".join(lines) + "\n"
@@ -279,6 +403,7 @@ def write_causal_stability_outputs(
     edge_stability: pd.DataFrame,
     group_consistency: Mapping[str, Any],
     negative_control_report: str,
+    null_control_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Path]:
     """Write causal audit sidecar artifacts to a plain output directory."""
     root = Path(output_dir)
@@ -287,6 +412,7 @@ def write_causal_stability_outputs(
     group_path = root / "platform_consistency.json"
     summary_path = root / "causal_audit_summary.json"
     report_path = root / "negative_control_report.md"
+    null_manifest_path = root / "null_control_manifest.json"
     edge_stability.to_csv(edge_path, index=False)
     group_path.write_text(json.dumps(group_consistency, indent=2, ensure_ascii=False), encoding="utf-8")
     summary = {
@@ -301,35 +427,67 @@ def write_causal_stability_outputs(
         if "stability_class" in edge_stability
         else {},
     }
+    if null_control_metadata is not None:
+        summary["null_control"] = dict(null_control_metadata)
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     report_path.write_text(negative_control_report, encoding="utf-8")
-    return {
+    paths = {
         "edge_stability": edge_path,
         "platform_consistency": group_path,
         "causal_audit_summary": summary_path,
         "negative_control_report": report_path,
     }
+    if null_control_metadata is not None:
+        null_manifest_path.write_text(
+            json.dumps(dict(null_control_metadata), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        paths["null_control_manifest"] = null_manifest_path
+    return paths
 
 
 def run_causal_stability_audit(
     step2_dir: str | Path,
     output_dir: str | Path | None = None,
     threshold: float = 0.5,
+    n_null_controls: int = 0,
+    null_modes: Sequence[str] = SUPPORTED_NULL_MODES,
+    random_seed: int = 42,
 ) -> dict[str, Any]:
     """Run a lightweight audit from existing Step2 artifacts."""
     inputs = load_step2_audit_inputs(step2_dir)
+    null_freqs = build_null_frequency_matrices(
+        inputs["bootstrap_freq"],
+        n_controls=n_null_controls,
+        null_modes=null_modes,
+        random_seed=random_seed,
+    )
+    null_manifest = _null_control_manifest(
+        null_freqs,
+        n_requested=n_null_controls,
+        null_modes=null_modes,
+        random_seed=random_seed,
+    )
     edge_table = build_edge_stability_table(
         adjacency=inputs["adjacency"],
         bootstrap_freq=inputs["bootstrap_freq"],
         node_labels=inputs["node_labels"],
         type_mapping=inputs["type_mapping"],
+        null_freqs=null_freqs,
         causal_input_metadata=inputs["causal_input_metadata"],
         threshold=threshold,
     )
     group_consistency = summarize_group_consistency(None, inputs["node_labels"], threshold=threshold)
-    report = build_negative_control_report(edge_table, metadata=inputs["causal_input_metadata"])
+    report_metadata = {**inputs["causal_input_metadata"], **null_manifest}
+    report = build_negative_control_report(edge_table, metadata=report_metadata)
     paths = (
-        write_causal_stability_outputs(output_dir, edge_table, group_consistency, report)
+        write_causal_stability_outputs(
+            output_dir,
+            edge_table,
+            group_consistency,
+            report,
+            null_control_metadata=null_manifest,
+        )
         if output_dir is not None
         else {}
     )
@@ -337,5 +495,7 @@ def run_causal_stability_audit(
         "edge_stability": edge_table,
         "platform_consistency": group_consistency,
         "negative_control_report": report,
+        "null_freqs": null_freqs,
+        "null_control_manifest": null_manifest,
         "output_paths": paths,
     }
