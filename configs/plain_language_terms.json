@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "files": [
+    "README.md",
+    "docs/research/target_discovery_ranking_policy_v1.md",
+    "docs/research/causal_null_control_policy_v1.md",
+    "docs/research/benchmark_contract_v1.md",
+    "docs/research/task_c_mean_difference_baseline_v1.md",
+    "docs/research/task_s_simple_baselines_v1.md"
+  ],
+  "rules": [
+    {"term": "benchmark contract", "aliases": ["benchmark contract", "benchmark contracts"], "preferred_phrases": ["预先固定的比较规则"]},
+    {"term": "promotion gate", "preferred_phrases": ["进入下一证据阶段的条件"]},
+    {"term": "evidence-gated", "preferred_phrases": ["由直接证据决定"]},
+    {"term": "holdout", "aliases": ["holdout", "holdouts"], "preferred_phrases": ["独立验证数据"]},
+    {"term": "artifact", "aliases": ["artifact", "artifacts"], "preferred_phrases": ["分析输出文件", "可复查的输出"]},
+    {"term": "manifest", "aliases": ["manifest", "manifests"], "preferred_phrases": ["分析记录清单"]},
+    {"term": "sidecar", "aliases": ["sidecar", "sidecars"], "preferred_phrases": ["独立的补充分析"]},
+    {"term": "baseline", "aliases": ["baseline", "baselines"], "preferred_phrases": ["简单对照方法"]},
+    {"term": "coverage", "preferred_phrases": ["可作出判断的比例"]},
+    {"term": "abstention", "preferred_phrases": ["暂不判断的比例", "暂不判断"]},
+    {"term": "smoke test", "preferred_phrases": ["最小运行检查"]},
+    {"term": "pipeline", "preferred_phrases": ["分析流程"]},
+    {"term": "adapter", "aliases": ["adapter", "adapters"], "preferred_phrases": ["接入层"]}
+  ]
+}

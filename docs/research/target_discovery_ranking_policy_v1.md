@@ -1,43 +1,51 @@
-# Target Discovery Ranking Policy v1
+# 候选靶点排序规则 v1
 
-Status: active audit policy for post-v0.6 development.
+状态：适用于 v0.6 之后研究工作的现行审计规则。
 
-## Estimand boundary
+## 这份文件解决什么问题
 
-The main ranking orders data-derived target candidates. It does not estimate a
-validated causal treatment effect or a spatial drug mechanism. Causal graphs,
-spatial propagation, ligand-receptor priors, and mechanism-chain scores remain
-sidecars until their own external intervention gates pass.
+HyperSCA 会从数据中整理候选靶点。本规则说明哪些证据可以决定候选顺序，哪些结果只能用于安排后续验证，以避免补充模型在证据不足时改变主要排名。
 
-## Default policy: `evidence_gated`
+## 通俗解释
 
-Candidates are sorted lexicographically, with stable tie handling, by:
+默认采用由直接证据决定的排序（evidence-gated ranking）。表达差异的来源数量、方向一致性、统计显著性和效应量依次决定顺序。因果、空间传播、扰动和机制结果作为独立的补充分析（sidecar）保存，只为后续研究提供旁证。
 
-1. number of independent DE sources;
-2. direction consistency across observed effects;
-3. `-log10` adjusted P value;
-4. mean absolute log-fold change;
-5. gene symbol, as a deterministic final tie-breaker.
+## 不能据此得出什么结论
 
-No weighted sum is used. `final_score = (n - rank + 1) / n` is an ordinal
-display value only. The output must mark every row with
-`ranking_basis=tiered_unweighted_evidence` and
-`final_score_method=ordinal_rank_display_not_weighted_sum`.
+主排名只整理数据支持的候选对象，不估计已经验证的治疗因果效应，也不证明空间药物作用机制。候选排名靠前不等于它是有效治疗靶点。补充模块只有通过各自的外部干预检验后，才可提高相应证据等级。
 
-The runtime writes the exact policy to `scoring/ranking_policy.json` and the
-gate decision to `scoring/module_admission.csv`. A partially or inconsistently
-marked ranking is blocked.
+这些补充结果不改变候选靶点排序。
 
-## Sidecar policy
+## 机器读取名称
 
-The following may be reported for audit and validation prioritization but may
-not change main rank order:
+- 默认规则：`evidence_gated`
+- 历史复现规则：`legacy_full`
+- 排名依据字段：`ranking_basis=tiered_unweighted_evidence`
+- 展示分数字段：`final_score_method=ordinal_rank_display_not_weighted_sum`
+- 规则文件：`scoring/ranking_policy.json`
+- 模块准入文件：`scoring/module_admission.csv`
 
-- causal graph centrality or flow;
-- perturbation and spatial propagation proxy metrics;
-- ligand-receptor and mechanism priors;
-- other representation or niche sidecars without a passed external gate.
+这些代码名、字段和文件路径保持不变。
 
-The `legacy_full` profile preserves the historical weighted sum for
-reproduction only and is explicitly blocked from main-ranking admission.
-Manual gene or target seeds are rejected at the pipeline boundary.
+## 默认排序方法
+
+候选对象按以下条件依次比较；前一项相同时才比较后一项，并保持稳定的并列处理：
+
+1. 支持该候选的独立差异表达来源数量；
+2. 已观察效应的方向一致性；
+3. 调整后 P 值的 `-log10`；
+4. 平均绝对对数倍数变化；
+5. 基因符号，作为可重复的最终并列判定条件。
+
+排序不使用加权总分。`final_score = (n - rank + 1) / n` 只用于直观显示名次，不表示加权证据强度。每一行都必须带有前述 `ranking_basis` 和 `final_score_method` 标记；标记不完整或相互矛盾时停止输出主要排名。
+
+## 补充证据的使用范围
+
+以下结果可写入审计报告，并用于决定优先验证哪些候选，但不得改变主要顺序：
+
+- 因果图中心性或信号流；
+- 扰动模拟和空间传播代理指标；
+- 配体—受体关系和机制先验；
+- 尚未通过外部检验的其他表示学习或生态位结果。
+
+`legacy_full` 保留历史加权总分，只用于复现旧结果，明确禁止用于当前主要排名。分析流程（pipeline）也会在入口处拒绝人工指定的基因或靶点种子。

@@ -41,5 +41,8 @@ jobs:
       - name: Validate core CPU imports
         run: python scripts/validate_env.py --profile core-cpu
 
+      - name: Check reader-facing terminology
+        run: python scripts/check_plain_language.py
+
       - name: Run test suite
         run: pytest tests -q
