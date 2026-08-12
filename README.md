@@ -2,6 +2,8 @@
   <img src="docs/Logo_high%20res.png" alt="HyperSCA Logo" width="280" />
 </p>
 
+[![CI](https://github.com/luvega/HyperSCA/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/luvega/HyperSCA/actions/workflows/ci.yml)
+
 HyperSCA (Hyperbolic Spatiotemporal Causal Analysis) 是一个面向空间组学与单细胞组学联合分析的多组学计算框架。该框架集成双曲几何嵌入、因果图发现和反事实扰动分析，支持 scRNA-seq、空间转录组及临床/表型分层数据的联合建模，用于机制推断与可干预靶点评估。除肿瘤免疫场景外，也可用于自身免疫、慢性炎症、感染及组织损伤修复等疾病环境。
 
 HyperSCA is a multi-omics research pipeline for joint single-cell and spatial omics modeling, combining hyperbolic representation learning, causal graph inference, counterfactual perturbation, and spatially aware target prioritization.
@@ -123,20 +125,27 @@ conda create -n hypersca python=3.10 -y
 conda activate hypersca
 ```
 
-### 2) Install Dependencies
+### 2) Install the Core CPU Environment
 
 ```bash
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -e ".[dev]"
 ```
 
-CUDA 12.4 推荐安装：
+`pyproject.toml` exposes HyperSCA as an editable Python package while retaining
+the existing `src.*` import paths. Core CPU dependencies are maintained in
+`requirements-core.txt`. To add the extended single-cell, spatial, causal, and
+notebook stack, run:
 
 ```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-pip install torch-geometric -f https://data.pyg.org/whl/torch-2.6.0+cu124.html
+python -m pip install -r requirements.txt
 ```
 
-如需复现历史扰动 baseline，可额外安装可选依赖；核心流程不依赖 `scgen`：
+GPU 环境需要先从 PyTorch 官方索引安装与本机 CUDA 对应的 `torch`，再从
+[PyG wheel matrix](https://data.pyg.org/whl/) 安装版本匹配的编译扩展。扩展名维护在
+`requirements-gpu.txt`，不进入 CPU/CI 依赖解析。历史扰动 baseline 则单独安装；
+核心流程不依赖 `scgen`：
 
 ```bash
 pip install -r requirements-optional-baselines.txt
@@ -145,17 +154,18 @@ pip install -r requirements-optional-baselines.txt
 ### 3) Validate Runtime Environment
 
 ```bash
-python scripts/validate_env.py
+python scripts/validate_env.py --profile core-cpu
+pytest tests -q
 ```
 
-`scgen` 仅作为可选历史 baseline 检查；缺失或因 `scvi-tools` 版本不兼容导入失败时，验证脚本会报告 warning，但不会阻断 HyperSCA 核心环境。
+验证档位与依赖边界对应：
 
-当前本地开发快照使用外部短路径 conda 环境 `C:\h` 通过环境验证和测试回归；若使用 Windows PowerShell，可直接运行：
+- `core-cpu`：CI 与无加速器开发环境；不检查 CUDA 或编译型 PyG 扩展。
+- `gpu`：核心依赖 + CUDA + 编译型 PyG 扩展。
+- `full`：完整科研栈 + GPU/PyG；也是不传 `--profile` 时的兼容默认值。
 
-```powershell
-C:\h\python.exe scripts\validate_env.py
-C:\h\python.exe -m pytest tests -q -p no:cacheprovider
-```
+`scgen` 仅作为 `full` 档位中的可选历史 baseline 检查；缺失或因
+`scvi-tools` 版本不兼容导入失败时会报告 warning，但不会单独阻断验证。
 
 ## Quick Start
 

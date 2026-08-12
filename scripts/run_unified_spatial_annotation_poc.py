@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import json
 import os
 import subprocess
@@ -59,7 +59,7 @@ def _write_json(path: Path, payload: dict[str, Any] | list[dict[str, Any]]) -> N
 
 
 def _progress_timestamp() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _initialize_progress(path: Path | None, *, run_id: str) -> None:
