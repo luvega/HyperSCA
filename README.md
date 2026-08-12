@@ -17,6 +17,18 @@ HyperSCA is a multi-omics research pipeline for joint single-cell and spatial om
 - [Bear evidence synthesis](reports/research/bear_hypersca_spatial_causal_20260810/report.md)
 - [Comparison matrix](reports/research/bear_hypersca_spatial_causal_20260810/comparison_matrix.tsv)
 - [Innovation claim register](reports/research/bear_hypersca_spatial_causal_20260810/innovation_claim_register.tsv)
+- [Frozen Tasks C/S/D benchmark contract](docs/research/benchmark_contract_v1.md)
+
+Validate the preregistered comparison contract before running a new benchmark:
+
+```bash
+python scripts/validate_benchmark_contract.py
+```
+
+The contract freezes Tasks C/S/D, five seeds, split and feature rules, equal tuning
+budgets, simple baselines, null controls, coverage/abstention gates, and conservative
+promotion criteria. A valid contract is not a benchmark result; all tasks remain
+`not_evaluated` until external holdouts and required baselines are run.
 
 ## Project and Algorithm Overview
 

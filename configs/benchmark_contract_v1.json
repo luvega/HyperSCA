@@ -1,0 +1,155 @@
+{
+  "schema_version": "1.0",
+  "contract_id": "hypersca-csd-benchmark-v1",
+  "status": "frozen",
+  "claim_boundary": "Promotion supports a benchmark-backed candidate claim only; it does not establish clinical efficacy, target validity, or universal algorithm superiority.",
+  "shared_design": {
+    "random_seeds": [11, 23, 47, 71, 97],
+    "feature_policy": "All compared methods receive the same train-derived feature set; no test, holdout, or validation outcome may influence feature selection.",
+    "tuning": {
+      "max_trials_per_method": 20,
+      "objective": "task_primary_metric",
+      "same_budget_for_all_methods": true
+    },
+    "stopping_rule": {
+      "type": "fixed_budget_with_train_only_early_stopping",
+      "maximum_epochs": 200,
+      "early_stopping_patience": 10
+    },
+    "uncertainty": {
+      "confidence_level": 0.95,
+      "method": "paired_cluster_bootstrap"
+    },
+    "required_run_artifacts": [
+      "run_manifest.json",
+      "input_summary.json",
+      "metrics.json",
+      "predictions.csv",
+      "promotion_decision.json"
+    ]
+  },
+  "tasks": {
+    "C": {
+      "title": "Interventional causal network recovery",
+      "estimand": "Directed average gene-expression effect of intervening on a source gene on each target gene within an explicitly held-out biological context.",
+      "unit_of_analysis": "directed_gene_pair_by_context",
+      "split": {
+        "id": "C-context-intervention-holdout-v1",
+        "strategy": "grouped_external_context_holdout",
+        "group_keys": ["biological_context", "perturbation_target"],
+        "leakage_forbidden": [
+          "held_out_perturbation_labels_in_training",
+          "test_derived_feature_selection",
+          "test_edges_in_prior_construction"
+        ]
+      },
+      "primary_metric": {
+        "name": "average_precision",
+        "direction": "maximize"
+      },
+      "secondary_metrics": [
+        "auroc",
+        "precision_at_k",
+        "edge_direction_accuracy",
+        "coverage",
+        "abstention_rate"
+      ],
+      "required_simple_baselines": ["mean_difference"],
+      "null_controls": [
+        "perturbation_label_permutation",
+        "control_resampling"
+      ],
+      "promotion": {
+        "minimum_coverage": 0.8,
+        "maximum_abstention_rate": 0.2,
+        "minimum_seed_success_rate": 0.8,
+        "requires_external_holdout": true,
+        "requires_null_controls": true,
+        "paired_improvement_ci_lower_gt": 0.0
+      }
+    },
+    "S": {
+      "title": "Spatial own and neighbor perturbation effects",
+      "estimand": "Cell-autonomous expression change and the additional distance-indexed expression change in non-perturbed neighboring cells, reported as separate endpoints.",
+      "unit_of_analysis": "cell_or_spot_by_perturbation_by_spatial_block",
+      "split": {
+        "id": "S-slice-spatial-block-holdout-v1",
+        "strategy": "external_slice_plus_spatial_block_holdout",
+        "group_keys": ["sample_or_slice", "spatial_block", "perturbation_target"],
+        "leakage_forbidden": [
+          "adjacent_train_test_spatial_blocks",
+          "test_coordinates_in_hyperparameter_selection",
+          "test_derived_feature_selection"
+        ]
+      },
+      "primary_metric": {
+        "name": "neighbor_effect_rmse",
+        "direction": "minimize"
+      },
+      "secondary_metrics": [
+        "own_effect_rmse",
+        "neighbor_effect_pcc",
+        "distance_decay_calibration_error",
+        "coverage",
+        "abstention_rate"
+      ],
+      "required_simple_baselines": [
+        "own_only",
+        "fixed_distance_decay"
+      ],
+      "null_controls": [
+        "coordinate_permutation",
+        "neighbor_identity_permutation"
+      ],
+      "promotion": {
+        "minimum_coverage": 0.8,
+        "maximum_abstention_rate": 0.2,
+        "minimum_seed_success_rate": 0.8,
+        "requires_external_holdout": true,
+        "requires_null_controls": true,
+        "paired_improvement_ci_lower_gt": 0.0
+      }
+    },
+    "D": {
+      "title": "Spatial drug mechanism prioritization",
+      "estimand": "Association between a drug intervention and measured response within a pre-specified niche, dose, and time stratum, conditional on documented exposure and target engagement.",
+      "unit_of_analysis": "drug_by_niche_by_dose_by_time",
+      "split": {
+        "id": "D-moa-drug-context-holdout-v1",
+        "strategy": "moa_or_scaffold_plus_external_context_holdout",
+        "group_keys": ["mechanism_or_scaffold", "drug", "biological_context"],
+        "leakage_forbidden": [
+          "same_drug_across_train_and_test",
+          "signature_database_duplicate_leakage",
+          "test_response_in_candidate_generation"
+        ]
+      },
+      "primary_metric": {
+        "name": "spearman_response_correlation",
+        "direction": "maximize"
+      },
+      "secondary_metrics": [
+        "average_precision_active_drug",
+        "dose_response_calibration_error",
+        "target_engagement_coverage",
+        "coverage",
+        "abstention_rate"
+      ],
+      "required_simple_baselines": [
+        "non_spatial_signature_reversal"
+      ],
+      "null_controls": [
+        "drug_label_permutation",
+        "signature_sign_permutation"
+      ],
+      "promotion": {
+        "minimum_coverage": 0.8,
+        "maximum_abstention_rate": 0.2,
+        "minimum_seed_success_rate": 0.8,
+        "requires_external_holdout": true,
+        "requires_null_controls": true,
+        "paired_improvement_ci_lower_gt": 0.0
+      }
+    }
+  }
+}
