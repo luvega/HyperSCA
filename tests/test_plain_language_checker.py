@@ -42,6 +42,20 @@ def test_explained_first_use_passes_and_later_short_use_is_allowed() -> None:
     assert check_document(text, [RULE], "x.md") == []
 
 
+def test_ignored_code_block_does_not_shift_reported_line_number() -> None:
+    text = (
+        "开头。\n\n"
+        "```bash\n"
+        "benchmark contract\n"
+        "第二行代码\n"
+        "```\n\n"
+        "The benchmark contract is fixed.\n"
+    )
+    issues = check_document(text, [RULE], "x.md")
+    assert len(issues) == 1
+    assert issues[0].line == 8
+
+
 def test_checker_cli_passes_repository_scope() -> None:
     completed = subprocess.run(
         [sys.executable, "scripts/check_plain_language.py"],

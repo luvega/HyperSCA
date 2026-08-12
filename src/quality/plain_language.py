@@ -16,7 +16,12 @@ class PlainLanguageIssue:
 
 
 def strip_non_prose(text: str) -> str:
-    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    text = re.sub(
+        r"```.*?```",
+        lambda match: "\n" * match.group(0).count("\n"),
+        text,
+        flags=re.DOTALL,
+    )
     text = re.sub(r"`[^`]*`", "", text)
     text = re.sub(r"\]\([^)]*\)", "]", text)
     return text
