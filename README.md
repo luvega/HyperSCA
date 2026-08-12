@@ -228,6 +228,21 @@ python scripts/run_step2.py \
   --output-dir results/step2
 ```
 
+Step2 后可运行 append-only 稳定性审计。默认 `--n-null-controls 0` 保留历史
+行为；需要频率/拓扑 surrogate null 时显式固定数量、模式和 seed：
+
+```bash
+python scripts/run_causal_stability_audit.py \
+  --step2-dir results/step2 \
+  --n-null-controls 100 \
+  --null-modes matrix_permutation,node_label_shuffle,outgoing_weight_permutation \
+  --random-seed 42
+```
+
+输出包含 `null_control_manifest.json` 与摘要哈希。此审计只打乱已保存的
+bootstrap-frequency 矩阵，不等价于对原始细胞、处理、坐标或先验进行打乱后
+重拟合；因此只用于 causal-candidate sidecar，不能作为干预因果证明。
+
 ### D. Run Step3 (Counterfactual Perturbation)
 
 ```bash
