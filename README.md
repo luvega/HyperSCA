@@ -6,6 +6,16 @@ HyperSCA (Hyperbolic Spatiotemporal Causal Analysis) 是一个面向空间组学
 
 HyperSCA is a multi-omics research pipeline for joint single-cell and spatial omics modeling, combining hyperbolic representation learning, causal graph inference, counterfactual perturbation, and spatially aware target prioritization.
 
+## Current Release Status
+
+`v0.6.0` is an evidence-gated audit baseline. It consolidates the reviewed spatial-annotation and admission/from-scratch gates already merged through PRs #1-#5, and publishes a reproducible research assessment of causal inference, spatial perturbation, and drug-mechanism methods. HyperSCA remains an audit-stage research prototype: the release does not promote the hyperbolic v3/energy sidecars, claim state-of-the-art performance, or assert externally validated spatial drug mechanisms.
+
+- [v0.6.0 release notes](docs/releases/v0.6.0.md)
+- [HyperSCA progress and research landscape report](reports/research/hypersca_causal_spatial_drug_landscape_20260810.md)
+- [Bear evidence synthesis](reports/research/bear_hypersca_spatial_causal_20260810/report.md)
+- [Comparison matrix](reports/research/bear_hypersca_spatial_causal_20260810/comparison_matrix.tsv)
+- [Innovation claim register](reports/research/bear_hypersca_spatial_causal_20260810/innovation_claim_register.tsv)
+
 ## Project and Algorithm Overview
 
 HyperSCA 的研究完整版流程由六个连续阶段构成，可按具体队列与研究问题灵活裁剪：

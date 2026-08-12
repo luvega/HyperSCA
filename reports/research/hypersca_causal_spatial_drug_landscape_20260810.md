@@ -56,7 +56,7 @@ pytest tests -q -p no:cacheprovider
 python scripts/validate_env.py
 ```
 
-本地判断以 2026-08-10 的工作树为准，不把未跟踪文件视为已经进入远程主线。历史结果主要来自 [benchmark progress](../../docs/research/hypersca_benchmark_progress_20260622.md)、[当前算法 ARS 评审](../methodology/hypersca_current_version_algorithm_ars_review_20260622.md)、[hyperbolic-spatial v3 评审](../methodology/hypersca_hyperbolic_spatial_v3_progress_review_20260622.md) 与 [post-merge PR queue](../../docs/research/hypersca_post_merge_pr_queue_20260623.md)。
+本地判断以 2026-08-10 的工作树为准，不把未跟踪文件视为已经进入远程主线。历史结果主要来自公开发布的 [benchmark progress](../../docs/research/hypersca_benchmark_progress_20260622.md)，以及当时工作树中的算法 ARS 评审、hyperbolic-spatial v3 评审和 post-merge PR queue。后三项属于本地迁移审计材料，未随 v0.6.0 发布；本文已保留其用于结论的数值与证据边界。
 
 ### 2.2 外部检索
 
