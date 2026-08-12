@@ -8,6 +8,7 @@ from src.evaluation.benchmark_contract import (
 )
 from src.evaluation.spatial_metrics import evaluate_spatial_propagation
 from src.evaluation.task_c_benchmark import MeanDifferenceNetworkBaseline
+from src.evaluation.task_s_benchmark import predict_task_s_baseline
 from src.evaluation.cross_sample_metrics import evaluate_cross_sample
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "evaluate_cross_sample",
     "load_benchmark_contract",
     "MeanDifferenceNetworkBaseline",
+    "predict_task_s_baseline",
 ]

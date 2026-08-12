@@ -34,6 +34,10 @@ Task C now includes a deterministic mean-difference baseline compatible with the
 three-array NPZ cache and callable model interface published by CausalBench. See
 [Task C mean-difference baseline v1](docs/research/task_c_mean_difference_baseline_v1.md).
 
+Task S provides matched `own_only` and `fixed_distance_decay` spatial baselines.
+They share the same upstream own-effect prediction and report own versus neighbor
+endpoints separately. See [Task S simple spatial baselines v1](docs/research/task_s_simple_baselines_v1.md).
+
 ## Project and Algorithm Overview
 
 HyperSCA 的研究完整版流程由六个连续阶段构成，可按具体队列与研究问题灵活裁剪：
