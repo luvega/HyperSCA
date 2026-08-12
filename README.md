@@ -18,6 +18,7 @@ HyperSCA is a multi-omics research pipeline for joint single-cell and spatial om
 - [Comparison matrix](reports/research/bear_hypersca_spatial_causal_20260810/comparison_matrix.tsv)
 - [Innovation claim register](reports/research/bear_hypersca_spatial_causal_20260810/innovation_claim_register.tsv)
 - [Frozen Tasks C/S/D benchmark contract](docs/research/benchmark_contract_v1.md)
+- [项目术语与表达指南](docs/style/plain_language_terminology.md)：说明本文档如何用通俗文字解释标准术语，并保持科学证据边界。
 
 Validate the preregistered comparison contract before running a new benchmark:
 
