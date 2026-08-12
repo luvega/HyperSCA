@@ -1,0 +1,16 @@
+query_id	phase	label	query	mode	result_count	useful_count	json_file	bib_file
+q01	collision	literal	single-cell spatial transcriptomics causal inference counterfactual drug target discovery integrated platform	ultra_low	20	5	raw/q01-literal-20260810-134259.json	raw/q01-literal-20260810-134259.bib
+q02	collision	method	causal graph counterfactual spatial propagation perturbation modeling single-cell transcriptomics	ultra_low	20	7	raw/q02-method-20260810-134256.json	raw/q02-method-20260810-134256.bib
+q03	collision	problem	predict cell-autonomous and neighborhood perturbation effects spatial transcriptomics	ultra_low	20	5	raw/q03-problem-20260810-134253.json	raw/q03-problem-20260810-134253.bib
+q04	collision	conclusion	spatial niche specific drug mechanism target prioritization transcriptomics	ultra_low	20	2	raw/q04-conclusion-20260810-134313.json	raw/q04-conclusion-20260810-134313.bib
+q05	collision	adjacent	virtual tissue digital twin multicellular response drug perturbation spatial omics	ultra_low	20	2	raw/q05-adjacent-20260810-134313.json	raw/q05-adjacent-20260810-134313.bib
+q06	collision	frontier	2025 2026 spatial perturbation causal single-cell drug response preprint	ultra_low	20	4	raw/q06-frontier-20260810-134313.json	raw/q06-frontier-20260810-134313.bib
+q07	collision	literal-ranked	single-cell spatial transcriptomics causal inference counterfactual drug target discovery integrated platform	low	15	3	raw/q07-literal-low-20260810-134358.json	raw/q07-literal-low-20260810-134358.bib
+q08	collision	method-ranked	causal graph counterfactual spatial propagation perturbation modeling single-cell transcriptomics	low	15	6	raw/q08-method-low-20260810-134359.json	raw/q08-method-low-20260810-134359.bib
+q09	collision	problem-ranked	predict cell-autonomous and neighborhood perturbation effects spatial transcriptomics	low	15	5	raw/q09-problem-low-20260810-134352.json	raw/q09-problem-low-20260810-134352.bib
+q10	collision	conclusion-ranked	spatial niche specific drug mechanism target prioritization transcriptomics	low	15	3	raw/q10-conclusion-low-20260810-134452.json	raw/q10-conclusion-low-20260810-134452.bib
+q11	collision	frontier-ranked	2025 2026 spatial perturbation causal single-cell drug response preprint	low	15	5	raw/q11-frontier-low-20260810-134501.json	raw/q11-frontier-low-20260810-134501.bib
+q12	quiet-support	evidence-gate	evidence-gated benchmarking joint cell-autonomous neighborhood perturbation effects target prioritization spatial single-cell	low	15	3	raw/q12-quiet-evidence-gate-20260810-134604.json	raw/q12-quiet-evidence-gate-20260810-134604.bib
+q13	quiet-support	pharmacology	spatially resolved pharmacological perturbation dose time target engagement neighborhood drug mechanism transcriptomics	low	15	4	raw/q13-quiet-pharmacology-20260810-134607.json	raw/q13-quiet-pharmacology-20260810-134607.bib
+q14	challenge	contradiction	failure poor generalization spatial transcriptomics drug response prediction causal mechanism perturbation	low	15	8	raw/q14-challenge-contradiction-20260810-134601.json	raw/q14-challenge-contradiction-20260810-134601.bib
+q15	challenge	method-criticism	identifiability confounding data leakage benchmark criticism causal inference counterfactual single-cell perturbation spatial transcriptomics	low	15	4	raw/q15-challenge-method-20260810-134604.json	raw/q15-challenge-method-20260810-134604.bib
