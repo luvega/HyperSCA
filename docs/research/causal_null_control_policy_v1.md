@@ -1,41 +1,45 @@
-# Causal Stability Null-Control Policy v1
+# 因果稳定性与零效应对照规则 v1
 
-Status: active audit policy for post-v0.6 development.
+状态：适用于 v0.6 之后研究工作的现行审计规则。
 
-## Scope
+## 这份文件解决什么问题
 
-The current implementation generates surrogate null matrices from the saved
-Step2 bootstrap-frequency matrix. It measures whether reported edge frequency
-and topology are unusually strong relative to controlled rearrangements of the
-same matrix. It does not rerun causal discovery on altered cell-level data and
-therefore cannot establish identifiability, remove hidden confounding, or prove
-an intervention mechanism.
+因果关系图可能受样本波动或数据结构影响。本规则规定如何检查同一关系能否在重复分析中出现，以及随机重排后的数据是否也会产生同样有说服力的关系。
 
-## Reproducible controls
+## 通俗解释
 
-Each run freezes `n_null_controls`, `null_modes`, and `random_seed`. Supported
-modes are:
+重复抽样检查（bootstrap）会多次抽取数据，观察同一条关系是否反复出现。零效应对照（null control）会在保持部分数据特征的同时随机重排已保存的关系频率矩阵，用来判断观察到的边频率和网络结构是否明显强于随机结果。
 
-- `matrix_permutation`: permute all off-diagonal frequencies;
-- `node_label_shuffle`: jointly permute row and column labels;
-- `outgoing_weight_permutation`: permute each source row's off-diagonal weight
-  multiset while preserving that multiset.
+## 不能据此得出什么结论
 
-The historical name `degree_preserving` is accepted as an alias for
-`outgoing_weight_permutation`; it does not claim exact preservation of the full
-directed degree sequence.
+当前实现只重排第二步保存的重复抽样频率矩阵，不会在改变后的细胞级数据上重新发现因果关系。因此，它不能证明因果关系可识别，不能排除隐藏混杂，也不能证明干预机制。矩阵重排结果不是细胞或干预层面的零效应证据。
 
-The audit writes `null_control_manifest.json` with the canonical modes, seed,
-requested/generated counts, scope, and SHA-256 digest of generated matrices.
-Generated matrices are reproducible from the saved input matrix and manifest.
+通过检查的关系仍然只是独立的补充分析（sidecar），不改变候选靶点排序。
 
-## Gate
+## 机器读取名称
 
-Fewer than 10 null matrices can never pass the negative-control gate. With at
-least 10 matrices, an edge must exceed its null 95th percentile and pass
-Benjamini-Hochberg FDR at the configured alpha. Passing edges remain
-`sidecar_only`; the audit does not change target ranking.
+- 运行参数：`n_null_controls`、`null_modes`、`random_seed`
+- 支持模式：`matrix_permutation`、`node_label_shuffle`、`outgoing_weight_permutation`
+- 历史别名：`degree_preserving`
+- 分析记录清单（manifest）：`null_control_manifest.json`
+- 文件内容指纹：`SHA-256 digest`
 
-Future Task C work must add data-level nulls—such as intervention-label
-shuffle, observation permutation, and prior-off reruns—and external
-interventional scoring before causal promotion is considered.
+这些参数、模式名和文件名保持不变。
+
+## 可重复的随机对照
+
+每次运行固定对照数量、重排模式和随机起点：
+
+- `matrix_permutation`：重排全部非对角频率；
+- `node_label_shuffle`：用同一顺序重排行标签和列标签；
+- `outgoing_weight_permutation`：在每个来源行内重排非对角权重，同时保留该行的权重集合。
+
+历史名称 `degree_preserving` 作为 `outgoing_weight_permutation` 的别名继续可用，但它不表示完整的有向度序列得到严格保留。
+
+运行结果会在记录清单中保存规范模式名、随机起点、请求和实际生成的数量、适用范围，以及所生成矩阵的 SHA-256。根据保存的输入矩阵和该清单，可以重复生成相同对照。
+
+## 进入下一证据阶段的条件
+
+少于 10 个零效应矩阵时不能通过负控检查。达到至少 10 个矩阵后，一条关系必须高于其零效应分布的第 95 百分位数，并在设定的显著性水平下通过 Benjamini–Hochberg 假发现率校正。
+
+后续任务 C 还需要加入数据层面的零效应对照，例如重排干预标签、重排观测值、关闭先验后重新运行，并在外部干预数据上评分，之后才能考虑提高因果证据等级。

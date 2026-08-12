@@ -5,6 +5,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+MAINTAINED_DOCS = [
+    "README.md",
+    "docs/research/target_discovery_ranking_policy_v1.md",
+    "docs/research/causal_null_control_policy_v1.md",
+    "docs/research/benchmark_contract_v1.md",
+    "docs/research/task_c_mean_difference_baseline_v1.md",
+    "docs/research/task_s_simple_baselines_v1.md",
+]
+
 
 def test_agents_requires_plain_language_for_user_facing_text() -> None:
     policy = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
@@ -29,3 +38,30 @@ def test_readme_links_the_plain_language_guide() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "docs/style/plain_language_terminology.md" in readme
     assert "项目术语与表达指南" in readme
+
+
+def test_maintained_documents_keep_conservative_scientific_language() -> None:
+    combined = "\n".join(
+        (ROOT / path).read_text(encoding="utf-8") for path in MAINTAINED_DOCS
+    )
+    assert "不能据此声称临床疗效" in combined
+    assert "不改变候选靶点排序" in combined
+    assert "只证明分析流程可以运行" in combined
+    assert "own effect" in combined
+    assert "neighbor effect" in combined
+
+
+def test_stable_interface_names_remain_documented() -> None:
+    combined = "\n".join(
+        (ROOT / path).read_text(encoding="utf-8") for path in MAINTAINED_DOCS
+    )
+    for stable_name in (
+        "promotion_status",
+        "contract_sha256",
+        "run_manifest.json",
+        "input_summary.json",
+        "metrics.json",
+        "predictions.csv",
+        "promotion_decision.json",
+    ):
+        assert stable_name in combined

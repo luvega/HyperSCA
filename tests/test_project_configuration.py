@@ -65,3 +65,13 @@ def test_ci_targets_python_310_core_cpu_contract() -> None:
     assert 'python -m pip install -e ".[dev]"' in workflow
     assert "python scripts/validate_env.py --profile core-cpu" in workflow
     assert "pytest tests -q" in workflow
+
+
+def test_ci_runs_plain_language_check_before_tests() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    check = "python scripts/check_plain_language.py"
+    tests = "pytest tests -q"
+    assert check in workflow
+    assert workflow.index(check) < workflow.index(tests)
