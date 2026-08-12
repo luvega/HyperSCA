@@ -1,0 +1,9 @@
+# Optional compiled PyTorch Geometric extensions.
+#
+# Install torch for the target CUDA runtime first, then install matching wheels
+# from https://data.pyg.org/whl/ as documented by PyTorch Geometric.
+
+torch-scatter
+torch-sparse
+torch-cluster
+torch-spline-conv

@@ -1,6 +1,7 @@
 """Validate the HyperSCA runtime environment."""
 from __future__ import annotations
 
+import argparse
 import importlib
 import os
 import sys
@@ -27,6 +28,16 @@ class ImportCheckResult:
     warnings: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ValidationPlan:
+    """Checks enabled for one environment validation profile."""
+
+    required_imports: tuple[ImportSpec, ...]
+    optional_imports: tuple[ImportSpec, ...]
+    check_gpu: bool
+    pyg_extensions: tuple[ImportSpec, ...]
+
+
 ImportFunc = Callable[[str], object]
 
 
@@ -45,6 +56,15 @@ REQUIRED_IMPORTS = [
     ImportSpec("diffusers", "diffusers"),
 ]
 
+CORE_IMPORTS = [
+    ImportSpec("scanpy", "scanpy"),
+    ImportSpec("torch", "torch"),
+    ImportSpec("torch_geometric", "torch_geometric", dist_name="torch-geometric"),
+    ImportSpec("geoopt", "geoopt"),
+    ImportSpec("dowhy", "dowhy"),
+    ImportSpec("anndata", "anndata"),
+]
+
 OPTIONAL_IMPORTS = [
     ImportSpec("scgen", "scgen"),
 ]
@@ -55,6 +75,39 @@ PYG_EXTENSION_IMPORTS = [
     ImportSpec("torch_cluster", "torch_cluster", dist_name="torch-cluster"),
     ImportSpec("torch_spline_conv", "torch_spline_conv", dist_name="torch-spline-conv"),
 ]
+
+
+def build_validation_plan(profile: str) -> ValidationPlan:
+    """Return the checks associated with a named validation profile."""
+    if profile == "core-cpu":
+        return ValidationPlan(tuple(CORE_IMPORTS), (), False, ())
+    if profile == "gpu":
+        return ValidationPlan(
+            tuple(CORE_IMPORTS),
+            (),
+            True,
+            tuple(PYG_EXTENSION_IMPORTS),
+        )
+    if profile == "full":
+        return ValidationPlan(
+            tuple(REQUIRED_IMPORTS),
+            tuple(OPTIONAL_IMPORTS),
+            True,
+            tuple(PYG_EXTENSION_IMPORTS),
+        )
+    raise ValueError(f"Unknown validation profile: {profile}")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--profile",
+        choices=("core-cpu", "gpu", "full"),
+        default="full",
+        help="validation scope (default: full, preserving legacy behavior)",
+    )
+    return parser.parse_args(argv)
 
 
 def _version_text(module: object, spec: ImportSpec) -> str:
@@ -127,27 +180,38 @@ def check_data_readability(root: Path) -> None:
         print(f"  Data directory not found at {data_dir}")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    plan = build_validation_plan(args.profile)
     project_root = Path(__file__).resolve().parents[1]
 
     print("=" * 60)
-    print("HyperSCA Environment Validation")
+    print(f"HyperSCA Environment Validation ({args.profile})")
     print("=" * 60)
 
     errors: list[str] = []
     warnings: list[str] = []
 
     print("\n[1] Core package imports...")
-    import_result = check_imports()
+    import_result = check_imports(
+        required=plan.required_imports,
+        optional=plan.optional_imports,
+    )
     errors.extend(import_result.errors)
     warnings.extend(import_result.warnings)
 
-    print("\n[2] GPU check...")
-    errors.extend(check_gpu())
+    if plan.check_gpu:
+        print("\n[2] GPU check...")
+        errors.extend(check_gpu())
+    else:
+        print("\n[2] GPU check... SKIPPED by profile")
 
-    print("\n[3] PyG extensions...")
-    pyg_result = check_imports(required=PYG_EXTENSION_IMPORTS, optional=[])
-    errors.extend(pyg_result.errors)
+    if plan.pyg_extensions:
+        print("\n[3] PyG extensions...")
+        pyg_result = check_imports(required=plan.pyg_extensions, optional=[])
+        errors.extend(pyg_result.errors)
+    else:
+        print("\n[3] PyG extensions... SKIPPED by profile")
 
     print("\n[4] Data readability check...")
     check_data_readability(project_root)
