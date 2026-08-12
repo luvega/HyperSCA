@@ -4,13 +4,11 @@
 
 [![CI](https://github.com/luvega/HyperSCA/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/luvega/HyperSCA/actions/workflows/ci.yml)
 
-HyperSCA（Hyperbolic Spatiotemporal Causal Analysis）联合分析单细胞和空间组学数据。它先用双曲表示（hyperbolic embedding）整理细胞状态及其层级关系，再推断候选因果关系图，并用反事实扰动模拟评估候选靶点。结果用于形成待验证的机制假设和干预候选，不能单独证明药物机制或治疗效果。项目支持 scRNA-seq、空间转录组及临床/表型分层数据，可用于肿瘤免疫、自身免疫、慢性炎症、感染和组织损伤修复等研究场景。
-
-下文把数据依次经过多个研究步骤的过程称为多组学分析流程（pipeline）。HyperSCA 联合处理单细胞和空间组学数据，结合双曲表示、因果关系图推断、反事实扰动模拟和空间信息，对候选靶点进行排序。
+HyperSCA（Hyperbolic Spatiotemporal Causal Analysis）是一套联合处理单细胞和空间组学数据的多步骤分析流程（pipeline）。它先用双曲表示（hyperbolic embedding）整理细胞状态及其层级关系，再推断候选因果关系图，并用反事实扰动模拟评估候选靶点。结果用于形成待验证的机制假设和干预候选，不能单独证明药物机制或治疗效果。项目支持 scRNA-seq、空间转录组及临床/表型分层数据，可用于肿瘤免疫、自身免疫、慢性炎症、感染和组织损伤修复等研究场景。
 
 ## 当前发布状态
 
-`v0.6.0` 是由直接证据决定结论等级的审计版本（evidence-gated audit release）。它汇总了 PR #1—#5 已审查的空间注释、模块准入和从头运行规则，并给出可重复的因果推断、空间扰动和药物机制方法评估。HyperSCA 仍是审计阶段的研究原型：该版本没有让双曲 v3/energy 独立的补充分析（sidecars）进入主要结论，不声称达到最先进性能，也不声称空间药物机制已得到外部验证。
+`v0.6.0` 是由直接证据决定结论等级的审计版本。它汇总了 PR #1—#5 已审查的空间注释、模块准入和从头运行规则，并给出可重复的因果推断、空间扰动和药物机制方法评估。HyperSCA 仍是审计阶段的研究原型：该版本没有让双曲 v3/energy 独立的补充分析（sidecars）进入主要结论，不声称达到最先进性能，也不声称空间药物机制已得到外部验证。
 
 - [v0.6.0 发布说明](docs/releases/v0.6.0.md)
 - [HyperSCA 进度与研究版图报告](reports/research/hypersca_causal_spatial_drug_landscape_20260810.md)
@@ -54,10 +52,10 @@ HyperSCA 的研究完整版流程由六个连续阶段构成，可按具体队�
 2026-06-22 阶段性方法对照保持以下保守结论：
 
 - 主比较只纳入两个内部训练的 v3 分支：`hvae_hierarchy_spatial_v3_product` 与 `hvae_hierarchy_spatial_v3_product__without_radial_depth_loss`。
-- SCimilarity 仅作为 external pretrained appendix reference，不作为主排名竞争对象。
+- SCimilarity 仅作为外部预训练参考方法（external pretrained appendix reference），不作为主要排名的竞争对象。
 - 两个 v3 分支仍为 `audit_only_no_promotion`：`target rank delta` 仍为 0，`target enrichment` 尚未改善，prototype/radial hierarchy 监督仍接近随机水平。
-- VisiumHD full cell2location 已通过 545,913 行 abundance 输出校验；VisiumHD segmented RCTD 作为近单细胞分辨率空间对照。
-- Xenium 保持 panel-aware 分支；targeted panel 数据不运行 whole-transcriptome RCTD/cell2location 假设。
+- VisiumHD 完整数据规模的 cell2location 已通过 545,913 行丰度结果检查；基于分割结果的 RCTD 作为近单细胞分辨率空间对照。
+- Xenium 保持按测量基因面板处理的分支（panel-aware）；定向基因面板数据不采用全转录组 RCTD/cell2location 假设。
 
 当前阶段性审计材料保留为简要报告和图：
 
@@ -96,16 +94,16 @@ HyperSCA 的研究完整版流程由六个连续阶段构成，可按具体队�
 - 核心包：`src/discovery/target_discovery/`
   - `config.py`、`pipeline.py`、`stage.py`、`artifacts.py` 定义配置、步骤顺序、阶段约定和本次运行的分析记录清单（manifest）。
   - `loaders.py`、`candidates.py`、`expression.py`、`spatial.py` 构建轻量数据输入。
-  - `geometry.py`、`causal_stage.py`、`perturbation_stage.py`、`scoring.py`、`niche.py`、`reporting.py`、`figures.py` 负责双几何比较、Step2/Step3 wrapper、证据排序、生态位映射、报告和图。
+  - `geometry.py`、`causal_stage.py`、`perturbation_stage.py`、`scoring.py`、`niche.py`、`reporting.py`、`figures.py` 负责双几何比较、步骤 2/3 接入层（wrapper）、证据排序、生态位映射、报告和图。
 - 输出根目录：默认写入 `results/discovery/target_discovery/<run_id>/`，按 `candidates/`、`expression/`、`spatial/`、`geometry/{mode}/`、`causal/{mode}/`、`perturbation/{mode}/`、`scoring/`、`niche/`、`reports/`、`figures/` 分区，并生成 `manifest.json` 与 `reports/migration_notes.md`。
 
 ### 6）细胞行为规则与虚拟组织模拟
 
 - 入口脚本：`scripts/run_behavior_grammar_simulation.py`
 - 核心包：`src/behavior_grammar/`
-  - `rules.py` 定义 `BehaviorRule`, `SignalDictionary`, `BehaviorDictionary`, `RuleSet` 与 Hill/linear/step response。
+  - `rules.py` 定义 `BehaviorRule`、`SignalDictionary`、`BehaviorDictionary`、`RuleSet`，以及 Hill、线性和阶跃响应。
   - `rule_builder.py` 从 `results/discovery/target_discovery/<run_id>/manifest.json`、评分表、因果边、生态位映射和表达矩阵生成数据驱动规则。
-  - `simulation.py` 运行确定性 toy virtual tissue simulation，并输出 QoI sensitivity 与组合干预场景比较。
+  - `simulation.py` 运行确定性的简化虚拟组织模拟（toy virtual tissue simulation），并输出关注结果量敏感性（QoI sensitivity）和组合干预场景比较。
   - `pipeline.py` 复用本次运行专用的可复查分析输出文件（artifacts）清单，写入规则、轨迹、摘要、敏感性表和动态图。
 - 输出根目录：默认写入 `results/behavior_grammar/<run_id>/`，包含 `rules/rules.json`、`rules/rules.md`、`simulation/population_trajectory.csv`、`simulation/simulation_summary.json`、`simulation/qoi_sensitivity.csv` 与 `figures/population_trajectories.png`。
 
@@ -115,7 +113,7 @@ HyperSCA 的研究完整版流程由六个连续阶段构成，可按具体队�
 
 - `<PATH_TO_scRNA_REFERENCE>`
   - 代表文件：`*-NormalizedCounts.tsv`, `*-DE_result.tsv`
-  - 用途：构建 cluster-level 表达矩阵、候选差异基因池与细胞状态先验。
+  - 用途：构建细胞群层面的表达矩阵、候选差异基因池和细胞状态先验。
 - `<PATH_TO_SPATIAL_OMICS>`
   - 代表文件：`STmetadata_*.csv`, `spot_annotations.*`
   - 用途：空间反卷积、细胞共定位邻接、传播梯度与生态位结构评估。
@@ -191,7 +189,7 @@ pytest tests -q
 | Hierarchy Correlation | −0.569 | **+1.000** | 反转→完美 |
 | 证据维度 | 3 | **5** (+spatial, +niche) | +2 独立维度 |
 
-数据规模：485K spots × 3 空间平台 + 3 scRNA-seq 队列，**靶点发现完全数据驱动**（无预设 anchor）。
+数据规模：485K 个空间位置 × 3 个空间平台 + 3 个 scRNA-seq 队列，**靶点发现完全由数据驱动**（无预设锚定对象，anchor）。
 
 ### scCRC_ICB 分步示例（单细胞基础流程）
 
