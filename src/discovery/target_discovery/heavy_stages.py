@@ -5,8 +5,14 @@ from typing import Any, Mapping
 
 import pandas as pd
 
+from src.discovery.target_discovery.admission import build_module_admission_status
 from src.discovery.target_discovery.geometry import blend_adjacencies, compute_geometry
-from src.discovery.target_discovery.scoring import compare_modes, retain_hubs_and_combos, score_candidates
+from src.discovery.target_discovery.scoring import (
+    compare_modes,
+    ranking_policy,
+    retain_hubs_and_combos,
+    score_candidates,
+)
 from src.discovery.target_discovery.stage import TargetDiscoveryRunContext
 
 
@@ -42,6 +48,7 @@ class EvidenceScoringStage:
     def run(self, context: TargetDiscoveryRunContext, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         causal = inputs["causal_results"]
         perturb = inputs["perturbation_results"]
+        score_profile = context.config.score_profile
         ranking = score_candidates(
             inputs["candidate_pool"],
             causal["hyperbolic"],
@@ -49,6 +56,7 @@ class EvidenceScoringStage:
             perturb["hyperbolic"],
             perturb["euclidean"],
             inputs["cluster_expression"],
+            score_profile=score_profile,
         )
         hubs, combos = retain_hubs_and_combos(ranking, perturb["hyperbolic"])
         comparison = compare_modes(
@@ -60,13 +68,36 @@ class EvidenceScoringStage:
             perturb["euclidean"],
             ranking,
         )
+        module_admission = build_module_admission_status(
+            ranking=ranking,
+            perturbation_scores=perturb["hyperbolic"],
+        )
         context.writer.write_table("target_ranking.csv", ranking, section="scoring")
         evidence_cols = [
             col
-            for col in ["gene", "rank", "final_score", "s_causal", "s_spatial", "s_consistency", "s_actionability", "s_niche"]
+            for col in [
+                "gene",
+                "rank",
+                "final_score",
+                "ranking_basis",
+                "final_score_method",
+                "evidence_support_tier",
+                "evidence_source_count",
+                "direction_consistency",
+                "neg_log10_padj",
+                "mean_abs_lfc",
+                "rank_rationale",
+                "s_causal",
+                "s_spatial",
+                "s_consistency",
+                "s_actionability",
+                "s_niche",
+            ]
             if col in ranking
         ]
         context.writer.write_table("evidence_matrix.csv", ranking[evidence_cols], section="scoring")
+        context.writer.write_table("module_admission.csv", module_admission, section="scoring")
+        context.writer.write_json("ranking_policy.json", ranking_policy(score_profile), section="scoring")
         context.writer.write_table("hub_targets_retained.csv", hubs, section="scoring")
         context.writer.write_table("spatiotemporal_regulatory_combos.csv", combos, section="scoring")
         context.writer.write_json("mode_comparison.json", comparison, section="scoring")
@@ -75,6 +106,7 @@ class EvidenceScoringStage:
             "retained_hubs": hubs,
             "retained_combos": combos,
             "mode_comparison": comparison,
+            "module_admission": module_admission,
         }
 
 

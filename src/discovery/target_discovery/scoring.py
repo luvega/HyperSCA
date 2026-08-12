@@ -10,6 +10,21 @@ from src.discovery.target_discovery.constants import SCORE_WEIGHTS
 from src.discovery.target_discovery.utils import minmax
 
 
+ADMITTED_EVIDENCE_MODULES = (
+    "multi_source_de;direction_consistency;de_significance;de_effect_magnitude"
+)
+SIDECAR_ONLY_MODULES = (
+    "causal_graph;perturbation_proxy;spatial_proxy;mechanism_prior_lr"
+)
+EVIDENCE_GATED_SORT_KEYS = (
+    "evidence_source_count",
+    "direction_consistency",
+    "neg_log10_padj",
+    "mean_abs_lfc",
+    "gene",
+)
+
+
 def _numeric_series(frame: pd.DataFrame, column: str, default: float = 0.0) -> np.ndarray:
     if column not in frame:
         return np.full(len(frame), default, dtype=float)
@@ -22,6 +37,62 @@ def _split_celltypes(value: Any) -> list[str]:
     return [part for part in str(value).split(";") if part]
 
 
+def _support_tier(source_count: float) -> str:
+    count = int(max(source_count, 0))
+    if count >= 3:
+        return "three_source"
+    if count == 2:
+        return "two_source"
+    if count == 1:
+        return "single_source"
+    return "unknown"
+
+
+def _ordinal_display_score(n_rows: int) -> np.ndarray:
+    if n_rows <= 0:
+        return np.array([], dtype=float)
+    return (n_rows - np.arange(n_rows, dtype=float)) / float(n_rows)
+
+
+def _rank_rationale(row: pd.Series) -> str:
+    return ";".join(
+        [
+            f"evidence_tier={row.get('evidence_support_tier', 'unknown')}",
+            f"direction_consistency={float(row.get('direction_consistency', 0.0)):.3f}",
+            f"de_significance={float(row.get('neg_log10_padj', 0.0)):.3f}",
+            f"de_effect_magnitude={float(row.get('mean_abs_lfc', 0.0)):.3f}",
+            f"sidecar_not_ranked={SIDECAR_ONLY_MODULES}",
+        ]
+    )
+
+
+def ranking_policy(score_profile: str) -> dict[str, Any]:
+    """Return the machine-readable ranking contract for a run."""
+    if score_profile == "evidence_gated":
+        return {
+            "policy_version": "1.0",
+            "score_profile": score_profile,
+            "ranking_basis": "tiered_unweighted_evidence",
+            "sort_keys": list(EVIDENCE_GATED_SORT_KEYS),
+            "admitted_evidence_modules": ADMITTED_EVIDENCE_MODULES.split(";"),
+            "sidecar_only_modules": SIDECAR_ONLY_MODULES.split(";"),
+            "final_score_method": "ordinal_rank_display_not_weighted_sum",
+            "promotion_status": "audit_only_no_promotion",
+        }
+    if score_profile == "legacy_full":
+        return {
+            "policy_version": "1.0",
+            "score_profile": score_profile,
+            "ranking_basis": "legacy_weighted_sum",
+            "sort_keys": ["final_score"],
+            "admitted_evidence_modules": [],
+            "sidecar_only_modules": [],
+            "final_score_method": "legacy_weighted_sum",
+            "promotion_status": "legacy_reproduction_only",
+        }
+    raise ValueError(f"unsupported score_profile: {score_profile}")
+
+
 def score_candidates(
     candidate_pool: pd.DataFrame,
     step2_hyp: dict,
@@ -29,6 +100,8 @@ def score_candidates(
     step3_hyp: dict,
     step3_euc: dict,
     cluster_expr: pd.DataFrame,
+    *,
+    score_profile: str = "evidence_gated",
 ) -> pd.DataFrame:
     del step2_euc, step3_euc
     pool = candidate_pool.copy()
@@ -93,15 +166,47 @@ def score_candidates(
     pool["s_actionability"] = minmax(np.array(action_scores))
     pool["s_niche"] = minmax(np.array(niche_scores))
 
-    weights = SCORE_WEIGHTS
-    pool["final_score"] = (
-        weights["causal"] * pool["s_causal"]
-        + weights["spatial"] * pool["s_spatial"]
-        + weights["consistency"] * pool["s_consistency"]
-        + weights["actionability"] * pool["s_actionability"]
-        + weights["niche"] * pool["s_niche"]
-    )
-    pool = pool.sort_values("final_score", ascending=False).reset_index(drop=True)
+    source_count = _numeric_series(pool, "cross_queue_count")
+    pool["gene"] = pool["gene"].astype(str)
+    pool["direction_consistency"] = direction
+    pool["mean_abs_lfc"] = mean_abs_lfc
+    pool["neg_log10_padj"] = _numeric_series(pool, "neg_log10_padj")
+    pool["evidence_source_count"] = source_count.astype(int)
+    pool["evidence_support_tier"] = [_support_tier(value) for value in source_count]
+    pool["admitted_evidence_modules"] = ADMITTED_EVIDENCE_MODULES
+    pool["sidecar_only_modules"] = SIDECAR_ONLY_MODULES
+    pool["rank_rationale"] = [_rank_rationale(row) for _, row in pool.iterrows()]
+
+    if score_profile == "evidence_gated":
+        for column in EVIDENCE_GATED_SORT_KEYS[:-1]:
+            if column not in pool:
+                pool[column] = 0.0
+        pool = pool.sort_values(
+            list(EVIDENCE_GATED_SORT_KEYS),
+            ascending=[False, False, False, False, True],
+            kind="mergesort",
+        ).reset_index(drop=True)
+        pool["final_score"] = _ordinal_display_score(len(pool))
+        pool["ranking_basis"] = "tiered_unweighted_evidence"
+        pool["final_score_method"] = "ordinal_rank_display_not_weighted_sum"
+    elif score_profile == "legacy_full":
+        weights = SCORE_WEIGHTS
+        pool["final_score"] = (
+            weights["causal"] * pool["s_causal"]
+            + weights["spatial"] * pool["s_spatial"]
+            + weights["consistency"] * pool["s_consistency"]
+            + weights["actionability"] * pool["s_actionability"]
+            + weights["niche"] * pool["s_niche"]
+        )
+        pool = pool.sort_values("final_score", ascending=False).reset_index(drop=True)
+        pool["ranking_basis"] = "legacy_weighted_sum"
+        pool["final_score_method"] = "legacy_weighted_sum"
+        pool["admitted_evidence_modules"] = "legacy_weighted_components"
+        pool["sidecar_only_modules"] = ""
+        pool["rank_rationale"] = "legacy_weighted_reproduction_only"
+    else:
+        raise ValueError(f"unsupported score_profile: {score_profile}")
+    pool["score_profile"] = score_profile
     pool["rank"] = pool.index + 1
     return pool
 

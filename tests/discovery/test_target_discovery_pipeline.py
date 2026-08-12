@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 import pandas as pd
+import pytest
 
 from src.discovery.target_discovery.config import DiscoveryPaths, TargetDiscoveryConfig
 from src.discovery.target_discovery.lightweight_stages import (
@@ -48,6 +49,19 @@ def test_pipeline_runs_fake_stages_and_writes_manifest(tmp_path):
     assert outputs["b"] == 2
     assert (tmp_path / "runs" / "smoke" / "manifest.json").exists()
     assert (tmp_path / "runs" / "smoke" / "fake" / "one.json").exists()
+
+
+def test_default_config_uses_evidence_gated_ranking(tmp_path):
+    cfg = _config(tmp_path)
+
+    assert cfg.score_profile == "evidence_gated"
+
+
+def test_target_discovery_cli_does_not_accept_manual_gene_seeds():
+    from scripts.run_target_discovery import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--genes", "GREM1"])
 
 
 def test_default_target_discovery_stages_include_append_only_sidecars():

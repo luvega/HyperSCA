@@ -54,6 +54,9 @@ class TargetDiscoveryPipeline:
         self.icb_data_mode_detector = icb_data_mode_detector
 
     def run(self) -> dict[str, Any]:
+        from src.discovery.target_discovery.guardrails import validate_no_manual_target_lists
+
+        validate_no_manual_target_lists(self.config)
         run_id = self.config.resolved_run_id()
         writer = ArtifactWriter(self.config.paths.output_base, run_id=run_id)
         context = TargetDiscoveryRunContext(

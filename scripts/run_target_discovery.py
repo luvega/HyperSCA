@@ -12,10 +12,6 @@ from src.discovery.target_discovery.config import DiscoveryPaths, GeometryModeCo
 from src.discovery.target_discovery.pipeline import TargetDiscoveryPipeline
 
 
-def _parse_genes(value: str) -> tuple[str, ...]:
-    return tuple(gene.strip() for gene in value.split(",") if gene.strip())
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="HyperSCA Target Discovery")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "results" / "discovery" / "target_discovery")
@@ -24,10 +20,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--geometry-k", type=int, default=4)
     parser.add_argument("--geometry-blend", type=float, default=0.30)
     parser.add_argument("--platform", choices=["cosmx", "visium", "visiumhd", "all"], default="all")
-    parser.add_argument("--genes", type=str, default="")
     parser.add_argument("--hierarchy-levels", type=int, default=3)
     parser.add_argument("--skip-figures", action="store_true")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--score-profile",
+        choices=["evidence_gated", "legacy_full"],
+        default="evidence_gated",
+    )
     return parser
 
 
@@ -39,11 +39,11 @@ def main() -> int:
         geometry=GeometryModeConfig(geometry_k=args.geometry_k, geometry_blend=args.geometry_blend),
         max_perturb=args.max_perturb,
         platform=args.platform,
-        focused_genes=_parse_genes(args.genes),
         hierarchy_levels=args.hierarchy_levels,
         run_id=args.run_id,
         device=args.device,
         skip_figures=args.skip_figures,
+        score_profile=args.score_profile,
     )
     outputs = TargetDiscoveryPipeline(config).run()
     print(f"Run directory: {outputs['run_dir']}")

@@ -7,6 +7,7 @@ import pytest
 
 from src.discovery.target_discovery.guardrails import (
     validate_from_scratch_config,
+    validate_no_manual_target_lists,
     validate_no_forbidden_result_files,
 )
 
@@ -39,6 +40,13 @@ def test_validate_from_scratch_config_rejects_manual_target_lists(tmp_path):
 
     with pytest.raises(ValueError, match="focused_genes|manual target"):
         validate_from_scratch_config(config)
+
+
+def test_validate_no_manual_target_lists_applies_to_every_discovery_mode(tmp_path):
+    config = _config(tmp_path, from_scratch=False, focused_genes=("GREM1",))
+
+    with pytest.raises(ValueError, match="focused_genes|manual target"):
+        validate_no_manual_target_lists(config)
 
 
 def test_validate_from_scratch_config_rejects_legacy_output_paths(tmp_path):

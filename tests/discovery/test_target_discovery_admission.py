@@ -55,3 +55,23 @@ def test_build_module_admission_status_enforces_evidence_gates():
     assert by_module.loc["causal_graph", "allowed_use"] == "exploratory_annotation_only"
     assert by_module.loc["perturbation_proxy", "status"] == "sidecar_only"
     assert by_module.loc["perturbation_proxy", "allowed_use"] == "validation_prioritization_only"
+
+
+def test_mixed_or_partially_marked_ranking_is_blocked():
+    from src.discovery.target_discovery.admission import build_module_admission_status
+
+    ranking = pd.DataFrame(
+        {
+            "gene": ["A", "B"],
+            "ranking_basis": ["tiered_unweighted_evidence", "legacy_weighted_sum"],
+            "final_score_method": [
+                "ordinal_rank_display_not_weighted_sum",
+                "legacy_weighted_sum",
+            ],
+        }
+    )
+
+    status = build_module_admission_status(ranking=ranking).set_index("module")
+
+    assert status.loc["main_ranking", "status"] == "blocked"
+    assert status.loc["final_score", "status"] == "blocked"
