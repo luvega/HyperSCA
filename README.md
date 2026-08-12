@@ -30,6 +30,10 @@ budgets, simple baselines, null controls, coverage/abstention gates, and conserv
 promotion criteria. A valid contract is not a benchmark result; all tasks remain
 `not_evaluated` until external holdouts and required baselines are run.
 
+Task C now includes a deterministic mean-difference baseline compatible with the
+three-array NPZ cache and callable model interface published by CausalBench. See
+[Task C mean-difference baseline v1](docs/research/task_c_mean_difference_baseline_v1.md).
+
 ## Project and Algorithm Overview
 
 HyperSCA 的研究完整版流程由六个连续阶段构成，可按具体队列与研究问题灵活裁剪：
