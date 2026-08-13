@@ -42,6 +42,9 @@ MAXIMUM_CONFIG_BYTES = 64 * 1024
 MAXIMUM_JSON_DEPTH = 16
 MAXIMUM_SEED = 2**32 - 1
 MAXIMUM_METHOD_WORKER_BYTES = 4 * 1024 * 1024
+MAXIMUM_METHOD_COMMAND_ARGUMENTS = 512
+MAXIMUM_METHOD_BOUNDARY_FILES = 64
+MAXIMUM_METHOD_ENVIRONMENT_ENTRIES = 4_096
 CONTROL_LABEL = "non-targeting"
 
 FEATURE_SELECTION = "common_expression_genes_train_control_variance_v1"
@@ -1040,14 +1043,8 @@ def _verify_method_worker_entry(
 
 
 def _normalized_python_interpreters(
-    values: Sequence[str | Path] | None,
+    values: tuple[str | Path, ...],
 ) -> set[Path]:
-    if values is None or isinstance(values, (str, bytes)) or not isinstance(
-        values, Sequence
-    ):
-        raise TaskCRehearsalError(
-            "allowed Python interpreters must be an ordered path list"
-        )
     allowed: set[Path] = set()
     for value in values:
         if not isinstance(value, (str, Path)):
@@ -1076,6 +1073,128 @@ def _normalized_python_interpreters(
     return allowed
 
 
+def _bounded_sequence_tuple(
+    values: object,
+    *,
+    label: str,
+    maximum_items: int,
+) -> tuple[Any, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise TaskCRehearsalError(f"{label} must be an ordered list")
+    if type(values) is tuple:
+        copied = values
+    else:
+        copied_values: list[Any] = []
+        try:
+            iterator = iter(values)
+            for _index in range(maximum_items + 1):
+                try:
+                    copied_values.append(next(iterator))
+                except StopIteration:
+                    break
+        except Exception as exc:
+            raise TaskCRehearsalError(
+                f"{label} could not be copied safely"
+            ) from exc
+        copied = tuple(copied_values)
+    if not copied:
+        raise TaskCRehearsalError(f"{label} must not be empty")
+    if len(copied) > maximum_items:
+        raise TaskCRehearsalError(f"{label} contains too many values")
+    return copied
+
+
+def _strict_command_snapshot(command: object) -> tuple[str, ...]:
+    copied = _bounded_sequence_tuple(
+        command,
+        label="method command",
+        maximum_items=MAXIMUM_METHOD_COMMAND_ARGUMENTS,
+    )
+    if any(type(argument) is not str for argument in copied):
+        raise TaskCRehearsalError(
+            "method command must contain exact text arguments"
+        )
+    if any("\x00" in argument for argument in copied):
+        raise TaskCRehearsalError("method command text must not contain NUL")
+    return copied  # type: ignore[return-value]
+
+
+def _allowed_interpreter_snapshot(
+    values: object,
+) -> tuple[str | Path, ...]:
+    copied = _bounded_sequence_tuple(
+        values,
+        label="allowed Python interpreters",
+        maximum_items=MAXIMUM_METHOD_BOUNDARY_FILES,
+    )
+    if any(not isinstance(value, (str, Path)) for value in copied):
+        raise TaskCRehearsalError(
+            "allowed Python interpreters must contain only paths"
+        )
+    return copied  # type: ignore[return-value]
+
+
+def _worker_snapshot_tuple(
+    values: object,
+) -> tuple[MethodWorkerEntrySnapshot, ...]:
+    copied = _bounded_sequence_tuple(
+        values,
+        label="allowed worker snapshots",
+        maximum_items=MAXIMUM_METHOD_BOUNDARY_FILES,
+    )
+    if any(type(value) is not MethodWorkerEntrySnapshot for value in copied):
+        raise TaskCRehearsalError(
+            "allowed workers must use frozen entry snapshots"
+        )
+    return copied  # type: ignore[return-value]
+
+
+def _environment_snapshot(
+    environment: Mapping[str, str] | None,
+) -> Mapping[str, str]:
+    source: Mapping[str, str] = os.environ if environment is None else environment
+    if not isinstance(source, Mapping):
+        raise TaskCRehearsalError(
+            "method environment must contain safe text names and values"
+        )
+    copied: dict[str, str] = {}
+    try:
+        iterator = iter(source.items())
+        for _index in range(MAXIMUM_METHOD_ENVIRONMENT_ENTRIES + 1):
+            try:
+                item = next(iterator)
+            except StopIteration:
+                break
+            if type(item) not in {tuple, list} or len(item) != 2:
+                raise TaskCRehearsalError(
+                    "method environment contains a malformed entry"
+                )
+            key, value = item
+            if (
+                type(key) is not str
+                or type(value) is not str
+                or not key
+                or "\x00" in key
+                or "\x00" in value
+                or key in copied
+            ):
+                raise TaskCRehearsalError(
+                    "method environment must contain unique safe text names and values"
+                )
+            copied[key] = value
+    except TaskCRehearsalError:
+        raise
+    except Exception as exc:
+        raise TaskCRehearsalError(
+            "method environment could not be copied safely"
+        ) from exc
+    if len(copied) > MAXIMUM_METHOD_ENVIRONMENT_ENTRIES:
+        raise TaskCRehearsalError(
+            "method environment contains too many entries"
+        )
+    return MappingProxyType(copied)
+
+
 def validate_private_scoring_command(
     command: Sequence[str],
     *,
@@ -1092,19 +1211,7 @@ def validate_private_scoring_command(
     which executes an immutable private copy in the same checked boundary.
     """
 
-    if isinstance(command, (str, bytes)) or not isinstance(command, Sequence):
-        raise TaskCRehearsalError("method command must be an ordered list of text")
-    try:
-        count = len(command)
-        arguments = tuple(command[index] for index in range(count))
-    except (IndexError, KeyError, TypeError, OverflowError) as exc:
-        raise TaskCRehearsalError(
-            "method command must be an ordered list of text"
-        ) from exc
-    if not arguments or any(type(argument) is not str for argument in arguments):
-        raise TaskCRehearsalError("method command must be an ordered list of text")
-    if any("\x00" in argument for argument in arguments):
-        raise TaskCRehearsalError("method command text must not contain NUL")
+    arguments = _strict_command_snapshot(command)
 
     private = _real_private_directory(private_root)
     if execution_cwd is None:
@@ -1136,8 +1243,37 @@ def validate_private_scoring_command(
             raise TaskCRehearsalError(
                 "method command must not use dynamic Python execution"
             )
-    allowed_interpreters = _normalized_python_interpreters(
+    private_text = os.fspath(private)
+    for argument in arguments:
+        for candidate_text in _command_path_candidates(argument):
+            if private_text in candidate_text:
+                raise TaskCRehearsalError(
+                    "method command contains a private scoring path"
+                )
+            try:
+                candidate = Path(candidate_text).expanduser()
+                if not candidate.is_absolute():
+                    candidate = cwd / candidate
+                lexical = Path(os.path.normpath(os.fspath(candidate)))
+                if _path_is_within(lexical, private):
+                    raise TaskCRehearsalError(
+                        "method command contains a private scoring path"
+                    )
+                resolved = candidate.resolve(strict=False)
+            except TaskCRehearsalError:
+                raise
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if resolved == private or private in resolved.parents:
+                raise TaskCRehearsalError(
+                    "method command contains a private scoring path"
+                )
+    interpreter_values = _allowed_interpreter_snapshot(
         allowed_python_interpreters
+    )
+    worker_snapshots = _worker_snapshot_tuple(allowed_worker_snapshots)
+    allowed_interpreters = _normalized_python_interpreters(
+        interpreter_values
     )
     try:
         interpreter = Path(arguments[0]).expanduser()
@@ -1169,21 +1305,8 @@ def validate_private_scoring_command(
     worker_entry, _initial_payload, _initial_identity = _method_worker_bytes(
         requested_worker_entry
     )
-    if (
-        allowed_worker_snapshots is None
-        or isinstance(allowed_worker_snapshots, (str, bytes))
-        or not isinstance(allowed_worker_snapshots, Sequence)
-        or not allowed_worker_snapshots
-        or any(
-            type(snapshot) is not MethodWorkerEntrySnapshot
-            for snapshot in allowed_worker_snapshots
-        )
-    ):
-        raise TaskCRehearsalError(
-            "allowed workers must use frozen entry snapshots"
-        )
     snapshots_by_path: dict[Path, MethodWorkerEntrySnapshot] = {}
-    for snapshot in allowed_worker_snapshots:
+    for snapshot in worker_snapshots:
         if snapshot.path in snapshots_by_path:
             raise TaskCRehearsalError(
                 "allowed worker snapshots must contain unique entries"
@@ -1194,31 +1317,6 @@ def validate_private_scoring_command(
             "method command does not use a registered worker entry"
         )
 
-    private_text = os.fspath(private)
-    for argument in arguments:
-        for candidate_text in _command_path_candidates(argument):
-            if private_text in candidate_text:
-                raise TaskCRehearsalError(
-                    "method command contains a private scoring path"
-                )
-            try:
-                candidate = Path(candidate_text).expanduser()
-                if not candidate.is_absolute():
-                    candidate = cwd / candidate
-                lexical = Path(os.path.normpath(os.fspath(candidate)))
-                if _path_is_within(lexical, private):
-                    raise TaskCRehearsalError(
-                        "method command contains a private scoring path"
-                    )
-                resolved = candidate.resolve(strict=False)
-            except TaskCRehearsalError:
-                raise
-            except (OSError, RuntimeError, ValueError):
-                continue
-            if resolved == private or private in resolved.parents:
-                raise TaskCRehearsalError(
-                    "method command contains a private scoring path"
-                )
     _verify_method_worker_entry(
         requested_worker_entry,
         snapshots_by_path[worker_entry],
@@ -1302,16 +1400,21 @@ def run_validated_private_scoring_command(
     after success, failure or timeout.
     """
 
+    arguments = _strict_command_snapshot(command)
+    interpreter_values = _allowed_interpreter_snapshot(
+        allowed_python_interpreters
+    )
+    snapshots = _worker_snapshot_tuple(allowed_worker_snapshots)
+    process_environment = _environment_snapshot(environment)
     validate_private_scoring_command(
-        command,
+        arguments,
         private_root=private_root,
         execution_cwd=execution_cwd,
-        allowed_python_interpreters=allowed_python_interpreters,
-        allowed_worker_snapshots=allowed_worker_snapshots,
+        allowed_python_interpreters=interpreter_values,
+        allowed_worker_snapshots=snapshots,
     )
-    arguments = tuple(command)
     cwd = _real_execution_directory(execution_cwd)
-    interpreters = _normalized_python_interpreters(allowed_python_interpreters)
+    interpreters = _normalized_python_interpreters(interpreter_values)
     interpreter = Path(arguments[0]).expanduser().resolve(strict=True)
     if interpreter not in interpreters:
         raise TaskCRehearsalError(
@@ -1321,7 +1424,6 @@ def run_validated_private_scoring_command(
         os.stat(interpreter, follow_symlinks=False)
     )
 
-    snapshots = tuple(allowed_worker_snapshots)
     entry_path = Path(arguments[2]).expanduser()
     if not entry_path.is_absolute():
         entry_path = cwd / entry_path
@@ -1348,21 +1450,6 @@ def run_validated_private_scoring_command(
     for snapshot in snapshots:
         _verify_method_worker_entry(snapshot.path, snapshot)
 
-    if environment is not None:
-        if not isinstance(environment, Mapping) or any(
-            type(key) is not str
-            or type(value) is not str
-            or "\x00" in key
-            or "\x00" in value
-            or not key
-            for key, value in environment.items()
-        ):
-            raise TaskCRehearsalError(
-                "method environment must contain safe text names and values"
-            )
-        process_environment = dict(environment)
-    else:
-        process_environment = os.environ.copy()
     if timeout_seconds is not None and (
         isinstance(timeout_seconds, bool)
         or not isinstance(timeout_seconds, (int, float))
@@ -1380,12 +1467,12 @@ def run_validated_private_scoring_command(
             for snapshot in snapshots
         }
         os.chmod(bundle, 0o500, follow_symlinks=False)
-        launch_command = [
+        launch_command = (
             str(interpreter),
             "-I",
             str(copied[entry_path]),
             *arguments[3:],
-        ]
+        )
         interpreter_after = _file_identity(
             os.stat(interpreter, follow_symlinks=False)
         )

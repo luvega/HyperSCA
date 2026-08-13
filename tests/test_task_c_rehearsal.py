@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import importlib.util
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import replace
 import os
 from pathlib import Path
@@ -1148,6 +1148,62 @@ def test_validated_launcher_rejects_worker_change_before_snapshot(
             allowed_python_interpreters=(interpreter,),
             allowed_worker_snapshots=(snapshot,),
         )
+
+
+def test_validated_launcher_snapshots_a_changing_command_exactly_once(
+    tmp_path: Path,
+) -> None:
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "import sys\nprint(sys.argv[1])\n",
+        encoding="utf-8",
+    )
+    snapshot = freeze_method_worker_entry(worker)
+    interpreter = Path(sys.executable).resolve(strict=True)
+    safe = (str(interpreter), "-I", str(worker), "safe-value")
+    changed = (
+        str(interpreter),
+        "-I",
+        str(worker),
+        str(private_root / "must-not-be-launched.npz"),
+    )
+
+    class ChangingCommand(Sequence[str]):
+        def __init__(self) -> None:
+            self.iteration_count = 0
+            self.was_indexed = False
+
+        def __len__(self) -> int:
+            return len(safe)
+
+        def __getitem__(self, index):
+            self.was_indexed = True
+            return safe[index]
+
+        def __iter__(self):
+            self.iteration_count += 1
+            return iter(
+                safe
+                if self.iteration_count == 1 and not self.was_indexed
+                else changed
+            )
+
+    command = ChangingCommand()
+    completed = run_validated_private_scoring_command(
+        command,
+        private_root=private_root,
+        execution_cwd=tmp_path,
+        allowed_python_interpreters=[interpreter],
+        allowed_worker_snapshots=[snapshot],
+        environment=dict(os.environ),
+    )
+
+    assert command.iteration_count == 1
+    assert not command.was_indexed
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "safe-value"
 
 
 def test_official_evaluation_worker_exposes_help_without_external_imports(
