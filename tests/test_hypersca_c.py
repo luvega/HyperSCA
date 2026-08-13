@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,24 @@ from src.causal.hypersca_c import (
 
 ROOT = Path(__file__).resolve().parents[1]
 
+EXPECTED_CONFIG_PAYLOAD: dict[str, object] = {
+    "schema_version": "1.0",
+    "learning_rate": 0.01,
+    "maximum_epochs": 200,
+    "early_stopping_patience": 10,
+    "shared_l1": 0.001,
+    "context_l1": 0.002,
+    "acyclicity_weight": 0.01,
+    "enable_context_adjustments": True,
+    "prior_discount": 0.0,
+    "selection_threshold": 0.0001,
+    "bootstrap_repeats": 20,
+    "bootstrap_success_fraction": 0.8,
+    "minimum_source_variance": 1e-08,
+    "control_label": "non-targeting",
+    "excluded_label": "excluded",
+}
+
 
 def default_config_payload() -> dict[str, object]:
     return json.loads(
@@ -26,7 +45,9 @@ def default_config_payload() -> dict[str, object]:
 
 
 def test_default_config_is_frozen_and_has_no_prior_discount() -> None:
-    config = HyperSCACConfig.from_mapping(default_config_payload())
+    payload = default_config_payload()
+    assert payload == EXPECTED_CONFIG_PAYLOAD
+    config = HyperSCACConfig.from_mapping(payload)
     assert config.schema_version == "1.0"
     assert config.prior_discount == 0.0
     assert config.enable_context_adjustments is True
@@ -81,6 +102,10 @@ def test_zero_diagonal_removes_self_edges() -> None:
         ({"minimum_source_variance": 0.0}, "minimum_source_variance"),
         ({"control_label": ""}, "control_label"),
         ({"excluded_label": " excluded"}, "excluded_label"),
+        ({"control_label": "non targeting"}, "control_label"),
+        ({"excluded_label": "excl\tuded"}, "excluded_label"),
+        ({"control_label": "non\ntargeting"}, "control_label"),
+        ({"excluded_label": "excl\u2003uded"}, "excluded_label"),
         (
             {"control_label": "excluded", "excluded_label": "excluded"},
             "different",
@@ -114,6 +139,59 @@ def test_config_wraps_non_mapping_input_in_domain_error() -> None:
         )
 
 
+def test_config_wraps_mapping_read_failure_in_domain_error() -> None:
+    class UnreadableValues(Mapping[str, object]):
+        def __iter__(self) -> Iterator[str]:
+            return iter(EXPECTED_CONFIG_PAYLOAD)
+
+        def __len__(self) -> int:
+            return len(EXPECTED_CONFIG_PAYLOAD)
+
+        def __getitem__(self, key: str) -> object:
+            raise RuntimeError(f"cannot read {key}")
+
+    with pytest.raises(HyperSCACError, match="validated"):
+        HyperSCACConfig.from_mapping(UnreadableValues())
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [
+        ({"schema_version": "2.0"}, "schema_version"),
+        ({"learning_rate": float("nan")}, "learning_rate"),
+        ({"shared_l1": -0.1}, "shared_l1"),
+        ({"bootstrap_repeats": 0}, "bootstrap_repeats"),
+        ({"enable_context_adjustments": 1}, "enable_context_adjustments"),
+        ({"control_label": ""}, "control_label"),
+        ({"excluded_label": "excl\tuded"}, "excluded_label"),
+    ],
+)
+def test_direct_config_construction_cannot_bypass_validation(
+    change: dict[str, object], match: str
+) -> None:
+    payload = dict(EXPECTED_CONFIG_PAYLOAD)
+    payload.update(change)
+    with pytest.raises(HyperSCACError, match=match):
+        HyperSCACConfig(**payload)  # type: ignore[arg-type]
+
+
+def test_direct_config_construction_normalizes_numpy_numbers() -> None:
+    payload = dict(EXPECTED_CONFIG_PAYLOAD)
+    payload.update(
+        {
+            "learning_rate": np.float32(0.01),
+            "maximum_epochs": np.int64(200),
+            "early_stopping_patience": np.int32(10),
+            "bootstrap_repeats": np.int64(20),
+        }
+    )
+    config = HyperSCACConfig(**payload)  # type: ignore[arg-type]
+    assert type(config.learning_rate) is float
+    assert type(config.maximum_epochs) is int
+    assert type(config.early_stopping_patience) is int
+    assert type(config.bootstrap_repeats) is int
+
+
 def test_intervention_mask_keeps_unknown_but_valid_labels_available() -> None:
     mask = build_intervention_mask(["unknown-target"], ["A", "B"])
     assert mask.dtype == np.float32
@@ -130,6 +208,13 @@ def test_intervention_mask_keeps_unknown_but_valid_labels_available() -> None:
         ([1], ["A"], "interventions"),
         ([" A"], ["A"], "whitespace"),
         (["unknown target"], ["A"], "whitespace"),
+        (["unknown\ttarget"], ["A"], "whitespace"),
+        (["unknown\ntarget"], ["A"], "whitespace"),
+        (["unknown\u2003target"], ["A"], "whitespace"),
+        (["A"], ["gene name"], "whitespace"),
+        (["A"], ["gene\tname"], "whitespace"),
+        (["A"], ["gene\nname"], "whitespace"),
+        (["A"], ["gene\u2003name"], "whitespace"),
         ([], ["A"], "interventions"),
         (["excluded"], ["A"], "no usable"),
     ],
@@ -141,6 +226,17 @@ def test_intervention_mask_rejects_ambiguous_inputs(
 ) -> None:
     with pytest.raises(HyperSCACError, match=match):
         build_intervention_mask(interventions, gene_names)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "excluded_label",
+    ["excluded label", "excluded\tlabel", "excluded\nlabel", "excluded\u2003label"],
+)
+def test_intervention_mask_rejects_whitespace_in_excluded_label(
+    excluded_label: str,
+) -> None:
+    with pytest.raises(HyperSCACError, match="excluded_label.*whitespace"):
+        build_intervention_mask(["A"], ["A"], excluded_label=excluded_label)
 
 
 def test_zero_diagonal_preserves_tensor_properties_and_gradient() -> None:

@@ -36,6 +36,78 @@ class HyperSCACConfig:
     control_label: str
     excluded_label: str
 
+    def __post_init__(self) -> None:
+        """阻止直接构造绕过第一版候选方法的固定规则。"""
+
+        schema_version = _required_text(self.schema_version, "schema_version")
+        if schema_version != "1.0":
+            raise HyperSCACError("schema_version must be 1.0")
+
+        learning_rate = _finite_number(self.learning_rate, "learning_rate")
+        if learning_rate <= 0.0:
+            raise HyperSCACError("learning_rate must be greater than 0")
+
+        maximum_epochs = _positive_integer(self.maximum_epochs, "maximum_epochs")
+        early_stopping_patience = _positive_integer(
+            self.early_stopping_patience, "early_stopping_patience"
+        )
+        bootstrap_repeats = _positive_integer(
+            self.bootstrap_repeats, "bootstrap_repeats"
+        )
+
+        nonnegative_names = (
+            "shared_l1",
+            "context_l1",
+            "acyclicity_weight",
+            "selection_threshold",
+        )
+        normalized_nonnegative: dict[str, float] = {}
+        for name in nonnegative_names:
+            value = _finite_number(getattr(self, name), name)
+            if value < 0.0:
+                raise HyperSCACError(f"{name} must be non-negative")
+            normalized_nonnegative[name] = value
+
+        prior_discount = _finite_number(self.prior_discount, "prior_discount")
+        if not 0.0 <= prior_discount < 1.0:
+            raise HyperSCACError("prior_discount must be in [0, 1)")
+
+        bootstrap_success_fraction = _finite_number(
+            self.bootstrap_success_fraction, "bootstrap_success_fraction"
+        )
+        if not 0.0 < bootstrap_success_fraction <= 1.0:
+            raise HyperSCACError("bootstrap_success_fraction must be in (0, 1]")
+
+        minimum_source_variance = _finite_number(
+            self.minimum_source_variance, "minimum_source_variance"
+        )
+        if minimum_source_variance <= 0.0:
+            raise HyperSCACError("minimum_source_variance must be greater than 0")
+
+        if type(self.enable_context_adjustments) is not bool:
+            raise HyperSCACError("enable_context_adjustments must be a bool")
+
+        control_label = _required_text(self.control_label, "control_label")
+        excluded_label = _required_text(self.excluded_label, "excluded_label")
+        if control_label == excluded_label:
+            raise HyperSCACError("control_label and excluded_label must be different")
+
+        normalized_values: dict[str, object] = {
+            "schema_version": schema_version,
+            "learning_rate": learning_rate,
+            "maximum_epochs": maximum_epochs,
+            "early_stopping_patience": early_stopping_patience,
+            **normalized_nonnegative,
+            "prior_discount": prior_discount,
+            "bootstrap_repeats": bootstrap_repeats,
+            "bootstrap_success_fraction": bootstrap_success_fraction,
+            "minimum_source_variance": minimum_source_variance,
+            "control_label": control_label,
+            "excluded_label": excluded_label,
+        }
+        for name, value in normalized_values.items():
+            object.__setattr__(self, name, value)
+
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "HyperSCACConfig":
         """读取并严格检查一组已固定的候选方法设置。"""
@@ -62,84 +134,19 @@ class HyperSCACConfig:
                 "configuration fields do not match: " + "; ".join(details)
             )
 
-        schema_version = _required_text(payload["schema_version"], "schema_version")
-        if schema_version != "1.0":
-            raise HyperSCACError("schema_version must be 1.0")
-
-        learning_rate = _finite_number(payload["learning_rate"], "learning_rate")
-        if learning_rate <= 0.0:
-            raise HyperSCACError("learning_rate must be greater than 0")
-
-        maximum_epochs = _positive_integer(payload["maximum_epochs"], "maximum_epochs")
-        early_stopping_patience = _positive_integer(
-            payload["early_stopping_patience"], "early_stopping_patience"
-        )
-        bootstrap_repeats = _positive_integer(
-            payload["bootstrap_repeats"], "bootstrap_repeats"
-        )
-
-        nonnegative_names = (
-            "shared_l1",
-            "context_l1",
-            "acyclicity_weight",
-            "selection_threshold",
-        )
-        numeric: dict[str, float] = {"learning_rate": learning_rate}
-        for name in nonnegative_names:
-            value = _finite_number(payload[name], name)
-            if value < 0.0:
-                raise HyperSCACError(f"{name} must be non-negative")
-            numeric[name] = value
-
-        prior_discount = _finite_number(payload["prior_discount"], "prior_discount")
-        if not 0.0 <= prior_discount < 1.0:
-            raise HyperSCACError("prior_discount must be in [0, 1)")
-
-        bootstrap_success_fraction = _finite_number(
-            payload["bootstrap_success_fraction"], "bootstrap_success_fraction"
-        )
-        if not 0.0 < bootstrap_success_fraction <= 1.0:
-            raise HyperSCACError("bootstrap_success_fraction must be in (0, 1]")
-
-        minimum_source_variance = _finite_number(
-            payload["minimum_source_variance"], "minimum_source_variance"
-        )
-        if minimum_source_variance <= 0.0:
-            raise HyperSCACError("minimum_source_variance must be greater than 0")
-
-        enabled = payload["enable_context_adjustments"]
-        if type(enabled) is not bool:
-            raise HyperSCACError("enable_context_adjustments must be a bool")
-
-        control_label = _required_text(payload["control_label"], "control_label")
-        excluded_label = _required_text(payload["excluded_label"], "excluded_label")
-        if control_label == excluded_label:
-            raise HyperSCACError("control_label and excluded_label must be different")
-
-        return cls(
-            schema_version=schema_version,
-            learning_rate=learning_rate,
-            maximum_epochs=maximum_epochs,
-            early_stopping_patience=early_stopping_patience,
-            shared_l1=numeric["shared_l1"],
-            context_l1=numeric["context_l1"],
-            acyclicity_weight=numeric["acyclicity_weight"],
-            enable_context_adjustments=enabled,
-            prior_discount=prior_discount,
-            selection_threshold=numeric["selection_threshold"],
-            bootstrap_repeats=bootstrap_repeats,
-            bootstrap_success_fraction=bootstrap_success_fraction,
-            minimum_source_variance=minimum_source_variance,
-            control_label=control_label,
-            excluded_label=excluded_label,
-        )
+        try:
+            return cls(**dict(payload))  # type: ignore[arg-type]
+        except HyperSCACError:
+            raise
+        except Exception as exc:
+            raise HyperSCACError("configuration values could not be validated") from exc
 
 
 def _required_text(value: object, name: str) -> str:
-    if not isinstance(value, str) or not value or value != value.strip():
-        raise HyperSCACError(
-            f"{name} must be non-empty text without surrounding whitespace"
-        )
+    if not isinstance(value, str) or not value:
+        raise HyperSCACError(f"{name} must be non-empty text without whitespace")
+    if any(character.isspace() for character in value):
+        raise HyperSCACError(f"{name} must not contain whitespace")
     return value
 
 
@@ -164,8 +171,6 @@ def _positive_integer(value: object, name: str) -> int:
 def _text_vector(
     values: Sequence[str],
     name: str,
-    *,
-    forbid_whitespace: bool = False,
 ) -> tuple[str, ...]:
     if isinstance(values, (str, bytes)):
         raise HyperSCACError(
@@ -184,15 +189,7 @@ def _text_vector(
 
     result: list[str] = []
     for value in array.tolist():
-        if not isinstance(value, str):
-            raise HyperSCACError(f"{name} must contain only text labels")
-        if not value or value != value.strip():
-            raise HyperSCACError(
-                f"{name} labels must be non-empty text without surrounding whitespace"
-            )
-        if forbid_whitespace and any(character.isspace() for character in value):
-            raise HyperSCACError(f"{name} labels must not contain whitespace")
-        result.append(value)
+        result.append(_required_text(value, f"{name} label"))
     return tuple(result)
 
 
@@ -204,7 +201,7 @@ def build_intervention_mask(
 ) -> np.ndarray:
     """标出可用于学习的表达值，并遮挡被直接干预的基因。"""
 
-    labels = _text_vector(interventions, "interventions", forbid_whitespace=True)
+    labels = _text_vector(interventions, "interventions")
     genes = _text_vector(gene_names, "gene_names")
     _required_text(excluded_label, "excluded_label")
     if len(set(genes)) != len(genes):
