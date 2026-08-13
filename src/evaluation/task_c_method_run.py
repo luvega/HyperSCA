@@ -101,22 +101,9 @@ _PUBLIC_TASK_C_PATHS = frozenset(
         "target_adapt_refit",
     )
 )
-_DERIVED_INPUT_FIELDS = frozenset(
-    {
-        "schema_version",
-        "derived_input_schema",
-        "condition",
-        "direction",
-        "stage",
-        "parents",
-        "transformation",
-        "output",
-        "environment_labels",
-    }
-)
-_DERIVED_TRANSFORMATION = "per_environment_control_center_then_row_concatenate_v1"
 _RUNTIME_CODE_CLOSURE = (
     "src/evaluation/task_c_method_run.py",
+    "src/evaluation/task_c_profile_input.py",
     "scripts/run_task_c_method.py",
     "src/evaluation/task_c_predictions.py",
     "src/evaluation/task_c_runtime.py",
@@ -162,12 +149,12 @@ class _DerivedInput:
     manifest_snapshot: _Snapshot
     public_manifest_snapshot: _Snapshot
     public_manifest_payload: dict[str, Any]
-    parent_snapshots: tuple[_Snapshot, _Snapshot]
+    parent_snapshots: tuple[_Snapshot, ...]
     expression: np.ndarray
     interventions: np.ndarray
     genes: tuple[str, ...]
-    environment_labels: np.ndarray
-    direction: str
+    environment_labels: np.ndarray | None
+    run_context_id: str
 
 
 def _json_bytes(payload: object) -> bytes:
@@ -573,34 +560,7 @@ def _context_for_public_path(relative: str) -> str:
     raise TaskCMethodRunError("public path does not identify one Task C context")
 
 
-def _derived_parent_records(direction: str, stage: str) -> tuple[dict[str, str], ...]:
-    if direction not in {"k562_to_rpe1", "rpe1_to_k562"}:
-        raise TaskCMethodRunError("derived direction must be k562_to_rpe1 or rpe1_to_k562")
-    if stage != "refit":
-        raise TaskCMethodRunError("derived stage must be refit for the fixed Task C run")
-    source, target = direction.split("_to_", 1)
-    return (
-        {
-            "role": "source",
-            "context_id": source,
-            "public_relative_path": f"cross/{direction}/source_refit.npz",
-        },
-        {
-            "role": "target_adapt",
-            "context_id": target,
-            "public_relative_path": f"cross/{direction}/target_adapt_refit.npz",
-        },
-    )
-
-
-def _gene_names_sha256(genes: Sequence[str]) -> str:
-    encoded = json.dumps(
-        list(genes), ensure_ascii=False, separators=(",", ":")
-    ).encode("utf-8")
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
-
-
-def _center_and_concatenate(
+def _standardize_and_concatenate(
     parents: Sequence[tuple[str, np.ndarray, np.ndarray, tuple[str, ...]]],
 ) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], np.ndarray]:
     if len(parents) != 2:
@@ -613,12 +573,17 @@ def _center_and_concatenate(
         if genes != expected_genes:
             raise TaskCMethodRunError("derived parents must use the same fixed gene order")
         controls = labels == _CONTROL_LABEL
-        if not np.any(controls):
+        if int(np.count_nonzero(controls)) < 2:
             raise TaskCMethodRunError(
-                f"derived parent {context_id} has no non-targeting control cells"
+                f"derived parent {context_id} needs at least two control cells"
             )
-        control_mean = np.asarray(expression[controls], dtype=np.float64).mean(axis=0)
-        centered.append(np.asarray(expression, dtype=np.float64) - control_mean)
+        control_values = np.asarray(expression[controls], dtype=np.float64)
+        control_mean = control_values.mean(axis=0)
+        control_scale = control_values.std(axis=0, ddof=0)
+        safe_scale = np.where(control_scale <= 1e-6, 1.0, control_scale)
+        centered.append(
+            (np.asarray(expression, dtype=np.float64) - control_mean) / safe_scale
+        )
         interventions.append(np.asarray(labels, dtype=str))
         environments.append(np.asarray([context_id] * len(labels), dtype=str))
     expression_out = np.concatenate(centered, axis=0)
@@ -630,100 +595,32 @@ def _center_and_concatenate(
     return expression_out, interventions_out, expected_genes, environment_out
 
 
-def _npz_bytes(
-    expression: np.ndarray,
-    interventions: np.ndarray,
-    genes: Sequence[str],
-    environment_labels: np.ndarray,
-) -> bytes:
-    buffer = io.BytesIO()
-    np.savez(
-        buffer,
-        expression_matrix=np.asarray(expression),
-        interventions=np.asarray(interventions),
-        var_names=np.asarray(tuple(genes)),
-        environment_labels=np.asarray(environment_labels),
-    )
-    return buffer.getvalue()
-
-
 def materialize_task_c_derived_input(
     *,
     public_manifest_path: Path,
     direction: str,
     stage: str,
     output_dir: Path,
+    profile: str = "connection",
 ) -> dict[str, str]:
-    """Build one cross-environment learning file from two registered public parents."""
-    parent_records = _derived_parent_records(direction, stage)
-    manifest_path = _lexical_absolute(public_manifest_path)
-    captured: list[tuple[_Snapshot, _Snapshot, dict[str, Any], str]] = []
-    loaded: list[tuple[str, np.ndarray, np.ndarray, tuple[str, ...]]] = []
-    for record in parent_records:
-        relative = record["public_relative_path"]
-        item = _capture_public_input(manifest_path.parent / relative, manifest_path)
-        if item[3] != relative:
-            raise TaskCMethodRunError("derived parent path changed during capture")
-        captured.append(item)
-        expression, interventions, genes, environment = _load_fixed_npz(item[0])
-        if environment is not None:
-            raise TaskCMethodRunError("public parent unexpectedly contains environment labels")
-        loaded.append((record["context_id"], expression, interventions, genes))
-    if captured[0][1] != captured[1][1]:
-        raise TaskCMethodRunError("public manifest changed between derived parent reads")
-    expression, interventions, genes, environments = _center_and_concatenate(loaded)
-    output_bytes = _npz_bytes(expression, interventions, genes, environments)
-    output_record = {
-        "sha256": f"sha256:{hashlib.sha256(output_bytes).hexdigest()}",
-        "size_bytes": len(output_bytes),
-        "gene_names_sha256": _gene_names_sha256(genes),
-    }
-    parents = [
-        {**dict(record), "sha256": item[0].sha256}
-        for record, item in zip(parent_records, captured, strict=True)
-    ]
-    source, target = direction.split("_to_", 1)
-    manifest: dict[str, object] = {
-        "schema_version": SCHEMA_VERSION,
-        "derived_input_schema": "task_c_derived_input_v1",
-        "condition": "cross_environment",
-        "direction": direction,
-        "stage": stage,
-        "parents": parents,
-        "transformation": _DERIVED_TRANSFORMATION,
-        "output": output_record,
-        "environment_labels": {
-            "ordered_context_ids": [source, target],
-            "cell_counts": {
-                source: int(np.count_nonzero(environments == source)),
-                target: int(np.count_nonzero(environments == target)),
-            },
-        },
-    }
-    destination = _lexical_absolute(output_dir)
-    if destination.exists() or destination.is_symlink():
-        raise TaskCMethodRunError("derived output directory already exists")
-    parent = destination.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(
-        tempfile.mkdtemp(prefix=f".{destination.name}.staging-", dir=parent)
-    )
-    published = False
+    """Build a cross-environment profile subset from registered public parents."""
+
+    if stage != "refit":
+        raise TaskCMethodRunError("derived profile stage must be refit")
     try:
-        _write_new(staging / "derived_input.npz", output_bytes)
-        _write_json(staging / "derived_input_manifest.json", manifest)
-        _verify_snapshot(captured[0][1], "public manifest")
-        for index, item in enumerate(captured):
-            _verify_snapshot(item[0], f"derived parent {index + 1}")
-        _publish_bundle(staging, destination)
-        published = True
-    finally:
-        if not published and staging.exists() and not staging.is_symlink():
-            shutil.rmtree(staging)
-    return {
-        "input_npz": str(destination / "derived_input.npz"),
-        "manifest": str(destination / "derived_input_manifest.json"),
-    }
+        from src.evaluation.task_c_profile_input import (
+            materialize_task_c_profile_input,
+        )
+
+        return materialize_task_c_profile_input(
+            public_manifest_path=public_manifest_path,
+            profile=profile,
+            condition="cross_environment",
+            direction=direction,
+            output_dir=output_dir,
+        )
+    except ValueError as exc:
+        raise TaskCMethodRunError(str(exc)) from exc
 
 
 def _validate_derived_input(
@@ -732,125 +629,62 @@ def _validate_derived_input(
     derived_manifest_path: Path,
     public_manifest_path: Path,
 ) -> _DerivedInput:
-    derived_manifest = _capture_file(
-        derived_manifest_path,
-        "derived input manifest",
-        maximum_bytes=MAXIMUM_RECORD_BYTES,
-        reject_private=True,
-        require_single_link=True,
-    )
-    payload = _parse_json(derived_manifest, "derived input manifest")
-    if set(payload) != _DERIVED_INPUT_FIELDS:
-        raise TaskCMethodRunError("derived input manifest fields do not match the fixed schema")
-    if (
-        payload.get("schema_version") != SCHEMA_VERSION
-        or payload.get("derived_input_schema") != "task_c_derived_input_v1"
-        or payload.get("condition") != "cross_environment"
-        or payload.get("transformation") != _DERIVED_TRANSFORMATION
-    ):
-        raise TaskCMethodRunError("derived input manifest identity is invalid")
-    direction = payload.get("direction")
-    stage = payload.get("stage")
-    if not isinstance(direction, str) or not isinstance(stage, str):
-        raise TaskCMethodRunError("derived direction and stage must be text")
-    expected_parents = _derived_parent_records(direction, stage)
-    parents = payload.get("parents")
-    if not isinstance(parents, list) or len(parents) != 2:
-        raise TaskCMethodRunError("derived input manifest needs exactly two parents")
-    captured_parents: list[_Snapshot] = []
-    loaded: list[tuple[str, np.ndarray, np.ndarray, tuple[str, ...]]] = []
-    public_snapshot: _Snapshot | None = None
-    public_payload: dict[str, Any] | None = None
-    public_root = _lexical_absolute(public_manifest_path).parent
-    for observed, expected in zip(parents, expected_parents, strict=True):
-        if not isinstance(observed, dict) or set(observed) != {
-            "role",
-            "context_id",
-            "public_relative_path",
-            "sha256",
-        }:
-            raise TaskCMethodRunError("derived parent record is malformed")
-        for field, expected_value in expected.items():
-            if observed.get(field) != expected_value:
-                raise TaskCMethodRunError(
-                    "derived parent does not match its direction and stage"
-                )
-        selected, manifest_snapshot, manifest_payload, relative = _capture_public_input(
-            public_root / expected["public_relative_path"],
-            public_manifest_path,
+    try:
+        from src.evaluation.task_c_profile_input import (
+            validate_task_c_profile_input,
         )
-        if relative != expected["public_relative_path"] or observed.get("sha256") != selected.sha256:
-            raise TaskCMethodRunError("derived parent SHA-256 or public path changed")
-        if public_snapshot is not None and manifest_snapshot != public_snapshot:
-            raise TaskCMethodRunError("public manifest changed between derived parent checks")
-        public_snapshot = manifest_snapshot
-        public_payload = manifest_payload
-        captured_parents.append(selected)
-        expression, interventions, genes, environment = _load_fixed_npz(selected)
-        if environment is not None:
-            raise TaskCMethodRunError("derived public parent has an unexpected fourth array")
-        loaded.append((expected["context_id"], expression, interventions, genes))
-    assert public_snapshot is not None and public_payload is not None
+
+        validated = validate_task_c_profile_input(
+            input_path=input_path,
+            profile_manifest_path=derived_manifest_path,
+            public_manifest_path=public_manifest_path,
+        )
+    except ValueError as exc:
+        raise TaskCMethodRunError(str(exc)) from exc
     input_snapshot = _capture_file(
-        input_path,
-        "derived input NPZ",
+        validated.input_path,
+        "profile input NPZ",
         maximum_bytes=MAXIMUM_INPUT_BYTES,
         reject_private=True,
         require_single_link=True,
     )
-    output_record = payload.get("output")
-    if not isinstance(output_record, dict) or set(output_record) != {
-        "sha256",
-        "size_bytes",
-        "gene_names_sha256",
-    }:
-        raise TaskCMethodRunError("derived output identity is malformed")
-    if (
-        output_record.get("sha256") != input_snapshot.sha256
-        or output_record.get("size_bytes") != input_snapshot.size
-    ):
-        raise TaskCMethodRunError("derived output file does not match its manifest")
-    expression, interventions, genes, environment_labels = _load_fixed_npz(
-        input_snapshot,
-        include_environment_labels=True,
+    derived_manifest = _capture_file(
+        validated.manifest_path,
+        "profile input manifest",
+        maximum_bytes=MAXIMUM_RECORD_BYTES,
+        reject_private=True,
+        require_single_link=True,
     )
-    assert environment_labels is not None
-    if output_record.get("gene_names_sha256") != _gene_names_sha256(genes):
-        raise TaskCMethodRunError("derived output gene order changed")
-    expected_expression, expected_interventions, expected_genes, expected_labels = (
-        _center_and_concatenate(loaded)
+    public_snapshot = _capture_file(
+        public_manifest_path,
+        "public manifest",
+        maximum_bytes=MAXIMUM_RECORD_BYTES,
+        reject_private=True,
+        require_single_link=True,
     )
-    if (
-        genes != expected_genes
-        or not np.array_equal(expression, expected_expression, equal_nan=False)
-        or not np.array_equal(interventions, expected_interventions)
-        or not np.array_equal(environment_labels, expected_labels)
-    ):
-        raise TaskCMethodRunError(
-            "derived input arrays do not match the registered parent transformation"
+    public_payload = _parse_json(public_snapshot, "public manifest")
+    captured_parents = tuple(
+        _capture_file(
+            path,
+            "profile parent",
+            maximum_bytes=MAXIMUM_INPUT_BYTES,
+            reject_private=True,
         )
-    environment_record = payload.get("environment_labels")
-    source, target = direction.split("_to_", 1)
-    expected_environment_record = {
-        "ordered_context_ids": [source, target],
-        "cell_counts": {
-            source: int(np.count_nonzero(expected_labels == source)),
-            target: int(np.count_nonzero(expected_labels == target)),
-        },
-    }
-    if environment_record != expected_environment_record:
-        raise TaskCMethodRunError("derived environment label record changed")
+        for path in validated.parent_paths
+    )
+    run_context_id = validated.direction or validated.context_id
+    assert run_context_id is not None
     return _DerivedInput(
         input_snapshot=input_snapshot,
         manifest_snapshot=derived_manifest,
         public_manifest_snapshot=public_snapshot,
         public_manifest_payload=public_payload,
-        parent_snapshots=(captured_parents[0], captured_parents[1]),
-        expression=expression,
-        interventions=interventions,
-        genes=genes,
-        environment_labels=environment_labels,
-        direction=direction,
+        parent_snapshots=captured_parents,
+        expression=validated.expression,
+        interventions=validated.interventions,
+        genes=validated.gene_names,
+        environment_labels=validated.environment_labels,
+        run_context_id=run_context_id,
     )
 
 
@@ -864,16 +698,29 @@ def _build_hypersca_command(
     output_dir: Path,
     seed: int,
     device: str,
+    profile_input_path: Path | None = None,
+    profile_manifest_path: Path | None = None,
 ) -> tuple[str, ...]:
     context_arguments = tuple(
         item
         for value in context_values
         for item in ("--context", value)
     )
+    profile_arguments = (
+        (
+            "--profile-input",
+            str(profile_input_path),
+            "--profile-manifest",
+            str(profile_manifest_path),
+        )
+        if profile_input_path is not None and profile_manifest_path is not None
+        else ()
+    )
     return (
         sys.executable,
         str(project_root / "scripts/run_hypersca_c.py"),
         *context_arguments,
+        *profile_arguments,
         "--config",
         str(config_path),
         "--gene-list",
@@ -1016,6 +863,8 @@ def _safe_command_record(command: Sequence[str]) -> dict[str, object]:
         "--config",
         "--gene-list",
         "--public-manifest",
+        "--profile-input",
+        "--profile-manifest",
         "--output-dir",
     }
     template: list[str] = []
@@ -1335,6 +1184,25 @@ def _read_existing_json(path: Path, label: str) -> tuple[dict[str, Any], _Snapsh
     return _parse_json(snapshot, label), snapshot
 
 
+def _validate_hypersca_inner_bundle(
+    output_dir: Path,
+    *,
+    fixed_inputs: Mapping[str, object],
+    recompute: bool,
+) -> None:
+    from src.causal.hypersca_c_run import (
+        recompute_hypersca_c_output_bundle,
+        validate_hypersca_c_output_bundle,
+    )
+
+    validator = (
+        recompute_hypersca_c_output_bundle
+        if recompute
+        else validate_hypersca_c_output_bundle
+    )
+    validator(output_dir, **fixed_inputs)
+
+
 def _validate_existing_output(
     output_dir: Path,
     *,
@@ -1342,6 +1210,8 @@ def _validate_existing_output(
     spec: TaskCMethodSpec,
     gene_names: Sequence[str] | None,
     expected_raw: pd.DataFrame | None = None,
+    hypersca_validation_inputs: Mapping[str, object] | None = None,
+    recompute_hypersca: bool = False,
 ) -> dict[str, object]:
     root = _lexical_absolute(output_dir)
     _reject_symlink_components(root, "existing result directory")
@@ -1558,10 +1428,16 @@ def _validate_existing_output(
         ):
             raise TaskCMethodRunError("outer failure status differs from inner status")
     if spec.method_id == "hypersca_c" and existing_status == _COMPLETED_STATUS:
+        if hypersca_validation_inputs is None:
+            raise TaskCMethodRunError(
+                "HyperSCA-C validation requires the caller's fixed inputs"
+            )
         try:
-            from src.causal.hypersca_c_run import validate_hypersca_c_output_bundle
-
-            validate_hypersca_c_output_bundle(root / "raw_method_output")
+            _validate_hypersca_inner_bundle(
+                root / "raw_method_output",
+                fixed_inputs=hypersca_validation_inputs,
+                recompute=recompute_hypersca,
+            )
         except Exception as exc:
             raise TaskCMethodRunError(
                 "HyperSCA-C inner scientific evidence is invalid"
@@ -1699,6 +1575,7 @@ def run_task_c_method(
     genes: tuple[str, ...] | None = None
     hypersca_input_hashes: dict[str, str] = {}
     command: tuple[str, ...] | None = None
+    hypersca_validation_inputs: dict[str, object] | None = None
     if external_source_sha256 is not None:
         hypersca_input_hashes["official_source_worktree_sha256"] = (
             external_source_sha256
@@ -1715,13 +1592,18 @@ def run_task_c_method(
         data_status = None
         context_id = None
     elif spec.method_id == "hypersca_c":
-        if input_npz is not None:
+        profile_mode = input_npz is not None or derived_input_manifest_path is not None
+        if profile_mode and (
+            input_npz is None
+            or derived_input_manifest_path is None
+            or bool(context_values)
+        ):
             raise TaskCMethodRunError(
-                "HyperSCA-C needs --context files, not one --input-npz file"
+                "HyperSCA-C profile runs need one input and profile manifest, without contexts"
             )
-        if derived_input_manifest_path is not None:
+        if not profile_mode and (input_npz is not None or not context_values):
             raise TaskCMethodRunError(
-                "HyperSCA-C receives its two registered contexts directly, not a derived NPZ"
+                "HyperSCA-C needs registered context files or one validated profile input"
             )
         if data_status != "external_benchmark":
             raise TaskCMethodRunError("HyperSCA-C unified runs require registered public data")
@@ -1729,10 +1611,9 @@ def run_task_c_method(
             public_manifest_path is None
             or hypersca_config_path is None
             or gene_list_path is None
-            or not context_values
         ):
             raise TaskCMethodRunError(
-                "HyperSCA-C requires public manifest, config, gene list, and context files"
+                "HyperSCA-C requires public manifest, config, and gene list"
             )
         for name, path in {
             "config": hypersca_config_path,
@@ -1748,32 +1629,56 @@ def run_task_c_method(
             extra_snapshots[name] = snapshot
             hypersca_input_hashes[name] = snapshot.sha256
         genes = _hypersca_genes(extra_snapshots["gene_list"])
-        parsed_contexts: dict[str, Path] = {}
-        for raw_context in context_values:
-            if not isinstance(raw_context, str) or "=" not in raw_context:
-                raise TaskCMethodRunError("HyperSCA-C context must use name=path")
-            name, raw_path = raw_context.split("=", 1)
-            if name not in {"k562", "rpe1"} or not raw_path or name in parsed_contexts:
-                raise TaskCMethodRunError(
-                    "HyperSCA-C contexts must be unique k562=path or rpe1=path values"
-                )
-            parsed_contexts[name] = Path(raw_path)
-        for name, context_path in sorted(parsed_contexts.items()):
-            selected, captured_manifest, manifest_payload, relative = _capture_public_input(
-                context_path,
-                public_manifest_path,
+        if profile_mode:
+            assert input_npz is not None and derived_input_manifest_path is not None
+            derived = _validate_derived_input(
+                input_path=input_npz,
+                derived_manifest_path=derived_input_manifest_path,
+                public_manifest_path=public_manifest_path,
             )
-            if public_manifest_snapshot is not None and captured_manifest != public_manifest_snapshot:
-                raise TaskCMethodRunError("public manifest changed between context checks")
-            public_manifest_snapshot = captured_manifest
-            public_manifest_payload = manifest_payload
-            extra_snapshots[f"context_{name}"] = selected
-            hypersca_input_hashes[f"context_{name}_sha256"] = selected.sha256
-            hypersca_input_hashes[f"context_{name}_public_path"] = relative
-            if _context_for_public_path(relative) != name:
+            if genes != derived.genes:
                 raise TaskCMethodRunError(
-                    "HyperSCA-C context label disagrees with its registered public path"
+                    "HyperSCA-C gene list must match the profile gene order"
                 )
+            if context_id != derived.run_context_id:
+                raise TaskCMethodRunError(
+                    "HyperSCA-C context id must match the profile context or direction"
+                )
+            input_snapshot = derived.input_snapshot
+            derived_input_manifest_snapshot = derived.manifest_snapshot
+            public_manifest_snapshot = derived.public_manifest_snapshot
+            public_manifest_payload = derived.public_manifest_payload
+            for index, parent_snapshot in enumerate(derived.parent_snapshots):
+                extra_snapshots[f"profile_parent_{index + 1}"] = parent_snapshot
+            extra_snapshots["profile_manifest"] = derived.manifest_snapshot
+            hypersca_input_hashes["profile_context"] = derived.run_context_id
+        else:
+            parsed_contexts: dict[str, Path] = {}
+            for raw_context in context_values:
+                if not isinstance(raw_context, str) or "=" not in raw_context:
+                    raise TaskCMethodRunError("HyperSCA-C context must use name=path")
+                name, raw_path = raw_context.split("=", 1)
+                if name not in {"k562", "rpe1"} or not raw_path or name in parsed_contexts:
+                    raise TaskCMethodRunError(
+                        "HyperSCA-C contexts must be unique k562=path or rpe1=path values"
+                    )
+                parsed_contexts[name] = Path(raw_path)
+            for name, context_path in sorted(parsed_contexts.items()):
+                selected, captured_manifest, manifest_payload, relative = _capture_public_input(
+                    context_path,
+                    public_manifest_path,
+                )
+                if public_manifest_snapshot is not None and captured_manifest != public_manifest_snapshot:
+                    raise TaskCMethodRunError("public manifest changed between context checks")
+                public_manifest_snapshot = captured_manifest
+                public_manifest_payload = manifest_payload
+                extra_snapshots[f"context_{name}"] = selected
+                hypersca_input_hashes[f"context_{name}_sha256"] = selected.sha256
+                hypersca_input_hashes[f"context_{name}_public_path"] = relative
+                if _context_for_public_path(relative) != name:
+                    raise TaskCMethodRunError(
+                        "HyperSCA-C context label disagrees with its registered public path"
+                    )
         assert public_manifest_payload is not None
         manifest_minimum = public_manifest_payload.get("min_cells_per_intervention")
         if isinstance(manifest_minimum, bool) or not isinstance(manifest_minimum, int):
@@ -1788,7 +1693,23 @@ def run_task_c_method(
             output_dir=_lexical_absolute(output_dir) / "raw_method_output",
             seed=seed,
             device=device,
+            profile_input_path=(input_npz if profile_mode else None),
+            profile_manifest_path=(
+                derived_input_manifest_path if profile_mode else None
+            ),
         )
+        hypersca_validation_inputs = {
+            "context_values": tuple(context_values),
+            "profile_input_path": input_npz if profile_mode else None,
+            "profile_manifest_path": (
+                derived_input_manifest_path if profile_mode else None
+            ),
+            "config_path": hypersca_config_path,
+            "gene_list_path": gene_list_path,
+            "public_manifest_path": public_manifest_path,
+            "seed": seed,
+            "device": device,
+        }
     else:
         if input_npz is None:
             raise TaskCMethodRunError("this method requires one allowed input NPZ")
@@ -1816,13 +1737,13 @@ def run_task_c_method(
                 expression = derived.expression
                 interventions = derived.interventions
                 genes = derived.genes
-                extra_snapshots["derived_parent_source"] = derived.parent_snapshots[0]
-                extra_snapshots["derived_parent_target"] = derived.parent_snapshots[1]
+                for index, parent_snapshot in enumerate(derived.parent_snapshots):
+                    extra_snapshots[f"profile_parent_{index + 1}"] = parent_snapshot
                 extra_snapshots["derived_input_manifest"] = derived.manifest_snapshot
-                hypersca_input_hashes["derived_direction"] = derived.direction
-                if context_id != derived.direction:
+                hypersca_input_hashes["profile_context"] = derived.run_context_id
+                if context_id != derived.run_context_id:
                     raise TaskCMethodRunError(
-                        "context id must equal the derived cross-environment direction"
+                        "context id must equal the recorded profile context or direction"
                     )
             else:
                 input_snapshot, public_manifest_snapshot, public_manifest_payload, public_relative = (
@@ -1908,6 +1829,8 @@ def run_task_c_method(
             spec=spec,
             gene_names=genes,
             expected_raw=expected_raw,
+            hypersca_validation_inputs=hypersca_validation_inputs,
+            recompute_hypersca=(spec.method_id == "hypersca_c"),
         )
 
     staging = Path(
@@ -1943,6 +1866,10 @@ def run_task_c_method(
                 output_dir=staging / "raw_method_output",
                 seed=seed,
                 device=device,
+                profile_input_path=(input_npz if profile_mode else None),
+                profile_manifest_path=(
+                    derived_input_manifest_path if profile_mode else None
+                ),
             )
         command_record = _safe_command_record(command) if command else None
         environment = _environment_manifest(
@@ -2016,7 +1943,8 @@ def run_task_c_method(
                         )
 
                         validate_hypersca_c_output_bundle(
-                            staging / "raw_method_output"
+                            staging / "raw_method_output",
+                            **(hypersca_validation_inputs or {}),
                         )
                         snapshot = _capture_file(
                             raw_source,
@@ -2092,6 +2020,7 @@ def run_task_c_method(
             spec=spec,
             gene_names=genes,
             expected_raw=(raw if spec.method_id == "mean_difference" else None),
+            hypersca_validation_inputs=hypersca_validation_inputs,
         )
         _publish_bundle(staging, output_dir)
         published = True
@@ -2136,6 +2065,7 @@ def run_task_c_method(
                 expected_environment=environment_payload,
                 spec=spec,
                 gene_names=genes,
+                hypersca_validation_inputs=hypersca_validation_inputs,
             )
             _publish_bundle(staging, output_dir)
             published = True

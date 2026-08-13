@@ -40,6 +40,8 @@ from src.evaluation.task_c_runtime import (
 from src.evaluation.task_c_method_run import (
     MAXIMUM_TASK_C_RUN_GENES,
     TaskCMethodRunError,
+    _standardize_and_concatenate,
+    _validate_hypersca_inner_bundle,
     build_task_c_method_command,
     materialize_task_c_derived_input,
     read_task_c_raw_predictions,
@@ -51,6 +53,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REGISTRY = ROOT / "configs/task_c_methods_v1.json"
 TASK_C_RUNTIME_CLOSURE = (
     "src/evaluation/task_c_method_run.py",
+    "src/evaluation/task_c_profile_input.py",
     "scripts/run_task_c_method.py",
     "src/evaluation/task_c_predictions.py",
     "src/evaluation/task_c_runtime.py",
@@ -80,6 +83,41 @@ def test_publication_only_method_gets_explicit_unavailable_status() -> None:
     }
     assert status["status"] == "official_assets_unavailable"
     assert status["publication"].startswith("https://openreview.net/")
+
+
+def test_hypersca_inner_validation_recomputes_only_for_reuse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.causal.hypersca_c_run as hypersca_run
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        hypersca_run,
+        "validate_hypersca_c_output_bundle",
+        lambda *args, **kwargs: calls.append("validate"),
+    )
+    monkeypatch.setattr(
+        hypersca_run,
+        "recompute_hypersca_c_output_bundle",
+        lambda *args, **kwargs: calls.append("recompute"),
+    )
+    fixed_inputs = {
+        "config_path": tmp_path / "config.json",
+        "gene_list_path": tmp_path / "genes.json",
+        "public_manifest_path": tmp_path / "public.json",
+        "seed": 11,
+        "device": "cpu",
+    }
+
+    _validate_hypersca_inner_bundle(
+        tmp_path / "nested", fixed_inputs=fixed_inputs, recompute=False
+    )
+    _validate_hypersca_inner_bundle(
+        tmp_path / "nested", fixed_inputs=fixed_inputs, recompute=True
+    )
+
+    assert calls == ["validate", "recompute"]
 
 
 def test_timeout_is_not_mislabeled_and_terminates_the_process_group(
@@ -1991,6 +2029,60 @@ def test_cross_environment_derived_input_is_recomputed_before_mean_run(
         assert set(archive["environment_labels"].tolist()) == {"k562", "rpe1"}
 
 
+def test_cross_environment_formula_uses_control_population_standard_deviation(
+) -> None:
+    genes = ("A", "B")
+    first = np.asarray([[1.0, 2.0], [1.0, 4.0], [3.0, 6.0]])
+    second = np.asarray([[5.0, 8.0], [5.0, 12.0], [7.0, 16.0]])
+    labels = np.asarray(["non-targeting", "non-targeting", "A"])
+
+    expression, interventions, observed_genes, environments = (
+        _standardize_and_concatenate(
+            (
+                ("k562", first, labels, genes),
+                ("rpe1", second, labels, genes),
+            )
+        )
+    )
+
+    np.testing.assert_allclose(
+        expression,
+        np.asarray(
+            [
+                [0.0, -1.0],
+                [0.0, 1.0],
+                [2.0, 3.0],
+                [0.0, -1.0],
+                [0.0, 1.0],
+                [2.0, 3.0],
+            ]
+        ),
+    )
+    assert interventions.tolist() == labels.tolist() * 2
+    assert observed_genes == genes
+    assert environments.tolist() == ["k562"] * 3 + ["rpe1"] * 3
+
+
+def test_cross_environment_formula_requires_two_controls() -> None:
+    with pytest.raises(TaskCMethodRunError, match="at least two|2 control"):
+        _standardize_and_concatenate(
+            (
+                (
+                    "k562",
+                    np.asarray([[1.0, 2.0], [3.0, 4.0]]),
+                    np.asarray(["non-targeting", "A"]),
+                    ("A", "B"),
+                ),
+                (
+                    "rpe1",
+                    np.asarray([[1.0, 2.0], [1.0, 4.0]]),
+                    np.asarray(["non-targeting", "non-targeting"]),
+                    ("A", "B"),
+                ),
+            )
+        )
+
+
 @pytest.mark.parametrize("mutation", ["parent", "direction", "labels", "output"])
 def test_cross_environment_derived_input_rejects_identity_or_content_drift(
     tmp_path: Path,
@@ -2007,7 +2099,7 @@ def test_cross_environment_derived_input_rejects_identity_or_content_drift(
     manifest_path = Path(derived["manifest"])
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if mutation == "parent":
-        manifest["parents"][0]["sha256"] = "sha256:" + "0" * 64
+        manifest["contexts"][0]["parent_sha256"] = "sha256:" + "0" * 64
     elif mutation == "direction":
         manifest["direction"] = "rpe1_to_k562"
     else:
@@ -2031,7 +2123,10 @@ def test_cross_environment_derived_input_rejects_identity_or_content_drift(
         encoding="utf-8",
     )
 
-    with pytest.raises(TaskCMethodRunError, match="derived|parent|direction|environment"):
+    with pytest.raises(
+        TaskCMethodRunError,
+        match="profile|derived|parent|direction|environment",
+    ):
         run_task_c_method(
             method_id="mean_difference",
             input_npz=input_path,
@@ -2351,6 +2446,93 @@ def test_external_method_accepts_a_recomputed_formal_cross_input(
         "--seed",
         "--output-semantics",
     ]
+
+
+def test_hypersca_dispatches_the_exact_validated_profile_subset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.evaluation.task_c_profile_input import (
+        materialize_task_c_profile_input,
+    )
+
+    bundle = _materialized_public_bundle(tmp_path)
+    profile = materialize_task_c_profile_input(
+        public_manifest_path=Path(bundle["public_manifest"]),
+        condition="within_environment",
+        context_id="k562",
+        output_dir=tmp_path / "profile",
+        profile="connection",
+    )
+    profile_manifest = json.loads(
+        Path(profile["manifest"]).read_text(encoding="utf-8")
+    )
+    gene_list = tmp_path / "genes.json"
+    gene_list.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "selection_id": "profile-connection",
+                "selection_basis": "统一比较范围记录中的固定基因顺序",
+                "genes": profile_manifest["gene_selection"]["ordered_genes"],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = tmp_path / "config.json"
+    config.write_text("{}\n", encoding="utf-8")
+    captured: dict[str, tuple[str, ...]] = {}
+
+    def fake_run(
+        command: Sequence[str],
+        *,
+        output_dir: Path,
+        timeout_seconds: object,
+    ) -> dict[str, object]:
+        del timeout_seconds
+        captured["command"] = tuple(command)
+        runtime = Path(output_dir)
+        runtime.mkdir()
+        inner = {"schema_version": "1.0", "status": "completed_raw_inference"}
+        (runtime / "method_status.json").write_text(
+            json.dumps(inner) + "\n", encoding="utf-8"
+        )
+        (runtime / "resource_usage.json").write_text(
+            '{"schema_version":"1.0"}\n', encoding="utf-8"
+        )
+        return inner
+
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run.run_isolated_method",
+        fake_run,
+    )
+    with pytest.raises(TaskCMethodRunError):
+        run_task_c_method(
+            method_id="hypersca_c",
+            input_npz=Path(profile["input_npz"]),
+            derived_input_manifest_path=Path(profile["manifest"]),
+            output_dir=tmp_path / "run",
+            seed=11,
+            registry_path=REGISTRY,
+            asset_root=tmp_path / "assets",
+            data_status="external_benchmark",
+            context_id="k562",
+            public_manifest_path=Path(bundle["public_manifest"]),
+            hypersca_config_path=config,
+            gene_list_path=gene_list,
+            project_root=ROOT,
+        )
+
+    command = captured["command"]
+    assert command[command.index("--profile-input") + 1] == str(
+        profile["input_npz"]
+    )
+    assert command[command.index("--profile-manifest") + 1] == str(
+        profile["manifest"]
+    )
+    assert "--context" not in command
 
 
 @pytest.mark.parametrize("nested_case", ["missing_raw", "missing_evidence_files"])

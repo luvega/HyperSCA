@@ -29,8 +29,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--context",
         action="append",
-        required=True,
         help="公开训练文件，格式为 k562=path 或 rpe1=path，可重复提供。",
+    )
+    parser.add_argument(
+        "--profile-input",
+        type=Path,
+        help="从公开父文件重算并限制基因、细胞数量的统一比较输入。",
+    )
+    parser.add_argument(
+        "--profile-manifest",
+        type=Path,
+        help="统一比较输入的来源、抽样位置和转换记录。",
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--gene-list", type=Path, required=True)
@@ -50,7 +59,9 @@ def main(argv: list[str] | None = None) -> int:
         except (TypeError, ValueError) as exc:
             raise HyperSCACError("seed 必须是整数") from exc
         summary = run_hypersca_c(
-            context_values=args.context,
+            context_values=args.context or (),
+            profile_input_path=args.profile_input,
+            profile_manifest_path=args.profile_manifest,
             config_path=args.config,
             gene_list_path=args.gene_list,
             public_manifest_path=args.public_manifest,

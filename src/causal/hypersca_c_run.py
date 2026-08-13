@@ -129,6 +129,7 @@ _RUN_MANIFEST_STATIC_FIELDS = frozenset(
         "config",
         "gene_selection",
         "public_manifest",
+        "profile_input",
         "code",
         "run_identity",
     }
@@ -953,6 +954,7 @@ def _build_identity(
     config_sha256: str,
     gene_sha256: str,
     public_manifest_sha256: str,
+    profile_input: Mapping[str, object] | None,
 ) -> dict[str, object]:
     identity = {
         "schema_version": "1.0",
@@ -978,6 +980,15 @@ def _build_identity(
         "git_commit": code["git_commit"],
         "code_dirty": code["dirty"],
         "code_state_sha256": code["code_state_sha256"],
+        "profile_input": (
+            {
+                "input_sha256": profile_input["input_sha256"],
+                "manifest_sha256": profile_input["manifest_sha256"],
+                "profile": profile_input["profile"],
+            }
+            if profile_input is not None
+            else None
+        ),
     }
     identity.update(condition)
     return identity
@@ -1249,6 +1260,11 @@ def _validate_run_manifest_semantics(
             config_sha256=str(config["sha256"]),
             gene_sha256=str(gene["sha256"]),
             public_manifest_sha256=str(public_manifest["sha256"]),
+            profile_input=(
+                expected_static["profile_input"]
+                if isinstance(expected_static["profile_input"], Mapping)
+                else None
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise HyperSCACError("冻结运行记录无法重建运行身份") from exc
@@ -1479,61 +1495,132 @@ def _write_new_output(
             shutil.rmtree(staging, ignore_errors=True)
 
 
-def validate_hypersca_c_output_bundle(output_dir: Path) -> dict[str, object]:
-    """Recheck one complete HyperSCA-C raw result without fitting it again."""
+def validate_hypersca_c_output_bundle(
+    output_dir: Path,
+    *,
+    context_values: Sequence[str] = (),
+    profile_input_path: Path | None = None,
+    profile_manifest_path: Path | None = None,
+    config_path: Path,
+    gene_list_path: Path,
+    public_manifest_path: Path,
+    seed: int,
+    device: str,
+) -> dict[str, object]:
+    """Recheck output against caller-supplied inputs without fitting again."""
 
-    output = _lexical_absolute(output_dir)
-    manifest = _read_output_json(output / "run_manifest.json", "运行清单")
-    try:
-        identity = manifest["run_identity"]
-        expected_static = {
-            field: manifest[field] for field in _RUN_MANIFEST_STATIC_FIELDS
-        }
-        contexts = expected_static["contexts"]
-        genes = expected_static["gene_selection"]
-        config = expected_static["config"]
-        if (
-            not isinstance(identity, Mapping)
-            or not isinstance(contexts, Sequence)
-            or not isinstance(genes, Mapping)
-            or not isinstance(config, Mapping)
-        ):
-            raise TypeError
-        context_ids = tuple(str(record["context_id"]) for record in contexts)
-        ordered_genes = tuple(str(gene) for gene in genes["ordered_genes"])
-        config_values = config["values"]
-        if not isinstance(config_values, Mapping):
-            raise TypeError
-        requested_repeats = int(config_values["bootstrap_repeats"])
-        selection_threshold = float(config_values["selection_threshold"])
-        seed = int(expected_static["seed"])
-        condition = {
-            field: expected_static[field]
-            for field in ("condition", "mode", "direction", "stage")
-        }
-    except (KeyError, TypeError, ValueError) as exc:
-        raise HyperSCACError(
-            "HyperSCA-C 原始输出无法重建科学核验条件"
-        ) from exc
-    verified = _reuse_existing_output(
-        output,
-        identity,
-        expected_static=expected_static,
-        context_ids=context_ids,
-        gene_names=ordered_genes,
-        requested_repeats=requested_repeats,
-        selection_threshold=selection_threshold,
+    return run_hypersca_c(
+        context_values=context_values,
+        profile_input_path=profile_input_path,
+        profile_manifest_path=profile_manifest_path,
+        config_path=config_path,
+        gene_list_path=gene_list_path,
+        public_manifest_path=public_manifest_path,
+        output_dir=output_dir,
         seed=seed,
-        condition=condition,
+        device=device,
     )
-    if verified is None:
-        raise HyperSCACError("HyperSCA-C 原始输出不完整")
-    return verified
+
+
+def recompute_hypersca_c_output_bundle(
+    output_dir: Path,
+    *,
+    context_values: Sequence[str] = (),
+    profile_input_path: Path | None = None,
+    profile_manifest_path: Path | None = None,
+    config_path: Path,
+    gene_list_path: Path,
+    public_manifest_path: Path,
+    seed: int,
+    device: str,
+) -> dict[str, object]:
+    """Reproduce a completed bundle and reject scientifically different results.
+
+    This stronger check is intended for reuse.  The ordinary validator proves
+    that a bundle is internally coherent and belongs to the supplied inputs;
+    repeating the fixed run also catches a locally rewritten, consistently
+    resealed prediction bundle.
+    """
+
+    arguments = {
+        "context_values": context_values,
+        "profile_input_path": profile_input_path,
+        "profile_manifest_path": profile_manifest_path,
+        "config_path": config_path,
+        "gene_list_path": gene_list_path,
+        "public_manifest_path": public_manifest_path,
+        "seed": seed,
+        "device": device,
+    }
+    verified = validate_hypersca_c_output_bundle(output_dir, **arguments)
+    original_snapshots: dict[str, tuple[_FileSnapshot, bytes]] = {}
+    for name in ("raw_predictions.csv", "fit_summary.json", "method_status.json"):
+        snapshot, payload = _capture_file_snapshot(
+            _lexical_absolute(output_dir) / name,
+            f"待复用的 {name}",
+            collect_bytes=True,
+        )
+        assert payload is not None
+        original_snapshots[name] = (snapshot, payload)
+
+    temporary_root = Path(
+        tempfile.mkdtemp(
+            prefix=f".{_lexical_absolute(output_dir).name}.recompute-",
+            dir=_lexical_absolute(output_dir).parent,
+        )
+    )
+    try:
+        reproduced = temporary_root / "output"
+        run_hypersca_c(output_dir=reproduced, **arguments)
+        for name, (_, expected_bytes) in original_snapshots.items():
+            _, observed_bytes = _capture_file_snapshot(
+                reproduced / name,
+                f"重新计算的 {name}",
+                collect_bytes=True,
+            )
+            if observed_bytes != expected_bytes:
+                raise HyperSCACError(
+                    f"待复用的 {name} 与固定输入的确定性重新计算结果不一致"
+                )
+        for name, (snapshot, _) in original_snapshots.items():
+            _verify_file_snapshot(snapshot, f"待复用的 {name}")
+        validate_hypersca_c_output_bundle(output_dir, **arguments)
+        return verified
+    finally:
+        shutil.rmtree(temporary_root, ignore_errors=True)
+
+
+def _profile_context_content_sha256(
+    expression: np.ndarray,
+    interventions: np.ndarray,
+    genes: Sequence[str],
+) -> str:
+    digest = hashlib.sha256(b"HyperSCA-C-profile-context-v1\0")
+    for name, values in (
+        ("expression", np.asarray(expression)),
+        ("interventions", np.asarray(interventions)),
+    ):
+        contiguous = np.ascontiguousarray(values)
+        metadata = json.dumps(
+            {"name": name, "dtype": contiguous.dtype.str, "shape": list(contiguous.shape)},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest.update(len(metadata).to_bytes(8, "big"))
+        digest.update(metadata)
+        digest.update(memoryview(contiguous).cast("B"))
+    encoded_genes = json.dumps(
+        list(genes), ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    digest.update(encoded_genes)
+    return f"sha256:{digest.hexdigest()}"
 
 
 def run_hypersca_c(
     *,
-    context_values: Sequence[str],
+    context_values: Sequence[str] = (),
+    profile_input_path: Path | None = None,
+    profile_manifest_path: Path | None = None,
     config_path: Path,
     gene_list_path: Path,
     public_manifest_path: Path,
@@ -1543,7 +1630,16 @@ def run_hypersca_c(
 ) -> dict[str, object]:
     """Validate one registered run, fit it, and safely materialize four artifacts."""
 
-    parsed_contexts = _parse_context_values(context_values)
+    profile_requested = profile_input_path is not None or profile_manifest_path is not None
+    if profile_requested and (
+        profile_input_path is None
+        or profile_manifest_path is None
+        or bool(context_values)
+    ):
+        raise HyperSCACError(
+            "统一比较范围文件必须同时提供 input 和 manifest，且不能再提供 --context"
+        )
+    parsed_contexts = [] if profile_requested else _parse_context_values(context_values)
     gene_path, gene_selection, gene_snapshot = _load_gene_selection(gene_list_path)
     config_file, config, config_values, config_snapshot = _load_config(config_path)
     normalized_seed = _validated_seed(seed)
@@ -1559,68 +1655,151 @@ def run_hypersca_c(
         public_manifest_path,
         selected_paths=[path for _, path in parsed_contexts],
     )
-
-    matched_inputs: list[tuple[str, Path, str, _FileSnapshot, bytes]] = []
-    for context_id, raw_path in parsed_contexts:
-        input_path, relative, input_snapshot, input_bytes = _match_public_input(
-            raw_path,
-            manifest_path=manifest_path,
-            files=public_files,
-            inventory=public_inventory,
-            selected_bytes=selected_public_bytes,
-        )
-        matched_inputs.append(
-            (context_id, input_path, relative, input_snapshot, input_bytes)
-        )
-    condition = _condition_record(matched_inputs)
-
-    datasets = []
+    datasets: list[HyperSCACContext] = []
     context_records: list[dict[str, object]] = []
     context_snapshots: list[tuple[str, _FileSnapshot, str]] = []
-    expected_raw_genes: tuple[str, ...] | None = None
     selected_genes = tuple(gene_selection["genes"])
-    for context_id, input_path, relative, input_snapshot, input_bytes in matched_inputs:
-        dataset = load_task_c_dataset_from_verified_bytes(
-            input_path,
-            context_id=context_id,
-            source_bytes=input_bytes,
-            source_sha256=input_snapshot.sha256,
-        )
-        if dataset.source_sha256 != input_snapshot.sha256:
-            raise HyperSCACError(f"{context_id} context 输入在加载期间发生变化")
-        _verify_file_snapshot_stat(input_snapshot, f"{context_id} context 输入文件")
-        _validate_selected_dataset_semantics(
-            dataset,
-            relative=relative,
-            manifest=public_manifest_payload,
-        )
-        if expected_raw_genes is None:
-            expected_raw_genes = dataset.gene_names
-        elif dataset.gene_names != expected_raw_genes:
-            raise HyperSCACError("所有 context 原始文件必须使用相同的基因顺序")
-        gene_index = {gene: index for index, gene in enumerate(dataset.gene_names)}
-        missing = [gene for gene in selected_genes if gene not in gene_index]
-        if missing:
-            raise HyperSCACError(f"基因清单含有数据中不存在的基因：{missing}")
-        columns = np.asarray([gene_index[gene] for gene in selected_genes], dtype=int)
-        datasets.append(
-            HyperSCACContext(
-                context_id=context_id,
-                expression=dataset.expression[:, columns],
-                interventions=dataset.interventions,
-                gene_names=selected_genes,
+    profile_data = None
+    profile_record: dict[str, object] | None = None
+    if profile_requested:
+        try:
+            from src.evaluation.task_c_profile_input import (
+                validate_task_c_profile_input,
             )
-        )
-        context_records.append(
-            {
-                "context_id": context_id,
-                "input_path": str(input_path),
-                "input_sha256": input_snapshot.sha256,
-                "content_sha256": dataset.content_sha256,
-                "public_relative_path": relative,
+
+            assert profile_input_path is not None and profile_manifest_path is not None
+            profile_data = validate_task_c_profile_input(
+                input_path=profile_input_path,
+                profile_manifest_path=profile_manifest_path,
+                public_manifest_path=manifest_path,
+            )
+        except ValueError as exc:
+            raise HyperSCACError(str(exc)) from exc
+        if profile_data.public_manifest_sha256 != public_manifest_snapshot.sha256:
+            raise HyperSCACError("统一比较范围记录不属于当前公开清单")
+        if selected_genes != profile_data.gene_names:
+            raise HyperSCACError("基因清单必须精确等于统一比较范围记录的固定顺序")
+        if profile_data.condition == "within_environment":
+            assert profile_data.context_id is not None
+            context_order = (profile_data.context_id,)
+            condition = {
+                "condition": f"within_refit_{profile_data.context_id}",
+                "mode": "within",
+                "direction": None,
+                "stage": "refit",
             }
-        )
-        context_snapshots.append((context_id, input_snapshot, dataset.content_sha256))
+        else:
+            assert profile_data.direction is not None
+            context_order = tuple(profile_data.direction.split("_to_", 1))
+            condition = {
+                "condition": f"cross_refit_{profile_data.direction}",
+                "mode": "cross",
+                "direction": profile_data.direction,
+                "stage": "refit",
+            }
+        profile_contexts = profile_data.manifest["contexts"]
+        if not isinstance(profile_contexts, list):
+            raise HyperSCACError("统一比较范围记录缺少细胞背景来源")
+        records_by_context = {
+            str(record["context_id"]): record
+            for record in profile_contexts
+            if isinstance(record, Mapping)
+        }
+        for context_id in context_order:
+            selected = (
+                np.ones(len(profile_data.interventions), dtype=bool)
+                if profile_data.environment_labels is None
+                else profile_data.environment_labels == context_id
+            )
+            expression = profile_data.expression[selected]
+            interventions = profile_data.interventions[selected]
+            if not np.any(selected) or context_id not in records_by_context:
+                raise HyperSCACError("统一比较范围记录缺少实际细胞背景")
+            datasets.append(
+                HyperSCACContext(
+                    context_id=context_id,
+                    expression=expression,
+                    interventions=interventions,
+                    gene_names=selected_genes,
+                )
+            )
+            source_record = records_by_context[context_id]
+            context_records.append(
+                {
+                    "context_id": context_id,
+                    "input_path": str(profile_data.input_path),
+                    "input_sha256": profile_data.input_sha256,
+                    "content_sha256": _profile_context_content_sha256(
+                        expression, interventions, selected_genes
+                    ),
+                    "public_relative_path": source_record["public_relative_path"],
+                }
+            )
+        profile_record = {
+            "input_path": str(profile_data.input_path),
+            "input_sha256": profile_data.input_sha256,
+            "manifest_path": str(profile_data.manifest_path),
+            "manifest_sha256": profile_data.manifest_sha256,
+            "profile": profile_data.profile,
+            "record": dict(profile_data.manifest),
+        }
+    else:
+        matched_inputs: list[tuple[str, Path, str, _FileSnapshot, bytes]] = []
+        for context_id, raw_path in parsed_contexts:
+            input_path, relative, input_snapshot, input_bytes = _match_public_input(
+                raw_path,
+                manifest_path=manifest_path,
+                files=public_files,
+                inventory=public_inventory,
+                selected_bytes=selected_public_bytes,
+            )
+            matched_inputs.append(
+                (context_id, input_path, relative, input_snapshot, input_bytes)
+            )
+        condition = _condition_record(matched_inputs)
+        expected_raw_genes: tuple[str, ...] | None = None
+        for context_id, input_path, relative, input_snapshot, input_bytes in matched_inputs:
+            dataset = load_task_c_dataset_from_verified_bytes(
+                input_path,
+                context_id=context_id,
+                source_bytes=input_bytes,
+                source_sha256=input_snapshot.sha256,
+            )
+            if dataset.source_sha256 != input_snapshot.sha256:
+                raise HyperSCACError(f"{context_id} context 输入在加载期间发生变化")
+            _verify_file_snapshot_stat(input_snapshot, f"{context_id} context 输入文件")
+            _validate_selected_dataset_semantics(
+                dataset,
+                relative=relative,
+                manifest=public_manifest_payload,
+            )
+            if expected_raw_genes is None:
+                expected_raw_genes = dataset.gene_names
+            elif dataset.gene_names != expected_raw_genes:
+                raise HyperSCACError("所有 context 原始文件必须使用相同的基因顺序")
+            gene_index = {gene: index for index, gene in enumerate(dataset.gene_names)}
+            missing = [gene for gene in selected_genes if gene not in gene_index]
+            if missing:
+                raise HyperSCACError(f"基因清单含有数据中不存在的基因：{missing}")
+            columns = np.asarray([gene_index[gene] for gene in selected_genes], dtype=int)
+            datasets.append(
+                HyperSCACContext(
+                    context_id=context_id,
+                    expression=dataset.expression[:, columns],
+                    interventions=dataset.interventions,
+                    gene_names=selected_genes,
+                )
+            )
+            context_records.append(
+                {
+                    "context_id": context_id,
+                    "input_path": str(input_path),
+                    "input_sha256": input_snapshot.sha256,
+                    "content_sha256": dataset.content_sha256,
+                    "public_relative_path": relative,
+                }
+            )
+            context_snapshots.append((context_id, input_snapshot, dataset.content_sha256))
     selected_public_bytes.clear()
 
     code = _git_state()
@@ -1636,6 +1815,7 @@ def run_hypersca_c(
         config_sha256=config_snapshot.sha256,
         gene_sha256=gene_snapshot.sha256,
         public_manifest_sha256=public_manifest_snapshot.sha256,
+        profile_input=profile_record,
     )
     gene_record: dict[str, object] = {
         "path": str(gene_path),
@@ -1663,6 +1843,7 @@ def run_hypersca_c(
             "path": str(manifest_path),
             "sha256": public_manifest_snapshot.sha256,
         },
+        "profile_input": profile_record,
         "code": dict(code),
         "run_identity": identity,
     }
@@ -1698,6 +1879,25 @@ def run_hypersca_c(
         context_snapshots=context_snapshots,
         code=code,
     )
+    if profile_data is not None:
+        try:
+            from src.evaluation.task_c_profile_input import (
+                validate_task_c_profile_input,
+            )
+
+            refreshed_profile = validate_task_c_profile_input(
+                input_path=profile_data.input_path,
+                profile_manifest_path=profile_data.manifest_path,
+                public_manifest_path=manifest_path,
+            )
+        except ValueError as exc:
+            raise HyperSCACError(str(exc)) from exc
+        if (
+            refreshed_profile.input_sha256 != profile_data.input_sha256
+            or refreshed_profile.manifest_sha256 != profile_data.manifest_sha256
+            or refreshed_profile.manifest != profile_data.manifest
+        ):
+            raise HyperSCACError("统一比较范围输入在拟合期间发生变化")
     predictions, summary, method_status = _validate_run_scientific_result(
         predictions=result.predictions,
         summary=result.summary,

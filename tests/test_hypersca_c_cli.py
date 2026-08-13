@@ -474,10 +474,88 @@ def test_public_hypersca_output_validator_reuses_the_frozen_scientific_checks(
         device="cpu",
     )
 
-    validated = validate_hypersca_c_output_bundle(output)
+    validation_inputs = {
+        "context_values": (
+            f"k562={prepared_run['k562']}",
+            f"rpe1={prepared_run['rpe1']}",
+        ),
+        "config_path": Path(prepared_run["config"]),
+        "gene_list_path": Path(prepared_run["gene_list"]),
+        "public_manifest_path": Path(prepared_run["public_manifest"]),
+        "seed": 11,
+        "device": "cpu",
+    }
+    validated = validate_hypersca_c_output_bundle(output, **validation_inputs)
 
     assert validated["requested_repeats"] == 2
     assert 0.0 <= validated["coverage"] <= 1.0
+
+    manifest_path = output / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    forged_hash = f"sha256:{'0' * 64}"
+    manifest["contexts"][0]["input_sha256"] = forged_hash
+    manifest["run_identity"]["contexts"][0]["input_sha256"] = forged_hash
+    _rewrite_run_manifest(manifest_path, manifest)
+
+    with pytest.raises(HyperSCACError, match="输入|身份|清单|context"):
+        validate_hypersca_c_output_bundle(output, **validation_inputs)
+
+
+def test_deterministic_recompute_rejects_synchronized_zero_forgery(
+    prepared_run: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+    from src.evaluation.task_c_data import sha256_path, write_json
+
+    monkeypatch.setattr(
+        run_module,
+        "fit_stable_hypersca_c",
+        lambda *args, **kwargs: _one_success_stability_result(),
+    )
+    output = tmp_path / "deterministic-recompute"
+    arguments = {
+        "context_values": (
+            f"k562={prepared_run['k562']}",
+            f"rpe1={prepared_run['rpe1']}",
+        ),
+        "config_path": Path(prepared_run["config"]),
+        "gene_list_path": Path(prepared_run["gene_list"]),
+        "public_manifest_path": Path(prepared_run["public_manifest"]),
+        "seed": 11,
+        "device": "cpu",
+    }
+    run_module.run_hypersca_c(output_dir=output, **arguments)
+
+    raw_path = output / "raw_predictions.csv"
+    forged = pd.read_csv(raw_path, keep_default_na=False)
+    metric_columns = [
+        "effect",
+        "median_effect",
+        "direction",
+        "selection_frequency",
+        "direction_agreement",
+        "context_consistency",
+        "effect_k562",
+        "effect_rpe1",
+        "score",
+    ]
+    forged.loc[:, metric_columns] = 0.0
+    forged = forged.sort_values(
+        ["abstained", "score", "source", "target"],
+        ascending=[True, False, True, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    forged.to_csv(raw_path, index=False)
+    manifest_path = output / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"]["raw_predictions.csv"]["sha256"] = sha256_path(raw_path)
+    _rewrite_run_manifest(manifest_path, manifest)
+    run_module.validate_hypersca_c_output_bundle(output, **arguments)
+
+    with pytest.raises(HyperSCACError, match="重新计算|deterministic|一致"):
+        run_module.recompute_hypersca_c_output_bundle(output, **arguments)
 
 
 def test_existing_partial_output_is_rejected_without_changes(
