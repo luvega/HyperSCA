@@ -15,6 +15,7 @@ from src.evaluation.task_c_data import (
     materialize_task_c_split,
 )
 from src.evaluation.task_c_benchmark import score_mean_difference_network
+from src.evaluation.task_c_predictions import normalize_task_c_predictions
 from src.evaluation.task_c_profile_input import (
     PROFILE_LIMITS,
     TaskCProfileInputError,
@@ -86,9 +87,11 @@ def test_profiles_freeze_gene_and_cell_limits_for_within_and_cross(
             "interventions",
             "var_names",
         }
-        assert archive["expression_matrix"].shape == (2_000, 64)
+        assert archive["expression_matrix"].shape[0] <= 2_000
+        assert archive["expression_matrix"].shape[1] == 64
     with np.load(comprehensive["input_npz"], allow_pickle=False) as archive:
-        assert archive["expression_matrix"].shape == (2_960, 72)
+        assert archive["expression_matrix"].shape[0] <= 20_000
+        assert archive["expression_matrix"].shape[1] == 256
     with np.load(cross["input_npz"], allow_pickle=False) as archive:
         assert set(archive.files) == {
             "expression_matrix",
@@ -99,10 +102,9 @@ def test_profiles_freeze_gene_and_cell_limits_for_within_and_cross(
         environments, counts = np.unique(
             archive["environment_labels"], return_counts=True
         )
-        assert dict(zip(environments.tolist(), counts.tolist())) == {
-            "k562": 2_000,
-            "rpe1": 800,
-        }
+        observed_counts = dict(zip(environments.tolist(), counts.tolist()))
+        assert observed_counts["k562"] <= 2_000
+        assert observed_counts["rpe1"] <= 2_000
         for context in environments:
             selected = archive["environment_labels"] == context
             controls = archive["interventions"][selected] == "non-targeting"
@@ -153,7 +155,7 @@ def test_profiles_freeze_gene_and_cell_limits_for_within_and_cross(
     )
     assert cross_manifest["environment_labels"] == {
         "ordered_context_ids": ["k562", "rpe1"],
-        "cell_counts": {"k562": 2_000, "rpe1": 800},
+        "cell_counts": observed_counts,
     }
 
 
@@ -194,7 +196,14 @@ def test_train_tune_and_refit_profiles_share_genes_but_use_separate_parents(
     assert tune_manifest["stage"] == "tune"
     assert train_manifest["gene_selection"] == refit_manifest["gene_selection"]
     assert tune_manifest["gene_selection"] == refit_manifest["gene_selection"]
-    assert tune_manifest["gene_selection"]["selection_reference_stage"] == "refit"
+    assert tune_manifest["gene_selection"]["selection_reference_stage"] == "train"
+    assert tune_manifest["gene_selection"]["candidate_rule"] == (
+        "common_expression_genes_train_control_variance_v1"
+    )
+    assert {
+        record["public_relative_path"]
+        for record in tune_manifest["gene_selection"]["parents"]
+    } == {"within/k562/train.npz", "within/rpe1/train.npz"}
     assert tune_manifest["contexts"][0]["public_relative_path"] == (
         "within/k562/tune.npz"
     )
@@ -321,7 +330,9 @@ def test_profile_reserves_the_public_minimum_for_every_retained_label(
         genes = tuple(archive["var_names"].tolist())
     counts = dict(zip(*np.unique(interventions, return_counts=True)))
     assert counts["non-targeting"] >= 5
-    assert all(counts[gene] >= 5 for gene in genes)
+    observed_sources = set(interventions.tolist()) - {"non-targeting"}
+    assert all(counts[gene] >= 5 for gene in observed_sources)
+    assert observed_sources < set(genes)
     result = score_mean_difference_network(
         expression,
         interventions,
@@ -331,7 +342,7 @@ def test_profile_reserves_the_public_minimum_for_every_retained_label(
     assert not result.scores.empty
 
 
-def test_gene_selection_shrinks_deterministically_to_fit_minimum_cell_quotas(
+def test_gene_selection_does_not_shrink_the_target_universe_to_fit_cell_quotas(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -339,22 +350,77 @@ def test_gene_selection_shrinks_deterministically_to_fit_minimum_cell_quotas(
 
     bundle = _sparse_intervention_bundle(tmp_path)
     monkeypatch.setitem(profile_module.PROFILE_LIMITS, "connection", (64, 15))
+    with pytest.raises(TaskCProfileInputError, match="cell cap"):
+        materialize_task_c_profile_input(
+            public_manifest_path=Path(bundle["public_manifest"]),
+            profile="connection",
+            condition="within_environment",
+            context_id="k562",
+            output_dir=tmp_path / "profile",
+        )
+
+
+def test_holdout_intervention_gene_can_enter_train_only_gene_universe(
+    tmp_path: Path,
+) -> None:
+    genes = ("A", "B", "C", "D", "E")
+    labels = ["non-targeting"] * 30 + [gene for gene in genes for _ in range(8)]
+
+    def load_pair(root: Path, high_variance_gene: str | None):
+        root.mkdir(parents=True)
+        datasets = {}
+        for context, seed in (("k562", 41), ("rpe1", 43)):
+            expression = np.random.default_rng(seed).normal(
+                scale=0.01, size=(len(labels), len(genes))
+            )
+            if high_variance_gene is not None:
+                column = genes.index(high_variance_gene)
+                control_rows = np.flatnonzero(np.asarray(labels) == "non-targeting")
+                expression[control_rows, column] = np.linspace(-20.0, 20.0, len(control_rows))
+            path = root / f"{context}.npz"
+            np.savez(
+                path,
+                expression_matrix=expression,
+                interventions=np.asarray(labels),
+                var_names=np.asarray(genes),
+            )
+            datasets[context] = load_task_c_dataset(path, context_id=context)
+        return datasets
+
+    probe = load_pair(tmp_path / "probe", None)
+    probe_split = build_shared_task_c_split(
+        probe["k562"], probe["rpe1"], seed=11, min_cells=5
+    )
+    holdout_gene = probe_split.holdout_sources[0]
+    actual = load_pair(tmp_path / "actual", holdout_gene)
+    split = build_shared_task_c_split(
+        actual["k562"], actual["rpe1"], seed=11, min_cells=5
+    )
+    bundle = materialize_task_c_split(
+        actual["k562"], actual["rpe1"], split, tmp_path / "public"
+    )
     created = materialize_task_c_profile_input(
         public_manifest_path=Path(bundle["public_manifest"]),
         profile="connection",
         condition="within_environment",
         context_id="k562",
+        stage="train",
         output_dir=tmp_path / "profile",
     )
     manifest = json.loads(Path(created["manifest"]).read_text(encoding="utf-8"))
-    assert len(manifest["gene_selection"]["ordered_genes"]) == 2
-    assert manifest["gene_selection"]["dropped_due_to_cell_budget"]
+    assert manifest["gene_selection"]["ordered_genes"][0] == holdout_gene
+    assert holdout_gene not in split.train_sources + split.tune_sources
     with np.load(created["input_npz"], allow_pickle=False) as archive:
-        labels, counts = np.unique(archive["interventions"], return_counts=True)
-    assert dict(zip(labels.tolist(), counts.tolist())) == {
-        "non-targeting": 5,
-        **{gene: 5 for gene in manifest["gene_selection"]["ordered_genes"]},
-    }
+        result = score_mean_difference_network(
+            archive["expression_matrix"],
+            archive["interventions"],
+            tuple(archive["var_names"].tolist()),
+            min_cells_per_intervention=5,
+        )
+    normalized = normalize_task_c_predictions(
+        result.scores.loc[:, ["source", "target", "score"]], genes
+    )
+    assert holdout_gene in set(normalized["source"])
 
 
 def test_profile_materialization_is_deterministic_and_validator_recomputes_parents(

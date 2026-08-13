@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 from src.evaluation.task_c_method_run import (  # noqa: E402
     MAXIMUM_RAW_PREDICTION_BYTES,
     MAXIMUM_RECORD_BYTES,
+    MAXIMUM_INPUT_BYTES,
     TaskCMethodRunError,
     _capture_file,
     _capture_public_input,
@@ -30,6 +31,7 @@ from src.evaluation.task_c_method_run import (  # noqa: E402
     _load_fixed_npz,
     _parse_json,
     _validate_status_seal,
+    validate_task_c_method_output_bundle,
 )
 from src.evaluation.task_c_profile_input import (  # noqa: E402
     TaskCProfileInputError,
@@ -127,7 +129,52 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="一次已完成方法运行及其候选设置记录，可重复但最多二十次。",
     )
+    parser.add_argument(
+        "--trial-input",
+        action="append",
+        default=[],
+        metavar="TRIAL_DIR=TRAIN_NPZ",
+        help="每个正式候选实际读取的公开 train 文件；每个候选恰好提供一次。",
+    )
+    parser.add_argument(
+        "--trial-profile-manifest",
+        action="append",
+        default=[],
+        metavar="TRIAL_DIR=PROFILE_JSON",
+        help="候选使用小型派生输入时，对应的 train 来源记录。",
+    )
+    parser.add_argument(
+        "--trial-hypersca-config",
+        action="append",
+        default=[],
+        metavar="TRIAL_DIR=CONFIG_JSON",
+        help="HyperSCA-C 候选实际使用的固定设置。",
+    )
+    parser.add_argument(
+        "--trial-gene-list",
+        action="append",
+        default=[],
+        metavar="TRIAL_DIR=GENES_JSON",
+        help="HyperSCA-C 候选实际使用的固定基因清单。",
+    )
+    parser.add_argument(
+        "--registry",
+        type=Path,
+        default=ROOT / "configs/task_c_methods_v1.json",
+        help="产生候选运行时使用的方法清单。",
+    )
+    parser.add_argument(
+        "--asset-root",
+        type=Path,
+        default=ROOT / "results/task_c_method_assets",
+        help="外部方法的固定代码和环境证据目录。",
+    )
     parser.add_argument("--output-json", required=True, type=Path, help="新的选择记录文件。")
+    parser.add_argument(
+        "--status-json",
+        type=Path,
+        help="选择状态；默认写在 output-json 后加 .status.json。",
+    )
     parser.add_argument(
         "--config",
         required=True,
@@ -209,6 +256,22 @@ def _safe_directory(path: Path, label: str) -> Path:
     if not absolute.is_dir():
         raise TaskCTuningError(f"{label} must be a directory")
     return absolute
+
+
+def _path_bindings(values: Sequence[str], label: str) -> dict[Path, Path]:
+    bindings: dict[Path, Path] = {}
+    for value in values:
+        if not isinstance(value, str) or "=" not in value:
+            raise TaskCTuningError(f"{label} must use TRIAL_DIR=PATH")
+        raw_trial, raw_path = value.split("=", 1)
+        if not raw_trial or not raw_path:
+            raise TaskCTuningError(f"{label} must use TRIAL_DIR=PATH")
+        trial = Path(os.path.abspath(os.fspath(Path(raw_trial).expanduser())))
+        path = Path(os.path.abspath(os.fspath(Path(raw_path).expanduser())))
+        if trial in bindings:
+            raise TaskCTuningError(f"{label} repeats one trial directory")
+        bindings[trial] = path
+    return bindings
 
 
 def _verify_method_artifacts(
@@ -486,6 +549,8 @@ def _trial_record(
         "run_identity_sha256": (
             environment.get("run_identity_sha256") if not synthetic_smoke else None
         ),
+        "artifacts": status.get("artifacts") if not synthetic_smoke else None,
+        "trial_directory": str(root),
     }
     return (
         trial_index,
@@ -673,10 +738,24 @@ def _publish_json(path: Path, payload: bytes) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def _selection_failure_category(message: str) -> str:
+    lowered = message.lower()
+    if "positive" in lowered or "relation" in lowered and "tuning" in lowered:
+        return "no_public_tuning_relations"
+    if "trial" in lowered or "candidate" in lowered or "prediction" in lowered:
+        return "invalid_trial_bundle"
+    return "invalid_tuning_input"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    status_path = args.status_json or Path(f"{args.output_json}.status.json")
+    failure_condition: str | None = None
+    failure_tune_sha256: str | None = None
     try:
+        if status_path.exists() or status_path.is_symlink():
+            raise TaskCTuningError("selection status JSON already exists")
         if len(args.trial_dir) > MAXIMUM_TRIALS:
             raise TaskCTuningError("configuration selection allows at most twenty trials")
         config_snapshot = _snapshot(
@@ -693,6 +772,8 @@ def main(argv: list[str] | None = None) -> int:
             data_status,
             tune_scope,
         ) = _load_tune_input(args)
+        failure_condition = str(tune_scope["condition"])
+        failure_tune_sha256 = evidence_hashes["tune_input_sha256"]
         tuning_edges = build_tuning_response_edges(
             expression,
             labels,
@@ -703,8 +784,57 @@ def main(argv: list[str] | None = None) -> int:
         trials = []
         trial_snapshots: list[object] = []
         identities: list[dict[str, object]] = []
+        trial_inputs = _path_bindings(args.trial_input, "trial input binding")
+        trial_profiles = _path_bindings(
+            args.trial_profile_manifest, "trial profile manifest binding"
+        )
+        trial_configs = _path_bindings(
+            args.trial_hypersca_config, "trial HyperSCA-C config binding"
+        )
+        trial_genes = _path_bindings(
+            args.trial_gene_list, "trial gene-list binding"
+        )
+        expected_trial_roots = {
+            Path(os.path.abspath(os.fspath(path.expanduser()))) for path in args.trial_dir
+        }
+        for bindings, label in (
+            (trial_inputs, "trial input"),
+            (trial_profiles, "trial profile manifest"),
+            (trial_configs, "trial HyperSCA-C config"),
+            (trial_genes, "trial gene list"),
+        ):
+            if not set(bindings) <= expected_trial_roots:
+                raise TaskCTuningError(f"{label} binding names an unknown trial")
+        if not args.synthetic_smoke and set(trial_inputs) != expected_trial_roots:
+            raise TaskCTuningError(
+                "formal selection requires exactly one actual train input for every trial"
+            )
+        if args.synthetic_smoke and any(
+            (trial_inputs, trial_profiles, trial_configs, trial_genes)
+        ):
+            raise TaskCTuningError("synthetic smoke trials cannot use formal input bindings")
         expected_rows = len(genes) * (len(genes) - 1)
         for trial_dir in args.trial_dir:
+            trial_root = Path(
+                os.path.abspath(os.fspath(Path(trial_dir).expanduser()))
+            )
+            if not args.synthetic_smoke:
+                try:
+                    validate_task_c_method_output_bundle(
+                        output_dir=trial_root,
+                        input_npz=trial_inputs[trial_root],
+                        registry_path=args.registry,
+                        asset_root=args.asset_root,
+                        public_manifest_path=args.public_manifest,
+                        derived_input_manifest_path=trial_profiles.get(trial_root),
+                        hypersca_config_path=trial_configs.get(trial_root),
+                        gene_list_path=trial_genes.get(trial_root),
+                        project_root=ROOT,
+                    )
+                except TaskCMethodRunError as exc:
+                    raise TaskCTuningError(
+                        f"trial bundle failed reconstruction from its actual train input: {exc}"
+                    ) from exc
             index, parameters, frame, identity, snapshots = _trial_record(
                 trial_dir,
                 synthetic_smoke=args.synthetic_smoke,
@@ -713,6 +843,26 @@ def main(argv: list[str] | None = None) -> int:
                 expected_scope=tune_scope,
             )
             trials.append((index, parameters, frame))
+            if not args.synthetic_smoke:
+                train_snapshot = _snapshot(
+                    trial_inputs[trial_root],
+                    "actual trial train input",
+                    maximum_bytes=MAXIMUM_INPUT_BYTES,
+                    require_single_link=False,
+                )
+                trial_snapshots.append(train_snapshot)
+                identity["training_input_binding_sha256"] = train_snapshot.sha256
+                profile_path = trial_profiles.get(trial_root)
+                if profile_path is None:
+                    identity["training_profile_binding_sha256"] = None
+                else:
+                    profile_snapshot = _snapshot(
+                        profile_path,
+                        "actual trial profile manifest",
+                        maximum_bytes=MAXIMUM_RECORD_BYTES,
+                    )
+                    trial_snapshots.append(profile_snapshot)
+                    identity["training_profile_binding_sha256"] = profile_snapshot.sha256
             identities.append(identity)
             trial_snapshots.extend(snapshots)
         shared_identity_fields = (
@@ -737,6 +887,21 @@ def main(argv: list[str] | None = None) -> int:
             maximum_trials=config.maximum_trials_per_method,
             gene_names=genes,
         )
+        trial_metrics = [
+            {
+                "trial_index": trial_index,
+                "average_precision": float(
+                    select_task_c_configuration(
+                        [(trial_index, parameters, frame)],
+                        tuning_edges=tuning_edges,
+                        maximum_trials=config.maximum_trials_per_method,
+                        gene_names=genes,
+                    )["average_precision"]
+                ),
+                "parameters": thaw_task_c_json(parameters),
+            }
+            for trial_index, parameters, frame in trials
+        ]
         code_snapshots = tuple(
             _snapshot(path, "tuning code", maximum_bytes=MAXIMUM_RECORD_BYTES)
             for path in (
@@ -766,12 +931,20 @@ def main(argv: list[str] | None = None) -> int:
             "data_status": data_status,
             **evidence_hashes,
             "config_sha256": config_snapshot.sha256,
+            "config": _strict_json(config_snapshot, "tuning configuration"),
             "code_sha256": code_identity,
             "tuning_positive_relation_count": len(tuning_edges),
+            "tuning_edges": [list(edge) for edge in sorted(tuning_edges)],
+            "tuning_edges_sha256": _sha256(
+                _json_bytes([list(edge) for edge in sorted(tuning_edges)])
+            ),
             "gene_count": len(genes),
             "training_input_sha256s": training_inputs,
             "training_profile_manifest_sha256s": training_profiles,
             "trials": sorted(identities, key=lambda item: int(item["trial_index"])),
+            "trial_metrics": sorted(
+                trial_metrics, key=lambda item: int(item["trial_index"])
+            ),
         }
         result["selection_record_sha256"] = _sha256(_json_bytes(result))
         all_snapshots = (
@@ -782,6 +955,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         _verify_snapshots(all_snapshots)
         _publish_json(args.output_json, _json_bytes(result))
+        _publish_json(
+            status_path,
+            _json_bytes(
+                {
+                    "schema_version": "1.0",
+                    "status": "completed_selection",
+                    "condition": result["condition"],
+                    "tune_input_sha256": result["evidence"]["tune_input_sha256"],
+                    "selection_record_sha256": result["selection_record_sha256"],
+                    "reason_category": None,
+                    "reason": None,
+                }
+            ),
+        )
     except (
         TaskCTuningError,
         TaskCMethodRunError,
@@ -789,6 +976,33 @@ def main(argv: list[str] | None = None) -> int:
         OSError,
         UnicodeError,
     ) as exc:
+        if not status_path.exists() and not status_path.is_symlink():
+            tune_sha256 = failure_tune_sha256
+            try:
+                tune_sha256 = _snapshot(
+                    args.tune_npz,
+                    "failed tuning input",
+                    maximum_bytes=MAXIMUM_INPUT_BYTES,
+                ).sha256
+            except Exception:
+                pass
+            try:
+                _publish_json(
+                    status_path,
+                    _json_bytes(
+                        {
+                            "schema_version": "1.0",
+                            "status": "failed_selection",
+                            "condition": failure_condition,
+                            "tune_input_sha256": tune_sha256,
+                            "selection_record_sha256": None,
+                            "reason_category": _selection_failure_category(str(exc)),
+                            "reason": str(exc),
+                        }
+                    ),
+                )
+            except Exception:
+                pass
         parser.error(str(exc))
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False))
     return 0

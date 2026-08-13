@@ -32,6 +32,7 @@ CROSS_TRANSFORMATION = "per_environment_control_zscore_then_row_concatenate_v1"
 GENE_SELECTION_RULE = (
     "mean_context_control_population_variance_desc_then_gene_lexicographic_v1"
 )
+GENE_CANDIDATE_RULE = "common_expression_genes_train_control_variance_v1"
 CELL_SELECTION_RULE = (
     "label_stratified_minimum_reserved_without_replacement_seed_11_v2"
 )
@@ -598,9 +599,6 @@ def _selected_genes(
     inventory: Mapping[str, _FileSnapshot],
     gene_limit: int,
     *,
-    cell_limit: int,
-    eligible_sources: Sequence[str],
-    minimum_cells: int,
     load_parent: Any,
 ) -> tuple[
     tuple[str, ...],
@@ -611,7 +609,7 @@ def _selected_genes(
     loaded = []
     parents = []
     for context in ("k562", "rpe1"):
-        relative = f"within/{context}/refit.npz"
+        relative = f"within/{context}/train.npz"
         snapshot = inventory[relative]
         expression, labels, genes = load_parent(snapshot)
         controls = labels == CONTROL_LABEL
@@ -630,50 +628,26 @@ def _selected_genes(
     genes = loaded[0][0]
     if loaded[1][0] != genes:
         raise TaskCProfileInputError("gene-selection parents use different gene orders")
-    counts_by_context = []
-    for context in ("k562", "rpe1"):
-        _, labels, _ = load_parent(inventory[f"within/{context}/refit.npz"])
-        counts_by_context.append(Counter(labels.tolist()))
-    candidates = {
-        source
-        for source in eligible_sources
-        if source in genes
-        and all(counts.get(source, 0) >= minimum_cells for counts in counts_by_context)
-    }
-    if len(candidates) < 2:
-        raise TaskCProfileInputError(
-            "profile needs at least two shared intervention sources with enough cells"
-        )
+    if len(genes) < 2:
+        raise TaskCProfileInputError("profile needs at least two common expression genes")
     mean_variance = np.mean(
         np.stack([values.var(axis=0, ddof=0) for _, values in loaded], axis=0),
         axis=0,
     )
     ranked = sorted(
-        (index for index, gene in enumerate(genes) if gene in candidates),
+        range(len(genes)),
         key=lambda index: (-mean_variance[index], genes[index]),
     )
-    maximum_sources_by_cell_budget = cell_limit // minimum_cells - 1
-    if maximum_sources_by_cell_budget < 2:
-        raise TaskCProfileInputError(
-            "cell cap cannot retain controls and at least two intervention sources"
-        )
-    selection_count = min(
-        gene_limit,
-        maximum_sources_by_cell_budget,
-        len(ranked),
-    )
+    selection_count = min(gene_limit, len(ranked))
     selected_indices = tuple(int(index) for index in ranked[:selection_count])
     if len(selected_indices) < 2:
         raise TaskCProfileInputError("profile needs at least two selected genes")
-    otherwise_selected = ranked[: min(gene_limit, len(ranked))]
-    dropped_due_to_cell_budget = tuple(
-        genes[index] for index in otherwise_selected[selection_count:]
-    )
+    dropped_due_to_gene_limit = tuple(genes[index] for index in ranked[selection_count:])
     return (
         tuple(genes[index] for index in selected_indices),
         selected_indices,
         tuple(parents),
-        dropped_due_to_cell_budget,
+        dropped_due_to_gene_limit,
     )
 
 
@@ -884,9 +858,6 @@ def _build_profile(
             return loaded_parent
         return cached[1]
 
-    eligible_sources = tuple(public_manifest["train_sources"]) + tuple(
-        public_manifest["tune_sources"]
-    )
     minimum_cells = public_manifest["min_cells_per_intervention"]
     if (
         isinstance(minimum_cells, bool)
@@ -894,12 +865,9 @@ def _build_profile(
         or minimum_cells < 1
     ):
         raise TaskCProfileInputError("public minimum cell count is invalid")
-    genes, gene_indices, gene_parents, dropped_due_to_cell_budget = _selected_genes(
+    genes, gene_indices, gene_parents, dropped_due_to_gene_limit = _selected_genes(
         inventory,
         gene_limit,
-        cell_limit=cell_limit,
-        eligible_sources=eligible_sources,
-        minimum_cells=minimum_cells,
         load_parent=load_parent,
     )
     expressions: list[np.ndarray] = []
@@ -973,10 +941,11 @@ def _build_profile(
         if stage == "tune"
         else set(genes)
     )
-    required_response_sources = set(genes) & stage_sources
+    required_response_sources = (
+        set(genes) & stage_sources & (set(final_counts) - {CONTROL_LABEL, EXCLUDED_LABEL})
+    )
     if (
-        not required_response_sources
-        or final_counts.get(CONTROL_LABEL, 0) < minimum_cells
+        final_counts.get(CONTROL_LABEL, 0) < minimum_cells
         or any(
             final_counts.get(gene, 0) < minimum_cells
             for gene in required_response_sources
@@ -1028,11 +997,12 @@ def _build_profile(
         "stage": stage,
         "gene_selection": {
             "rule": GENE_SELECTION_RULE,
-            "selection_reference_stage": "refit",
+            "candidate_rule": GENE_CANDIDATE_RULE,
+            "selection_reference_stage": "train",
             "parents": list(gene_parents),
             "ordered_genes": list(genes),
             "ordered_indices": list(gene_indices),
-            "dropped_due_to_cell_budget": list(dropped_due_to_cell_budget),
+            "dropped_due_to_gene_limit": list(dropped_due_to_gene_limit),
         },
         "contexts": context_records,
         "environment_labels": environment_record,

@@ -79,7 +79,41 @@ def build_parser() -> argparse.ArgumentParser:
             "完成公开调节后生成的选择记录；只用于把选定设置绑定到重新拟合运行。"
         ),
     )
+    parser.add_argument("--selection-status", type=Path, help="已完成选择的状态记录。")
+    parser.add_argument("--selection-tune-input", type=Path, help="选择时实际评分的 tune 文件。")
+    parser.add_argument(
+        "--selection-profile-manifest", type=Path, help="选择时 tune 文件的来源记录。"
+    )
+    parser.add_argument("--selection-config", type=Path, help="选择时固定的调节规则。")
+    parser.add_argument(
+        "--selection-trial-dir", action="append", type=Path, default=[], help="参与选择的候选目录。"
+    )
+    parser.add_argument(
+        "--selection-trial-input", action="append", default=[], help="格式 TRIAL_DIR=TRAIN_NPZ。"
+    )
+    parser.add_argument(
+        "--selection-trial-profile-manifest", action="append", default=[], help="格式 TRIAL_DIR=PROFILE_JSON。"
+    )
+    parser.add_argument(
+        "--selection-trial-hypersca-config", action="append", default=[], help="格式 TRIAL_DIR=CONFIG_JSON。"
+    )
+    parser.add_argument(
+        "--selection-trial-gene-list", action="append", default=[], help="格式 TRIAL_DIR=GENES_JSON。"
+    )
     return parser
+
+
+def _path_bindings(values: list[str], label: str) -> dict[Path, Path]:
+    result: dict[Path, Path] = {}
+    for value in values:
+        if "=" not in value:
+            raise TaskCMethodRunError(f"{label} 必须使用 TRIAL_DIR=PATH")
+        trial, path = value.split("=", 1)
+        key = Path(trial).resolve()
+        if not trial or not path or key in result:
+            raise TaskCMethodRunError(f"{label} 必须逐个候选且不能重复")
+        result[key] = Path(path).resolve()
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -113,6 +147,25 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=timeout_seconds,
             trial_parameters_path=args.trial_parameters,
             selection_record_path=args.selection_record,
+            selection_status_path=args.selection_status,
+            selection_tune_input_path=args.selection_tune_input,
+            selection_tune_profile_manifest_path=args.selection_profile_manifest,
+            selection_config_path=args.selection_config,
+            selection_trial_directories=tuple(args.selection_trial_dir),
+            selection_trial_input_bindings=_path_bindings(
+                args.selection_trial_input, "selection-trial-input"
+            ),
+            selection_trial_profile_bindings=_path_bindings(
+                args.selection_trial_profile_manifest,
+                "selection-trial-profile-manifest",
+            ),
+            selection_trial_hypersca_configs=_path_bindings(
+                args.selection_trial_hypersca_config,
+                "selection-trial-hypersca-config",
+            ),
+            selection_trial_gene_lists=_path_bindings(
+                args.selection_trial_gene_list, "selection-trial-gene-list"
+            ),
             project_root=ROOT,
         )
     except (TaskCMethodRunError, OSError, UnicodeError) as exc:

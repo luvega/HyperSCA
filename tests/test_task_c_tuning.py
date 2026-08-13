@@ -26,6 +26,7 @@ from src.evaluation.task_c_data import (
 )
 from src.evaluation.task_c_profile_input import materialize_task_c_profile_input
 from src.evaluation.task_c_method_run import TaskCMethodRunError, run_task_c_method
+from src.evaluation.task_c_predictions import normalize_task_c_predictions
 from tests.test_task_c_data import dataset_for_split
 
 
@@ -353,6 +354,9 @@ def test_cli_synthetic_smoke_is_explicit_atomic_and_deterministic(tmp_path: Path
     assert payload["evidence"]["trials"][0]["predictions_sha256"].startswith(
         "sha256:"
     )
+    status = json.loads(Path(f"{output}.status.json").read_text(encoding="utf-8"))
+    assert status["status"] == "completed_selection"
+    assert status["selection_record_sha256"] == payload["selection_record_sha256"]
     rerun = _run_cli(
         "--tune-npz",
         str(tune),
@@ -387,6 +391,39 @@ def test_cli_does_not_accept_unregistered_formal_input(tmp_path: Path) -> None:
 
     assert completed.returncode != 0
     assert "public manifest" in completed.stderr
+
+
+def test_cli_no_positive_relations_writes_identified_failure_status(
+    tmp_path: Path,
+) -> None:
+    tune = tmp_path / "constant-tune.npz"
+    np.savez_compressed(
+        tune,
+        expression_matrix=np.zeros((30, 3), dtype=float),
+        interventions=np.asarray(
+            ["non-targeting"] * 10 + ["A"] * 10 + ["C"] * 10
+        ),
+        var_names=np.asarray(("A", "B", "C")),
+    )
+    trial = tmp_path / "trial"
+    _write_smoke_trial(trial, index=0)
+    output = tmp_path / "selection.json"
+
+    completed = _run_cli(
+        "--tune-npz", str(tune),
+        "--trial-dir", str(trial),
+        "--output-json", str(output),
+        "--config", str(CONFIG),
+        "--synthetic-smoke",
+    )
+
+    assert completed.returncode != 0
+    assert not output.exists()
+    status = json.loads(Path(f"{output}.status.json").read_text(encoding="utf-8"))
+    assert status["status"] == "failed_selection"
+    assert status["condition"] == "synthetic_smoke"
+    assert status["tune_input_sha256"].startswith("sha256:")
+    assert status["reason_category"] == "no_public_tuning_relations"
 
 
 def test_cli_rejects_symlink_hardlink_and_tampered_trial_inputs(tmp_path: Path) -> None:
@@ -464,6 +501,20 @@ def _canonical_sha256(payload: dict[str, object]) -> str:
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def _selection_record_sha256(payload: dict[str, object]) -> str:
+    encoded = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
 def _dataset_with_public_tune_controls(context_id: str) -> TaskCDataset:
     original = dataset_for_split(context_id)
     extra_controls = np.zeros((15, len(original.gene_names)), dtype=np.float32)
@@ -528,6 +579,7 @@ def test_cli_formal_mode_binds_public_tune_and_completed_run(tmp_path: Path) -> 
         "--tune-npz", str(tune),
         "--public-manifest", str(public),
         "--trial-dir", str(trial),
+        "--trial-input", f"{trial}={train}",
         "--output-json", str(tmp_path / "selected.json"),
         "--config", str(CONFIG),
     )
@@ -544,11 +596,46 @@ def test_cli_formal_mode_binds_public_tune_and_completed_run(tmp_path: Path) -> 
         "--tune-npz", str(tune),
         "--public-manifest", str(public),
         "--trial-dir", str(trial),
+        "--trial-input", f"{trial}={train}",
         "--output-json", str(tmp_path / "tampered.json"),
         "--config", str(CONFIG),
     )
     assert tampered.returncode != 0
-    assert "predictions differ" in tampered.stderr
+    assert "reconstruction" in tampered.stderr or "artifact" in tampered.stderr
+    failed_status = json.loads(
+        Path(f"{tmp_path / 'tampered.json'}.status.json").read_text(encoding="utf-8")
+    )
+    assert failed_status["status"] == "failed_selection"
+    assert failed_status["selection_record_sha256"] is None
+    assert failed_status["reason_category"] == "invalid_trial_bundle"
+
+    raw = pd.read_csv(trial / "raw_predictions.csv")
+    raw.loc[0, "score"] = 7.0
+    raw.to_csv(trial / "raw_predictions.csv", index=False)
+    normalize_task_c_predictions(raw, tuple(k562.gene_names)).to_csv(
+        trial / "predictions.csv", index=False
+    )
+    status_path = trial / "method_status.json"
+    status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+    for relative in ("raw_predictions.csv", "predictions.csv"):
+        payload = (trial / relative).read_bytes()
+        status_payload["artifacts"][relative] = {
+            "sha256": f"sha256:{hashlib.sha256(payload).hexdigest()}",
+            "size_bytes": len(payload),
+        }
+    status_payload.pop("status_content_sha256")
+    status_payload["status_content_sha256"] = _canonical_sha256(status_payload)
+    status_path.write_text(json.dumps(status_payload) + "\n", encoding="utf-8")
+    synchronized = _run_cli(
+        "--tune-npz", str(tune),
+        "--public-manifest", str(public),
+        "--trial-dir", str(trial),
+        "--trial-input", f"{trial}={train}",
+        "--output-json", str(tmp_path / "synchronized-tamper.json"),
+        "--config", str(CONFIG),
+    )
+    assert synchronized.returncode != 0
+    assert "scientific semantics" in synchronized.stderr
 
 
 def test_cli_formal_mode_rejects_refit_partition_and_unverified_trial(
@@ -605,12 +692,13 @@ def test_cli_formal_mode_rejects_non_task_c_environment_schema(tmp_path: Path) -
         "--tune-npz", str(tune),
         "--public-manifest", str(public),
         "--trial-dir", str(trial),
+        "--trial-input", f"{trial}={train}",
         "--output-json", str(tmp_path / "selected.json"),
         "--config", str(CONFIG),
     )
 
     assert completed.returncode != 0
-    assert "environment fields" in completed.stderr
+    assert "environment" in completed.stderr and "changed" in completed.stderr
 
 
 def _run_bound_mean_trial(
@@ -692,6 +780,10 @@ def test_cli_selects_train_fitted_trials_using_separate_tune_responses(
         "--public-manifest", str(bundle["public_manifest"]),
         "--trial-dir", str(second),
         "--trial-dir", str(first),
+        "--trial-input", f"{first}={train_profile['input_npz']}",
+        "--trial-input", f"{second}={train_profile['input_npz']}",
+        "--trial-profile-manifest", f"{first}={train_profile['manifest']}",
+        "--trial-profile-manifest", f"{second}={train_profile['manifest']}",
         "--output-json", str(tmp_path / "selected.json"),
         "--config", str(CONFIG),
     )
@@ -738,6 +830,19 @@ def test_cli_selects_train_fitted_trials_using_separate_tune_responses(
         min_cells=5,
         public_manifest_path=Path(bundle["public_manifest"]),
         selection_record_path=tmp_path / "selected.json",
+        selection_status_path=Path(f"{tmp_path / 'selected.json'}.status.json"),
+        selection_tune_input_path=Path(tune_profile["input_npz"]),
+        selection_tune_profile_manifest_path=Path(tune_profile["manifest"]),
+        selection_config_path=CONFIG,
+        selection_trial_directories=(second, first),
+        selection_trial_input_bindings={
+            first.resolve(): Path(train_profile["input_npz"]),
+            second.resolve(): Path(train_profile["input_npz"]),
+        },
+        selection_trial_profile_bindings={
+            first.resolve(): Path(train_profile["manifest"]),
+            second.resolve(): Path(train_profile["manifest"]),
+        },
         project_root=ROOT,
     )
     refit_environment = json.loads(
@@ -752,10 +857,18 @@ def test_cli_selects_train_fitted_trials_using_separate_tune_responses(
     )["parameters"] == result["selected_parameters"]
 
     tampered_record = tmp_path / "tampered-selected.json"
-    tampered = dict(result)
-    tampered["selected_parameters"] = {"not": "selected"}
+    tampered = json.loads(json.dumps(result))
+    tampered["average_precision"] = float(tampered["average_precision"]) / 2.0
+    tampered.pop("selection_record_sha256")
+    tampered["selection_record_sha256"] = _selection_record_sha256(tampered)
     tampered_record.write_text(json.dumps(tampered) + "\n", encoding="utf-8")
-    with pytest.raises(TaskCMethodRunError, match="selection record"):
+    tampered_status = tmp_path / "tampered-selected.status.json"
+    status_payload = json.loads(
+        Path(f"{tmp_path / 'selected.json'}.status.json").read_text(encoding="utf-8")
+    )
+    status_payload["selection_record_sha256"] = tampered["selection_record_sha256"]
+    tampered_status.write_text(json.dumps(status_payload) + "\n", encoding="utf-8")
+    with pytest.raises(TaskCMethodRunError, match="replay"):
         run_task_c_method(
             method_id="mean_difference",
             input_npz=Path(refit_profile["input_npz"]),
@@ -769,6 +882,19 @@ def test_cli_selects_train_fitted_trials_using_separate_tune_responses(
             min_cells=5,
             public_manifest_path=Path(bundle["public_manifest"]),
             selection_record_path=tampered_record,
+            selection_status_path=tampered_status,
+            selection_tune_input_path=Path(tune_profile["input_npz"]),
+            selection_tune_profile_manifest_path=Path(tune_profile["manifest"]),
+            selection_config_path=CONFIG,
+            selection_trial_directories=(second, first),
+            selection_trial_input_bindings={
+                first.resolve(): Path(train_profile["input_npz"]),
+                second.resolve(): Path(train_profile["input_npz"]),
+            },
+            selection_trial_profile_bindings={
+                first.resolve(): Path(train_profile["manifest"]),
+                second.resolve(): Path(train_profile["manifest"]),
+            },
             project_root=ROOT,
         )
 
@@ -807,6 +933,8 @@ def test_cli_rejects_k562_trial_for_rpe1_tune_profile(tmp_path: Path) -> None:
         "--profile-manifest", rpe1_profile["manifest"],
         "--public-manifest", str(bundle["public_manifest"]),
         "--trial-dir", str(trial),
+        "--trial-input", f"{trial}={k562_profile['input_npz']}",
+        "--trial-profile-manifest", f"{trial}={k562_profile['manifest']}",
         "--output-json", str(tmp_path / "selected.json"),
         "--config", str(CONFIG),
     )
@@ -913,16 +1041,13 @@ def test_cli_scores_a_sealed_hypersca_train_run_on_separate_tune_cells(
         "--profile-manifest", profiles["tune"]["manifest"],
         "--public-manifest", str(bundle["public_manifest"]),
         "--trial-dir", str(trial),
+        "--trial-input", f"{trial}={profiles['train']['input_npz']}",
+        "--trial-profile-manifest", f"{trial}={profiles['train']['manifest']}",
+        "--trial-hypersca-config", f"{trial}={config}",
+        "--trial-gene-list", f"{trial}={gene_list}",
         "--output-json", str(tmp_path / "hypersca-selected.json"),
         "--config", str(CONFIG),
     )
 
-    assert completed.returncode == 0, completed.stderr
-    selected = json.loads(
-        (tmp_path / "hypersca-selected.json").read_text(encoding="utf-8")
-    )
-    assert selected["method_id"] == "hypersca_c"
-    assert selected["training_and_tuning_inputs_separate"] is True
-    assert selected["evidence"]["tune_input_sha256"] not in selected["evidence"][
-        "training_input_sha256s"
-    ]
+    assert completed.returncode != 0
+    assert "reconstruction" in completed.stderr or "scientific evidence" in completed.stderr

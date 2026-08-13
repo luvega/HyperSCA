@@ -87,12 +87,16 @@ _SELECTION_EVIDENCE_FIELDS = frozenset(
         "profile_manifest_sha256",
         "gene_order_sha256",
         "config_sha256",
+        "config",
         "code_sha256",
         "tuning_positive_relation_count",
+        "tuning_edges",
+        "tuning_edges_sha256",
         "gene_count",
         "training_input_sha256s",
         "training_profile_manifest_sha256s",
         "trials",
+        "trial_metrics",
     }
 )
 _COMPLETED_STATUS = "completed_standardized_output"
@@ -1617,8 +1621,10 @@ def _validate_existing_output(
             "returned_by_method",
         ]:
             raise TaskCMethodRunError("standardized prediction columns changed")
+        observed["source"] = observed["source"].astype("string")
+        observed["target"] = observed["target"].astype("string")
         try:
-            pd.testing.assert_frame_equal(expected, observed, check_dtype=False)
+            pd.testing.assert_frame_equal(expected, observed, check_dtype=True)
         except AssertionError as exc:
             raise TaskCMethodRunError("existing result scientific semantics changed") from exc
         if spec.method_id == "mean_difference":
@@ -1808,6 +1814,106 @@ def _hypersca_genes(snapshot: _Snapshot) -> tuple[str, ...]:
     return genes
 
 
+def validate_task_c_method_output_bundle(
+    *,
+    output_dir: Path,
+    input_npz: Path,
+    registry_path: Path,
+    asset_root: Path,
+    public_manifest_path: Path,
+    derived_input_manifest_path: Path | None = None,
+    hypersca_config_path: Path | None = None,
+    gene_list_path: Path | None = None,
+    project_root: Path | None = None,
+) -> dict[str, object]:
+    """Rebuild a completed candidate from its actual fixed training inputs.
+
+    The sealed candidate record supplies only its pre-run index, parameters, method,
+    context, and seed.  The caller must supply the real public input files; normal
+    reuse validation then recomputes scientific output and every evidence hash.
+    """
+
+    root = _lexical_absolute(output_dir)
+    sealed_snapshot = _capture_file(
+        root / "trial_parameters.json",
+        "sealed trial parameters",
+        maximum_bytes=MAXIMUM_RECORD_BYTES,
+        require_single_link=True,
+    )
+    sealed = _parse_json(sealed_snapshot, "sealed trial parameters")
+    environment_snapshot = _capture_file(
+        root / "environment_manifest.json",
+        "environment manifest",
+        maximum_bytes=MAXIMUM_RECORD_BYTES,
+        require_single_link=True,
+    )
+    environment = _parse_json(environment_snapshot, "environment manifest")
+    if set(sealed) != {
+        "schema_version",
+        "trial_index",
+        "method_id",
+        "condition",
+        "profile",
+        "stage",
+        "context_id",
+        "direction",
+        "seed",
+        "training_input_sha256",
+        "profile_manifest_sha256",
+        "public_manifest_sha256",
+        "gene_order_sha256",
+        "parameters",
+    }:
+        raise TaskCMethodRunError("sealed trial parameter fields changed")
+    if (
+        sealed.get("schema_version") != SCHEMA_VERSION
+        or sealed.get("stage") != "train"
+        or isinstance(sealed.get("trial_index"), bool)
+        or not isinstance(sealed.get("trial_index"), int)
+        or int(sealed["trial_index"]) < 0
+        or not isinstance(sealed.get("parameters"), dict)
+        or environment.get("data_status") != "external_benchmark"
+    ):
+        raise TaskCMethodRunError("completed candidate is not a formal train-stage trial")
+    min_cells = environment.get("min_cells")
+    if isinstance(min_cells, bool) or not isinstance(min_cells, int):
+        raise TaskCMethodRunError("completed candidate minimum cell count changed")
+    candidate = {
+        "schema_version": SCHEMA_VERSION,
+        "trial_index": sealed["trial_index"],
+        "parameters": sealed["parameters"],
+    }
+    temporary_parent = _lexical_absolute(output_dir).parent
+    with tempfile.TemporaryDirectory(
+        prefix=f".{root.name}.verify-", dir=temporary_parent
+    ) as temporary_name:
+        candidate_path = Path(temporary_name) / "trial_candidate.json"
+        _write_new(candidate_path, _json_bytes(candidate))
+        return run_task_c_method(
+            method_id=str(sealed["method_id"]),
+            input_npz=input_npz,
+            output_dir=root,
+            seed=int(sealed["seed"]),
+            registry_path=registry_path,
+            asset_root=asset_root,
+            data_status="external_benchmark",
+            context_id=str(sealed["context_id"]),
+            min_cells=min_cells,
+            public_manifest_path=public_manifest_path,
+            derived_input_manifest_path=derived_input_manifest_path,
+            hypersca_config_path=hypersca_config_path,
+            gene_list_path=gene_list_path,
+            device=(
+                "cuda"
+                if isinstance(environment.get("command"), dict)
+                and "cuda" in environment["command"].get("template", [])
+                else "cpu"
+            ),
+            trial_parameters_path=candidate_path,
+            project_root=project_root,
+        )
+
+
 def _verify_all_snapshots(
     registry_snapshot: _Snapshot,
     input_snapshot: _Snapshot | None,
@@ -1849,6 +1955,15 @@ def run_task_c_method(
     timeout_seconds: int | float = 86_400,
     trial_parameters_path: Path | None = None,
     selection_record_path: Path | None = None,
+    selection_status_path: Path | None = None,
+    selection_tune_input_path: Path | None = None,
+    selection_tune_profile_manifest_path: Path | None = None,
+    selection_config_path: Path | None = None,
+    selection_trial_directories: Sequence[Path] = (),
+    selection_trial_input_bindings: Mapping[Path, Path] | None = None,
+    selection_trial_profile_bindings: Mapping[Path, Path] | None = None,
+    selection_trial_hypersca_configs: Mapping[Path, Path] | None = None,
+    selection_trial_gene_lists: Mapping[Path, Path] | None = None,
     project_root: Path | None = None,
 ) -> dict[str, object]:
     """Run one registered method and publish a verified, reusable evidence bundle."""
@@ -1885,6 +2000,20 @@ def run_task_c_method(
         if selection_record_path is not None
         else None
     )
+    if selection_record_snapshot is None and any(
+        (
+            selection_status_path,
+            selection_tune_input_path,
+            selection_tune_profile_manifest_path,
+            selection_config_path,
+            selection_trial_directories,
+            selection_trial_input_bindings,
+            selection_trial_profile_bindings,
+            selection_trial_hypersca_configs,
+            selection_trial_gene_lists,
+        )
+    ):
+        raise TaskCMethodRunError("selection replay evidence needs one selection record")
     if trial_candidate_snapshot is not None and selection_record_snapshot is not None:
         raise TaskCMethodRunError(
             "choose either trial parameters or one selection record, not both"
@@ -2199,6 +2328,42 @@ def run_task_c_method(
             raise TaskCMethodRunError(
                 "a selection record may only authorize the public refit stage"
             )
+        if (
+            selection_status_path is None
+            or selection_tune_input_path is None
+            or selection_config_path is None
+            or not selection_trial_directories
+            or selection_trial_input_bindings is None
+            or selection_trial_profile_bindings is None
+            or public_manifest_path is None
+        ):
+            raise TaskCMethodRunError(
+                "selection record requires completed status, actual tune input, tuning config, and every trial binding"
+            )
+        try:
+            from src.evaluation.task_c_tuning import (
+                TaskCTuningError,
+                validate_task_c_selection_record,
+            )
+
+            validate_task_c_selection_record(
+                record_path=selection_record_snapshot.path,
+                status_path=selection_status_path,
+                tune_input_path=selection_tune_input_path,
+                tune_profile_manifest_path=selection_tune_profile_manifest_path,
+                public_manifest_path=public_manifest_path,
+                config_path=selection_config_path,
+                trial_directories=selection_trial_directories,
+                trial_input_bindings=selection_trial_input_bindings,
+                trial_profile_bindings=selection_trial_profile_bindings,
+                registry_path=registry_path,
+                asset_root=asset_root,
+                trial_hypersca_configs=selection_trial_hypersca_configs,
+                trial_gene_lists=selection_trial_gene_lists,
+                project_root=root,
+            )
+        except TaskCTuningError as exc:
+            raise TaskCMethodRunError(f"selection record replay failed: {exc}") from exc
         selection_record, candidate_parameters = _validated_selection_record(
             selection_record_snapshot,
             method_id=spec.method_id,

@@ -6,6 +6,9 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 from types import MappingProxyType
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 import unicodedata
@@ -459,3 +462,132 @@ def select_task_c_configuration(
         average_precision=metric,
         completed_trial_count=len(evaluated),
     )
+
+
+def validate_task_c_selection_record(
+    *,
+    record_path: Path,
+    status_path: Path,
+    tune_input_path: Path,
+    tune_profile_manifest_path: Path | None,
+    public_manifest_path: Path,
+    config_path: Path,
+    trial_directories: Sequence[Path],
+    trial_input_bindings: Mapping[Path, Path],
+    trial_profile_bindings: Mapping[Path, Path],
+    registry_path: Path,
+    asset_root: Path,
+    trial_hypersca_configs: Mapping[Path, Path] | None = None,
+    trial_gene_lists: Mapping[Path, Path] | None = None,
+    project_root: Path | None = None,
+) -> dict[str, object]:
+    """Replay public tuning evidence and require an exact selection record."""
+
+    root = (project_root or Path(__file__).resolve().parents[2]).resolve(strict=True)
+    try:
+        observed = json.loads(record_path.read_text(encoding="utf-8"))
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise TaskCTuningError("selection record or completed status cannot be read") from exc
+    if (
+        not isinstance(observed, dict)
+        or not isinstance(status, dict)
+        or set(status)
+        != {
+            "schema_version",
+            "status",
+            "condition",
+            "tune_input_sha256",
+            "selection_record_sha256",
+            "reason_category",
+            "reason",
+        }
+        or status.get("schema_version") != "1.0"
+        or status.get("status") != "completed_selection"
+        or status.get("condition") != observed.get("condition")
+        or status.get("tune_input_sha256")
+        != (
+            observed.get("evidence", {}).get("tune_input_sha256")
+            if isinstance(observed.get("evidence"), dict)
+            else None
+        )
+        or status.get("selection_record_sha256")
+        != observed.get("selection_record_sha256")
+        or status.get("reason") is not None
+        or status.get("reason_category") is not None
+    ):
+        raise TaskCTuningError("selection status does not authorize refitting")
+    configs = trial_hypersca_configs or {}
+    gene_lists = trial_gene_lists or {}
+    normalized_dirs = tuple(path.resolve(strict=True) for path in trial_directories)
+    input_bindings = {
+        trial.resolve(strict=True): value for trial, value in trial_input_bindings.items()
+    }
+    profile_bindings = {
+        trial.resolve(strict=True): value for trial, value in trial_profile_bindings.items()
+    }
+    config_bindings = {
+        trial.resolve(strict=True): value for trial, value in configs.items()
+    }
+    gene_bindings = {
+        trial.resolve(strict=True): value for trial, value in gene_lists.items()
+    }
+    if set(input_bindings) != set(normalized_dirs):
+        raise TaskCTuningError("selection replay needs one actual train input per trial")
+    with tempfile.TemporaryDirectory(prefix="task-c-selection-replay-") as temporary:
+        rebuilt = Path(temporary) / "selection.json"
+        rebuilt_status = Path(temporary) / "selection.status.json"
+        command = [
+            sys.executable,
+            str(root / "scripts/select_task_c_configuration.py"),
+            "--tune-npz",
+            str(tune_input_path),
+            "--public-manifest",
+            str(public_manifest_path),
+            "--output-json",
+            str(rebuilt),
+            "--status-json",
+            str(rebuilt_status),
+            "--config",
+            str(config_path),
+            "--registry",
+            str(registry_path),
+            "--asset-root",
+            str(asset_root),
+        ]
+        if tune_profile_manifest_path is not None:
+            command.extend(("--profile-manifest", str(tune_profile_manifest_path)))
+        for trial in normalized_dirs:
+            command.extend(("--trial-dir", str(trial)))
+            command.extend(("--trial-input", f"{trial}={input_bindings[trial]}"))
+            if trial in profile_bindings:
+                command.extend(
+                    (
+                        "--trial-profile-manifest",
+                        f"{trial}={profile_bindings[trial]}",
+                    )
+                )
+            if trial in config_bindings:
+                command.extend(
+                    ("--trial-hypersca-config", f"{trial}={config_bindings[trial]}")
+                )
+            if trial in gene_bindings:
+                command.extend(("--trial-gene-list", f"{trial}={gene_bindings[trial]}"))
+        completed = subprocess.run(
+            command,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise TaskCTuningError(
+                "selection evidence replay failed: " + completed.stderr.strip()
+            )
+        try:
+            expected = json.loads(rebuilt.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise TaskCTuningError("selection replay did not produce a valid record") from exc
+    if observed != expected:
+        raise TaskCTuningError("selection record differs from replayed public evidence")
+    return expected
