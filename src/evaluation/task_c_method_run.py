@@ -55,6 +55,7 @@ MAXIMUM_TASK_C_RUN_GENES = 256
 MAXIMUM_INPUT_BYTES = 512 * 1024 * 1024
 MAXIMUM_RAW_PREDICTION_BYTES = 64 * 1024 * 1024
 MAXIMUM_RECORD_BYTES = 4 * 1024 * 1024
+MAXIMUM_TUNING_TRIALS = 20
 _CONTROL_LABEL = "non-targeting"
 _EXCLUDED_LABEL = "excluded"
 _DATA_STATUSES = frozenset({"external_benchmark", "synthetic_smoke"})
@@ -210,6 +211,11 @@ class _DerivedInput:
     genes: tuple[str, ...]
     environment_labels: np.ndarray | None
     run_context_id: str
+    condition: str
+    profile: str
+    stage: str
+    context_id: str | None
+    direction: str | None
 
 
 def _json_bytes(payload: object) -> bytes:
@@ -383,6 +389,89 @@ def _parse_json(snapshot: _Snapshot, label: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise TaskCMethodRunError(f"{label} must be a JSON object")
     return payload
+
+
+def _trial_candidate(snapshot: _Snapshot | None) -> tuple[int | None, dict[str, Any]]:
+    if snapshot is None:
+        return None, {}
+    payload = _parse_json(snapshot, "trial parameter candidate")
+    if set(payload) != {"schema_version", "trial_index", "parameters"}:
+        raise TaskCMethodRunError("trial parameter candidate fields changed")
+    trial_index = payload.get("trial_index")
+    if (
+        payload.get("schema_version") != SCHEMA_VERSION
+        or isinstance(trial_index, bool)
+        or not isinstance(trial_index, int)
+        or not 0 <= trial_index < MAXIMUM_TUNING_TRIALS
+        or not isinstance(payload.get("parameters"), dict)
+    ):
+        raise TaskCMethodRunError(
+            "trial candidate needs index zero to nineteen and one parameter object"
+        )
+    return trial_index, dict(payload["parameters"])
+
+
+def _scope_for_public_path(relative: str) -> dict[str, str | None]:
+    parts = Path(relative).parts
+    if (
+        len(parts) == 3
+        and parts[0] == "within"
+        and parts[1] in {"k562", "rpe1"}
+        and parts[2] in {"train.npz", "tune.npz", "refit.npz"}
+    ):
+        return {
+            "condition": "within_environment",
+            "profile": "full_public",
+            "stage": parts[2].removesuffix(".npz"),
+            "context_id": parts[1],
+            "direction": None,
+        }
+    if len(parts) == 3 and parts[0] == "cross" and "_to_" in parts[1]:
+        stage = next(
+            (
+                value
+                for value in ("train", "tune", "refit")
+                if parts[2] in {f"source_{value}.npz", f"target_adapt_{value}.npz"}
+            ),
+            None,
+        )
+        if stage is not None:
+            return {
+                "condition": "cross_environment",
+                "profile": "full_public",
+                "stage": stage,
+                "context_id": parts[1],
+                "direction": parts[1],
+            }
+    raise TaskCMethodRunError("public input path has no fixed Task C scope")
+
+
+def _sealed_trial_parameters(
+    *,
+    method_id: str,
+    seed: int,
+    trial_index: int | None,
+    parameters: Mapping[str, Any],
+    scope: Mapping[str, str | None],
+    tune_input_sha256: str | None,
+    profile_manifest_sha256: str | None,
+    public_manifest_sha256: str | None,
+) -> dict[str, object]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "trial_index": trial_index,
+        "method_id": method_id,
+        "condition": scope["condition"],
+        "profile": scope["profile"],
+        "stage": scope["stage"],
+        "context_id": scope["context_id"],
+        "direction": scope["direction"],
+        "seed": seed,
+        "tune_input_sha256": tune_input_sha256,
+        "profile_manifest_sha256": profile_manifest_sha256,
+        "public_manifest_sha256": public_manifest_sha256,
+        "parameters": dict(parameters),
+    }
 
 
 def _canonical_text(values: np.ndarray, label: str) -> tuple[str, ...]:
@@ -661,8 +750,8 @@ def materialize_task_c_derived_input(
 ) -> dict[str, str]:
     """Build a cross-environment profile subset from registered public parents."""
 
-    if stage != "refit":
-        raise TaskCMethodRunError("derived profile stage must be refit")
+    if stage not in {"tune", "refit"}:
+        raise TaskCMethodRunError("derived profile stage must be tune or refit")
     try:
         from src.evaluation.task_c_profile_input import (
             materialize_task_c_profile_input,
@@ -673,6 +762,7 @@ def materialize_task_c_derived_input(
             profile=profile,
             condition="cross_environment",
             direction=direction,
+            stage=stage,
             output_dir=output_dir,
         )
     except ValueError as exc:
@@ -736,6 +826,11 @@ def _validate_derived_input(
         genes=validated.gene_names,
         environment_labels=validated.environment_labels,
         run_context_id=run_context_id,
+        condition=validated.condition,
+        profile=validated.profile,
+        stage=validated.stage,
+        context_id=validated.context_id,
+        direction=validated.direction,
     )
 
 
@@ -1117,6 +1212,8 @@ def _run_identity(
     min_cells: int,
     command_record: Mapping[str, object] | None,
     hypersca_inputs: Mapping[str, str],
+    trial_parameters: Mapping[str, object],
+    trial_parameters_sha256: str,
 ) -> tuple[dict[str, object], str]:
     identity: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -1139,6 +1236,10 @@ def _run_identity(
         "assets": {name: snapshot.sha256 for name, snapshot in asset_snapshots.items()},
         "command": dict(command_record) if command_record is not None else None,
         "hypersca_inputs": dict(hypersca_inputs),
+        "trial_parameters": {
+            "sha256": trial_parameters_sha256,
+            "content": dict(trial_parameters),
+        },
     }
     digest = f"sha256:{hashlib.sha256(_json_bytes(identity)).hexdigest()}"
     return identity, digest
@@ -1160,6 +1261,8 @@ def _environment_manifest(
     min_cells: int,
     command_record: Mapping[str, object] | None,
     hypersca_inputs: Mapping[str, str],
+    trial_parameters: Mapping[str, object],
+    trial_parameters_sha256: str,
 ) -> dict[str, object]:
     identity, identity_sha256 = _run_identity(
         spec=spec,
@@ -1176,6 +1279,8 @@ def _environment_manifest(
         min_cells=min_cells,
         command_record=command_record,
         hypersca_inputs=hypersca_inputs,
+        trial_parameters=trial_parameters,
+        trial_parameters_sha256=trial_parameters_sha256,
     )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1222,6 +1327,10 @@ def _environment_manifest(
         },
         "run_identity": identity,
         "run_identity_sha256": identity_sha256,
+        "trial_parameters": {
+            "sha256": trial_parameters_sha256,
+            "content": dict(trial_parameters),
+        },
     }
 
 
@@ -1286,6 +1395,7 @@ def _validate_existing_output(
         "artifacts",
         "inner_status",
         "status_origin",
+        "trial_parameters_sha256",
         _STATUS_SELF_FIELD,
     }
     if frozenset(status) not in {
@@ -1300,6 +1410,22 @@ def _validate_existing_output(
         raise TaskCMethodRunError("existing result method identity changed")
     if status.get("run_identity_sha256") != expected_identity_sha256:
         raise TaskCMethodRunError("existing result status identity changed")
+    expected_trial = expected_environment.get("trial_parameters")
+    if not isinstance(expected_trial, dict):
+        raise TaskCMethodRunError("expected trial parameter identity is malformed")
+    trial_snapshot = _capture_file(
+        root / "trial_parameters.json",
+        "sealed trial parameters",
+        maximum_bytes=MAXIMUM_RECORD_BYTES,
+        require_single_link=True,
+    )
+    if (
+        trial_snapshot.sha256 != expected_trial.get("sha256")
+        or _parse_json(trial_snapshot, "sealed trial parameters")
+        != expected_trial.get("content")
+        or status.get("trial_parameters_sha256") != trial_snapshot.sha256
+    ):
+        raise TaskCMethodRunError("sealed trial parameter identity changed")
     recorded_artifacts = status.get("artifacts")
     actual_artifacts = _artifact_records(root)
     if recorded_artifacts != actual_artifacts:
@@ -1311,7 +1437,11 @@ def _validate_existing_output(
             raise TaskCMethodRunError("publication-only result status changed")
         if "raw_predictions.csv" in actual_artifacts or "predictions.csv" in actual_artifacts:
             raise TaskCMethodRunError("publication-only result contains invented predictions")
-        if top_level != {"method_status.json", "environment_manifest.json"}:
+        if top_level != {
+            "method_status.json",
+            "environment_manifest.json",
+            "trial_parameters.json",
+        }:
             raise TaskCMethodRunError("publication-only result has unexpected files")
         if status.get("inner_status") is not None or status.get(
             "status_origin"
@@ -1361,6 +1491,7 @@ def _validate_existing_output(
                 "environment_manifest.json",
                 "raw_predictions.csv",
                 "predictions.csv",
+                "trial_parameters.json",
             }
         elif spec.method_id == "hypersca_c":
             expected_top = {
@@ -1370,6 +1501,7 @@ def _validate_existing_output(
                 "predictions.csv",
                 "raw_runtime",
                 "raw_method_output",
+                "trial_parameters.json",
             }
         else:
             expected_top = {
@@ -1378,6 +1510,7 @@ def _validate_existing_output(
                 "raw_predictions.csv",
                 "predictions.csv",
                 "raw_runtime",
+                "trial_parameters.json",
             }
         if top_level != expected_top:
             raise TaskCMethodRunError("completed result file set changed")
@@ -1391,7 +1524,11 @@ def _validate_existing_output(
     else:
         if {"raw_predictions.csv", "predictions.csv"} & top_level:
             raise TaskCMethodRunError("failed result must not contain prediction files")
-        expected_failed_top = {"method_status.json", "environment_manifest.json"}
+        expected_failed_top = {
+            "method_status.json",
+            "environment_manifest.json",
+            "trial_parameters.json",
+        }
         if status.get("inner_status") is not None:
             expected_failed_top.add("raw_runtime")
         if spec.method_id == "hypersca_c" and "raw_method_output" in top_level:
@@ -1574,6 +1711,7 @@ def run_task_c_method(
     gene_list_path: Path | None = None,
     device: str = "cpu",
     timeout_seconds: int | float = 86_400,
+    trial_parameters_path: Path | None = None,
     project_root: Path | None = None,
 ) -> dict[str, object]:
     """Run one registered method and publish a verified, reusable evidence bundle."""
@@ -1588,6 +1726,18 @@ def run_task_c_method(
     if not math.isfinite(float(timeout_seconds)) or float(timeout_seconds) <= 0:
         raise TaskCMethodRunError("timeout must be a positive number")
     root = (project_root or Path(__file__).resolve().parents[2]).resolve(strict=True)
+    trial_candidate_snapshot = (
+        _capture_file(
+            trial_parameters_path,
+            "trial parameter candidate",
+            maximum_bytes=MAXIMUM_RECORD_BYTES,
+            reject_private=True,
+            require_single_link=True,
+        )
+        if trial_parameters_path is not None
+        else None
+    )
+    trial_index, candidate_parameters = _trial_candidate(trial_candidate_snapshot)
 
     registry_snapshot = _capture_file(
         registry_path,
@@ -1639,12 +1789,15 @@ def run_task_c_method(
     derived_input_manifest_snapshot: _Snapshot | None = None
     public_manifest_payload: dict[str, Any] | None = None
     extra_snapshots: dict[str, _Snapshot] = {}
+    if trial_candidate_snapshot is not None:
+        extra_snapshots["trial_parameter_candidate"] = trial_candidate_snapshot
     expression: np.ndarray | None = None
     interventions: np.ndarray | None = None
     genes: tuple[str, ...] | None = None
     hypersca_input_hashes: dict[str, str] = {}
     command: tuple[str, ...] | None = None
     hypersca_validation_inputs: dict[str, object] | None = None
+    trial_scope: dict[str, str | None]
     if external_source_sha256 is not None:
         hypersca_input_hashes["official_source_worktree_sha256"] = (
             external_source_sha256
@@ -1664,6 +1817,13 @@ def run_task_c_method(
             raise TaskCMethodRunError("publication-only methods do not inspect Task C data")
         data_status = None
         context_id = None
+        trial_scope = {
+            "condition": "publication_record",
+            "profile": "not_runnable",
+            "stage": "not_runnable",
+            "context_id": None,
+            "direction": None,
+        }
     elif spec.method_id == "hypersca_c":
         profile_mode = input_npz is not None or derived_input_manifest_path is not None
         if profile_mode and (
@@ -1725,6 +1885,13 @@ def run_task_c_method(
                 extra_snapshots[f"profile_parent_{index + 1}"] = parent_snapshot
             extra_snapshots["profile_manifest"] = derived.manifest_snapshot
             hypersca_input_hashes["profile_context"] = derived.run_context_id
+            trial_scope = {
+                "condition": derived.condition,
+                "profile": derived.profile,
+                "stage": derived.stage,
+                "context_id": derived.run_context_id,
+                "direction": derived.direction,
+            }
         else:
             parsed_contexts: dict[str, Path] = {}
             for raw_context in context_values:
@@ -1752,6 +1919,13 @@ def run_task_c_method(
                     raise TaskCMethodRunError(
                         "HyperSCA-C context label disagrees with its registered public path"
                     )
+            trial_scope = {
+                "condition": "multi_context",
+                "profile": "full_public",
+                "stage": "refit",
+                "context_id": None,
+                "direction": None,
+            }
         assert public_manifest_payload is not None
         manifest_minimum = public_manifest_payload.get("min_cells_per_intervention")
         if isinstance(manifest_minimum, bool) or not isinstance(manifest_minimum, int):
@@ -1818,6 +1992,13 @@ def run_task_c_method(
                     raise TaskCMethodRunError(
                         "context id must equal the recorded profile context or direction"
                     )
+                trial_scope = {
+                    "condition": derived.condition,
+                    "profile": derived.profile,
+                    "stage": derived.stage,
+                    "context_id": derived.run_context_id,
+                    "direction": derived.direction,
+                }
             else:
                 input_snapshot, public_manifest_snapshot, public_manifest_payload, public_relative = (
                     _capture_public_input(input_npz, public_manifest_path)
@@ -1827,12 +2008,20 @@ def run_task_c_method(
                     raise TaskCMethodRunError(
                         "context id disagrees with the registered public path"
                     )
+                trial_scope = _scope_for_public_path(public_relative)
         else:
             if public_manifest_path is not None or derived_input_manifest_path is not None:
                 raise TaskCMethodRunError(
                     "synthetic smoke data must not be presented as registered public data"
                 )
             input_snapshot = _capture_synthetic_input(input_npz)
+            trial_scope = {
+                "condition": "synthetic_smoke",
+                "profile": "synthetic_smoke",
+                "stage": "synthetic_smoke",
+                "context_id": context_id,
+                "direction": None,
+            }
         if expression is None:
             expression, interventions, genes, environment_labels = _load_fixed_npz(
                 input_snapshot
@@ -1848,6 +2037,40 @@ def run_task_c_method(
                 raise TaskCMethodRunError(
                     "minimum cells must match the fixed public split manifest"
                 )
+
+    if trial_candidate_snapshot is not None:
+        if spec.method_id != "hypersca_c" and candidate_parameters:
+            raise TaskCMethodRunError(
+                "this fixed comparison method does not accept tunable parameters"
+            )
+        if spec.method_id == "hypersca_c":
+            assert "config" in extra_snapshots
+            if candidate_parameters != _parse_json(
+                extra_snapshots["config"], "HyperSCA-C config"
+            ):
+                raise TaskCMethodRunError(
+                    "HyperSCA-C trial parameters must exactly equal the run config"
+                )
+    sealed_trial_parameters = _sealed_trial_parameters(
+        method_id=spec.method_id,
+        seed=seed,
+        trial_index=trial_index,
+        parameters=candidate_parameters,
+        scope=trial_scope,
+        tune_input_sha256=input_snapshot.sha256 if input_snapshot else None,
+        profile_manifest_sha256=(
+            derived_input_manifest_snapshot.sha256
+            if derived_input_manifest_snapshot
+            else None
+        ),
+        public_manifest_sha256=(
+            public_manifest_snapshot.sha256 if public_manifest_snapshot else None
+        ),
+    )
+    sealed_trial_parameters_bytes = _json_bytes(sealed_trial_parameters)
+    sealed_trial_parameters_sha256 = (
+        f"sha256:{hashlib.sha256(sealed_trial_parameters_bytes).hexdigest()}"
+    )
 
     staging_parent = _lexical_absolute(output_dir).parent
     if not staging_parent.exists():
@@ -1880,6 +2103,8 @@ def run_task_c_method(
             min_cells=min_cells,
             command_record=command_record,
             hypersca_inputs=hypersca_input_hashes,
+            trial_parameters=sealed_trial_parameters,
+            trial_parameters_sha256=sealed_trial_parameters_sha256,
         )
         expected_raw: pd.DataFrame | None = None
         if spec.method_id == "mean_difference":
@@ -1988,7 +2213,10 @@ def run_task_c_method(
             min_cells=min_cells,
             command_record=command_record,
             hypersca_inputs=hypersca_input_hashes,
+            trial_parameters=sealed_trial_parameters,
+            trial_parameters_sha256=sealed_trial_parameters_sha256,
         )
+        _write_new(staging / "trial_parameters.json", sealed_trial_parameters_bytes)
         _write_json(staging / "environment_manifest.json", environment)
 
         status_name: str
@@ -2118,6 +2346,7 @@ def run_task_c_method(
             "status_origin": status_origin,
             "run_identity_sha256": environment["run_identity_sha256"],
             "artifacts": artifacts,
+            "trial_parameters_sha256": sealed_trial_parameters_sha256,
         }
         if reason is not None:
             status["reason"] = reason
@@ -2167,6 +2396,7 @@ def run_task_c_method(
                 "run_identity_sha256": environment_payload["run_identity_sha256"],
                 "reason": str(exc),
                 "artifacts": _artifact_records(staging),
+                "trial_parameters_sha256": sealed_trial_parameters_sha256,
             })
             _write_json(staging / "method_status.json", status)
             _validate_existing_output(

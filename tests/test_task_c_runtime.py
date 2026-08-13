@@ -1781,6 +1781,19 @@ def test_mean_difference_unified_cli_writes_a_complete_verified_bundle(
     assert status["artifacts"]["predictions.csv"]["sha256"].startswith("sha256:")
     assert environment["training_information"] == "partial_interventional"
     assert environment["data_status"] == "synthetic_smoke"
+    sealed_parameters = json.loads(
+        (output / "trial_parameters.json").read_text(encoding="utf-8")
+    )
+    assert sealed_parameters["parameters"] == {}
+    assert sealed_parameters["trial_index"] is None
+    assert sealed_parameters["stage"] == "synthetic_smoke"
+    assert environment["trial_parameters"]["content"] == sealed_parameters
+    assert status["trial_parameters_sha256"] == environment["trial_parameters"][
+        "sha256"
+    ]
+    assert status["artifacts"]["trial_parameters.json"]["sha256"] == status[
+        "trial_parameters_sha256"
+    ]
     assert "passed_real_rehearsal" not in (output / "method_status.json").read_text(
         encoding="utf-8"
     )
@@ -1963,6 +1976,75 @@ def test_unified_run_reuses_only_an_exact_scientifically_valid_bundle(
         encoding="utf-8",
     )
     with pytest.raises(TaskCMethodRunError, match="changed|hash|semantic"):
+        run_task_c_method(**arguments)
+
+
+def test_trial_parameters_are_bound_before_run_and_changed_candidate_cannot_reuse(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.npz"
+    _write_method_input(input_path)
+    candidate = tmp_path / "candidate.json"
+    candidate.write_text(
+        '{"schema_version":"1.0","trial_index":3,"parameters":{}}\n',
+        encoding="utf-8",
+    )
+    arguments = {
+        "method_id": "mean_difference",
+        "input_npz": input_path,
+        "output_dir": tmp_path / "run",
+        "seed": 11,
+        "registry_path": REGISTRY,
+        "asset_root": tmp_path / "assets",
+        "data_status": "synthetic_smoke",
+        "context_id": "synthetic",
+        "min_cells": 2,
+        "trial_parameters_path": candidate,
+        "project_root": ROOT,
+    }
+
+    run_task_c_method(**arguments)
+    record_path = tmp_path / "run/trial_parameters.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["trial_index"] == 3
+    assert record["method_id"] == "mean_difference"
+    assert record["seed"] == 11
+    assert record["tune_input_sha256"].startswith("sha256:")
+
+    candidate.write_text(
+        '{"schema_version":"1.0","trial_index":4,"parameters":{}}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(TaskCMethodRunError, match="environment|identity|parameter"):
+        run_task_c_method(**arguments)
+
+
+def test_bound_trial_parameter_artifact_cannot_be_replaced_and_resealed(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.npz"
+    _write_method_input(input_path)
+    output = tmp_path / "run"
+    arguments = {
+        "method_id": "mean_difference",
+        "input_npz": input_path,
+        "output_dir": output,
+        "seed": 11,
+        "registry_path": REGISTRY,
+        "asset_root": tmp_path / "assets",
+        "data_status": "synthetic_smoke",
+        "context_id": "synthetic",
+        "min_cells": 2,
+        "project_root": ROOT,
+    }
+    run_task_c_method(**arguments)
+    parameters_path = output / "trial_parameters.json"
+    parameters = json.loads(parameters_path.read_text(encoding="utf-8"))
+    parameters["trial_index"] = 9
+    parameters_path.write_text(json.dumps(parameters) + "\n", encoding="utf-8")
+    _update_outer_artifact_record(output, "trial_parameters.json")
+
+    with pytest.raises(TaskCMethodRunError, match="parameter|environment|identity"):
         run_task_c_method(**arguments)
 
 

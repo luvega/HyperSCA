@@ -157,6 +157,81 @@ def test_profiles_freeze_gene_and_cell_limits_for_within_and_cross(
     }
 
 
+def test_tune_profiles_reuse_refit_gene_selection_and_only_read_tune_cells(
+    large_public_bundle: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    public_manifest = Path(large_public_bundle["public_manifest"])
+    refit = materialize_task_c_profile_input(
+        public_manifest_path=public_manifest,
+        profile="connection",
+        condition="within_environment",
+        context_id="k562",
+        stage="refit",
+        output_dir=tmp_path / "refit",
+    )
+    tune = materialize_task_c_profile_input(
+        public_manifest_path=public_manifest,
+        profile="connection",
+        condition="within_environment",
+        context_id="k562",
+        stage="tune",
+        output_dir=tmp_path / "tune",
+    )
+    refit_manifest = json.loads(Path(refit["manifest"]).read_text(encoding="utf-8"))
+    tune_manifest = json.loads(Path(tune["manifest"]).read_text(encoding="utf-8"))
+
+    assert tune_manifest["stage"] == "tune"
+    assert tune_manifest["gene_selection"] == refit_manifest["gene_selection"]
+    assert tune_manifest["gene_selection"]["selection_reference_stage"] == "refit"
+    assert tune_manifest["contexts"][0]["public_relative_path"] == (
+        "within/k562/tune.npz"
+    )
+    assert tune_manifest["contexts"][0]["role"] == "within_tune"
+    assert len(tune_manifest["gene_selection"]["ordered_genes"]) <= 64
+    with np.load(tune["input_npz"], allow_pickle=False) as archive:
+        assert set(archive.files) == {
+            "expression_matrix",
+            "interventions",
+            "var_names",
+        }
+        assert archive["expression_matrix"].shape[1] <= 64
+        assert set(archive["interventions"].tolist()) <= {
+            "non-targeting",
+            *set(tune_manifest["gene_selection"]["ordered_genes"]),
+        }
+    validated = validate_task_c_profile_input(
+        input_path=Path(tune["input_npz"]),
+        profile_manifest_path=Path(tune["manifest"]),
+        public_manifest_path=public_manifest,
+    )
+    assert validated.stage == "tune"
+
+
+def test_cross_tune_profile_records_direction_and_tune_parents(
+    large_public_bundle: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    created = materialize_task_c_profile_input(
+        public_manifest_path=Path(large_public_bundle["public_manifest"]),
+        profile="connection",
+        condition="cross_environment",
+        direction="k562_to_rpe1",
+        stage="tune",
+        output_dir=tmp_path / "cross-tune",
+    )
+    manifest = json.loads(Path(created["manifest"]).read_text(encoding="utf-8"))
+
+    assert manifest["stage"] == "tune"
+    assert manifest["direction"] == "k562_to_rpe1"
+    assert [record["public_relative_path"] for record in manifest["contexts"]] == [
+        "cross/k562_to_rpe1/source_tune.npz",
+        "cross/k562_to_rpe1/target_adapt_tune.npz",
+    ]
+    with np.load(created["input_npz"], allow_pickle=False) as archive:
+        assert set(archive["environment_labels"].tolist()) == {"k562", "rpe1"}
+
+
 def _sparse_intervention_bundle(tmp_path: Path) -> dict[str, object]:
     genes = tuple(f"S{index}" for index in range(8))
     labels = ["non-targeting"] * 3_000 + [
@@ -555,6 +630,7 @@ def test_hypersca_uses_the_same_capped_profile_cells(
         profile="connection",
         condition="within_environment",
         context_id="k562",
+        stage="tune",
         output_dir=tmp_path / "profile",
     )
     profile_manifest = json.loads(
@@ -624,8 +700,11 @@ def test_hypersca_uses_the_same_capped_profile_cells(
         device="cpu",
     )
 
-    assert observed_shapes == [(2_000, 64)]
+    with np.load(created["input_npz"], allow_pickle=False) as archive:
+        assert observed_shapes == [archive["expression_matrix"].shape]
     run_manifest = json.loads((output / "run_manifest.json").read_text(encoding="utf-8"))
+    assert run_manifest["stage"] == "tune"
+    assert run_manifest["condition"] == "within_tune_k562"
     assert run_manifest["profile_input"]["input_path"] == "<verified-profile-input>"
     assert run_manifest["contexts"][0]["input_path"] == "<verified-profile-input>"
     assert run_manifest["run_identity"]["contexts"][0]["input_path"] == (

@@ -30,7 +30,6 @@ from src.evaluation.task_c_method_run import (  # noqa: E402
     _load_fixed_npz,
     _parse_json,
     _validate_status_seal,
-    _verify_snapshot,
 )
 from src.evaluation.task_c_profile_input import (  # noqa: E402
     TaskCProfileInputError,
@@ -53,7 +52,10 @@ _SMOKE_TRIAL_FIELDS = frozenset(
 )
 _FORMAL_TRIAL_FIELDS = _SMOKE_TRIAL_FIELDS | frozenset(
     {
-        "run_identity_sha256",
+        "stage",
+        "context_id",
+        "direction",
+        "seed",
         "tune_input_sha256",
         "public_manifest_sha256",
         "profile_manifest_sha256",
@@ -61,7 +63,7 @@ _FORMAL_TRIAL_FIELDS = _SMOKE_TRIAL_FIELDS | frozenset(
 )
 _MAXIMUM_TRIAL_JSON_BYTES = 1024 * 1024
 _CONDITIONS = frozenset({"within_environment", "cross_environment"})
-_PROFILES = frozenset({"connection", "comprehensive"})
+_PROFILES = frozenset({"connection", "comprehensive", "full_public"})
 _COMPLETED_STATUS_FIELDS = frozenset(
     {
         "schema_version",
@@ -72,6 +74,7 @@ _COMPLETED_STATUS_FIELDS = frozenset(
         "inner_status",
         "status_origin",
         "status_content_sha256",
+        "trial_parameters_sha256",
     }
 )
 _ENVIRONMENT_FIELDS = frozenset(
@@ -97,6 +100,7 @@ _ENVIRONMENT_FIELDS = frozenset(
         "python",
         "run_identity",
         "run_identity_sha256",
+        "trial_parameters",
     }
 )
 
@@ -163,14 +167,20 @@ def _json_bytes(payload: object) -> bytes:
     ).encode("utf-8")
 
 
-def _snapshot(path: Path, label: str, *, maximum_bytes: int):
+def _snapshot(
+    path: Path,
+    label: str,
+    *,
+    maximum_bytes: int,
+    require_single_link: bool = True,
+):
     try:
         return _capture_file(
             path,
             label,
             maximum_bytes=maximum_bytes,
             reject_private=True,
-            require_single_link=True,
+            require_single_link=require_single_link,
         )
     except TaskCMethodRunError as exc:
         raise TaskCTuningError(str(exc)) from exc
@@ -208,7 +218,7 @@ def _verify_method_artifacts(
         if path.is_dir() and not path.is_symlink():
             continue
         relative = path.relative_to(root).as_posix()
-        if relative in {"method_status.json", "trial_parameters.json"}:
+        if relative == "method_status.json":
             continue
         snapshot = _snapshot(
             path,
@@ -244,6 +254,7 @@ def _trial_record(
     synthetic_smoke: bool,
     expected_rows: int,
     evidence_hashes: Mapping[str, str | None],
+    expected_scope: Mapping[str, str | None],
 ) -> tuple[
     int,
     Mapping[str, object],
@@ -261,6 +272,33 @@ def _trial_record(
             raise TaskCTuningError("synthetic trial directory must contain exactly two files")
     elif not {"method_status.json", "environment_manifest.json"}.issubset(top):
         raise TaskCTuningError("formal trial needs completed method status and environment evidence")
+    elif top not in (
+        {
+            "method_status.json",
+            "environment_manifest.json",
+            "trial_parameters.json",
+            "raw_predictions.csv",
+            "predictions.csv",
+        },
+        {
+            "method_status.json",
+            "environment_manifest.json",
+            "trial_parameters.json",
+            "raw_predictions.csv",
+            "predictions.csv",
+            "raw_runtime",
+        },
+        {
+            "method_status.json",
+            "environment_manifest.json",
+            "trial_parameters.json",
+            "raw_predictions.csv",
+            "predictions.csv",
+            "raw_runtime",
+            "raw_method_output",
+        },
+    ):
+        raise TaskCTuningError("formal trial has an unrecognized completed result layout")
     prediction_snapshot = _snapshot(
         root / "predictions.csv",
         "trial predictions",
@@ -294,6 +332,24 @@ def _trial_record(
         )
     snapshots: list[object] = [prediction_snapshot, parameter_snapshot]
     if not synthetic_smoke:
+        stage = parameters.get("stage")
+        record_context = parameters.get("context_id")
+        direction = parameters.get("direction")
+        record_seed = parameters.get("seed")
+        if (
+            stage != "tune"
+            or isinstance(record_seed, bool)
+            or not isinstance(record_seed, int)
+            or record_seed < 0
+            or record_context != expected_scope["context_id"]
+            or direction != expected_scope["direction"]
+            or condition != expected_scope["condition"]
+            or profile != expected_scope["profile"]
+            or stage != expected_scope["stage"]
+        ):
+            raise TaskCTuningError(
+                "trial context, direction, profile, condition, or tune stage differs from tuning evidence"
+            )
         status_snapshot = _snapshot(
             root / "method_status.json",
             "trial method status",
@@ -335,10 +391,26 @@ def _trial_record(
             or not expected_context
             or status.get("run_identity_sha256")
             != environment.get("run_identity_sha256")
-            or parameters.get("run_identity_sha256")
-            != status.get("run_identity_sha256")
         ):
             raise TaskCTuningError("formal trial is not the recorded completed method run")
+        environment_trial = environment.get("trial_parameters")
+        identity_trial = run_identity.get("trial_parameters")
+        if (
+            not isinstance(environment_trial, dict)
+            or environment_trial.get("sha256") != parameter_snapshot.sha256
+            or environment_trial.get("content") != parameters
+            or identity_trial != environment_trial
+            or status.get("trial_parameters_sha256") != parameter_snapshot.sha256
+            or not isinstance(status.get("artifacts"), dict)
+            or status["artifacts"].get("trial_parameters.json")
+            != {
+                "sha256": parameter_snapshot.sha256,
+                "size_bytes": parameter_snapshot.size,
+            }
+        ):
+            raise TaskCTuningError(
+                "formal trial parameters were not sealed before the method run"
+            )
         for field, expected in evidence_hashes.items():
             if parameters.get(field) != expected:
                 raise TaskCTuningError(f"trial {field} differs from the tuning evidence")
@@ -359,10 +431,13 @@ def _trial_record(
         "method_id": method,
         "condition": condition,
         "profile": profile,
+        "seed": parameters.get("seed") if not synthetic_smoke else None,
         "trial_index": trial_index,
         "parameters_sha256": parameter_snapshot.sha256,
         "predictions_sha256": prediction_snapshot.sha256,
-        "run_identity_sha256": parameters.get("run_identity_sha256"),
+        "run_identity_sha256": (
+            environment.get("run_identity_sha256") if not synthetic_smoke else None
+        ),
     }
     return (
         trial_index,
@@ -396,6 +471,13 @@ def _load_tune_input(args: argparse.Namespace):
             },
             (input_snapshot,),
             "synthetic_smoke",
+            {
+                "condition": "synthetic_smoke",
+                "profile": "synthetic_smoke",
+                "stage": "synthetic_smoke",
+                "context_id": "synthetic",
+                "direction": None,
+            },
         )
     if args.public_manifest is None:
         raise TaskCTuningError("formal selection requires the matching public manifest")
@@ -409,7 +491,6 @@ def _load_tune_input(args: argparse.Namespace):
             raise TaskCTuningError(str(exc)) from exc
         if not (
             relative.startswith("within/") and relative.endswith("/tune.npz")
-            or relative.startswith("cross/") and relative.endswith("/source_tune.npz")
         ):
             raise TaskCTuningError("formal tuning input must be the registered tune partition")
         if public.get("min_cells_per_intervention", 0) < 5:
@@ -421,6 +502,14 @@ def _load_tune_input(args: argparse.Namespace):
             )
         snapshots = (input_snapshot, public_snapshot)
         profile_hash = None
+        context = Path(relative).parts[1]
+        scope = {
+            "condition": "within_environment",
+            "profile": "full_public",
+            "stage": "tune",
+            "context_id": context,
+            "direction": None,
+        }
     else:
         try:
             validated = validate_task_c_profile_input(
@@ -445,6 +534,13 @@ def _load_tune_input(args: argparse.Namespace):
             *validated.parent_snapshots,
         )
         profile_hash = validated.manifest_sha256
+        scope = {
+            "condition": validated.condition,
+            "profile": validated.profile,
+            "stage": validated.stage,
+            "context_id": validated.direction or validated.context_id,
+            "direction": validated.direction,
+        }
     if not sources.issubset(set(labels)):
         raise TaskCTuningError("public tune sources differ from the tuning cell labels")
     return (
@@ -459,15 +555,31 @@ def _load_tune_input(args: argparse.Namespace):
         },
         snapshots,
         "external_benchmark",
+        scope,
     )
 
 
 def _verify_snapshots(snapshots: Sequence[object]) -> None:
     for index, snapshot in enumerate(snapshots):
-        try:
-            _verify_snapshot(snapshot, f"fixed tuning input {index + 1}")  # type: ignore[arg-type]
-        except TaskCMethodRunError as exc:
-            raise TaskCTuningError(str(exc)) from exc
+        label = f"fixed tuning input {index + 1}"
+        current = _snapshot(
+            Path(getattr(snapshot, "path")),
+            label,
+            maximum_bytes=max(1, int(getattr(snapshot, "size"))),
+            require_single_link=False,
+        )
+        attributes = (
+            "path",
+            "payload",
+            "device",
+            "inode",
+            "size",
+            "modified_ns",
+            "changed_ns",
+            "link_count",
+        )
+        if any(getattr(current, name) != getattr(snapshot, name) for name in attributes):
+            raise TaskCTuningError(f"{label} changed during configuration selection")
 
 
 def _publish_json(path: Path, payload: bytes) -> None:
@@ -525,6 +637,7 @@ def main(argv: list[str] | None = None) -> int:
             evidence_hashes,
             tune_snapshots,
             data_status,
+            tune_scope,
         ) = _load_tune_input(args)
         tuning_edges = build_tuning_response_edges(
             expression,
@@ -543,17 +656,18 @@ def main(argv: list[str] | None = None) -> int:
                 synthetic_smoke=args.synthetic_smoke,
                 expected_rows=expected_rows,
                 evidence_hashes=evidence_hashes,
+                expected_scope=tune_scope,
             )
             trials.append((index, parameters, frame))
             identities.append(identity)
             trial_snapshots.extend(snapshots)
-        shared_identity_fields = ("method_id", "condition", "profile")
+        shared_identity_fields = ("method_id", "condition", "profile", "seed")
         if any(
             any(identity[field] != identities[0][field] for field in shared_identity_fields)
             for identity in identities[1:]
         ):
             raise TaskCTuningError(
-                "all trials must use the same method, condition, and profile"
+                "all trials must use the same method, condition, profile, and seed"
             )
         selection = select_task_c_configuration(
             trials,
@@ -574,8 +688,7 @@ def main(argv: list[str] | None = None) -> int:
         result = thaw_task_c_json(dict(selection))
         assert isinstance(result, dict)
         result["method_id"] = identities[0]["method_id"]
-        result["condition"] = identities[0]["condition"]
-        result["profile"] = identities[0]["profile"]
+        result.update(tune_scope)
         result["evidence"] = {
             "data_status": data_status,
             **evidence_hashes,

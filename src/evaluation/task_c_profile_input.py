@@ -124,6 +124,7 @@ class _FileSnapshot:
 class TaskCProfileInput:
     profile: str
     condition: str
+    stage: str
     context_id: str | None
     direction: str | None
     expression: np.ndarray
@@ -760,17 +761,20 @@ def _counts(labels: np.ndarray) -> dict[str, int]:
 def _actual_parent_records(
     *,
     condition: str,
+    stage: str,
     context_id: str | None,
     direction: str | None,
 ) -> tuple[dict[str, str], ...]:
+    if stage not in {"tune", "refit"}:
+        raise TaskCProfileInputError("profile stage must be tune or refit")
     if condition == "within_environment":
         if context_id not in {"k562", "rpe1"} or direction is not None:
             raise TaskCProfileInputError("within profile needs one k562 or rpe1 context")
         return (
             {
-                "role": "within_refit",
+                "role": f"within_{stage}",
                 "context_id": context_id,
-                "public_relative_path": f"within/{context_id}/refit.npz",
+                "public_relative_path": f"within/{context_id}/{stage}.npz",
             },
         )
     if condition == "cross_environment":
@@ -779,14 +783,16 @@ def _actual_parent_records(
         source, target = direction.split("_to_", 1)
         return (
             {
-                "role": "source_refit",
+                "role": f"source_{stage}",
                 "context_id": source,
-                "public_relative_path": f"cross/{direction}/source_refit.npz",
+                "public_relative_path": f"cross/{direction}/source_{stage}.npz",
             },
             {
-                "role": "target_adapt_refit",
+                "role": f"target_adapt_{stage}",
                 "context_id": target,
-                "public_relative_path": f"cross/{direction}/target_adapt_refit.npz",
+                "public_relative_path": (
+                    f"cross/{direction}/target_adapt_{stage}.npz"
+                ),
             },
         )
     raise TaskCProfileInputError(
@@ -816,12 +822,16 @@ def _build_profile(
     public_manifest_path: Path,
     profile: str,
     condition: str,
+    stage: str,
     context_id: str | None,
     direction: str | None,
 ) -> _BuiltProfile:
     gene_limit, cell_limit = _profile_limits(profile)
     parent_specs = _actual_parent_records(
-        condition=condition, context_id=context_id, direction=direction
+        condition=condition,
+        stage=stage,
+        context_id=context_id,
+        direction=direction,
     )
     public_snapshot, public_manifest, inventory = _load_public_manifest(
         public_manifest_path
@@ -956,8 +966,18 @@ def _build_profile(
     expression_out = np.concatenate(expressions, axis=0)
     interventions_out = np.concatenate(labels_out)
     final_counts = Counter(interventions_out.tolist())
-    if final_counts.get(CONTROL_LABEL, 0) < minimum_cells or any(
-        final_counts.get(gene, 0) < minimum_cells for gene in genes
+    required_response_sources = (
+        set(genes)
+        if stage == "refit"
+        else set(genes) & set(public_manifest["tune_sources"])
+    )
+    if (
+        not required_response_sources
+        or final_counts.get(CONTROL_LABEL, 0) < minimum_cells
+        or any(
+            final_counts.get(gene, 0) < minimum_cells
+            for gene in required_response_sources
+        )
     ):
         raise TaskCProfileInputError(
             "profile output does not retain the public minimum for every selected source"
@@ -1002,9 +1022,10 @@ def _build_profile(
         "condition": condition,
         "context_id": context_id,
         "direction": direction,
-        "stage": "refit",
+        "stage": stage,
         "gene_selection": {
             "rule": GENE_SELECTION_RULE,
+            "selection_reference_stage": "refit",
             "parents": list(gene_parents),
             "ordered_genes": list(genes),
             "ordered_indices": list(gene_indices),
@@ -1067,6 +1088,7 @@ def materialize_task_c_profile_input(
     profile: str,
     condition: str,
     output_dir: Path,
+    stage: str = "refit",
     context_id: str | None = None,
     direction: str | None = None,
 ) -> dict[str, str]:
@@ -1076,6 +1098,7 @@ def materialize_task_c_profile_input(
         public_manifest_path=public_manifest_path,
         profile=profile,
         condition=condition,
+        stage=stage,
         context_id=context_id,
         direction=direction,
     )
@@ -1131,7 +1154,12 @@ def validate_task_c_profile_input(
     condition = observed.get("condition")
     context_id = observed.get("context_id")
     direction = observed.get("direction")
-    if not isinstance(profile, str) or not isinstance(condition, str):
+    stage = observed.get("stage")
+    if (
+        not isinstance(profile, str)
+        or not isinstance(condition, str)
+        or stage not in {"tune", "refit"}
+    ):
         raise TaskCProfileInputError("profile manifest identity is malformed")
     if context_id is not None and not isinstance(context_id, str):
         raise TaskCProfileInputError("profile context identity is malformed")
@@ -1141,6 +1169,7 @@ def validate_task_c_profile_input(
         public_manifest_path=public_manifest_path,
         profile=profile,
         condition=condition,
+        stage=stage,
         context_id=context_id,
         direction=direction,
     )
@@ -1166,6 +1195,7 @@ def validate_task_c_profile_input(
     return TaskCProfileInput(
         profile=profile,
         condition=condition,
+        stage=stage,
         context_id=context_id,
         direction=direction,
         expression=built.expression,

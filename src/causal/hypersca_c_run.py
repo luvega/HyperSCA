@@ -1684,23 +1684,24 @@ def run_hypersca_c(
             raise HyperSCACError("统一比较范围记录不属于当前公开清单")
         if selected_genes != profile_data.gene_names:
             raise HyperSCACError("基因清单必须精确等于统一比较范围记录的固定顺序")
+        stage = profile_data.stage
         if profile_data.condition == "within_environment":
             assert profile_data.context_id is not None
             context_order = (profile_data.context_id,)
             condition = {
-                "condition": f"within_refit_{profile_data.context_id}",
+                "condition": f"within_{stage}_{profile_data.context_id}",
                 "mode": "within",
                 "direction": None,
-                "stage": "refit",
+                "stage": stage,
             }
         else:
             assert profile_data.direction is not None
             context_order = tuple(profile_data.direction.split("_to_", 1))
             condition = {
-                "condition": f"cross_refit_{profile_data.direction}",
+                "condition": f"cross_{stage}_{profile_data.direction}",
                 "mode": "cross",
                 "direction": profile_data.direction,
-                "stage": "refit",
+                "stage": stage,
             }
         profile_contexts = profile_data.manifest["contexts"]
         if not isinstance(profile_contexts, list):

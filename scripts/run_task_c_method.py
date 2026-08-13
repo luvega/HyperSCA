@@ -65,6 +65,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gene-list", type=Path, help="HyperSCA-C 固定基因清单。")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--timeout-seconds", default="86400")
+    parser.add_argument(
+        "--trial-parameters",
+        type=Path,
+        help=(
+            "运行前固定的候选编号和参数；省略时记录为无需调节的固定设置。"
+        ),
+    )
     return parser
 
 
@@ -97,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
             gene_list_path=args.gene_list,
             device=args.device,
             timeout_seconds=timeout_seconds,
+            trial_parameters_path=args.trial_parameters,
             project_root=ROOT,
         )
     except (TaskCMethodRunError, OSError, UnicodeError) as exc:

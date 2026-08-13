@@ -24,6 +24,8 @@ from src.evaluation.task_c_data import (
     build_shared_task_c_split,
     materialize_task_c_split,
 )
+from src.evaluation.task_c_profile_input import materialize_task_c_profile_input
+from src.evaluation.task_c_method_run import run_task_c_method
 from tests.test_task_c_data import dataset_for_split
 
 
@@ -567,6 +569,39 @@ def _dataset_with_public_tune_controls(context_id: str) -> TaskCDataset:
     )
 
 
+def _run_bound_direct_mean_trial(
+    tmp_path: Path,
+    *,
+    tune: Path,
+    public: Path,
+    trial_index: int,
+) -> Path:
+    candidate = tmp_path / f"direct-candidate-{trial_index}.json"
+    candidate.write_text(
+        json.dumps(
+            {"schema_version": "1.0", "trial_index": trial_index, "parameters": {}}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / f"direct-trial-{trial_index}"
+    run_task_c_method(
+        method_id="mean_difference",
+        input_npz=tune,
+        output_dir=output,
+        seed=11,
+        registry_path=ROOT / "configs/task_c_methods_v1.json",
+        asset_root=tmp_path / "assets",
+        data_status="external_benchmark",
+        context_id="k562",
+        min_cells=5,
+        public_manifest_path=public,
+        trial_parameters_path=candidate,
+        project_root=ROOT,
+    )
+    return output
+
+
 def test_cli_formal_mode_binds_public_tune_and_completed_run(tmp_path: Path) -> None:
     k562 = _dataset_with_public_tune_controls("k562")
     rpe1 = _dataset_with_public_tune_controls("rpe1")
@@ -574,12 +609,8 @@ def test_cli_formal_mode_binds_public_tune_and_completed_run(tmp_path: Path) -> 
     bundle = materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
     tune = Path(bundle["within"]["k562"]["tune"])
     public = Path(bundle["public_manifest"])
-    trial = tmp_path / "formal-trial"
-    _write_formal_trial(
-        trial,
-        index=0,
-        tune_sha256=f"sha256:{hashlib.sha256(tune.read_bytes()).hexdigest()}",
-        public_sha256=f"sha256:{hashlib.sha256(public.read_bytes()).hexdigest()}",
+    trial = _run_bound_direct_mean_trial(
+        tmp_path, tune=tune, public=public, trial_index=0
     )
 
     completed = _run_cli(
@@ -640,12 +671,8 @@ def test_cli_formal_mode_rejects_non_task_c_environment_schema(tmp_path: Path) -
     bundle = materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
     tune = Path(bundle["within"]["k562"]["tune"])
     public = Path(bundle["public_manifest"])
-    trial = tmp_path / "formal-trial"
-    _write_formal_trial(
-        trial,
-        index=0,
-        tune_sha256=f"sha256:{hashlib.sha256(tune.read_bytes()).hexdigest()}",
-        public_sha256=f"sha256:{hashlib.sha256(public.read_bytes()).hexdigest()}",
+    trial = _run_bound_direct_mean_trial(
+        tmp_path, tune=tune, public=public, trial_index=0
     )
     environment_path = trial / "environment_manifest.json"
     environment = json.loads(environment_path.read_text(encoding="utf-8"))
@@ -672,3 +699,132 @@ def test_cli_formal_mode_rejects_non_task_c_environment_schema(tmp_path: Path) -
 
     assert completed.returncode != 0
     assert "environment fields" in completed.stderr
+
+
+def _run_bound_mean_trial(
+    tmp_path: Path,
+    *,
+    bundle: dict[str, object],
+    profile: dict[str, str],
+    context_id: str,
+    trial_index: int,
+) -> Path:
+    candidate = tmp_path / f"candidate-{trial_index}.json"
+    candidate.write_text(
+        json.dumps(
+            {"schema_version": "1.0", "trial_index": trial_index, "parameters": {}}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / f"bound-trial-{trial_index}"
+    run_task_c_method(
+        method_id="mean_difference",
+        input_npz=Path(profile["input_npz"]),
+        derived_input_manifest_path=Path(profile["manifest"]),
+        output_dir=output,
+        seed=11,
+        registry_path=ROOT / "configs/task_c_methods_v1.json",
+        asset_root=tmp_path / "assets",
+        data_status="external_benchmark",
+        context_id=context_id,
+        min_cells=5,
+        public_manifest_path=Path(bundle["public_manifest"]),
+        trial_parameters_path=candidate,
+        project_root=ROOT,
+    )
+    return output
+
+
+def test_cli_selects_two_real_task_c_tune_profile_runs_without_sidecars(
+    tmp_path: Path,
+) -> None:
+    k562 = _dataset_with_public_tune_controls("k562")
+    rpe1 = _dataset_with_public_tune_controls("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11, min_cells=5)
+    bundle = materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
+    profile = materialize_task_c_profile_input(
+        public_manifest_path=Path(bundle["public_manifest"]),
+        profile="connection",
+        condition="within_environment",
+        context_id="k562",
+        stage="tune",
+        output_dir=tmp_path / "profile-tune",
+    )
+    first = _run_bound_mean_trial(
+        tmp_path,
+        bundle=bundle,
+        profile=profile,
+        context_id="k562",
+        trial_index=0,
+    )
+    second = _run_bound_mean_trial(
+        tmp_path,
+        bundle=bundle,
+        profile=profile,
+        context_id="k562",
+        trial_index=1,
+    )
+
+    completed = _run_cli(
+        "--tune-npz", profile["input_npz"],
+        "--profile-manifest", profile["manifest"],
+        "--public-manifest", str(bundle["public_manifest"]),
+        "--trial-dir", str(second),
+        "--trial-dir", str(first),
+        "--output-json", str(tmp_path / "selected.json"),
+        "--config", str(CONFIG),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads((tmp_path / "selected.json").read_text(encoding="utf-8"))
+    assert result["selected_trial_index"] == 0
+    assert result["condition"] == "within_environment"
+    assert result["profile"] == "connection"
+    assert result["context_id"] == "k562"
+    assert result["direction"] is None
+    assert result["stage"] == "tune"
+    assert {trial["seed"] for trial in result["evidence"]["trials"]} == {11}
+    assert not any(path.name == "trial_parameters.json" for path in tmp_path.glob("*.json"))
+
+
+def test_cli_rejects_k562_trial_for_rpe1_tune_profile(tmp_path: Path) -> None:
+    k562 = _dataset_with_public_tune_controls("k562")
+    rpe1 = _dataset_with_public_tune_controls("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11, min_cells=5)
+    bundle = materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
+    k562_profile = materialize_task_c_profile_input(
+        public_manifest_path=Path(bundle["public_manifest"]),
+        profile="connection",
+        condition="within_environment",
+        context_id="k562",
+        stage="tune",
+        output_dir=tmp_path / "k562-tune",
+    )
+    rpe1_profile = materialize_task_c_profile_input(
+        public_manifest_path=Path(bundle["public_manifest"]),
+        profile="connection",
+        condition="within_environment",
+        context_id="rpe1",
+        stage="tune",
+        output_dir=tmp_path / "rpe1-tune",
+    )
+    trial = _run_bound_mean_trial(
+        tmp_path,
+        bundle=bundle,
+        profile=k562_profile,
+        context_id="k562",
+        trial_index=0,
+    )
+
+    completed = _run_cli(
+        "--tune-npz", rpe1_profile["input_npz"],
+        "--profile-manifest", rpe1_profile["manifest"],
+        "--public-manifest", str(bundle["public_manifest"]),
+        "--trial-dir", str(trial),
+        "--output-json", str(tmp_path / "selected.json"),
+        "--config", str(CONFIG),
+    )
+
+    assert completed.returncode != 0
+    assert "context" in completed.stderr or "tuning evidence" in completed.stderr
