@@ -280,6 +280,53 @@ def test_option_equals_value_is_redacted_when_only_its_value_is_logged(
     assert "<command-argument>" in result["stderr_tail"]
 
 
+@pytest.mark.parametrize(
+    "private_argument",
+    [
+        "-i={root}/Patient cohort C/input matrix.npz",
+        "-I{root}/Patient cohort D/include files",
+    ],
+)
+def test_short_attached_option_paths_are_fully_redacted(
+    tmp_path: Path,
+    private_argument: str,
+) -> None:
+    argument = private_argument.format(root=tmp_path)
+    result = run_isolated_method(
+        [
+            sys.executable,
+            "-c",
+            "import sys; print(sys.argv[1], file=sys.stderr); sys.exit(3)",
+            argument,
+        ],
+        output_dir=tmp_path / "run",
+        timeout_seconds=10,
+    )
+
+    assert argument not in result["stderr_tail"]
+    assert "Patient" not in result["stderr_tail"]
+    assert "cohort" not in result["stderr_tail"]
+    assert "<command-argument>" in result["stderr_tail"]
+
+
+def test_short_equals_option_value_is_redacted_when_logged_without_option(
+    tmp_path: Path,
+) -> None:
+    result = run_isolated_method(
+        [
+            sys.executable,
+            "-c",
+            "import sys; print(sys.argv[1].split('=', 1)[1], file=sys.stderr); sys.exit(3)",
+            "-i=P7",
+        ],
+        output_dir=tmp_path / "run",
+        timeout_seconds=10,
+    )
+
+    assert "P7" not in result["stderr_tail"]
+    assert "<command-argument>" in result["stderr_tail"]
+
+
 def test_explicit_exit_137_is_not_reported_as_a_terminating_signal(
     tmp_path: Path,
 ) -> None:
@@ -1039,6 +1086,28 @@ def test_bootstrap_safe_yaml_rejects_mapping_pip_duplicate_keys_and_tags(
             project_root=project,
             run_command=_FakeBootstrapRunner(),
         )
+
+
+def test_bootstrap_deep_yaml_is_reported_as_a_runtime_input_error(
+    tmp_path: Path,
+) -> None:
+    project, registry = _copy_bootstrap_inputs(tmp_path)
+    nested = "[" * 2000 + "value" + "]" * 2000
+    (project / "envs/task_c/causalbench.yml").write_text(
+        f"name: {nested}\n",
+        encoding="utf-8",
+    )
+    cache = tmp_path / "cache"
+
+    with pytest.raises(TaskCRuntimeError, match="YAML|environment"):
+        bootstrap_task_c_methods(
+            cache_root=cache,
+            registry_path=registry,
+            project_root=project,
+            run_command=_FakeBootstrapRunner(),
+        )
+
+    assert not list(cache.glob(".bootstrap-staging-*"))
 
 
 def test_bad_registry_never_leaves_staging_and_is_repeatably_rejected(

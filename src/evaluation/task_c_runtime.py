@@ -47,6 +47,11 @@ _ALLOWED_CACHE_ENTRIES = {
 _RESOURCE_LIMIT_CODES = {137, 152}
 _RESOURCE_LIMIT_SIGNALS = {signal.SIGKILL, signal.SIGXCPU}
 _PRIVATE_PATH = re.compile(r"(?<![A-Za-z0-9_.-])/(?:[^\s\"']+)")
+_PLAIN_OPTION = re.compile(r"(?:--[A-Za-z][A-Za-z0-9_-]*|-[A-Za-z])")
+_OPTION_WITH_VALUE = re.compile(r"(-{1,2}[A-Za-z][A-Za-z0-9_-]*)=(.+)", re.DOTALL)
+_SHORT_OPTION_WITH_VALUE = re.compile(r"(-[A-Za-z])(.+)", re.DOTALL)
+_NEGATIVE_NUMBER = re.compile(r"-(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+_COMMAND_ARGUMENT_MARKER = "\x00TASK_C_COMMAND_ARGUMENT\x00"
 
 
 class TaskCRuntimeError(ValueError):
@@ -80,19 +85,33 @@ class _TailBuffer:
 
     def text(self, command: Sequence[str] = ()) -> str:
         decoded = self.raw_text()
-        for argument in sorted(set(command[1:]), key=len, reverse=True):
-            if argument.startswith("--") and "=" in argument:
-                option, value = argument.split("=", 1)
-                if value:
-                    decoded = decoded.replace(
-                        argument,
-                        f"{option}=<command-argument>",
-                    )
-                    if len(value) >= 4:
-                        decoded = decoded.replace(value, "<command-argument>")
-            elif len(argument) >= 4 and not argument.startswith("-"):
-                decoded = decoded.replace(argument, "<command-argument>")
-        return _PRIVATE_PATH.sub("<absolute-path>", decoded)
+        for argument in sorted(set(command), key=len, reverse=True):
+            if _PLAIN_OPTION.fullmatch(argument) or _NEGATIVE_NUMBER.fullmatch(
+                argument
+            ):
+                continue
+            equals_option = _OPTION_WITH_VALUE.fullmatch(argument)
+            attached_option = _SHORT_OPTION_WITH_VALUE.fullmatch(argument)
+            if equals_option is not None:
+                option, value = equals_option.groups()
+                decoded = decoded.replace(
+                    argument,
+                    f"{option}={_COMMAND_ARGUMENT_MARKER}",
+                )
+                decoded = decoded.replace(value, _COMMAND_ARGUMENT_MARKER)
+            elif attached_option is not None:
+                option, value = attached_option.groups()
+                decoded = decoded.replace(
+                    argument,
+                    f"{option}{_COMMAND_ARGUMENT_MARKER}",
+                )
+                decoded = decoded.replace(value, _COMMAND_ARGUMENT_MARKER)
+            else:
+                decoded = decoded.replace(argument, _COMMAND_ARGUMENT_MARKER)
+        return _PRIVATE_PATH.sub("<absolute-path>", decoded).replace(
+            _COMMAND_ARGUMENT_MARKER,
+            "<command-argument>",
+        )
 
     def raw_text(self) -> str:
         return bytes(self.content).decode("utf-8", errors="replace")
@@ -931,7 +950,14 @@ def _validate_environment_snapshot(
         ) from exc
     try:
         documents = list(yaml.load_all(text, Loader=_UniqueSafeYamlLoader))
-    except (yaml.YAMLError, TaskCRuntimeError, TypeError, ValueError) as exc:
+    except (
+        yaml.YAMLError,
+        TaskCRuntimeError,
+        TypeError,
+        ValueError,
+        RecursionError,
+        OverflowError,
+    ) as exc:
         if isinstance(exc, TaskCRuntimeError):
             raise
         raise TaskCRuntimeError(
