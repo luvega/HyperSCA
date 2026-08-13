@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from numbers import Integral
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -424,3 +424,376 @@ def write_json(path: Path | str, payload: Any) -> None:
             raise
     except (OSError, TypeError, ValueError) as exc:
         raise TaskCDataError(f"cannot write provenance JSON: {destination}") from exc
+
+
+def _validated_row_indices(
+    dataset: TaskCDataset,
+    indices: Sequence[int] | np.ndarray,
+) -> np.ndarray:
+    values = np.asarray(indices)
+    if values.ndim != 1 or values.dtype.kind not in {"i", "u"}:
+        raise TaskCDataError("row indices must be a one-dimensional integer sequence")
+    normalized = np.asarray([int(value) for value in values.tolist()], dtype=int)
+    if len(set(normalized.tolist())) != len(normalized):
+        raise TaskCDataError("row indices must be unique")
+    if np.any(normalized < 0) or np.any(normalized >= dataset.expression.shape[0]):
+        raise TaskCDataError("row index is out of range")
+    return normalized
+
+
+def _write_dataset_subset(
+    dataset: TaskCDataset,
+    indices: Sequence[int] | np.ndarray,
+    path: Path,
+) -> str:
+    """Atomically write one validated, self-describing dataset subset."""
+    selected = _validated_row_indices(dataset, indices)
+    destination = Path(path).expanduser().resolve()
+    temporary: str | None = None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".npz",
+            dir=destination.parent,
+        )
+        os.close(fd)
+        np.savez_compressed(
+            temporary,
+            expression_matrix=dataset.expression[selected],
+            interventions=dataset.interventions[selected],
+            var_names=np.asarray(dataset.gene_names),
+        )
+        with open(temporary, "rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except (OSError, ValueError, TypeError) as exc:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+        raise TaskCDataError(f"cannot atomically write dataset subset: {destination}") from exc
+    return str(destination)
+
+
+def _indices_for_sources(
+    dataset: TaskCDataset,
+    sources: Sequence[str],
+    control_indices: Sequence[int],
+) -> np.ndarray:
+    if isinstance(sources, (str, bytes)) or any(
+        not isinstance(source, str) or not source or source == CONTROL_LABEL
+        for source in sources
+    ):
+        raise TaskCDataError("intervention sources must be nonempty text labels")
+    if len(set(sources)) != len(sources):
+        raise TaskCDataError("intervention sources must be unique")
+    observed = set(dataset.interventions.tolist())
+    missing = set(sources) - observed
+    if missing:
+        raise TaskCDataError("intervention source is absent from the dataset")
+    controls = _validated_row_indices(dataset, control_indices)
+    if any(dataset.interventions[index] != CONTROL_LABEL for index in controls):
+        raise TaskCDataError("control indices must point only to control rows")
+    source_mask = np.isin(dataset.interventions, np.asarray(tuple(sources), dtype=str))
+    selected = np.concatenate((np.flatnonzero(source_mask), controls))
+    return _validated_row_indices(dataset, np.sort(selected))
+
+
+def _private_split_payload(split: TaskCSplit) -> dict[str, Any]:
+    return {
+        "schema_version": split.schema_version,
+        "split_id": split.split_id,
+        "seed": split.seed,
+        "train_sources": list(split.train_sources),
+        "tune_sources": list(split.tune_sources),
+        "holdout_sources": list(split.holdout_sources),
+        "control_indices": {
+            context: {name: list(values) for name, values in parts.items()}
+            for context, parts in split.control_indices.items()
+        },
+    }
+
+
+def _relative_to_root(path: str | Path, root: Path) -> str:
+    try:
+        return Path(path).resolve().relative_to(root).as_posix()
+    except ValueError as exc:
+        raise TaskCDataError("materialized artifact is outside its bundle") from exc
+
+
+def _artifact_inventory(paths: Sequence[str], root: Path) -> dict[str, str]:
+    return {
+        relative: sha256_path(root / relative)
+        for relative in sorted(_relative_to_root(path, root) for path in paths)
+    }
+
+
+def _gene_names_sha256(gene_names: tuple[str, ...]) -> str:
+    encoded = json.dumps(gene_names, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _materialization_identity(
+    k562: TaskCDataset,
+    rpe1: TaskCDataset,
+    split: TaskCSplit,
+) -> dict[str, Any]:
+    return {
+        "schema_version": split.schema_version,
+        "split_id": split.split_id,
+        "seed": split.seed,
+        "input_sha256": {
+            "k562": k562.source_sha256,
+            "rpe1": rpe1.source_sha256,
+        },
+        "gene_names_sha256": _gene_names_sha256(k562.gene_names),
+    }
+
+
+def _materialized_result(root: Path) -> dict[str, Any]:
+    within = {
+        context: {
+            name: str((root / relative).resolve())
+            for name, relative in {
+                "train": f"within/{context}/train.npz",
+                "tune": f"within/{context}/tune.npz",
+                "refit": f"within/{context}/refit.npz",
+                "holdout": f"private/within/{context}/holdout.npz",
+            }.items()
+        }
+        for context in ("k562", "rpe1")
+    }
+    cross = {
+        direction: {
+            name: str((root / relative).resolve())
+            for name, relative in {
+                "source_train": f"cross/{direction}/source_train.npz",
+                "source_tune": f"cross/{direction}/source_tune.npz",
+                "source_refit": f"cross/{direction}/source_refit.npz",
+                "target_adapt_train": f"cross/{direction}/target_adapt_train.npz",
+                "target_adapt_tune": f"cross/{direction}/target_adapt_tune.npz",
+                "target_adapt_refit": f"cross/{direction}/target_adapt_refit.npz",
+                "target_holdout": f"private/cross/{direction}/target_holdout.npz",
+            }.items()
+        }
+        for direction in ("k562_to_rpe1", "rpe1_to_k562")
+    }
+    return {
+        "within": within,
+        "cross": cross,
+        "public_manifest": str((root / "public_manifest.json").resolve()),
+        "private_manifest": str(
+            (root / "private" / "private_manifest.json").resolve()
+        ),
+    }
+
+
+def _read_manifest(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise TaskCDataError(f"cannot verify existing manifest: {path}") from exc
+    if not isinstance(payload, dict):
+        raise TaskCDataError(f"existing manifest is not a JSON object: {path}")
+    return payload
+
+
+def _expected_artifact_paths(
+    result: Mapping[str, Any],
+    root: Path,
+) -> tuple[set[str], set[str]]:
+    public_paths = {
+        _relative_to_root(path, root)
+        for partitions in result["within"].values()
+        for name, path in partitions.items()
+        if name != "holdout"
+    }
+    public_paths.update(
+        _relative_to_root(path, root)
+        for partitions in result["cross"].values()
+        for name, path in partitions.items()
+        if name != "target_holdout"
+    )
+    private_paths = {
+        _relative_to_root(partitions["holdout"], root)
+        for partitions in result["within"].values()
+    }
+    private_paths.update(
+        _relative_to_root(partitions["target_holdout"], root)
+        for partitions in result["cross"].values()
+    )
+    return public_paths, private_paths
+
+
+def _verify_artifact_inventory(
+    root: Path,
+    manifest: Mapping[str, Any],
+    expected_paths: set[str],
+) -> None:
+    files = manifest.get("files")
+    if not isinstance(files, dict) or set(files) != expected_paths:
+        raise TaskCDataError("existing manifest has an incomplete artifact hash inventory")
+    for relative, expected_hash in files.items():
+        if not isinstance(relative, str) or not isinstance(expected_hash, str):
+            raise TaskCDataError("existing artifact inventory is malformed")
+        candidate = (root / relative).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise TaskCDataError("existing artifact path escapes its bundle") from exc
+        if not candidate.is_file() or sha256_path(candidate) != expected_hash:
+            raise TaskCDataError(f"existing artifact hash changed: {relative}")
+
+
+def _reuse_existing_materialization(
+    root: Path,
+    identity: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    public_path = root / "public_manifest.json"
+    private_path = root / "private" / "private_manifest.json"
+    if not root.exists():
+        return None
+    try:
+        has_entries = next(root.iterdir(), None) is not None
+    except OSError as exc:
+        raise TaskCDataError(f"cannot inspect output directory: {root}") from exc
+    if not has_entries:
+        return None
+    if not public_path.is_file() or not private_path.is_file():
+        raise TaskCDataError("existing output is incomplete; choose a new output directory")
+    public = _read_manifest(public_path)
+    private = _read_manifest(private_path)
+    if public.get("materialization_identity") != identity or private.get(
+        "materialization_identity"
+    ) != identity:
+        raise TaskCDataError("existing output has a different materialization identity")
+    result = _materialized_result(root)
+    public_paths, private_paths = _expected_artifact_paths(result, root)
+    _verify_artifact_inventory(root, public, public_paths)
+    _verify_artifact_inventory(root, private, private_paths)
+    return result
+
+
+def materialize_task_c_split(
+    k562: TaskCDataset,
+    rpe1: TaskCDataset,
+    split: TaskCSplit,
+    output_dir: str | Path,
+) -> dict[str, Any]:
+    """Write allowed model-building data separately from sealed evaluation data."""
+    validate_task_c_split(split, k562, rpe1)
+    if k562.gene_names != rpe1.gene_names:
+        raise TaskCDataError("K562 and RPE1 gene names and gene order must match")
+    if k562.expression.shape[1] != len(k562.gene_names) or rpe1.expression.shape[
+        1
+    ] != len(rpe1.gene_names):
+        raise TaskCDataError("dataset gene names do not match expression columns")
+
+    root = Path(output_dir).expanduser().resolve()
+    identity = _materialization_identity(k562, rpe1, split)
+    reused = _reuse_existing_materialization(root, identity)
+    if reused is not None:
+        return reused
+
+    datasets = {"k562": k562, "rpe1": rpe1}
+    result = _materialized_result(root)
+    public_paths: list[str] = []
+    private_paths: list[str] = []
+
+    for context, dataset in datasets.items():
+        controls = split.control_indices[context]
+        for partition, sources, control_parts in (
+            ("train", split.train_sources, ("train",)),
+            ("tune", split.tune_sources, ("tune",)),
+            ("refit", split.train_sources + split.tune_sources, ("train", "tune")),
+            ("holdout", split.holdout_sources, ("holdout",)),
+        ):
+            control_indices = tuple(
+                index for part in control_parts for index in controls[part]
+            )
+            path = result["within"][context][partition]
+            written = _write_dataset_subset(
+                dataset,
+                _indices_for_sources(dataset, sources, control_indices),
+                Path(path),
+            )
+            (private_paths if partition == "holdout" else public_paths).append(written)
+
+    for source_name, target_name in (("k562", "rpe1"), ("rpe1", "k562")):
+        source = datasets[source_name]
+        target = datasets[target_name]
+        source_controls = split.control_indices[source_name]
+        target_controls = split.control_indices[target_name]
+        direction = f"{source_name}_to_{target_name}"
+        direction_paths = result["cross"][direction]
+        for partition, sources, control_parts in (
+            ("source_train", split.train_sources, ("train",)),
+            ("source_tune", split.tune_sources, ("tune",)),
+            (
+                "source_refit",
+                split.train_sources + split.tune_sources,
+                ("train", "tune"),
+            ),
+        ):
+            control_indices = tuple(
+                index for part in control_parts for index in source_controls[part]
+            )
+            public_paths.append(
+                _write_dataset_subset(
+                    source,
+                    _indices_for_sources(source, sources, control_indices),
+                    Path(direction_paths[partition]),
+                )
+            )
+        for partition, control_parts in (
+            ("target_adapt_train", ("train",)),
+            ("target_adapt_tune", ("tune",)),
+            ("target_adapt_refit", ("train", "tune")),
+        ):
+            control_indices = tuple(
+                index for part in control_parts for index in target_controls[part]
+            )
+            public_paths.append(
+                _write_dataset_subset(
+                    target,
+                    _validated_row_indices(target, control_indices),
+                    Path(direction_paths[partition]),
+                )
+            )
+        all_sources = split.train_sources + split.tune_sources + split.holdout_sources
+        private_paths.append(
+            _write_dataset_subset(
+                target,
+                _indices_for_sources(
+                    target, all_sources, target_controls["holdout"]
+                ),
+                Path(direction_paths["target_holdout"]),
+            )
+        )
+
+    private_payload = _private_split_payload(split)
+    private_payload.update(
+        {
+            "materialization_identity": identity,
+            "files": _artifact_inventory(private_paths, root),
+        }
+    )
+    public_payload = {
+        "schema_version": split.schema_version,
+        "split_id": split.split_id,
+        "seed": split.seed,
+        "train_sources": list(split.train_sources),
+        "tune_sources": list(split.tune_sources),
+        "holdout_source_count": len(split.holdout_sources),
+        "input_sha256": identity["input_sha256"],
+        "gene_names_sha256": identity["gene_names_sha256"],
+        "materialization_identity": identity,
+        "files": _artifact_inventory(public_paths, root),
+    }
+    write_json(result["private_manifest"], private_payload)
+    write_json(result["public_manifest"], public_payload)
+    return result

@@ -6,6 +6,8 @@ import types
 import hashlib
 from pathlib import Path
 
+import numpy as np
+
 from src.evaluation.task_c_data import build_task_c_reference_provenance
 
 
@@ -181,3 +183,73 @@ def test_operational_export_uses_stubs_and_records_reproducible_artifacts(
             pooled_path=data_dir / f"reference_{context}_pooled.csv",
             chipseq_path=data_dir / f"reference_{context}_chipseq.csv",
         )
+
+
+def _write_cli_dataset(path: Path) -> None:
+    genes = np.asarray(["A", "B", "C", "D", "E", "Z"])
+    labels = ["non-targeting"] * 10
+    for gene in genes[:5]:
+        labels.extend([str(gene)] * 5)
+    expression = np.arange(len(labels) * len(genes), dtype=np.float32).reshape(
+        len(labels), len(genes)
+    )
+    np.savez(
+        path,
+        expression_matrix=expression,
+        interventions=np.asarray(labels),
+        var_names=genes,
+    )
+
+
+def test_prepare_cli_writes_five_reproducible_splits(tmp_path: Path) -> None:
+    k562 = tmp_path / "k562.npz"
+    rpe1 = tmp_path / "rpe1.npz"
+    _write_cli_dataset(k562)
+    _write_cli_dataset(rpe1)
+    references = {}
+    for context in ("k562", "rpe1"):
+        for reference_id in ("pooled", "chipseq"):
+            path = tmp_path / f"reference_{context}_{reference_id}.csv"
+            rows = (
+                "source,target\nA,B\nB,A\n"
+                if reference_id == "pooled"
+                else "source,target\nA,B\n"
+            )
+            path.write_text(rows, encoding="utf-8")
+            references[f"{context}_{reference_id}"] = path
+    output = tmp_path / "prepared"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/prepare_task_c_data.py"),
+            "--k562-npz",
+            str(k562),
+            "--rpe1-npz",
+            str(rpe1),
+            "--k562-pooled-reference",
+            str(references["k562_pooled"]),
+            "--k562-chipseq-reference",
+            str(references["k562_chipseq"]),
+            "--rpe1-pooled-reference",
+            str(references["rpe1_pooled"]),
+            "--rpe1-chipseq-reference",
+            str(references["rpe1_chipseq"]),
+            "--output-dir",
+            str(output),
+            "--min-cells-per-intervention",
+            "5",
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    summary = json.loads(completed.stdout)
+    assert summary["status"] == "prepared"
+    assert [entry["seed"] for entry in summary["splits"]] == [11, 23, 47, 71, 97]
+    for seed in (11, 23, 47, 71, 97):
+        assert (output / "splits" / f"seed_{seed}" / "public_manifest.json").exists()
+    assert (output / "provenance" / "k562.json").exists()
+    assert (output / "provenance" / "rpe1.json").exists()
+    assert (output / "provenance" / "k562_references.json").exists()
+    assert (output / "provenance" / "rpe1_references.json").exists()

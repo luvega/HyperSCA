@@ -16,6 +16,8 @@ from src.evaluation.task_c_data import (
     build_task_c_provenance,
     build_task_c_reference_provenance,
     load_task_c_dataset,
+    materialize_task_c_split,
+    sha256_path,
     write_json,
 )
 
@@ -352,3 +354,136 @@ def test_write_json_is_sorted_and_utf8(tmp_path):
     write_json(path, {"z": "终", "a": 1})
     assert json.loads(path.read_text(encoding="utf-8")) == {"a": 1, "z": "终"}
     assert path.read_text(encoding="utf-8").endswith("\n")
+
+
+def _walk_text_values(value):
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            yield str(key)
+            yield from _walk_text_values(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _walk_text_values(nested)
+    elif isinstance(value, str):
+        yield value
+
+
+def test_materialized_training_files_exclude_holdout_sources(tmp_path: Path) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11, min_cells=5)
+    result = materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
+
+    train = load_task_c_dataset(result["within"]["k562"]["train"], context_id="k562")
+    assert not (set(train.interventions.tolist()) & set(split.holdout_sources))
+
+    public = json.loads(Path(result["public_manifest"]).read_text(encoding="utf-8"))
+    assert "holdout_sources" not in public
+    assert "control_indices" not in public
+    assert all("private" not in value for value in _walk_text_values(public))
+    assert not set(split.holdout_sources) & set(_walk_text_values(public))
+
+    private = json.loads(Path(result["private_manifest"]).read_text(encoding="utf-8"))
+    assert private["holdout_sources"] == list(split.holdout_sources)
+    assert private["control_indices"]["k562"]["holdout"] == list(
+        split.control_indices["k562"]["holdout"]
+    )
+
+
+def test_cross_context_adaptation_contains_only_target_controls(tmp_path: Path) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11, min_cells=5)
+    result = materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
+
+    adapt = load_task_c_dataset(
+        result["cross"]["k562_to_rpe1"]["target_adapt_refit"],
+        context_id="rpe1",
+    )
+    assert set(adapt.interventions.tolist()) == {"non-targeting"}
+    source_train = load_task_c_dataset(
+        result["cross"]["k562_to_rpe1"]["source_train"],
+        context_id="k562",
+    )
+    source_tune = load_task_c_dataset(
+        result["cross"]["k562_to_rpe1"]["source_tune"],
+        context_id="k562",
+    )
+    assert not (set(source_train.interventions.tolist()) & set(split.tune_sources))
+    assert not (set(source_tune.interventions.tolist()) & set(split.train_sources))
+
+
+def test_materialized_manifests_use_relative_paths_and_verified_hashes(tmp_path: Path) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=23)
+    root = tmp_path / "bundle"
+    result = materialize_task_c_split(k562, rpe1, split, root)
+
+    public = json.loads(Path(result["public_manifest"]).read_text(encoding="utf-8"))
+    private = json.loads(Path(result["private_manifest"]).read_text(encoding="utf-8"))
+    assert public["files"]
+    assert private["files"]
+    assert set(public["files"]).isdisjoint(private["files"])
+    for manifest in (public, private):
+        for relative_path, digest in manifest["files"].items():
+            assert not Path(relative_path).is_absolute()
+            assert sha256_path(root / relative_path) == digest
+
+
+def test_materialization_rejects_incompatible_gene_order(tmp_path: Path) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = replace(
+        dataset_for_split("rpe1"),
+        gene_names=("B", "A", "C", "D", "E", "F", "Z"),
+    )
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+    with pytest.raises(TaskCDataError, match="gene names|gene order"):
+        materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
+
+
+def test_materialization_reuses_matching_bundle_and_rejects_changed_identity(
+    tmp_path: Path,
+) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=47)
+    root = tmp_path / "bundle"
+    first = materialize_task_c_split(k562, rpe1, split, root)
+    original_manifest = Path(first["public_manifest"]).read_bytes()
+
+    second = materialize_task_c_split(k562, rpe1, split, root)
+    assert Path(second["public_manifest"]).read_bytes() == original_manifest
+
+    changed = replace(k562, source_sha256="sha256:changed")
+    with pytest.raises(TaskCDataError, match="existing|identity|different"):
+        materialize_task_c_split(changed, rpe1, split, root)
+
+
+def test_materialization_rejects_tampered_existing_artifact(tmp_path: Path) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=71)
+    root = tmp_path / "bundle"
+    result = materialize_task_c_split(k562, rpe1, split, root)
+    Path(result["within"]["k562"]["train"]).write_bytes(b"changed")
+
+    with pytest.raises(TaskCDataError, match="hash|changed|existing"):
+        materialize_task_c_split(k562, rpe1, split, root)
+
+
+def test_failed_npz_write_leaves_no_final_or_temporary_file(tmp_path, monkeypatch):
+    import src.evaluation.task_c_data as task_c_data
+
+    dataset = dataset_for_split("k562")
+    destination = tmp_path / "part.npz"
+
+    def fail_after_partial_write(path, **arrays):
+        Path(path).write_bytes(b"partial")
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(np, "savez_compressed", fail_after_partial_write)
+    with pytest.raises(TaskCDataError, match="write"):
+        task_c_data._write_dataset_subset(dataset, np.asarray([0, 1]), destination)
+    assert not destination.exists()
+    assert list(tmp_path.iterdir()) == []
