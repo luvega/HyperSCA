@@ -29,8 +29,14 @@ SCHEMA_VERSION = "1.0"
 GNU_TIME = Path("/usr/bin/time")
 DEFAULT_MAXIMUM_OUTPUT_BYTES = 64 * 1024
 HARD_MAXIMUM_OUTPUT_BYTES = 1024 * 1024
+MAXIMUM_BOOTSTRAP_RECORD_BYTES = 2 * 1024 * 1024
+MAXIMUM_BOOTSTRAP_COMMAND_BYTES = 8 * 1024 * 1024
+MAXIMUM_BOOTSTRAP_INPUT_BYTES = 1024 * 1024
+BOOTSTRAP_COMMAND_TIMEOUT_SECONDS = 600
 _ALLOWED_CACHE_ENTRIES = {
     "bootstrap_identity.json",
+    "bootstrap_manifest.json",
+    "bootstrap_status.json",
     "environment_manifests",
     "sources",
     "status",
@@ -49,8 +55,17 @@ class _TailBuffer:
         self.maximum_bytes = maximum_bytes
         self.content = bytearray()
         self.total_bytes = 0
+        self._evidence_window = b""
+        self.saw_invalid_output = False
+        self.saw_resource_limit = False
 
     def add(self, chunk: bytes) -> None:
+        evidence = (self._evidence_window + chunk).lower()
+        if b"failed_invalid_output" in evidence:
+            self.saw_invalid_output = True
+        if b"out of memory" in evidence or b"memoryerror" in evidence:
+            self.saw_resource_limit = True
+        self._evidence_window = evidence[-64:]
         self.total_bytes += len(chunk)
         self.content.extend(chunk)
         if len(self.content) > self.maximum_bytes:
@@ -60,27 +75,231 @@ class _TailBuffer:
     def was_truncated(self) -> bool:
         return self.total_bytes > self.maximum_bytes
 
-    def text(self) -> str:
-        decoded = bytes(self.content).decode("utf-8", errors="replace")
+    def text(self, command: Sequence[str] = ()) -> str:
+        decoded = self.raw_text()
+        for argument in sorted(set(command[1:]), key=len, reverse=True):
+            if len(argument) >= 4 and not argument.startswith("-"):
+                decoded = decoded.replace(argument, "<command-argument>")
         return _PRIVATE_PATH.sub("<absolute-path>", decoded)
+
+    def raw_text(self) -> str:
+        return bytes(self.content).decode("utf-8", errors="replace")
+
+
+class _DuplicateJsonKey(ValueError):
+    pass
+
+
+class _FileSnapshot:
+    def __init__(
+        self,
+        path: Path,
+        payload: bytes,
+        identity: tuple[int, int, int, int],
+    ) -> None:
+        self.path = path
+        self.payload = payload
+        self.identity = identity
+
+    @property
+    def sha256(self) -> str:
+        return _sha256_bytes(self.payload)
+
+
+class _CommandResult:
+    def __init__(self, stdout: str, stderr: str, returncode: int) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+class _RunDirectory:
+    """已打开的结果目录；后续写入不再解析可被替换的路径。"""
+
+    def __init__(
+        self,
+        path: Path,
+        descriptor: int,
+        identity: tuple[int, int],
+        parent_descriptor: int,
+        name: str,
+    ) -> None:
+        self.path = path
+        self.descriptor = descriptor
+        self.identity = identity
+        self.parent_descriptor = parent_descriptor
+        self.name = name
+
+    def close(self) -> None:
+        os.close(self.descriptor)
+        os.close(self.parent_descriptor)
+
+    def path_still_names_open_directory(self) -> bool:
+        try:
+            metadata = os.stat(
+                self.name,
+                dir_fd=self.parent_descriptor,
+                follow_symlinks=False,
+            )
+            path_metadata = self.path.stat(follow_symlinks=False)
+        except OSError:
+            return False
+        return (
+            stat.S_ISDIR(metadata.st_mode)
+            and (metadata.st_dev, metadata.st_ino) == self.identity
+            and stat.S_ISDIR(path_metadata.st_mode)
+            and (path_metadata.st_dev, path_metadata.st_ino) == self.identity
+        )
+
+    def unlink(self, name: str) -> None:
+        try:
+            os.unlink(name, dir_fd=self.descriptor)
+        except FileNotFoundError:
+            pass
 
 
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _json_bytes(payload: Mapping[str, object]) -> bytes:
     return (
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _json_object_without_duplicates(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonKey(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_deep_json(text: str) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > 32:
+                raise TaskCRuntimeError("JSON record is too deeply nested")
+        elif character in "]}":
+            depth -= 1
+
+
+def _strict_json_loads(payload: bytes | str, label: str) -> object:
+    if isinstance(payload, str):
+        encoded = payload.encode("utf-8")
+        text = payload
+    else:
+        encoded = payload
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise TaskCRuntimeError(f"{label} is not valid UTF-8") from exc
+    if len(encoded) > MAXIMUM_BOOTSTRAP_RECORD_BYTES:
+        raise TaskCRuntimeError(f"{label} is unusually large")
+    _reject_deep_json(text)
+    try:
+        return json.loads(text, object_pairs_hook=_json_object_without_duplicates)
+    except _DuplicateJsonKey as exc:
+        raise TaskCRuntimeError(str(exc)) from exc
+    except (json.JSONDecodeError, RecursionError, OverflowError) as exc:
+        raise TaskCRuntimeError(f"{label} is not valid JSON") from exc
+
+
+def _snapshot_regular_file(
+    path: Path,
+    label: str,
+    *,
+    maximum_bytes: int = MAXIMUM_BOOTSTRAP_INPUT_BYTES,
+) -> _FileSnapshot:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise TaskCRuntimeError(f"{label} is missing or unsafe") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise TaskCRuntimeError(f"{label} must be one regular, unlinked file")
+        if before.st_size <= 0 or before.st_size > maximum_bytes:
+            raise TaskCRuntimeError(f"{label} is empty or unusually large")
+        chunks: list[bytes] = []
+        remaining = maximum_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    if before_identity != after_identity or len(payload) != before.st_size:
+        raise TaskCRuntimeError(f"{label} changed while it was read")
+    return _FileSnapshot(path, payload, before_identity)
+
+
+def _verify_snapshot_unchanged(snapshot: _FileSnapshot, label: str) -> None:
+    current = _snapshot_regular_file(snapshot.path, label)
+    if current.identity != snapshot.identity or current.payload != snapshot.payload:
+        raise TaskCRuntimeError(f"{label} changed during preparation")
+
+
+def _write_snapshot(path: Path, payload: bytes) -> None:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        written = 0
+        while written < len(payload):
+            written += os.write(descriptor, payload[written:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(path.parent)
 
 
 def _reject_symlink_components(path: Path, label: str) -> None:
@@ -124,10 +343,63 @@ def _atomic_create_json(path: Path, payload: Mapping[str, object]) -> None:
             raise TaskCRuntimeError(
                 f"refusing to overwrite existing record {path.name}"
             ) from exc
+        _fsync_directory(path.parent)
     finally:
         if descriptor is not None:
             os.close(descriptor)
         temporary.unlink(missing_ok=True)
+        _fsync_directory(path.parent)
+
+
+def _atomic_json_at(
+    directory: _RunDirectory,
+    name: str,
+    payload: Mapping[str, object],
+    *,
+    replace: bool,
+) -> None:
+    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory.descriptor,
+        )
+        content = _json_bytes(payload)
+        written = 0
+        while written < len(content):
+            written += os.write(descriptor, content[written:])
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        if replace:
+            os.rename(
+                temporary,
+                name,
+                src_dir_fd=directory.descriptor,
+                dst_dir_fd=directory.descriptor,
+            )
+        else:
+            try:
+                os.link(
+                    temporary,
+                    name,
+                    src_dir_fd=directory.descriptor,
+                    dst_dir_fd=directory.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise TaskCRuntimeError(
+                    f"refusing to overwrite existing record {name}"
+                ) from exc
+            directory.unlink(temporary)
+        os.fsync(directory.descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        directory.unlink(temporary)
 
 
 def _atomic_replace_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -150,21 +422,11 @@ def _atomic_replace_json(path: Path, payload: Mapping[str, object]) -> None:
         os.close(descriptor)
         descriptor = None
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         if descriptor is not None:
             os.close(descriptor)
         temporary.unlink(missing_ok=True)
-
-
-def _read_json_object(path: Path, label: str) -> dict[str, object]:
-    _require_safe_regular_file(path, label)
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise TaskCRuntimeError(f"cannot read {label}") from exc
-    if not isinstance(value, dict):
-        raise TaskCRuntimeError(f"{label} must contain one JSON object")
-    return value
 
 
 def classify_publication_only_method(spec: TaskCMethodSpec) -> dict[str, object]:
@@ -208,29 +470,72 @@ def _validated_positive_number(value: object, label: str) -> float:
     return normalized
 
 
-def _prepare_empty_output_directory(path: str | Path) -> Path:
-    destination = Path(path).expanduser()
-    _reject_symlink_components(destination, "output directory")
-    if destination.exists():
-        if not destination.is_dir():
-            raise TaskCRuntimeError("output location must be a directory")
-        try:
-            if any(destination.iterdir()):
-                raise TaskCRuntimeError(
-                    "output directory must be new or an existing empty directory"
+def _prepare_empty_output_directory(path: str | Path) -> _RunDirectory:
+    destination = Path(os.path.abspath(Path(path).expanduser()))
+    parts = destination.parts
+    if len(parts) < 2 or destination == Path(destination.anchor):
+        raise TaskCRuntimeError("output directory must not be the filesystem root")
+    directory_flags = (
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        current_descriptor = os.open(destination.anchor, directory_flags)
+    except OSError as exc:
+        raise TaskCRuntimeError(
+            "output directory root cannot be opened safely"
+        ) from exc
+    try:
+        for component in parts[1:-1]:
+            try:
+                next_descriptor = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=current_descriptor,
                 )
-        except OSError as exc:
-            raise TaskCRuntimeError(
-                "output directory cannot be inspected safely"
-            ) from exc
-    else:
+            except FileNotFoundError:
+                os.mkdir(component, mode=0o755, dir_fd=current_descriptor)
+                os.fsync(current_descriptor)
+                next_descriptor = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=current_descriptor,
+                )
+            os.close(current_descriptor)
+            current_descriptor = next_descriptor
+        name = parts[-1]
         try:
-            destination.mkdir(parents=True, exist_ok=False)
-        except OSError as exc:
-            raise TaskCRuntimeError(
-                "output directory cannot be created safely"
-            ) from exc
-    return destination
+            os.mkdir(name, mode=0o755, dir_fd=current_descriptor)
+            os.fsync(current_descriptor)
+        except FileExistsError:
+            pass
+        descriptor = os.open(name, directory_flags, dir_fd=current_descriptor)
+    except OSError as exc:
+        os.close(current_descriptor)
+        raise TaskCRuntimeError(
+            "output directory cannot be created or opened safely"
+        ) from exc
+    metadata = os.fstat(descriptor)
+    opened = _RunDirectory(
+        destination,
+        descriptor,
+        (metadata.st_dev, metadata.st_ino),
+        current_descriptor,
+        name,
+    )
+    if not opened.path_still_names_open_directory():
+        opened.close()
+        raise TaskCRuntimeError("output directory changed while it was opened")
+    try:
+        entries = os.listdir(opened.descriptor)
+    except OSError as exc:
+        opened.close()
+        raise TaskCRuntimeError("output directory cannot be inspected safely") from exc
+    if entries:
+        opened.close()
+        raise TaskCRuntimeError(
+            "output directory must be new or an existing empty directory"
+        )
+    return opened
 
 
 def _command_trace(command: Sequence[str]) -> dict[str, object]:
@@ -285,8 +590,6 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 def _parse_maximum_resident_kib(path: Path) -> int | None:
-    if not path.exists():
-        return None
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -305,6 +608,39 @@ def _parse_maximum_resident_kib(path: Path) -> int | None:
     return None
 
 
+def _parse_maximum_resident_kib_at(
+    directory: _RunDirectory,
+    name: str,
+) -> tuple[int | None, bool]:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory.descriptor,
+        )
+    except OSError:
+        return None, False
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            return None, False
+        maximum = 64 * 1024
+        payload = os.read(descriptor, maximum + 1)
+        if len(payload) > maximum:
+            return None, False
+    finally:
+        os.close(descriptor)
+    text = payload.decode("utf-8", errors="replace")
+    for line in text.splitlines():
+        if "Maximum resident set size" not in line:
+            continue
+        value_text = line.rsplit(":", 1)[-1].strip()
+        if re.fullmatch(r"[0-9]+", value_text) is None:
+            return None, False
+        return int(value_text), True
+    return None, False
+
+
 def _executable_is_missing(executable: str) -> bool:
     if "/" in executable:
         candidate = Path(executable)
@@ -312,18 +648,20 @@ def _executable_is_missing(executable: str) -> bool:
     return shutil.which(executable) is None
 
 
-def _classify_return(return_code: int, stderr: str) -> str:
-    lowered = stderr.lower()
-    if "failed_invalid_output" in lowered:
+def _classify_return(return_code: int, stderr: _TailBuffer) -> str:
+    if stderr.saw_invalid_output:
         return "failed_invalid_output"
     if return_code == 0:
         return "completed_raw_inference"
-    signal_number = -return_code if return_code < 0 else return_code - 128
+    if return_code == 125:
+        return "failed_runtime_unavailable"
+    if return_code in {126, 127}:
+        return "failed_launch"
+    signal_number = -return_code if return_code < 0 else None
     if (
         return_code in _RESOURCE_LIMIT_CODES
         or signal_number in _RESOURCE_LIMIT_SIGNALS
-        or "out of memory" in lowered
-        or "memoryerror" in lowered
+        or stderr.saw_resource_limit
     ):
         return "failed_resource_limit"
     return "official_code_incompatible"
@@ -349,7 +687,7 @@ def run_isolated_method(
             f"maximum output bytes cannot exceed {HARD_MAXIMUM_OUTPUT_BYTES}"
         )
     destination = _prepare_empty_output_directory(output_dir)
-    resource_temporary = destination / f".resource_usage.{uuid.uuid4().hex}.tmp"
+    resource_temporary = f".resource_usage.{uuid.uuid4().hex}.tmp"
     stdout = _TailBuffer(maximum_output_bytes)
     stderr = _TailBuffer(maximum_output_bytes)
     started = time.monotonic()
@@ -357,91 +695,126 @@ def run_isolated_method(
     status = "official_code_incompatible"
     resource_meter = "gnu_time_v"
     process: subprocess.Popen[bytes] | None = None
+    resource_descriptor: int | None = None
     threads: list[threading.Thread] = []
+    pending_exception: BaseException | None = None
     missing_method = _executable_is_missing(normalized_command[0])
     missing_meter = not GNU_TIME.is_file() or not os.access(GNU_TIME, os.X_OK)
     try:
         if missing_method:
             stderr.add(b"registered method executable could not be started")
+            status = "failed_launch"
+            resource_meter = "unavailable"
         elif missing_meter:
+            status = "failed_runtime_unavailable"
             resource_meter = "unavailable"
             stderr.add(
                 b"GNU time resource meter is unavailable; method was not started"
             )
         else:
+            resource_descriptor = os.open(
+                resource_temporary,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=destination.descriptor,
+            )
             timed_command = [
                 str(GNU_TIME),
                 "-v",
                 "-o",
-                str(resource_temporary),
+                f"/proc/self/fd/{resource_descriptor}",
                 "--",
                 *normalized_command,
             ]
             environment = dict(os.environ)
             environment["LC_ALL"] = "C"
-            process = subprocess.Popen(
-                timed_command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-                bufsize=0,
-                env=environment,
-            )
-            assert process.stdout is not None and process.stderr is not None
-            threads = [
-                threading.Thread(
-                    target=_drain_stream,
-                    args=(process.stdout, stdout),
-                    daemon=True,
-                ),
-                threading.Thread(
-                    target=_drain_stream,
-                    args=(process.stderr, stderr),
-                    daemon=True,
-                ),
-            ]
-            for thread in threads:
-                thread.start()
             try:
-                return_code = process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                status = "failed_timeout"
-                _terminate_process_group(process)
+                process = subprocess.Popen(
+                    timed_command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                    bufsize=0,
+                    env=environment,
+                    pass_fds=(resource_descriptor,),
+                )
+            except OSError:
+                status = "failed_launch"
+                resource_meter = "unavailable"
+                stderr.add(b"registered method process could not be started")
+            if process is None:
                 return_code = None
             else:
-                # A method is not allowed to leave background descendants behind.
-                _terminate_process_group(process)
-            for thread in threads:
-                thread.join(timeout=1)
-            if status != "failed_timeout":
-                assert return_code is not None
-                status = _classify_return(return_code, stderr.text())
-    except BaseException:
+                assert process.stdout is not None and process.stderr is not None
+                threads = [
+                    threading.Thread(
+                        target=_drain_stream,
+                        args=(process.stdout, stdout),
+                        daemon=True,
+                    ),
+                    threading.Thread(
+                        target=_drain_stream,
+                        args=(process.stderr, stderr),
+                        daemon=True,
+                    ),
+                ]
+                for thread in threads:
+                    thread.start()
+                try:
+                    return_code = process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    status = "failed_timeout"
+                    _terminate_process_group(process)
+                    return_code = None
+                else:
+                    # A method is not allowed to leave background descendants behind.
+                    _terminate_process_group(process)
+                for thread in threads:
+                    thread.join(timeout=1)
+                if status != "failed_timeout":
+                    assert return_code is not None
+                    status = _classify_return(return_code, stderr)
+    except BaseException as exc:
         if process is not None:
             _terminate_process_group(process)
         for thread in threads:
             thread.join(timeout=1)
-        resource_temporary.unlink(missing_ok=True)
-        raise
+        status = "failed_runtime_unavailable"
+        resource_meter = "unavailable"
+        stderr.add(b"runtime supervision was interrupted")
+        pending_exception = exc
+
+    if resource_descriptor is not None:
+        os.close(resource_descriptor)
+        resource_descriptor = None
 
     elapsed = float(time.monotonic() - started)
     if not math.isfinite(elapsed) or elapsed < 0:
-        resource_temporary.unlink(missing_ok=True)
+        destination.unlink(resource_temporary)
+        destination.close()
         raise TaskCRuntimeError("elapsed time could not be measured safely")
     if return_code is not None and return_code < 0:
         terminating_signal: int | None = -return_code
-    elif return_code is not None and return_code >= 128:
-        terminating_signal = return_code - 128
     else:
         terminating_signal = None
+    maximum_resident_kib, resource_report_valid = _parse_maximum_resident_kib_at(
+        destination,
+        resource_temporary,
+    )
+    if not resource_report_valid:
+        resource_meter = "unavailable"
+        if process is not None and status == "completed_raw_inference":
+            status = "failed_runtime_unavailable"
+    if not destination.path_still_names_open_directory():
+        status = "failed_runtime_unavailable"
     payload: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "status": status,
         "return_code": return_code,
         "terminating_signal": terminating_signal,
         "elapsed_seconds": elapsed,
-        "stdout_tail": stdout.text(),
-        "stderr_tail": stderr.text(),
+        "stdout_tail": stdout.text(normalized_command),
+        "stderr_tail": stderr.text(normalized_command),
         "output_was_truncated": {
             "stdout": stdout.was_truncated,
             "stderr": stderr.was_truncated,
@@ -451,35 +824,99 @@ def run_isolated_method(
     resource_values: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "elapsed_seconds": elapsed,
-        "maximum_resident_kib": _parse_maximum_resident_kib(resource_temporary),
+        "maximum_resident_kib": maximum_resident_kib,
         "resource_meter": resource_meter,
     }
-    resource_temporary.unlink(missing_ok=True)
-    created: list[Path] = []
+    destination.unlink(resource_temporary)
+    created: list[str] = []
     try:
-        for path, record in (
-            (destination / "method_status.json", payload),
-            (destination / "resource_usage.json", resource_values),
+        for name, record in (
+            ("method_status.json", payload),
+            ("resource_usage.json", resource_values),
         ):
-            _atomic_create_json(path, record)
-            created.append(path)
+            _atomic_json_at(destination, name, record, replace=False)
+            created.append(name)
+        if not destination.path_still_names_open_directory() and payload["status"] != (
+            "failed_runtime_unavailable"
+        ):
+            payload["status"] = "failed_runtime_unavailable"
+            _atomic_json_at(
+                destination,
+                "method_status.json",
+                payload,
+                replace=True,
+            )
     except BaseException:
-        for path in created:
-            path.unlink(missing_ok=True)
+        for name in created:
+            destination.unlink(name)
         raise
+    finally:
+        destination.unlink(resource_temporary)
+        destination.close()
+    if pending_exception is not None:
+        raise pending_exception
     return payload
 
 
-def _environment_name(path: Path) -> str:
-    _require_safe_regular_file(path, f"environment file {path.name}")
+def _validate_environment_snapshot(
+    snapshot: _FileSnapshot,
+    expected_name: str,
+    causalbench_pin: str,
+) -> None:
+    try:
+        text = snapshot.payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise TaskCRuntimeError(
+            f"environment file {snapshot.path.name} is not valid UTF-8"
+        ) from exc
+    if "\t" in text or "\x00" in text or "\n---" in text:
+        raise TaskCRuntimeError(
+            f"environment file {snapshot.path.name} uses unsupported YAML structure"
+        )
     names = [
-        line.split(":", 1)[1].strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
+        line[len("name:") :].strip()
+        for line in text.splitlines()
         if line.startswith("name:")
     ]
-    if len(names) != 1 or not names[0]:
-        raise TaskCRuntimeError(f"environment name is missing from {path.name}")
-    return names[0]
+    if names != [expected_name]:
+        raise TaskCRuntimeError(
+            f"environment name in {snapshot.path.name} does not match the method registry"
+        )
+    for section in ("channels:", "dependencies:"):
+        if sum(line == section for line in text.splitlines()) != 1:
+            raise TaskCRuntimeError(
+                f"environment file {snapshot.path.name} has duplicate or missing YAML sections"
+            )
+    pip_headers = [
+        index
+        for index, line in enumerate(text.splitlines())
+        if re.fullmatch(r"  - pip:\s*", line)
+    ]
+    if len(pip_headers) != 1:
+        raise TaskCRuntimeError(
+            f"environment {expected_name} must contain one pip dependency section"
+        )
+    lines = text.splitlines()
+    pip_dependencies: list[str] = []
+    for line in lines[pip_headers[0] + 1 :]:
+        if line and not line.startswith(" "):
+            break
+        if line.startswith("  - "):
+            break
+        match = re.fullmatch(r"      - (\S+)\s*", line)
+        if match:
+            pip_dependencies.append(match.group(1))
+        elif line.strip() and not line.lstrip().startswith("#"):
+            raise TaskCRuntimeError(
+                f"environment {expected_name} has an ambiguous pip dependency"
+            )
+    vcs_dependencies = [
+        dependency for dependency in pip_dependencies if dependency.startswith("git+")
+    ]
+    if vcs_dependencies != [causalbench_pin]:
+        raise TaskCRuntimeError(
+            f"environment {expected_name} does not contain the fixed CausalBench source"
+        )
 
 
 def _source_records(registry: TaskCMethodRegistry) -> dict[str, dict[str, str]]:
@@ -502,7 +939,7 @@ def _source_records(registry: TaskCMethodRegistry) -> dict[str, dict[str, str]]:
 def _environment_records(
     registry: TaskCMethodRegistry,
     project_root: Path,
-) -> dict[str, Path]:
+) -> dict[str, _FileSnapshot]:
     records = {
         registry.causalbench["environment"]: project_root
         / "envs/task_c/causalbench.yml"
@@ -511,35 +948,81 @@ def _environment_records(
         if method.source_kind == "git":
             assert method.environment is not None
             records[method.environment] = project_root / "envs/task_c/psgrn.yml"
+    causalbench_pin = (
+        f"git+{registry.causalbench['repository']}@{registry.causalbench['commit']}"
+    )
+    snapshots: dict[str, _FileSnapshot] = {}
     for expected_name, path in records.items():
-        if _environment_name(path) != expected_name:
-            raise TaskCRuntimeError(
-                f"environment name in {path.name} does not match the method registry"
-            )
-        content = path.read_text(encoding="utf-8")
-        causalbench_pin = (
-            f"{registry.causalbench['repository']}@{registry.causalbench['commit']}"
-        )
-        if causalbench_pin not in content:
-            raise TaskCRuntimeError(
-                f"environment {expected_name} does not contain the fixed CausalBench source"
-            )
-    return records
+        snapshot = _snapshot_regular_file(path, f"environment file {path.name}")
+        _validate_environment_snapshot(snapshot, expected_name, causalbench_pin)
+        snapshots[expected_name] = snapshot
+    return snapshots
 
 
 def _bootstrap_identity(
-    registry_path: Path,
+    registry_snapshot: _FileSnapshot,
     sources: Mapping[str, Mapping[str, str]],
-    environments: Mapping[str, Path],
+    environments: Mapping[str, _FileSnapshot],
 ) -> dict[str, object]:
     return {
         "schema_version": SCHEMA_VERSION,
-        "registry_sha256": _sha256_file(registry_path),
+        "registry_sha256": registry_snapshot.sha256,
         "sources": {key: dict(value) for key, value in sources.items()},
         "environment_files": {
-            name: _sha256_file(path) for name, path in environments.items()
+            name: snapshot.sha256 for name, snapshot in environments.items()
         },
     }
+
+
+def _run_bounded_command(command: list[str], timeout: float) -> _CommandResult:
+    stdout = _TailBuffer(MAXIMUM_BOOTSTRAP_COMMAND_BYTES)
+    stderr = _TailBuffer(MAXIMUM_BOOTSTRAP_COMMAND_BYTES)
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            bufsize=0,
+        )
+    except OSError as exc:
+        raise TaskCRuntimeError(
+            f"official asset command could not start: {Path(command[0]).name}"
+        ) from exc
+    assert process.stdout is not None and process.stderr is not None
+    threads = [
+        threading.Thread(
+            target=_drain_stream, args=(process.stdout, stdout), daemon=True
+        ),
+        threading.Thread(
+            target=_drain_stream, args=(process.stderr, stderr), daemon=True
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        return_code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_group(process)
+        raise TaskCRuntimeError(
+            f"official asset command timed out: {Path(command[0]).name}"
+        ) from exc
+    except BaseException:
+        _terminate_process_group(process)
+        raise
+    finally:
+        for thread in threads:
+            thread.join(timeout=1)
+    _terminate_process_group(process)
+    if stdout.was_truncated or stderr.was_truncated:
+        raise TaskCRuntimeError(
+            f"official asset command output was unusually large: {Path(command[0]).name}"
+        )
+    if return_code != 0:
+        raise TaskCRuntimeError(
+            f"official asset command failed: {Path(command[0]).name}"
+        )
+    return _CommandResult(stdout.raw_text(), stderr.raw_text(), return_code)
 
 
 def _run_checked(
@@ -548,7 +1031,15 @@ def _run_checked(
     *,
     capture_output: bool = False,
 ) -> Any:
-    kwargs: dict[str, object] = {"check": True}
+    if runner is subprocess.run:
+        return _run_bounded_command(
+            command,
+            float(BOOTSTRAP_COMMAND_TIMEOUT_SECONDS),
+        )
+    kwargs: dict[str, object] = {
+        "check": True,
+        "timeout": BOOTSTRAP_COMMAND_TIMEOUT_SECONDS,
+    }
     if capture_output:
         kwargs.update({"capture_output": True, "text": True})
     try:
@@ -563,8 +1054,14 @@ def _validate_source_checkout(
     source: Path,
     expected: Mapping[str, str],
     runner: Callable[..., Any],
-) -> None:
-    if source.is_symlink() or not source.is_dir() or not (source / ".git").is_dir():
+) -> str:
+    git_directory = source / ".git"
+    if (
+        source.is_symlink()
+        or not source.is_dir()
+        or git_directory.is_symlink()
+        or not git_directory.is_dir()
+    ):
         raise TaskCRuntimeError("official source must be a regular Git checkout")
     repository = _run_checked(
         runner,
@@ -578,7 +1075,15 @@ def _validate_source_checkout(
     ).stdout.strip()
     changes = _run_checked(
         runner,
-        ["git", "-C", str(source), "status", "--porcelain"],
+        [
+            "git",
+            "-C",
+            str(source),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
         capture_output=True,
     ).stdout.strip()
     if repository != expected["repository"]:
@@ -588,17 +1093,92 @@ def _validate_source_checkout(
     if revision != expected["commit"]:
         raise TaskCRuntimeError("official source is not at the fixed commit")
     if changes:
-        raise TaskCRuntimeError("official source contains unreviewed local changes")
+        raise TaskCRuntimeError(
+            "official source contains changed, untracked, or ignored files"
+        )
+    replacements = _run_checked(
+        runner,
+        ["git", "-C", str(source), "replace", "-l"],
+        capture_output=True,
+    ).stdout.strip()
+    if replacements:
+        raise TaskCRuntimeError("official source uses an unreviewed Git replacement")
+    graft_path_text = _run_checked(
+        runner,
+        ["git", "-C", str(source), "rev-parse", "--git-path", "info/grafts"],
+        capture_output=True,
+    ).stdout.strip()
+    graft_path = Path(graft_path_text)
+    if not graft_path.is_absolute():
+        graft_path = source / graft_path
+    if graft_path.exists() or graft_path.is_symlink():
+        graft = _snapshot_regular_file(graft_path, "Git graft file")
+        if graft.payload.strip():
+            raise TaskCRuntimeError("official source uses an unreviewed Git graft")
+    tracked_text = _run_checked(
+        runner,
+        ["git", "-C", str(source), "ls-files", "-z", "--cached"],
+        capture_output=True,
+    ).stdout
+    committed_text = _run_checked(
+        runner,
+        ["git", "-C", str(source), "ls-tree", "-r", "-z", "--name-only", "HEAD"],
+        capture_output=True,
+    ).stdout
+    tracked = {item for item in tracked_text.split("\x00") if item}
+    committed = {item for item in committed_text.split("\x00") if item}
+    if tracked != committed or not tracked:
+        raise TaskCRuntimeError(
+            "official source tracked files do not match the fixed commit"
+        )
+    _run_checked(
+        runner,
+        ["git", "-C", str(source), "diff", "--no-ext-diff", "--quiet", "HEAD", "--"],
+    )
+    worktree_files: set[str] = set()
+    digest = hashlib.sha256()
+    for current_root, directory_names, file_names in os.walk(
+        source,
+        topdown=True,
+        followlinks=False,
+    ):
+        current = Path(current_root)
+        if current == source:
+            directory_names[:] = [name for name in directory_names if name != ".git"]
+        directory_names.sort()
+        file_names.sort()
+        for directory_name in tuple(directory_names):
+            directory = current / directory_name
+            if directory.is_symlink():
+                raise TaskCRuntimeError("official source contains a symbolic link")
+        for file_name in file_names:
+            path = current / file_name
+            if path.is_symlink():
+                raise TaskCRuntimeError("official source contains a symbolic link")
+            relative = path.relative_to(source).as_posix()
+            snapshot = _snapshot_regular_file(
+                path,
+                f"official source file {relative}",
+                maximum_bytes=512 * 1024 * 1024,
+            )
+            worktree_files.add(relative)
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\x00")
+            digest.update(bytes.fromhex(snapshot.sha256))
+    if worktree_files != tracked:
+        raise TaskCRuntimeError(
+            "official source contains untracked or missing worktree files"
+        )
+    return digest.hexdigest()
 
 
 def _ensure_source(
     source: Path,
     expected: Mapping[str, str],
     runner: Callable[..., Any],
-) -> None:
+) -> str:
     if source.exists() or source.is_symlink():
-        _validate_source_checkout(source, expected, runner)
-        return
+        return _validate_source_checkout(source, expected, runner)
     try:
         _run_checked(
             runner,
@@ -608,7 +1188,7 @@ def _ensure_source(
             runner,
             ["git", "-C", str(source), "checkout", "--detach", expected["commit"]],
         )
-        _validate_source_checkout(source, expected, runner)
+        return _validate_source_checkout(source, expected, runner)
     except BaseException:
         if source.exists() and not source.is_symlink():
             shutil.rmtree(source)
@@ -648,9 +1228,18 @@ def _normalized_packages(payload: object) -> list[dict[str, str]]:
 
 
 def _write_same_or_new(path: Path, payload: Mapping[str, object]) -> None:
+    expected_bytes = _json_bytes(payload)
     if path.exists() or path.is_symlink():
-        if _read_json_object(path, path.name) != dict(payload):
-            raise TaskCRuntimeError(f"existing {path.name} has a different identity")
+        snapshot = _snapshot_regular_file(
+            path,
+            path.name,
+            maximum_bytes=MAXIMUM_BOOTSTRAP_RECORD_BYTES,
+        )
+        _strict_json_loads(snapshot.payload, path.name)
+        if snapshot.payload != expected_bytes:
+            raise TaskCRuntimeError(
+                f"existing {path.name} bytes have a different identity"
+            )
         return
     _atomic_create_json(path, payload)
 
@@ -671,6 +1260,14 @@ def _prepare_cache_root(path: str | Path) -> Path:
     return root
 
 
+def _unlink_cache_record(path: Path) -> None:
+    if not (path.exists() or path.is_symlink()):
+        return
+    _require_safe_regular_file(path, path.name)
+    path.unlink()
+    _fsync_directory(path.parent)
+
+
 def _ensure_cache_subdirectory(path: Path, label: str) -> Path:
     if path.is_symlink():
         raise TaskCRuntimeError(f"cache {label} must not be a symbolic link")
@@ -682,6 +1279,18 @@ def _ensure_cache_subdirectory(path: Path, label: str) -> Path:
     return path
 
 
+def _reject_unexpected_entries(
+    directory: Path,
+    expected_names: set[str],
+    label: str,
+) -> None:
+    unexpected = {entry.name for entry in directory.iterdir()} - expected_names
+    if unexpected:
+        raise TaskCRuntimeError(
+            f"cache {label} contains unexpected entries: {sorted(unexpected)}"
+        )
+
+
 def bootstrap_task_c_methods(
     *,
     cache_root: str | Path,
@@ -691,98 +1300,223 @@ def bootstrap_task_c_methods(
 ) -> dict[str, object]:
     """获取固定版本的官方代码，建立隔离环境，并留下可重复核对的记录。"""
 
-    registry_file = Path(registry_path)
-    registry = load_task_c_method_registry(registry_file)
-    project = Path(project_root)
-    sources = _source_records(registry)
-    environments = _environment_records(registry, project)
-    identity = _bootstrap_identity(registry_file, sources, environments)
+    registry_snapshot = _snapshot_regular_file(
+        Path(registry_path),
+        "method registry",
+    )
     root = _prepare_cache_root(cache_root)
-    identity_path = root / "bootstrap_identity.json"
-    if identity_path.exists() or identity_path.is_symlink():
-        if _read_json_object(identity_path, "bootstrap identity") != identity:
-            raise TaskCRuntimeError(
-                "cache identity differs from the fixed registry or environment files"
-            )
-    else:
-        _atomic_create_json(identity_path, identity)
+    staging = root / f".bootstrap-staging-{uuid.uuid4().hex}"
+    staging.mkdir(mode=0o700)
+    _fsync_directory(root)
+    registry_copy = staging / "task_c_methods_v1.json"
+    _write_snapshot(registry_copy, registry_snapshot.payload)
+    registry = load_task_c_method_registry(registry_copy)
+    sources = _source_records(registry)
+    project = Path(project_root)
+    in_progress = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "asset_preparation_in_progress",
+    }
+    _atomic_replace_json(root / "bootstrap_status.json", in_progress)
+    _unlink_cache_record(root / "bootstrap_manifest.json")
 
-    source_root = _ensure_cache_subdirectory(root / "sources", "sources")
-    for source_id, expected in sources.items():
-        _ensure_source(source_root / source_id, expected, run_command)
-
-    status_root = _ensure_cache_subdirectory(root / "status", "status")
-    for method in registry.methods.values():
-        if method.source_kind == "publication_only":
-            method_status_root = _ensure_cache_subdirectory(
-                status_root / method.method_id,
-                f"status/{method.method_id}",
-            )
-            _write_same_or_new(
-                method_status_root / "method_status.json",
-                classify_publication_only_method(method),
-            )
-
-    environment_listing = _run_checked(
-        run_command,
-        ["conda", "env", "list", "--json"],
-        capture_output=True,
-    )
     try:
-        existing_environments = _existing_environment_names(
-            json.loads(environment_listing.stdout)
+        environments = _environment_records(registry, project)
+        environment_copies: dict[str, Path] = {}
+        input_directory = staging / "environment_inputs"
+        input_directory.mkdir()
+        for environment_name, snapshot in environments.items():
+            destination = input_directory / snapshot.path.name
+            _write_snapshot(destination, snapshot.payload)
+            environment_copies[environment_name] = destination
+
+        identity = _bootstrap_identity(
+            registry_snapshot,
+            sources,
+            environments,
         )
-    except json.JSONDecodeError as exc:
-        raise TaskCRuntimeError("conda environment list is not valid JSON") from exc
-    manifest_root = _ensure_cache_subdirectory(
-        root / "environment_manifests", "environment_manifests"
-    )
-    for environment_name, environment_file in environments.items():
-        if environment_name in existing_environments:
-            _run_checked(
+        identity_path = root / "bootstrap_identity.json"
+        _write_same_or_new(identity_path, identity)
+
+        source_root = _ensure_cache_subdirectory(root / "sources", "sources")
+        _reject_unexpected_entries(source_root, set(sources), "sources")
+        source_manifests: dict[str, dict[str, str]] = {}
+        for source_id, expected in sources.items():
+            worktree_sha256 = _ensure_source(
+                source_root / source_id,
+                expected,
+                run_command,
+            )
+            source_manifests[source_id] = {
+                **dict(expected),
+                "worktree_sha256": worktree_sha256,
+            }
+
+        publication_payloads = {
+            method.method_id: classify_publication_only_method(method)
+            for method in registry.methods.values()
+            if method.source_kind == "publication_only"
+        }
+        staged_status_root = staging / "status"
+        staged_status_root.mkdir()
+        for method_id, payload in publication_payloads.items():
+            method_root = staged_status_root / method_id
+            method_root.mkdir()
+            _atomic_create_json(method_root / "method_status.json", payload)
+
+        environment_listing = _run_checked(
+            run_command,
+            ["conda", "env", "list", "--json"],
+            capture_output=True,
+        )
+        existing_environments = _existing_environment_names(
+            _strict_json_loads(environment_listing.stdout, "conda environment list")
+        )
+        staged_manifest_root = staging / "environment_manifests"
+        staged_manifest_root.mkdir()
+        environment_payloads: dict[str, dict[str, object]] = {}
+        for environment_name, environment_file in environment_copies.items():
+            if environment_name in existing_environments:
+                _run_checked(
+                    run_command,
+                    [
+                        "conda",
+                        "env",
+                        "update",
+                        "--name",
+                        environment_name,
+                        "--file",
+                        str(environment_file),
+                        "--prune",
+                    ],
+                )
+            else:
+                _run_checked(
+                    run_command,
+                    ["conda", "env", "create", "--file", str(environment_file)],
+                )
+                existing_environments.add(environment_name)
+            package_listing = _run_checked(
                 run_command,
                 [
                     "conda",
-                    "env",
-                    "update",
-                    "--name",
+                    "run",
+                    "-n",
                     environment_name,
-                    "--file",
-                    str(environment_file),
-                    "--prune",
+                    "conda",
+                    "list",
+                    "--json",
                 ],
+                capture_output=True,
             )
-        else:
-            _run_checked(
-                run_command,
-                ["conda", "env", "create", "--file", str(environment_file)],
+            packages = _normalized_packages(
+                _strict_json_loads(package_listing.stdout, "conda package list")
             )
-        package_listing = _run_checked(
-            run_command,
-            ["conda", "run", "-n", environment_name, "conda", "list", "--json"],
-            capture_output=True,
+            manifest: dict[str, object] = {
+                "schema_version": SCHEMA_VERSION,
+                "environment": environment_name,
+                "specification_sha256": environments[environment_name].sha256,
+                "packages": packages,
+            }
+            environment_payloads[environment_name] = manifest
+            _atomic_create_json(
+                staged_manifest_root / f"{environment_name}.json",
+                manifest,
+            )
+
+        _verify_snapshot_unchanged(registry_snapshot, "method registry")
+        for environment_name, snapshot in environments.items():
+            _verify_snapshot_unchanged(
+                snapshot,
+                f"environment file for {environment_name}",
+            )
+
+        status_root = _ensure_cache_subdirectory(root / "status", "status")
+        _reject_unexpected_entries(status_root, set(publication_payloads), "status")
+        publication_hashes: dict[str, str] = {}
+        for method_id, payload in publication_payloads.items():
+            method_status_root = _ensure_cache_subdirectory(
+                status_root / method_id,
+                f"status/{method_id}",
+            )
+            _reject_unexpected_entries(
+                method_status_root,
+                {"method_status.json"},
+                f"status/{method_id}",
+            )
+            path = method_status_root / "method_status.json"
+            _write_same_or_new(path, payload)
+            publication_hashes[f"{method_id}/method_status.json"] = _sha256_bytes(
+                _json_bytes(payload)
+            )
+
+        manifest_root = _ensure_cache_subdirectory(
+            root / "environment_manifests", "environment_manifests"
         )
-        try:
-            packages = _normalized_packages(json.loads(package_listing.stdout))
-        except json.JSONDecodeError as exc:
-            raise TaskCRuntimeError("conda package list is not valid JSON") from exc
-        manifest: dict[str, object] = {
+        _reject_unexpected_entries(
+            manifest_root,
+            {f"{name}.json" for name in environment_payloads},
+            "environment_manifests",
+        )
+        environment_hashes: dict[str, str] = {}
+        for environment_name, payload in environment_payloads.items():
+            filename = f"{environment_name}.json"
+            _atomic_replace_json(manifest_root / filename, payload)
+            environment_hashes[filename] = _sha256_bytes(_json_bytes(payload))
+
+        overall_manifest: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
-            "environment": environment_name,
-            "specification_sha256": _sha256_file(environment_file),
-            "packages": packages,
+            "bootstrap_identity_sha256": _sha256_bytes(_json_bytes(identity)),
+            "sources": source_manifests,
+            "environment_manifests": environment_hashes,
+            "publication_statuses": publication_hashes,
         }
-        _atomic_replace_json(
-            manifest_root / f"{environment_name}.json",
-            manifest,
+        staged_overall_path = staging / "bootstrap_manifest.json"
+        _atomic_create_json(staged_overall_path, overall_manifest)
+        staged_overall = _snapshot_regular_file(
+            staged_overall_path,
+            "staged bootstrap manifest",
+            maximum_bytes=MAXIMUM_BOOTSTRAP_RECORD_BYTES,
         )
+        if staged_overall.payload != _json_bytes(overall_manifest):
+            raise TaskCRuntimeError(
+                "staged bootstrap manifest changed before publication"
+            )
+        parsed_overall = _strict_json_loads(
+            staged_overall.payload,
+            "staged bootstrap manifest",
+        )
+        if parsed_overall != overall_manifest:
+            raise TaskCRuntimeError("staged bootstrap manifest is inconsistent")
+        _atomic_replace_json(root / "bootstrap_manifest.json", overall_manifest)
+        overall_hash = _sha256_bytes(_json_bytes(overall_manifest))
+        completed_status = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "assets_and_environments_recorded",
+            "bootstrap_manifest_sha256": overall_hash,
+        }
+        _atomic_replace_json(root / "bootstrap_status.json", completed_status)
+    except BaseException:
+        _unlink_cache_record(root / "bootstrap_manifest.json")
+        failed_status = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "failed_asset_preparation",
+            "reason": (
+                "Official assets or isolated environments did not satisfy the "
+                "fixed preparation rules."
+            ),
+        }
+        _atomic_replace_json(root / "bootstrap_status.json", failed_status)
+        raise
+    finally:
+        if staging.exists() and not staging.is_symlink():
+            shutil.rmtree(staging)
+            _fsync_directory(root)
+
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "assets_and_environments_recorded",
         "source_count": len(sources),
         "environment_count": len(environments),
-        "publication_only_count": sum(
-            method.source_kind == "publication_only"
-            for method in registry.methods.values()
-        ),
+        "publication_only_count": len(publication_payloads),
     }

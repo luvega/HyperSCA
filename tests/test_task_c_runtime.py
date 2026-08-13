@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import io
 import math
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
 
+from src.evaluation import task_c_runtime as runtime_module
 from src.evaluation.task_c_method_registry import load_task_c_method_registry
 from src.evaluation.task_c_runtime import (
     TaskCRuntimeError,
+    _run_bounded_command,
     _parse_maximum_resident_kib,
     bootstrap_task_c_methods,
     classify_publication_only_method,
@@ -177,6 +182,241 @@ def test_invalid_output_marker_is_preserved_and_invalid_utf8_is_decoded(
     assert "\ufffd" in result["stderr_tail"]
 
 
+@pytest.mark.parametrize(
+    ("marker", "expected_status"),
+    [
+        ("failed_invalid_output: unknown gene", "failed_invalid_output"),
+        ("MemoryError: allocation failed", "failed_resource_limit"),
+    ],
+)
+def test_failure_marker_before_a_long_log_still_controls_classification(
+    tmp_path: Path, marker: str, expected_status: str
+) -> None:
+    program = (
+        "import sys; "
+        f"sys.stderr.write({marker!r} + '\\n'); "
+        "sys.stderr.write('later detail\\n' * 5000); "
+        "sys.exit(3)"
+    )
+
+    result = run_isolated_method(
+        [sys.executable, "-c", program],
+        output_dir=tmp_path / "run",
+        timeout_seconds=10,
+        maximum_output_bytes=256,
+    )
+
+    assert result["status"] == expected_status
+    assert marker not in result["stderr_tail"]
+
+
+def test_command_values_with_spaces_are_removed_from_saved_output(
+    tmp_path: Path,
+) -> None:
+    private_value = str(tmp_path / "patient cohort A" / "input matrix.npz")
+    result = run_isolated_method(
+        [
+            sys.executable,
+            "-c",
+            "import sys; print(sys.argv[1], file=sys.stderr); sys.exit(3)",
+            private_value,
+        ],
+        output_dir=tmp_path / "run",
+        timeout_seconds=10,
+    )
+
+    assert private_value not in result["stderr_tail"]
+    assert "patient cohort A" not in result["stderr_tail"]
+    assert "<command-argument>" in result["stderr_tail"]
+
+
+def test_explicit_exit_137_is_not_reported_as_a_terminating_signal(
+    tmp_path: Path,
+) -> None:
+    result = run_isolated_method(
+        [sys.executable, "-c", "raise SystemExit(137)"],
+        output_dir=tmp_path / "run",
+        timeout_seconds=10,
+    )
+
+    assert result["return_code"] == 137
+    assert result["terminating_signal"] is None
+
+
+@pytest.mark.parametrize(
+    ("return_code", "expected_status"),
+    [
+        (125, "failed_runtime_unavailable"),
+        (126, "failed_launch"),
+        (127, "failed_launch"),
+    ],
+)
+def test_runtime_wrapper_exit_codes_are_not_called_method_incompatibility(
+    tmp_path: Path, return_code: int, expected_status: str
+) -> None:
+    result = run_isolated_method(
+        [sys.executable, "-c", f"raise SystemExit({return_code})"],
+        output_dir=tmp_path / "run",
+        timeout_seconds=10,
+    )
+
+    assert result["status"] == expected_status
+    assert result["terminating_signal"] is None
+
+
+def test_missing_resource_meter_produces_paired_runtime_unavailable_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runtime_module, "GNU_TIME", tmp_path / "missing-time")
+    output = tmp_path / "run"
+
+    result = run_isolated_method(
+        [sys.executable, "-c", "print('must not run')"],
+        output_dir=output,
+        timeout_seconds=10,
+    )
+
+    assert result["status"] == "failed_runtime_unavailable"
+    resource = json.loads((output / "resource_usage.json").read_text(encoding="utf-8"))
+    assert resource["resource_meter"] == "unavailable"
+    assert {path.name for path in output.iterdir()} == {
+        "method_status.json",
+        "resource_usage.json",
+    }
+
+
+def test_launch_oserror_produces_paired_failed_launch_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_launch(*args: object, **kwargs: object) -> object:
+        raise OSError("test-only launch error")
+
+    monkeypatch.setattr(runtime_module.subprocess, "Popen", fail_launch)
+    output = tmp_path / "run"
+
+    result = run_isolated_method(
+        [sys.executable, "-c", "pass"],
+        output_dir=output,
+        timeout_seconds=10,
+    )
+
+    assert result["status"] == "failed_launch"
+    assert "could not be started" in result["stderr_tail"]
+    assert {path.name for path in output.iterdir()} == {
+        "method_status.json",
+        "resource_usage.json",
+    }
+
+
+def test_output_directory_replacement_cannot_redirect_records(tmp_path: Path) -> None:
+    output = tmp_path / "run"
+    moved = tmp_path / "original-run-inode"
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    marker = tmp_path / "method-started"
+    program = (
+        "import pathlib, time; "
+        f"pathlib.Path({str(marker)!r}).write_text('started'); "
+        "time.sleep(0.4)"
+    )
+    result_box: list[dict[str, object]] = []
+
+    thread = threading.Thread(
+        target=lambda: result_box.append(
+            run_isolated_method(
+                [sys.executable, "-c", program],
+                output_dir=output,
+                timeout_seconds=10,
+            )
+        )
+    )
+    thread.start()
+    for _ in range(200):
+        if marker.exists() and output.exists():
+            break
+        time.sleep(0.005)
+    else:
+        pytest.fail("method did not start in time")
+    output.rename(moved)
+    output.symlink_to(attacker, target_is_directory=True)
+    thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    assert result_box[0]["status"] == "failed_runtime_unavailable"
+    assert not list(attacker.iterdir())
+    assert {path.name for path in moved.iterdir()} == {
+        "method_status.json",
+        "resource_usage.json",
+    }
+    assert not list(moved.glob("*.tmp"))
+
+
+def test_keyboard_interrupt_still_cleans_runtime_temporary_files_and_records_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class InterruptedProcess:
+        pid = 99999999
+        returncode = None
+        stdout = io.BytesIO()
+        stderr = io.BytesIO()
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        runtime_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: InterruptedProcess(),
+    )
+    monkeypatch.setattr(
+        runtime_module, "_terminate_process_group", lambda process: None
+    )
+    output = tmp_path / "run"
+
+    with pytest.raises(KeyboardInterrupt):
+        run_isolated_method(
+            [sys.executable, "-c", "pass"],
+            output_dir=output,
+            timeout_seconds=10,
+        )
+
+    assert {path.name for path in output.iterdir()} == {
+        "method_status.json",
+        "resource_usage.json",
+    }
+    status = json.loads((output / "method_status.json").read_text(encoding="utf-8"))
+    assert status["status"] == "failed_runtime_unavailable"
+
+
+def test_bootstrap_bounded_process_is_terminated_on_keyboard_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InterruptedProcess:
+        pid = 99999998
+        stdout = io.BytesIO()
+        stderr = io.BytesIO()
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise KeyboardInterrupt
+
+    terminated: list[object] = []
+    monkeypatch.setattr(
+        runtime_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: InterruptedProcess(),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_terminate_process_group",
+        lambda process: terminated.append(process),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_bounded_command(["git", "--version"], timeout=10)
+
+    assert len(terminated) == 1
+
+
 def test_success_writes_exact_atomic_status_and_resource_records(
     tmp_path: Path,
 ) -> None:
@@ -278,7 +518,7 @@ def test_missing_executable_is_a_recorded_compatibility_failure(tmp_path: Path) 
         timeout_seconds=10,
     )
 
-    assert result["status"] == "official_code_incompatible"
+    assert result["status"] == "failed_launch"
     assert result["return_code"] is None
     assert "could not be started" in result["stderr_tail"]
 
@@ -295,17 +535,26 @@ class _FakeBootstrapRunner:
         self.calls: list[tuple[str, ...]] = []
         self.repositories: dict[Path, dict[str, str]] = {}
         self.environments: set[str] = set()
+        self.replacements: set[Path] = set()
+        self.environment_files_seen: list[Path] = []
+        self.environment_bytes_seen: list[bytes] = []
+        self.fail_environment_update = False
 
     def __call__(self, command: list[str], **kwargs: object) -> _FakeCompleted:
         assert command and all(type(part) is str for part in command)
         assert "shell" not in kwargs
         assert kwargs.get("check") is True
+        assert isinstance(kwargs.get("timeout"), (int, float))
+        assert kwargs["timeout"] > 0  # type: ignore[operator]
         self.calls.append(tuple(command))
         if command[:2] == ["git", "clone"]:
             repository, destination_text = command[2], command[3]
             destination = Path(destination_text)
             destination.mkdir(parents=True)
             (destination / ".git").mkdir()
+            (destination / "README.md").write_text(
+                "fixed official source\n", encoding="utf-8"
+            )
             self.repositories[destination] = {"repository": repository, "commit": ""}
             return _FakeCompleted()
         if command[0:2] == ["git", "-C"]:
@@ -320,7 +569,19 @@ class _FakeBootstrapRunner:
                 )
             if operation == ["rev-parse", "HEAD"]:
                 return _FakeCompleted(stdout=self.repositories[source]["commit"] + "\n")
-            if operation == ["status", "--porcelain"]:
+            if operation and operation[0] == "status":
+                return _FakeCompleted(stdout="")
+            if operation == ["replace", "-l"]:
+                return _FakeCompleted(
+                    stdout="replacement\n" if source in self.replacements else ""
+                )
+            if operation == ["rev-parse", "--git-path", "info/grafts"]:
+                return _FakeCompleted(stdout=str(source / ".git/info/grafts") + "\n")
+            if operation[:3] == ["ls-files", "-z", "--cached"]:
+                return _FakeCompleted(stdout="README.md\x00")
+            if operation[:4] == ["ls-tree", "-r", "-z", "--name-only"]:
+                return _FakeCompleted(stdout="README.md\x00")
+            if operation[:3] == ["diff", "--no-ext-diff", "--quiet"]:
                 return _FakeCompleted(stdout="")
         if command == ["conda", "env", "list", "--json"]:
             return _FakeCompleted(
@@ -334,7 +595,9 @@ class _FakeBootstrapRunner:
                 )
             )
         if command[:3] == ["conda", "env", "create"]:
-            environment_file = Path(command[4])
+            environment_file = Path(command[command.index("--file") + 1])
+            self.environment_files_seen.append(environment_file)
+            self.environment_bytes_seen.append(environment_file.read_bytes())
             name = next(
                 line.split(":", 1)[1].strip()
                 for line in environment_file.read_text(encoding="utf-8").splitlines()
@@ -343,6 +606,11 @@ class _FakeBootstrapRunner:
             self.environments.add(name)
             return _FakeCompleted()
         if command[:3] == ["conda", "env", "update"]:
+            if self.fail_environment_update:
+                raise subprocess.CalledProcessError(1, command)
+            environment_file = Path(command[command.index("--file") + 1])
+            self.environment_files_seen.append(environment_file)
+            self.environment_bytes_seen.append(environment_file.read_bytes())
             self.environments.add(command[4])
             return _FakeCompleted()
         if command[:3] == ["conda", "run", "-n"]:
@@ -364,6 +632,17 @@ class _FailingCloneRunner(_FakeBootstrapRunner):
             )
             raise subprocess.CalledProcessError(1, command)
         return super().__call__(command, **kwargs)
+
+
+def _copy_bootstrap_inputs(tmp_path: Path) -> tuple[Path, Path]:
+    project = tmp_path / "project"
+    environment_dir = project / "envs/task_c"
+    environment_dir.mkdir(parents=True)
+    for name in ("causalbench.yml", "psgrn.yml"):
+        (environment_dir / name).write_bytes((ROOT / "envs/task_c" / name).read_bytes())
+    registry = tmp_path / "task_c_methods_v1.json"
+    registry.write_bytes(REGISTRY.read_bytes())
+    return project, registry
 
 
 def test_bootstrap_uses_fixed_sources_environments_and_explicit_unavailability(
@@ -404,7 +683,27 @@ def test_bootstrap_uses_fixed_sources_environments_and_explicit_unavailability(
         "environment_files",
     }
     assert all(str(ROOT) not in path.read_text(encoding="utf-8") for path in manifests)
+    completion = json.loads(
+        (cache / "bootstrap_status.json").read_text(encoding="utf-8")
+    )
+    overall = cache / "bootstrap_manifest.json"
+    assert completion["status"] == "assets_and_environments_recorded"
+    assert (
+        completion["bootstrap_manifest_sha256"]
+        == hashlib.sha256(overall.read_bytes()).hexdigest()
+    )
+    overall_payload = json.loads(overall.read_text(encoding="utf-8"))
+    assert set(overall_payload["environment_manifests"]) == {
+        path.name for path in manifests
+    }
+    assert set(overall_payload["publication_statuses"]) == {
+        "betterboost/method_status.json",
+        "sparse_rc/method_status.json",
+        "catran/method_status.json",
+    }
+    assert all(path.is_relative_to(cache) for path in runner.environment_files_seen)
     assert not list(cache.rglob("*.tmp"))
+    assert not list(cache.glob(".bootstrap-staging-*"))
 
 
 def test_exact_bootstrap_rerun_reuses_sources_and_updates_environments(
@@ -453,6 +752,216 @@ def test_bootstrap_rejects_wrong_source_version_and_changed_identity(
     identity["registry_sha256"] = "f" * 64
     identity_path.write_text(json.dumps(identity), encoding="utf-8")
     with pytest.raises(TaskCRuntimeError, match="identity"):
+        bootstrap_task_c_methods(**arguments)
+
+
+def test_bootstrap_rejects_semantically_equal_but_rewritten_identity(
+    tmp_path: Path,
+) -> None:
+    cache = tmp_path / "method-assets"
+    runner = _FakeBootstrapRunner()
+    arguments = {
+        "cache_root": cache,
+        "registry_path": REGISTRY,
+        "project_root": ROOT,
+        "run_command": runner,
+    }
+    bootstrap_task_c_methods(**arguments)
+    identity_path = cache / "bootstrap_identity.json"
+    payload = json.loads(identity_path.read_text(encoding="utf-8"))
+    identity_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(TaskCRuntimeError, match="exact|bytes|identity"):
+        bootstrap_task_c_methods(**arguments)
+
+
+def test_bootstrap_json_records_reject_duplicate_keys_and_excessive_size(
+    tmp_path: Path,
+) -> None:
+    cache = tmp_path / "method-assets"
+    runner = _FakeBootstrapRunner()
+    arguments = {
+        "cache_root": cache,
+        "registry_path": REGISTRY,
+        "project_root": ROOT,
+        "run_command": runner,
+    }
+    bootstrap_task_c_methods(**arguments)
+    identity_path = cache / "bootstrap_identity.json"
+    original = identity_path.read_text(encoding="utf-8")
+    identity_path.write_text(
+        '{"schema_version":"1.0","schema_version":"1.0"}',
+        encoding="utf-8",
+    )
+    with pytest.raises(TaskCRuntimeError, match="duplicate"):
+        bootstrap_task_c_methods(**arguments)
+
+    identity_path.write_text(original + " " * (2 * 1024 * 1024), encoding="utf-8")
+    with pytest.raises(TaskCRuntimeError, match="large"):
+        bootstrap_task_c_methods(**arguments)
+
+
+def test_bootstrap_yaml_requires_a_structural_exact_vcs_pin(tmp_path: Path) -> None:
+    project, registry = _copy_bootstrap_inputs(tmp_path)
+    expected = load_task_c_method_registry(registry).causalbench
+    (project / "envs/task_c/causalbench.yml").write_text(
+        "\n".join(
+            [
+                f"name: {expected['environment']}",
+                "channels: [conda-forge]",
+                "dependencies:",
+                "  - python=3.10",
+                "  - pip:",
+                "      - example-package==1.0",
+                f"# git+{expected['repository']}@{expected['commit']}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TaskCRuntimeError, match="YAML|fixed CausalBench source"):
+        bootstrap_task_c_methods(
+            cache_root=tmp_path / "cache",
+            registry_path=registry,
+            project_root=project,
+            run_command=_FakeBootstrapRunner(),
+        )
+
+
+def test_bootstrap_yaml_rejects_duplicate_sections_and_extra_vcs_source(
+    tmp_path: Path,
+) -> None:
+    project, registry = _copy_bootstrap_inputs(tmp_path)
+    expected = load_task_c_method_registry(registry).causalbench
+    environment = project / "envs/task_c/causalbench.yml"
+    environment.write_text(
+        "\n".join(
+            [
+                f"name: {expected['environment']}",
+                "channels:",
+                "  - conda-forge",
+                "channels:",
+                "  - defaults",
+                "dependencies:",
+                "  - python=3.10",
+                "  - pip:",
+                f"      - git+{expected['repository']}@{expected['commit']}",
+                "      - git+https://example.invalid/other.git@" + "0" * 40,
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TaskCRuntimeError, match="YAML|VCS|fixed CausalBench source"):
+        bootstrap_task_c_methods(
+            cache_root=tmp_path / "cache",
+            registry_path=registry,
+            project_root=project,
+            run_command=_FakeBootstrapRunner(),
+        )
+
+
+class _MutatingInputRunner(_FakeBootstrapRunner):
+    def __init__(self, path: Path) -> None:
+        super().__init__()
+        self.path = path
+        self.mutated = False
+
+    def __call__(self, command: list[str], **kwargs: object) -> _FakeCompleted:
+        result = super().__call__(command, **kwargs)
+        if command == ["conda", "env", "list", "--json"] and not self.mutated:
+            self.path.write_bytes(
+                self.path.read_bytes() + b"\n# changed during preparation\n"
+            )
+            self.mutated = True
+        return result
+
+
+def test_bootstrap_uses_snapshots_and_rejects_inputs_changed_during_run(
+    tmp_path: Path,
+) -> None:
+    project, registry = _copy_bootstrap_inputs(tmp_path)
+    changed_environment = project / "envs/task_c/causalbench.yml"
+    original_bytes = changed_environment.read_bytes()
+    runner = _MutatingInputRunner(changed_environment)
+
+    with pytest.raises(TaskCRuntimeError, match="changed during preparation"):
+        bootstrap_task_c_methods(
+            cache_root=tmp_path / "cache",
+            registry_path=registry,
+            project_root=project,
+            run_command=runner,
+        )
+
+    assert runner.environment_files_seen
+    assert all(
+        path.is_relative_to(tmp_path / "cache")
+        for path in runner.environment_files_seen
+    )
+    assert original_bytes in runner.environment_bytes_seen
+    status = json.loads(
+        (tmp_path / "cache/bootstrap_status.json").read_text(encoding="utf-8")
+    )
+    assert status["status"] == "failed_asset_preparation"
+    assert not (tmp_path / "cache/bootstrap_manifest.json").exists()
+
+
+def test_failed_refresh_invalidates_an_older_completion_record(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    runner = _FakeBootstrapRunner()
+    arguments = {
+        "cache_root": cache,
+        "registry_path": REGISTRY,
+        "project_root": ROOT,
+        "run_command": runner,
+    }
+    bootstrap_task_c_methods(**arguments)
+    assert (cache / "bootstrap_manifest.json").exists()
+    runner.fail_environment_update = True
+
+    with pytest.raises(TaskCRuntimeError, match="official asset command failed"):
+        bootstrap_task_c_methods(**arguments)
+
+    status = json.loads((cache / "bootstrap_status.json").read_text(encoding="utf-8"))
+    assert status["status"] == "failed_asset_preparation"
+    assert not (cache / "bootstrap_manifest.json").exists()
+
+
+def test_bootstrap_rejects_untracked_symlink_replacement_and_grafts(
+    tmp_path: Path,
+) -> None:
+    cache = tmp_path / "cache"
+    runner = _FakeBootstrapRunner()
+    arguments = {
+        "cache_root": cache,
+        "registry_path": REGISTRY,
+        "project_root": ROOT,
+        "run_command": runner,
+    }
+    bootstrap_task_c_methods(**arguments)
+    source = cache / "sources/causalbench"
+
+    (source / "ignored-secret.tmp").write_text("unexpected", encoding="utf-8")
+    with pytest.raises(TaskCRuntimeError, match="untracked|ignored|official source"):
+        bootstrap_task_c_methods(**arguments)
+    (source / "ignored-secret.tmp").unlink()
+
+    (source / "outside-link").symlink_to(tmp_path / "outside")
+    with pytest.raises(TaskCRuntimeError, match="symbolic link|official source"):
+        bootstrap_task_c_methods(**arguments)
+    (source / "outside-link").unlink()
+
+    runner.replacements.add(source)
+    with pytest.raises(TaskCRuntimeError, match="replacement"):
+        bootstrap_task_c_methods(**arguments)
+    runner.replacements.clear()
+
+    graft = source / ".git/info/grafts"
+    graft.parent.mkdir(parents=True)
+    graft.write_text("0" * 40 + " " + "1" * 40 + "\n", encoding="utf-8")
+    with pytest.raises(TaskCRuntimeError, match="graft"):
         bootstrap_task_c_methods(**arguments)
 
 
