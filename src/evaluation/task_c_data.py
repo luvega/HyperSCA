@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import tempfile
+import zipfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,8 @@ def sha256_path(path: Path | str, chunked: int = 1024 * 1024) -> str:
 def _text_vector(values: np.ndarray, kind: str) -> tuple[str, ...]:
     if values.ndim != 1:
         raise TaskCDataError(f"{kind} must be a one-dimensional array")
+    if values.dtype.kind not in {"U", "S"}:
+        raise TaskCDataError(f"{kind} must be one-dimensional Unicode or byte-string arrays")
     result: list[str] = []
     for value in values.tolist():
         if isinstance(value, (list, tuple, dict, set, np.ndarray)):
@@ -59,9 +62,14 @@ def _text_vector(values: np.ndarray, kind: str) -> tuple[str, ...]:
         if isinstance(value, bytes):
             value = value.decode("utf-8", errors="strict")
         try:
-            text = str(value).strip()
+            text = str(value)
         except Exception as exc:
             raise TaskCDataError(f"{kind} contain non-stringable values") from exc
+        if not text:
+            result.append(text)
+            continue
+        if text != text.strip():
+            raise TaskCDataError(f"{kind} must not contain leading or trailing whitespace")
         result.append(text)
     return tuple(result)
 
@@ -70,6 +78,7 @@ def load_task_c_dataset(path: Path | str, *, context_id: str) -> TaskCDataset:
     if context_id not in {"k562", "rpe1"}:
         raise TaskCDataError("context_id must be exactly k562 or rpe1")
     source_path = Path(path).expanduser().resolve()
+    before = _file_signature(source_path)
     try:
         with np.load(source_path, allow_pickle=False) as archive:
             required = {"expression_matrix", "interventions", "var_names"}
@@ -81,7 +90,7 @@ def load_task_c_dataset(path: Path | str, *, context_id: str) -> TaskCDataset:
             genes_raw = np.asarray(archive["var_names"])
     except TaskCDataError:
         raise
-    except (OSError, ValueError, TypeError) as exc:
+    except (OSError, ValueError, TypeError, EOFError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
         raise TaskCDataError(f"cannot load Task C dataset: {source_path}") from exc
 
     if expression.ndim != 2:
@@ -113,8 +122,23 @@ def load_task_c_dataset(path: Path | str, *, context_id: str) -> TaskCDataset:
         gene_names=genes,
         context_id=context_id,
         source_path=source_path,
-        source_sha256=sha256_path(source_path),
+        source_sha256=_consistent_sha256(source_path, before),
     )
+
+
+def _file_signature(path: Path) -> tuple[int, int, int]:
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise TaskCDataError(f"cannot stat dataset file: {path}") from exc
+    return stat.st_size, stat.st_mtime_ns, stat.st_ino
+
+
+def _consistent_sha256(path: Path, before: tuple[int, int, int]) -> str:
+    digest = sha256_path(path)
+    if _file_signature(path) != before:
+        raise TaskCDataError(f"dataset changed while being loaded: {path}")
+    return digest
 
 
 def build_task_c_provenance(dataset: TaskCDataset) -> dict[str, Any]:
@@ -148,22 +172,22 @@ def build_task_c_provenance(dataset: TaskCDataset) -> dict[str, Any]:
     }
 
 
-def _validate_reference(path: Path | str) -> tuple[int, str]:
+def _validate_reference(path: Path | str) -> tuple[int, str, set[tuple[str, str]]]:
     path = Path(path).expanduser().resolve()
     try:
         with path.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle)
-            if not reader.fieldnames or not {"source", "target"}.issubset(reader.fieldnames):
-                raise TaskCDataError(f"reference CSV must contain source,target headers: {path}")
+            reader = csv.reader(handle)
+            header = next(reader, None)
+            if header != ["source", "target"]:
+                raise TaskCDataError(f"reference CSV must have exactly source,target headers: {path}")
             edges: set[tuple[str, str]] = set()
             count = 0
             for row in reader:
-                source, target = row.get("source"), row.get("target")
-                if source is None or target is None:
-                    raise TaskCDataError(f"reference CSV has malformed row: {path}")
-                source, target = source.strip(), target.strip()
-                if not source or not target or source.lower() in {"nan", "inf", "infinity"} or target.lower() in {"nan", "inf", "infinity"}:
-                    raise TaskCDataError(f"reference CSV source/target must be finite nonempty text: {path}")
+                if len(row) != 2:
+                    raise TaskCDataError(f"reference CSV rows must have exactly two fields: {path}")
+                source, target = row
+                if not source or not target or source != source.strip() or target != target.strip() or source.lower() in {"nan", "inf", "infinity"} or target.lower() in {"nan", "inf", "infinity"}:
+                    raise TaskCDataError(f"reference CSV source/target must be finite nonempty text without whitespace padding: {path}")
                 if source == target:
                     raise TaskCDataError(f"reference CSV contains self edge: {path}")
                 edge = (source, target)
@@ -175,14 +199,19 @@ def _validate_reference(path: Path | str) -> tuple[int, str]:
         raise
     except (OSError, UnicodeError, csv.Error) as exc:
         raise TaskCDataError(f"cannot read reference CSV: {path}") from exc
-    return count, sha256_path(path)
+    if count == 0:
+        raise TaskCDataError(f"reference CSV must contain at least one edge: {path}")
+    return count, sha256_path(path), edges
 
 
 def build_task_c_reference_provenance(*, context_id: str, pooled_path: Path | str, chipseq_path: Path | str) -> dict[str, Any]:
     if context_id not in {"k562", "rpe1"}:
         raise TaskCDataError("context_id must be exactly k562 or rpe1")
-    pooled_rows, pooled_hash = _validate_reference(pooled_path)
-    chip_rows, chip_hash = _validate_reference(chipseq_path)
+    pooled_rows, pooled_hash, pooled_edges = _validate_reference(pooled_path)
+    chip_rows, chip_hash, _ = _validate_reference(chipseq_path)
+    missing_reverse = {(target, source) for source, target in pooled_edges} - pooled_edges
+    if missing_reverse:
+        raise TaskCDataError("pooled reference must contain every reverse edge")
     return {
         "schema_version": "1.0",
         "context": context_id,

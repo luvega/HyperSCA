@@ -21,6 +21,11 @@ REFERENCES = [
     "reference_rpe1_pooled.csv",
     "reference_rpe1_chipseq.csv",
 ]
+KNOWN_SOURCE_FILES = (
+    "k562.h5ad", "rpe1.h5ad", "summary_stats.xlsx", "corum_complexes.txt.zip",
+    "human_lr_pair.txt", "protein.links.txt.gz", "protein.physical.links.txt.gz",
+    "protein.info.txt.gz",
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -138,14 +143,20 @@ def main(argv: list[str] | None = None) -> int:
         pooled = set().union(
             corum, ligand_receptor, string_network, string_physical, chipseq
         )
+        pooled_self = {edge for edge in pooled if edge[0] == edge[1]}
+        pooled = pooled - pooled_self
         pooled_bidir = pooled | {(target, source) for source, target in pooled}
+        chipseq_self = {edge for edge in chipseq if edge[0] == edge[1]}
         for reference_id, edges in (
             ("pooled", pooled_bidir),
-            ("chipseq", set(chipseq)),
+            ("chipseq", set(chipseq) - chipseq_self),
         ):
             path = args.data_dir / f"reference_{context_id}_{reference_id}.csv"
             _write_edges(path, edges)
             reference_paths[f"{context_id}_{reference_id}"] = str(path.resolve())
+        description.setdefault("dropped_self_edges", {})[context_id] = {
+            "pooled": len(pooled_self), "chipseq": len(chipseq_self)
+        }
 
     description["reference_paths"] = reference_paths
     description["reference_scope"] = {
@@ -164,6 +175,9 @@ def main(argv: list[str] | None = None) -> int:
         "string_network": "https://stringdb-static.org/download/protein.links.detailed.v11.5/9606.protein.links.detailed.v11.5.txt.gz",
         "string_physical": "https://stringdb-static.org/download/protein.physical.links.detailed.v11.5/9606.protein.physical.links.detailed.v11.5.txt.gz",
         "chip_atlas_license": "https://dbarchive.biosciencedbc.jp/en/chip-atlas/lic.html",
+        "k562_dataset": "https://plus.figshare.com/ndownloader/files/35773219",
+        "rpe1_dataset": "https://plus.figshare.com/ndownloader/files/35775606",
+        "string_protein_info": "https://stringdb-static.org/download/protein.info.v11.5/9606.protein.info.v11.5.txt.gz",
     }
     description["downloaded_at_utc"] = None
     description["acquisition_time_note"] = (
@@ -175,6 +189,10 @@ def main(argv: list[str] | None = None) -> int:
     ]
     description["sha256"] = {
         _relative_path(path, args.data_dir): _sha256(path) for path in artifact_paths
+    }
+    description["source_sha256"] = {
+        _relative_path(args.data_dir / name, args.data_dir): _sha256(args.data_dir / name)
+        for name in KNOWN_SOURCE_FILES if (args.data_dir / name).is_file()
     }
     manifest_path = args.data_dir / "export_manifest.json"
     _write_atomic(

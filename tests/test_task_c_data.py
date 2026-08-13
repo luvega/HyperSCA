@@ -22,8 +22,68 @@ def write_dataset(path: Path, genes: list[str], labels: list[str]) -> None:
              interventions=np.asarray(labels), var_names=np.asarray(genes))
 
 
-def write_reference(path: Path, rows: str = "source,target\nA,B\nB,C\n") -> None:
+def write_reference(path: Path, rows: str = "source,target\nA,B\nB,A\n") -> None:
     path.write_text(rows, encoding="utf-8")
+
+
+def test_reference_header_only_is_rejected(tmp_path):
+    pooled = tmp_path / "pooled.csv"
+    chipseq = tmp_path / "chipseq.csv"
+    write_reference(pooled, "source,target\n")
+    write_reference(chipseq)
+    with pytest.raises(TaskCDataError, match="at least one"):
+        build_task_c_reference_provenance(context_id="k562", pooled_path=pooled, chipseq_path=chipseq)
+
+
+def test_reference_extra_fields_are_rejected(tmp_path):
+    pooled = tmp_path / "pooled.csv"
+    chipseq = tmp_path / "chipseq.csv"
+    write_reference(pooled, "source,target,extra\nA,B,C\n")
+    write_reference(chipseq)
+    with pytest.raises(TaskCDataError, match="exactly"):
+        build_task_c_reference_provenance(context_id="k562", pooled_path=pooled, chipseq_path=chipseq)
+
+
+def test_reference_whitespace_endpoint_is_rejected(tmp_path):
+    pooled = tmp_path / "pooled.csv"
+    chipseq = tmp_path / "chipseq.csv"
+    write_reference(pooled, "source,target\nA ,B\nB,A\n")
+    write_reference(chipseq)
+    with pytest.raises(TaskCDataError, match="whitespace"):
+        build_task_c_reference_provenance(context_id="k562", pooled_path=pooled, chipseq_path=chipseq)
+
+
+def test_asymmetric_pooled_reference_is_rejected(tmp_path):
+    pooled = tmp_path / "pooled.csv"
+    chipseq = tmp_path / "chipseq.csv"
+    write_reference(pooled, "source,target\nA,B\n")
+    write_reference(chipseq)
+    with pytest.raises(TaskCDataError, match="reverse"):
+        build_task_c_reference_provenance(context_id="k562", pooled_path=pooled, chipseq_path=chipseq)
+
+
+def test_bad_npz_archive_is_rejected(tmp_path):
+    path = tmp_path / "truncated.npz"
+    path.write_bytes(b"PK\x03\x04truncated")
+    with pytest.raises(TaskCDataError, match="load|archive"):
+        load_task_c_dataset(path, context_id="k562")
+
+
+@pytest.mark.parametrize("field", ["interventions", "var_names"])
+def test_numeric_metadata_is_rejected(tmp_path, field):
+    path = tmp_path / f"numeric-{field}.npz"
+    arrays = {"expression_matrix": np.ones((1, 2)), "interventions": np.asarray(["non-targeting"]), "var_names": np.asarray(["A", "B"])}
+    arrays[field] = np.asarray([1, 2])
+    np.savez(path, **arrays)
+    with pytest.raises(TaskCDataError, match="Unicode|byte-string"):
+        load_task_c_dataset(path, context_id="k562")
+
+
+def test_metadata_whitespace_is_rejected(tmp_path):
+    path = tmp_path / "whitespace.npz"
+    np.savez(path, expression_matrix=np.ones((1, 2)), interventions=np.asarray([" non-targeting"]), var_names=np.asarray(["A", "B"]))
+    with pytest.raises(TaskCDataError, match="whitespace"):
+        load_task_c_dataset(path, context_id="k562")
 
 
 def test_valid_k562_dataset_loads(tmp_path):

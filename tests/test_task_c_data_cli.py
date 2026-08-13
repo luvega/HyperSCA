@@ -3,7 +3,10 @@ import importlib.util
 import subprocess
 import sys
 import types
+import hashlib
 from pathlib import Path
+
+from src.evaluation.task_c_data import build_task_c_reference_provenance
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +87,9 @@ def test_operational_export_uses_stubs_and_records_reproducible_artifacts(
             self.use_filter = use_filter
 
         def load(self):
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            (self.data_dir / "k562.h5ad").write_bytes(b"fake-k562")
+            (self.data_dir / "rpe1.h5ad").write_bytes(b"fake-rpe1")
             paths = []
             for name in ("k562", "rpe1"):
                 suffix = "_filtered" if self.use_filter else ""
@@ -98,11 +104,11 @@ def test_operational_export_uses_stubs_and_records_reproducible_artifacts(
 
         def load(self):
             return (
-                {("a", "b")},
+                {("a", "b"), ("a", "a")},
                 {("b", "c")},
                 {("c", "d")},
                 {("d", "e")},
-                {("z", "a"), ("b", "a")},
+                {("z", "a"), ("b", "a"), ("z", "z")},
             )
 
     package = types.ModuleType("causalscbench")
@@ -146,12 +152,18 @@ def test_operational_export_uses_stubs_and_records_reproducible_artifacts(
         "b,a\n"
         "z,a\n"
     )
+    assert "a,a" not in (data_dir / "reference_k562_pooled.csv").read_text()
+    assert "z,z" not in (data_dir / "reference_k562_chipseq.csv").read_text()
     manifest = json.loads((data_dir / "export_manifest.json").read_text())
     assert manifest["datasets"] == [
         "dataset_k562_filtered.npz",
         "dataset_rpe1_filtered.npz",
     ]
     assert manifest["downloaded_at_utc"] is None
+    assert manifest["dropped_self_edges"]["k562"] == {"pooled": 2, "chipseq": 1}
+    assert manifest["dropped_self_edges"]["rpe1"] == {"pooled": 2, "chipseq": 1}
+    assert manifest["source_sha256"]["k562.h5ad"] == "sha256:" + hashlib.sha256(b"fake-k562").hexdigest()
+    assert manifest["source_sha256"]["rpe1.h5ad"] == "sha256:" + hashlib.sha256(b"fake-rpe1").hexdigest()
     assert manifest["exported_at_utc"]
     assert set(manifest["sha256"]) == {
         "dataset_k562_filtered.npz",
@@ -163,3 +175,9 @@ def test_operational_export_uses_stubs_and_records_reproducible_artifacts(
     }
     assert all(value.startswith("sha256:") for value in manifest["sha256"].values())
     assert all(not Path(path).is_absolute() for path in manifest["sha256"])
+    for context in ("k562", "rpe1"):
+        build_task_c_reference_provenance(
+            context_id=context,
+            pooled_path=data_dir / f"reference_{context}_pooled.csv",
+            chipseq_path=data_dir / f"reference_{context}_chipseq.csv",
+        )
