@@ -1134,6 +1134,22 @@ def test_psgrn_source_constants_and_environment_match_the_registry() -> None:
     assert registry["causalbench"]["commit"] == EXPECTED_CAUSALBENCH_COMMIT
 
 
+def test_causalbench_environment_pins_import_compatible_scientific_packages() -> None:
+    environment = (ROOT / "envs/task_c/causalbench.yml").read_text(
+        encoding="utf-8"
+    )
+
+    for requirement in (
+        "numpy==1.24.4",
+        "pandas==2.0.3",
+        "scikit-learn==1.3.2",
+        "pgmpy==1.0.0",
+        "umap-learn==0.5.7",
+        "setuptools<81",
+    ):
+        assert requirement in environment
+
+
 def test_psgrn_uses_clean_git_source_and_limits_output_to_first_1000(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
