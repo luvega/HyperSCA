@@ -1,0 +1,174 @@
+{
+  "schema_version": "1.0",
+  "causalbench": {
+    "repository": "https://github.com/causalbench/causalbench.git",
+    "commit": "1a2143cffdc85f835b41ce8d52034be1bf903e71",
+    "environment": "hypersca-task-c-causalbench"
+  },
+  "output_semantics": {
+    "official_return_order": [
+      "hypersca_c",
+      "mean_difference",
+      "random1000",
+      "grnboost",
+      "pc",
+      "ges",
+      "gies",
+      "gsp",
+      "igsp",
+      "notears_linear",
+      "dcdi_g",
+      "dcdi_dsf",
+      "dcdfg_linear",
+      "dcdfg_mlp",
+      "sortnregress",
+      "guanlab_psgrn"
+    ],
+    "no_output": [
+      "betterboost",
+      "sparse_rc",
+      "catran"
+    ]
+  },
+  "methods": {
+    "hypersca_c": {
+      "role": "candidate",
+      "source_kind": "local",
+      "training_information": "partial_interventional",
+      "command": "local_hypersca_c",
+      "required_for_core_rehearsal": true
+    },
+    "mean_difference": {
+      "role": "simple_baseline",
+      "source_kind": "local",
+      "training_information": "partial_interventional",
+      "command": "local_mean_difference",
+      "required_for_core_rehearsal": true
+    },
+    "random1000": {
+      "role": "null_control",
+      "source_kind": "causalbench",
+      "training_information": "observational",
+      "command": "random1000",
+      "required_for_core_rehearsal": true
+    },
+    "grnboost": {
+      "role": "external_comparator",
+      "source_kind": "causalbench",
+      "training_information": "observational",
+      "command": "grnboost",
+      "required_for_core_rehearsal": true
+    },
+    "pc": {
+      "role": "external_comparator",
+      "source_kind": "causalbench",
+      "training_information": "observational",
+      "command": "pc",
+      "required_for_core_rehearsal": true
+    },
+    "ges": {
+      "role": "external_comparator",
+      "source_kind": "causalbench",
+      "training_information": "observational",
+      "command": "ges",
+      "required_for_core_rehearsal": false
+    },
+    "gies": {
+      "role": "external_comparator",
+      "source_kind": "causalbench",
+      "training_information": "partial_interventional",
+      "command": "gies",
+      "required_for_core_rehearsal": true
+    },
+    "gsp": {
+      "role": "external_comparator",
+      "source_kind": "causalbench",
+      "training_information": "observational",
+      "command": "gsp",
+      "required_for_core_rehearsal": false
+    },
+    "igsp": {
+      "role": "external_comparator",
+      "source_kind": "causalbench",
+      "training_information": "partial_interventional",
+      "command": "igsp",
+      "required_for_core_rehearsal": false
+    },
+    "notears_linear": {
+      "role": "external_comparator",
+      "source_kind": "causalbench",
+      "training_information": "observational",
+      "command": "notears-lin-sparse",
+      "required_for_core_rehearsal": true
+    },
+    "dcdi_g": {
+      "role": "external_comparator",
+      "source_kind": "causalbench",
+      "training_information": "partial_interventional",
+      "command": "DCDI-G",
+      "required_for_core_rehearsal": false
+    },
+    "dcdi_dsf": {
+      "role": "external_comparator",
+      "source_kind": "causalbench",
+      "training_information": "partial_interventional",
+      "command": "DCDI-DSF",
+      "required_for_core_rehearsal": false
+    },
+    "dcdfg_linear": {
+      "role": "external_comparator",
+      "source_kind": "causalbench",
+      "training_information": "partial_interventional",
+      "command": "DCDFG-LIN",
+      "required_for_core_rehearsal": false
+    },
+    "dcdfg_mlp": {
+      "role": "external_comparator",
+      "source_kind": "causalbench",
+      "training_information": "partial_interventional",
+      "command": "DCDFG-MLP",
+      "required_for_core_rehearsal": false
+    },
+    "sortnregress": {
+      "role": "external_comparator",
+      "source_kind": "causalbench",
+      "training_information": "observational",
+      "command": "sortnregress",
+      "required_for_core_rehearsal": false
+    },
+    "guanlab_psgrn": {
+      "role": "external_comparator",
+      "source_kind": "git",
+      "training_information": "partial_interventional",
+      "command": "psgrn",
+      "required_for_core_rehearsal": false,
+      "repository": "https://github.com/GuanLab/PSGRN.git",
+      "commit": "74aa640f7c472b23a69811f6795bb17678efd344",
+      "environment": "hypersca-task-c-psgrn"
+    },
+    "betterboost": {
+      "role": "external_comparator",
+      "source_kind": "publication_only",
+      "training_information": "partial_interventional",
+      "command": null,
+      "required_for_core_rehearsal": false,
+      "publication": "https://openreview.net/forum?id=gpDOOAOmMe"
+    },
+    "sparse_rc": {
+      "role": "external_comparator",
+      "source_kind": "publication_only",
+      "training_information": "partial_interventional",
+      "command": null,
+      "required_for_core_rehearsal": false,
+      "publication": "https://openreview.net/forum?id=TOaPl9tXlmD"
+    },
+    "catran": {
+      "role": "external_comparator",
+      "source_kind": "publication_only",
+      "training_information": "partial_interventional",
+      "command": null,
+      "required_for_core_rehearsal": false,
+      "publication": "https://openreview.net/forum?id=Wf0QRYUkhwV"
+    }
+  }
+}
