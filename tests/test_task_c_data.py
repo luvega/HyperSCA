@@ -1,6 +1,7 @@
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 import pytest
@@ -89,6 +90,54 @@ def test_shared_split_rejects_intervention_row_in_controls():
     controls["k562"]["train"] = (10,) + controls["k562"]["train"][1:]
     with pytest.raises(TaskCDataError, match="control|intervention"):
         validate_task_c_split(replace(split, control_indices=controls), k562, rpe1)
+
+
+def test_shared_split_nested_control_mappings_are_immutable():
+    split = build_shared_task_c_split(dataset_for_split("k562"), dataset_for_split("rpe1"), seed=11)
+    with pytest.raises(TypeError):
+        split.control_indices["k562"]["train"] = ()
+    with pytest.raises(TypeError):
+        split.control_indices["k562"] = {}
+
+
+def test_shared_split_rejects_source_reassignment_preserving_union():
+    k562, rpe1 = dataset_for_split("k562"), dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+    train = list(split.train_sources)
+    holdout = list(split.holdout_sources)
+    train[0], holdout[0] = holdout[0], train[0]
+    corrupt = replace(split, train_sources=tuple(train), holdout_sources=tuple(holdout))
+    with pytest.raises(TaskCDataError, match="deterministic|expected source"):
+        validate_task_c_split(corrupt, k562, rpe1)
+
+
+def test_shared_split_rejects_control_reassignment_preserving_union():
+    k562, rpe1 = dataset_for_split("k562"), dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+    partitions = {context: dict(values) for context, values in split.control_indices.items()}
+    train = list(partitions["k562"]["train"])
+    holdout = list(partitions["k562"]["holdout"])
+    train[0], holdout[0] = holdout[0], train[0]
+    partitions["k562"] = {"train": tuple(train), "tune": partitions["k562"]["tune"], "holdout": tuple(holdout)}
+    corrupt = replace(split, control_indices=MappingProxyType({
+        context: MappingProxyType(values) for context, values in partitions.items()
+    }))
+    with pytest.raises(TaskCDataError, match="deterministic|expected control"):
+        validate_task_c_split(corrupt, k562, rpe1)
+
+
+def test_shared_split_rejects_fewer_than_five_common_sources():
+    k562, rpe1 = dataset_for_split("k562"), dataset_for_split("rpe1")
+    rpe1 = replace(rpe1, interventions=np.asarray(["non-targeting"] * 10 + [source for source in ("A", "B", "C", "D") for _ in range(5)]))
+    with pytest.raises(TaskCDataError, match="5 shared"):
+        build_shared_task_c_split(k562, rpe1, seed=11)
+
+
+def test_shared_split_rejects_fewer_than_five_controls():
+    k562, rpe1 = dataset_for_split("k562"), dataset_for_split("rpe1")
+    k562 = replace(k562, interventions=np.asarray(["non-targeting"] * 4 + [source for source in ("A", "B", "C", "D", "E") for _ in range(5)]))
+    with pytest.raises(TaskCDataError, match="5 control"):
+        build_shared_task_c_split(k562, rpe1, seed=11)
 
 
 def write_dataset(path: Path, genes: list[str], labels: list[str]) -> None:

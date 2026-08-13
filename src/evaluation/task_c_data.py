@@ -12,6 +12,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from numbers import Integral
+from types import MappingProxyType
 from typing import Any, Mapping
 
 import numpy as np
@@ -70,6 +71,17 @@ def _control_partitions(dataset: TaskCDataset, seed: int) -> dict[str, tuple[int
     }
 
 
+def _source_partitions(sources: list[str], seed: int) -> dict[str, tuple[str, ...]]:
+    shuffled = np.random.default_rng(seed).permutation(np.asarray(sources, dtype=str))
+    train_end = int(len(shuffled) * 0.6)
+    tune_end = train_end + int(len(shuffled) * 0.2)
+    return {
+        "train": tuple(sorted(str(x) for x in shuffled[:train_end])),
+        "tune": tuple(sorted(str(x) for x in shuffled[train_end:tune_end])),
+        "holdout": tuple(sorted(str(x) for x in shuffled[tune_end:])),
+    }
+
+
 def build_shared_task_c_split(
     k562: TaskCDataset,
     rpe1: TaskCDataset,
@@ -88,17 +100,18 @@ def build_shared_task_c_split(
     common = sorted(_eligible_sources(k562, min_cells) & _eligible_sources(rpe1, min_cells))
     if len(common) < 5:
         raise TaskCDataError("at least 5 shared eligible intervention sources are required")
-    shuffled = np.random.default_rng(seed).permutation(np.asarray(common, dtype=str))
-    train_end = int(len(shuffled) * 0.6)
-    tune_end = train_end + int(len(shuffled) * 0.2)
+    source_parts = _source_partitions(common, seed)
     split = TaskCSplit(
         schema_version="1.0",
         split_id=f"C-context-intervention-holdout-v1-seed-{seed}",
         seed=seed,
-        train_sources=tuple(sorted(str(x) for x in shuffled[:train_end])),
-        tune_sources=tuple(sorted(str(x) for x in shuffled[train_end:tune_end])),
-        holdout_sources=tuple(sorted(str(x) for x in shuffled[tune_end:])),
-        control_indices={"k562": _control_partitions(k562, seed), "rpe1": _control_partitions(rpe1, seed)},
+        train_sources=source_parts["train"],
+        tune_sources=source_parts["tune"],
+        holdout_sources=source_parts["holdout"],
+        control_indices=MappingProxyType({
+            "k562": MappingProxyType(_control_partitions(k562, seed)),
+            "rpe1": MappingProxyType(_control_partitions(rpe1, seed)),
+        }),
         min_cells_per_intervention=min_cells,
     )
     validate_task_c_split(split, k562, rpe1)
@@ -131,9 +144,14 @@ def validate_task_c_split(split: TaskCSplit, k562: TaskCDataset, rpe1: TaskCData
         if seen.intersection(part):
             raise TaskCDataError("source partitions overlap")
         seen.update(part)
-    expected_sources = _eligible_sources(k562, int(split.min_cells_per_intervention)) & _eligible_sources(rpe1, int(split.min_cells_per_intervention))
-    if seen != expected_sources:
+    expected_sources = sorted(_eligible_sources(k562, int(split.min_cells_per_intervention)) & _eligible_sources(rpe1, int(split.min_cells_per_intervention)))
+    if seen != set(expected_sources):
         raise TaskCDataError("source partition union differs from exact shared eligible sources")
+    expected_source_parts = _source_partitions(expected_sources, int(split.seed))
+    if (split.train_sources, split.tune_sources, split.holdout_sources) != (
+        expected_source_parts["train"], expected_source_parts["tune"], expected_source_parts["holdout"]
+    ):
+        raise TaskCDataError("source partitions do not match deterministic seed assignment")
 
     if not isinstance(split.control_indices, Mapping) or set(split.control_indices) != {"k562", "rpe1"}:
         raise TaskCDataError("control indices must contain exactly k562 and rpe1 contexts")
@@ -164,6 +182,9 @@ def validate_task_c_split(split: TaskCSplit, k562: TaskCDataset, rpe1: TaskCData
             all_indices.update(values)
         if all_indices != controls:
             raise TaskCDataError(f"{context} control partition union differs from all controls")
+        expected_controls = _control_partitions(dataset, int(split.seed))
+        if any(partitions[name] != expected_controls[name] for name in ("train", "tune", "holdout")):
+            raise TaskCDataError(f"{context} control partitions do not match deterministic seed assignment")
 
 
 def sha256_path(path: Path | str, chunked: int = 1024 * 1024) -> str:
