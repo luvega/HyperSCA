@@ -510,6 +510,16 @@ def test_context_owns_read_only_normalized_copies() -> None:
         context.expression[0, 0] = 2.0
 
 
+def test_context_arrays_cannot_have_write_permission_restored() -> None:
+    context = small_context()
+    assert context.interventions.dtype.kind == "U"
+    assert context.interventions.shape == (6,)
+    for public_array in (context.expression, context.interventions):
+        assert public_array.flags.writeable is False
+        with pytest.raises(ValueError):
+            public_array.setflags(write=True)
+
+
 @pytest.mark.parametrize(
     ("context_id", "expression", "interventions", "gene_names", "match"),
     [
@@ -1018,15 +1028,64 @@ def valid_fit_payload() -> dict[str, object]:
 def test_direct_fit_construction_normalizes_and_protects_valid_results() -> None:
     payload = valid_fit_payload()
     shared_input = payload["shared"]
+    delta_input = payload["context_adjustments"]["k562"]  # type: ignore[index]
+    adjacency_input = payload["context_adjacencies"]["k562"]  # type: ignore[index]
+    history_input = payload["loss_history"]
     fit = HyperSCACFit(**payload)  # type: ignore[arg-type]
     shared_input[0, 1] = 9.0  # type: ignore[index]
+    delta_input[0, 1] = 9.0  # type: ignore[index]
+    adjacency_input[0, 1] = 9.0  # type: ignore[index]
+    history_input[0] = 9.0  # type: ignore[index]
     assert fit.shared[0, 1] == pytest.approx(0.2)
+    assert fit.context_adjustments["k562"][0, 1] == pytest.approx(0.1)
+    assert fit.context_adjacencies["k562"][0, 1] == pytest.approx(0.3)
+    assert fit.loss_history.tolist() == pytest.approx([1.0, 0.5])
     assert fit.shared.dtype == np.float32
     assert fit.loss_history.dtype == np.float64
     assert fit.config is payload["config"]
     assert fit.shared.flags.writeable is False
     assert fit.context_adjustments["k562"].flags.writeable is False
     assert fit.context_adjacencies["k562"].flags.writeable is False
+
+
+def test_fit_arrays_cannot_have_write_permission_restored() -> None:
+    fit = HyperSCACFit(**valid_fit_payload())  # type: ignore[arg-type]
+    public_arrays = (
+        fit.shared,
+        fit.context_adjustments["k562"],
+        fit.context_adjacencies["k562"],
+        fit.loss_history,
+    )
+    for public_array in public_arrays:
+        assert public_array.flags.writeable is False
+        with pytest.raises(ValueError):
+            public_array.setflags(write=True)
+
+
+def test_fit_rejects_repeated_context_items_from_a_custom_mapping() -> None:
+    class RepeatedItemsMapping(Mapping[str, np.ndarray]):
+        def __init__(self, value: np.ndarray) -> None:
+            self.value = value
+
+        def __getitem__(self, key: str) -> np.ndarray:
+            if key != "k562":
+                raise KeyError(key)
+            return self.value
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(("k562",))
+
+        def __len__(self) -> int:
+            return 1
+
+        def items(self) -> tuple[tuple[str, np.ndarray], ...]:
+            return (("k562", self.value), ("k562", self.value))
+
+    payload = valid_fit_payload()
+    repeated_delta = payload["context_adjustments"]["k562"]  # type: ignore[index]
+    payload["context_adjustments"] = RepeatedItemsMapping(repeated_delta)
+    with pytest.raises(HyperSCACError, match="context identifiers.*unique"):
+        HyperSCACFit(**payload)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(

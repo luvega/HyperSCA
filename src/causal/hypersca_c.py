@@ -352,6 +352,24 @@ def _numeric_matrix(values: object, name: str) -> np.ndarray:
     return normalized
 
 
+def _immutable_c_array(
+    values: object,
+    *,
+    dtype: np.dtype[object] | type[object] | None = None,
+) -> np.ndarray:
+    """以不可变 bytes 为底层存储，返回无法恢复写权限的 C 连续数组。"""
+
+    normalized = np.array(values, dtype=dtype, order="C", copy=True)
+    if normalized.dtype.hasobject:
+        raise HyperSCACError("public arrays must not use object storage")
+    immutable_buffer = normalized.tobytes(order="C")
+    return np.frombuffer(
+        immutable_buffer,
+        dtype=normalized.dtype,
+        count=normalized.size,
+    ).reshape(normalized.shape)
+
+
 @dataclass(frozen=True)
 class HyperSCACContext:
     """一个细胞环境中按细胞排列的表达和干预标签。"""
@@ -374,9 +392,8 @@ class HyperSCACContext:
                 "expression shape must match intervention rows and gene columns"
             )
 
-        label_array = np.array(labels, dtype=str, copy=True)
-        expression.setflags(write=False)
-        label_array.setflags(write=False)
+        expression = _immutable_c_array(expression, dtype=np.float32)
+        label_array = _immutable_c_array(np.array(labels, dtype=str, copy=True))
         object.__setattr__(self, "context_id", context_id)
         object.__setattr__(self, "expression", expression)
         object.__setattr__(self, "interventions", label_array)
@@ -401,8 +418,7 @@ def _validated_fit_matrix(
     # Check before float32 conversion so a tiny self-edge cannot silently underflow.
     if bool(np.any(np.diag(raw) != 0.0)):
         raise HyperSCACError(f"{name} matrix diagonal must be exactly zero")
-    result.setflags(write=False)
-    return result
+    return _immutable_c_array(result, dtype=np.float32)
 
 
 def _validated_loss_history(values: object) -> np.ndarray:
@@ -427,8 +443,7 @@ def _validated_loss_history(values: object) -> np.ndarray:
     result = np.array(array, dtype=np.float64, copy=True)
     if not bool(np.isfinite(result).all()):
         raise HyperSCACError("loss_history values must be finite")
-    result.setflags(write=False)
-    return result
+    return _immutable_c_array(result, dtype=np.float64)
 
 
 def _fit_matrix_mapping(
@@ -449,6 +464,8 @@ def _fit_matrix_mapping(
     singular = "adjustment" if name == "context_adjustments" else "adjacency"
     for raw_identifier, matrix in items:
         identifier = _required_text(raw_identifier, "context identifier")
+        if identifier in normalized:
+            raise HyperSCACError("context identifiers in a mapping must be unique")
         normalized[identifier] = _validated_fit_matrix(
             matrix,
             f"context {singular}",
@@ -729,7 +746,10 @@ def fit_hypersca_c_once(
     device: str,
     prior_mask: np.ndarray | None = None,
 ) -> HyperSCACFit:
-    """联合学习共享关系与各细胞环境的轻量调整。"""
+    """联合学习共享关系与各细胞环境的轻量调整。
+
+    调用者须先在外层流程固定符合运行预算的基因范围；本函数不自行裁剪基因。
+    """
 
     try:
         return _fit_hypersca_c_once(
