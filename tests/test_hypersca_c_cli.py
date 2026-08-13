@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -104,6 +105,7 @@ def prepared_run(tmp_path: Path) -> dict[str, object]:
         "reverse_source": Path(
             bundle["cross"]["rpe1_to_k562"]["source_refit"]
         ),
+        "private_holdout": Path(bundle["within"]["k562"]["holdout"]),
         "public_manifest": Path(bundle["public_manifest"]),
         "config": config_path,
         "gene_list": gene_path,
@@ -156,6 +158,31 @@ def _snapshot(directory: Path) -> dict[str, tuple[bytes, int]]:
         name: ((directory / name).read_bytes(), (directory / name).stat().st_mtime_ns)
         for name in sorted(ARTIFACT_NAMES)
     }
+
+
+def _all_failed_stability_result(
+    *, context_ids: tuple[str, ...] = ("k562", "rpe1")
+) -> object:
+    from src.causal.hypersca_c_stability import (
+        HyperSCAStabilityResult,
+        build_stability_table,
+    )
+
+    predictions, summary = build_stability_table(
+        [],
+        ("C", "A", "B"),
+        selection_threshold=0.1,
+        requested_repeats=2,
+        minimum_success_fraction=0.8,
+        source_variance={"C": 1.0, "A": 1.0, "B": 1.0},
+        minimum_source_variance=1e-8,
+        expected_contexts=context_ids,
+    )
+    return HyperSCAStabilityResult(
+        predictions=predictions,
+        summary=summary,
+        failures=("repeat_0:failed", "repeat_1:failed"),
+    )
 
 
 def test_hypersca_c_cli_writes_traced_raw_results_and_reuses_exact_run(
@@ -623,6 +650,102 @@ def test_public_manifest_requires_the_exact_public_artifact_inventory(
     assert not (tmp_path / "corrupt-manifest-output").exists()
 
 
+def test_public_inventory_rejects_private_hardlink_alias_before_fit(
+    prepared_run: dict[str, object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+    from src.evaluation.task_c_data import write_json
+
+    called = False
+
+    def forbidden_fit(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called = True
+        raise AssertionError("fit must not be called")
+
+    monkeypatch.setattr(run_module, "fit_stable_hypersca_c", forbidden_fit)
+    public_path = Path(prepared_run["cross_target_train"])
+    private_path = Path(prepared_run["private_holdout"])
+    public_path.unlink()
+    os.link(private_path, public_path)
+    manifest_path = Path(prepared_run["public_manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    relative = public_path.relative_to(manifest_path.parent).as_posix()
+    manifest["files"][relative] = sha256_path(public_path)
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(HyperSCACError, match="硬链接|inode|公开库存"):
+        run_module.run_hypersca_c(
+            context_values=[
+                f"k562={prepared_run['k562']}",
+                f"rpe1={prepared_run['rpe1']}",
+            ],
+            config_path=Path(prepared_run["config"]),
+            gene_list_path=Path(prepared_run["gene_list"]),
+            public_manifest_path=manifest_path,
+            output_dir=tmp_path / "private-hardlink-rejected",
+            seed=11,
+            device="cpu",
+        )
+    assert not called
+
+
+@pytest.mark.parametrize("tamper", ["target_labels", "gene_hash"])
+def test_selected_public_data_must_match_manifest_biology_before_fit(
+    prepared_run: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+    from src.evaluation.task_c_data import write_json
+
+    called = False
+
+    def forbidden_fit(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called = True
+        raise AssertionError("fit must not be called")
+
+    monkeypatch.setattr(run_module, "fit_stable_hypersca_c", forbidden_fit)
+    manifest_path = Path(prepared_run["public_manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if tamper == "target_labels":
+        target_path = Path(prepared_run["cross_target"])
+        target = load_task_c_dataset(target_path, context_id="rpe1")
+        labels = target.interventions.copy()
+        labels[0] = "A"
+        np.savez_compressed(
+            target_path,
+            expression_matrix=target.expression,
+            interventions=labels,
+            var_names=np.asarray(target.gene_names),
+        )
+        relative = target_path.relative_to(manifest_path.parent).as_posix()
+        manifest["files"][relative] = sha256_path(target_path)
+    else:
+        manifest["gene_names_sha256"] = f"sha256:{'0' * 64}"
+        manifest["materialization_identity"]["gene_names_sha256"] = (
+            manifest["gene_names_sha256"]
+        )
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(HyperSCACError, match="干预|基因|语义|gene"):
+        run_module.run_hypersca_c(
+            context_values=[
+                f"k562={prepared_run['cross_source']}",
+                f"rpe1={prepared_run['cross_target']}",
+            ],
+            config_path=Path(prepared_run["config"]),
+            gene_list_path=Path(prepared_run["gene_list"]),
+            public_manifest_path=manifest_path,
+            output_dir=tmp_path / f"biological-tamper-{tamper}",
+            seed=11,
+            device="cpu",
+        )
+    assert not called
+
+
 def test_gene_list_is_strict_and_selected_gene_must_exist(
     prepared_run: dict[str, object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -736,6 +859,137 @@ def test_input_changed_during_fit_is_rejected_before_any_artifact_is_written(
     assert not output.exists()
 
 
+@pytest.mark.parametrize(
+    "forgery",
+    [
+        "self_edge",
+        "duplicate_edge",
+        "wrong_gene",
+        "nan_effect",
+        "unknown_column",
+        "missing_context_effect",
+        "wrong_context_effect",
+        "wrong_requested_repeats",
+    ],
+)
+def test_run_boundary_rejects_forged_scientific_results_before_writing(
+    prepared_run: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forgery: str,
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+
+    valid = _all_failed_stability_result()
+    predictions = valid.predictions.copy(deep=True)
+    summary = dict(valid.summary)
+    failures = tuple(valid.failures)
+    if forgery == "self_edge":
+        predictions.loc[0, "target"] = predictions.loc[0, "source"]
+    elif forgery == "duplicate_edge":
+        predictions.loc[1, ["source", "target"]] = predictions.loc[
+            0, ["source", "target"]
+        ].to_numpy()
+    elif forgery == "wrong_gene":
+        predictions["source"] = predictions["source"].replace("A", "X")
+        predictions["target"] = predictions["target"].replace("A", "X")
+    elif forgery == "nan_effect":
+        predictions.loc[0, "effect"] = np.nan
+    elif forgery == "unknown_column":
+        predictions["unregistered_metric"] = 0.0
+    elif forgery == "missing_context_effect":
+        predictions = predictions.drop(columns="effect_rpe1")
+    elif forgery == "wrong_context_effect":
+        predictions = predictions.rename(columns={"effect_rpe1": "effect_HEK293"})
+    elif forgery == "wrong_requested_repeats":
+        summary["requested_repeats"] = 3
+        failures = (*failures, "repeat_2:failed")
+    forged = SimpleNamespace(
+        predictions=predictions,
+        summary=summary,
+        failures=failures,
+    )
+    monkeypatch.setattr(
+        run_module,
+        "fit_stable_hypersca_c",
+        lambda *args, **kwargs: forged,
+    )
+    output = tmp_path / f"forged-{forgery}"
+    with pytest.raises(HyperSCACError):
+        run_module.run_hypersca_c(
+            context_values=[
+                f"k562={prepared_run['k562']}",
+                f"rpe1={prepared_run['rpe1']}",
+            ],
+            config_path=Path(prepared_run["config"]),
+            gene_list_path=Path(prepared_run["gene_list"]),
+            public_manifest_path=Path(prepared_run["public_manifest"]),
+            output_dir=output,
+            seed=11,
+            device="cpu",
+        )
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("tampered_artifact", ["predictions", "summary", "status"])
+def test_reuse_rejects_semantic_tampering_even_with_synchronized_hashes(
+    prepared_run: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tampered_artifact: str,
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+    from src.evaluation.task_c_data import write_json
+
+    monkeypatch.setattr(
+        run_module,
+        "fit_stable_hypersca_c",
+        lambda *args, **kwargs: _all_failed_stability_result(),
+    )
+    output = tmp_path / f"semantic-tamper-{tampered_artifact}"
+    arguments = {
+        "context_values": [
+            f"k562={prepared_run['k562']}",
+            f"rpe1={prepared_run['rpe1']}",
+        ],
+        "config_path": Path(prepared_run["config"]),
+        "gene_list_path": Path(prepared_run["gene_list"]),
+        "public_manifest_path": Path(prepared_run["public_manifest"]),
+        "output_dir": output,
+        "seed": 11,
+        "device": "cpu",
+    }
+    run_module.run_hypersca_c(**arguments)
+
+    if tampered_artifact == "predictions":
+        artifact_name = "raw_predictions.csv"
+        predictions = pd.read_csv(output / artifact_name)
+        predictions["unregistered_metric"] = 0.0
+        predictions.to_csv(output / artifact_name, index=False)
+    elif tampered_artifact == "summary":
+        artifact_name = "fit_summary.json"
+        summary = json.loads((output / artifact_name).read_text(encoding="utf-8"))
+        summary["requested_repeats"] = 3
+        write_json(output / artifact_name, summary)
+    else:
+        artifact_name = "method_status.json"
+        status = json.loads((output / artifact_name).read_text(encoding="utf-8"))
+        status["usable_for_ranking"] = not status["usable_for_ranking"]
+        write_json(output / artifact_name, status)
+
+    manifest_path = output / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"][artifact_name]["sha256"] = sha256_path(
+        output / artifact_name
+    )
+    manifest.pop("run_manifest_content_sha256")
+    manifest["run_manifest_content_sha256"] = run_module._payload_sha256(manifest)
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(HyperSCACError):
+        run_module.run_hypersca_c(**arguments)
+
+
 def test_all_bootstrap_failures_remain_visible_and_unusable(
     prepared_run: dict[str, object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -780,3 +1034,71 @@ def test_all_bootstrap_failures_remain_visible_and_unusable(
     assert status["failure_count"] == status["requested_bootstraps"] == 2
     assert status["coverage"] == 0.0
     assert status["usable_for_ranking"] is False
+
+
+def test_root_untracked_code_changes_identity_and_blocks_existing_output_reuse(
+    prepared_run: dict[str, object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+
+    repository = tmp_path / "code-repository"
+    repository.mkdir()
+    tracked = repository / "tracked.txt"
+    tracked.write_text("registered\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=HyperSCA Test",
+            "-c",
+            "user.email=hypersca@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "baseline",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    tracked.write_text("already dirty\n", encoding="utf-8")
+    sitecustomize = repository / "sitecustomize.py"
+    sitecustomize.write_text("VERSION = 1\n", encoding="utf-8")
+    monkeypatch.setattr(run_module, "_ROOT", repository)
+
+    first_state = run_module._git_state()
+    assert first_state["dirty"] is True
+    monkeypatch.setattr(
+        run_module,
+        "fit_stable_hypersca_c",
+        lambda *args, **kwargs: _all_failed_stability_result(),
+    )
+    output = tmp_path / "code-state-output"
+    arguments = {
+        "context_values": [
+            f"k562={prepared_run['k562']}",
+            f"rpe1={prepared_run['rpe1']}",
+        ],
+        "config_path": Path(prepared_run["config"]),
+        "gene_list_path": Path(prepared_run["gene_list"]),
+        "public_manifest_path": Path(prepared_run["public_manifest"]),
+        "output_dir": output,
+        "seed": 11,
+        "device": "cpu",
+    }
+    run_module.run_hypersca_c(**arguments)
+
+    sitecustomize.write_text("VERSION = 2\n", encoding="utf-8")
+    second_state = run_module._git_state()
+    assert second_state["dirty"] is True
+    assert second_state["code_state_sha256"] != first_state["code_state_sha256"]
+    monkeypatch.setattr(
+        run_module,
+        "fit_stable_hypersca_c",
+        lambda *args, **kwargs: pytest.fail("changed code must not enter fit"),
+    )
+    before = _snapshot(output)
+    with pytest.raises(HyperSCACError, match="代码|已有输出|不能覆盖"):
+        run_module.run_hypersca_c(**arguments)
+    assert _snapshot(output) == before
