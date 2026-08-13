@@ -70,7 +70,7 @@ def _make_run(
         "seed": seed,
         "run_identity_sha256": "sha256:" + identity_character * 64,
         "status": status,
-        "validated_by_rehearsal_controller": True,
+        "controller_validation": "verified_task_c_rehearsal_bundle_v1",
     }
     _write_json(root / "method_status.json", status_payload)
     expected = PASSED_FILES if status == "passed_real_rehearsal" else FAILED_FILES
@@ -118,6 +118,7 @@ def test_precision_at_k_uses_frozen_stable_relation_order_for_cutoff_ties() -> N
     )
 
     assert metrics["precision_at_1"] == pytest.approx(1.0)
+    assert metrics["precision_at_1_tie_aware_sensitivity"] == pytest.approx(0.5)
     assert metrics["precision_at_k"] == pytest.approx(1.0)
     assert metrics["edge_direction_accuracy"] == pytest.approx(0.0)
     assert metrics["direction_tie_credit"] == pytest.approx(0.0)
@@ -140,7 +141,7 @@ def test_direction_metric_is_withheld_when_cell_environment_does_not_match() -> 
 
 def test_standard_prediction_schema_without_effect_is_accepted() -> None:
     scores = _complete_scores().drop(columns="effect")
-    scores["returned_by_method"] = [True, True, True, False, False, False]
+    scores["returned_by_method"] = [True, True, True, True, False, False]
 
     metrics = evaluate_declared_references(
         scores,
@@ -152,6 +153,30 @@ def test_standard_prediction_schema_without_effect_is_accepted() -> None:
     )
 
     assert metrics["edge_direction_accuracy"] == 1.0
+
+
+def test_unreturned_relations_must_keep_positive_zero_scores() -> None:
+    scores = _complete_scores()
+    scores["returned_by_method"] = [False] * len(scores)
+    with pytest.raises(TaskCAggregationError, match="unreturned"):
+        evaluate_declared_references(
+            scores,
+            pooled_reference={("A", "B")},
+            directed_chip_reference={("A", "B")},
+            eligible_sources={"A"},
+            directed_reference_context_match=True,
+        )
+
+    scores["score"] = 0.0
+    metrics = evaluate_declared_references(
+        scores,
+        pooled_reference={("A", "B")},
+        directed_chip_reference={("A", "B")},
+        eligible_sources={"A"},
+        directed_reference_context_match=True,
+        precision_values=(2,),
+    )
+    assert metrics["edge_direction_accuracy"] == 0.0
 
 
 def test_score_and_effect_columns_reject_numeric_text_or_boolean_values() -> None:
@@ -226,6 +251,23 @@ def test_reference_relations_outside_scored_gene_set_are_ignored() -> None:
 
     assert metrics["n_reference_edges_in_universe"] == 1
     assert metrics["directed_chip_edge_count"] == 1
+
+
+def test_precision_limit_is_disclosed_as_name_sensitive_when_scores_tie() -> None:
+    scores = _complete_scores()
+    scores["score"] = 0.0
+    metrics = evaluate_declared_references(
+        scores,
+        pooled_reference={("A", "B")},
+        directed_chip_reference=set(),
+        eligible_sources={"A"},
+        directed_reference_context_match=False,
+        precision_values=(1,),
+    )
+
+    assert metrics["precision_metric_role"] == "sensitivity_analysis"
+    assert metrics["primary_ranking_metric"] == "average_precision"
+    assert "gene names" in metrics["precision_tie_limitation"]
 
 
 def test_eligible_sources_must_stay_inside_scored_gene_set() -> None:
@@ -344,7 +386,8 @@ def test_failed_runs_remain_in_read_only_method_summary(tmp_path: Path) -> None:
     assert summary["failed_or_unavailable_count"] == 1
     assert summary["status_counts"]["failed_timeout"] == 1
     assert summary["validation_scope"] == (
-        "structural checks; extended records also require a controller validation declaration"
+        "formal completion requires the verified Task C rehearsal bundle "
+        "declaration; explicit legacy mode is structural only"
     )
     assert isinstance(summary["runs"], tuple)
     assert [run["method_id"] for run in summary["runs"]] == ["pc", "gies"]
@@ -368,11 +411,48 @@ def test_original_plan_minimal_run_records_are_accepted(tmp_path: Path) -> None:
         {"method_id": "gies", "status": "failed_timeout"},
     )
 
-    summary = aggregate_task_c_runs([passed, failed])
+    summary = aggregate_task_c_runs(
+        [passed, failed], allow_legacy_minimal=True
+    )
 
     assert summary["attempted_run_count"] == 2
-    assert summary["completed_run_count"] == 1
+    assert summary["completed_run_count"] == 0
+    assert summary["verified_completed_run_count"] == 0
+    assert summary["legacy_structural_completed_count"] == 1
+    assert summary["not_formally_completed_count"] == 2
+    assert summary["runs"][0]["controller_validation_status"] == (
+        "unverified_legacy_record"
+    )
     assert summary["status_counts"]["failed_timeout"] == 1
+
+
+def test_extended_status_counts_as_controller_validated_completion(tmp_path: Path) -> None:
+    passed = _make_run(
+        tmp_path / "passed",
+        method_id="pc",
+        status="passed_real_rehearsal",
+    )
+
+    summary = aggregate_task_c_runs([passed])
+
+    assert summary["completed_run_count"] == 1
+    assert summary["verified_completed_run_count"] == 1
+    assert summary["legacy_structural_completed_count"] == 0
+    assert summary["runs"][0]["controller_validation_status"] == (
+        "verified_task_c_rehearsal_bundle_v1"
+    )
+
+
+def test_minimal_status_is_rejected_unless_legacy_mode_is_explicit(tmp_path: Path) -> None:
+    run = tmp_path / "minimal"
+    run.mkdir()
+    _write_json(
+        run / "method_status.json",
+        {"method_id": "pc", "status": "failed_timeout"},
+    )
+
+    with pytest.raises(TaskCAggregationError, match="legacy minimal"):
+        aggregate_task_c_runs([run])
 
 
 def test_aggregation_rejects_duplicate_run_identity_or_seed_condition_method(
@@ -429,11 +509,13 @@ def test_aggregation_allows_known_controller_files_but_rejects_unknown_extras(
     _write_json(passed / "metrics.json", {"average_precision": 0.2})
     _write_json(passed / "run_manifest.json", {"schema_version": "1.0"})
     _write_json(passed / "resource_usage.json", {"schema_version": "1.0"})
-    assert aggregate_task_c_runs([passed])["completed_run_count"] == 1
+    summary = aggregate_task_c_runs([passed], allow_legacy_minimal=True)
+    assert summary["legacy_structural_completed_count"] == 1
+    assert summary["completed_run_count"] == 0
 
     (passed / "unregistered-diagnostic.txt").write_text("surprise", encoding="utf-8")
     with pytest.raises(TaskCAggregationError, match="file set"):
-        aggregate_task_c_runs([passed])
+        aggregate_task_c_runs([passed], allow_legacy_minimal=True)
 
 
 def test_aggregation_rejects_untrusted_or_malformed_status_and_metrics(
@@ -445,7 +527,7 @@ def test_aggregation_rejects_untrusted_or_malformed_status_and_metrics(
         status="failed_timeout",
     )
     payload = json.loads((unvalidated / "method_status.json").read_text())
-    payload["validated_by_rehearsal_controller"] = False
+    payload["controller_validation"] = "self_reported"
     _write_json(unvalidated / "method_status.json", payload)
     with pytest.raises(TaskCAggregationError, match="controller validation"):
         aggregate_task_c_runs([unvalidated])
@@ -472,6 +554,29 @@ def test_aggregation_rejects_untrusted_or_malformed_status_and_metrics(
     )
     with pytest.raises(TaskCAggregationError, match="non-finite"):
         aggregate_task_c_runs([nonfinite])
+
+    huge = _make_run(
+        tmp_path / "huge",
+        method_id="pc",
+        status="passed_real_rehearsal",
+    )
+    (huge / "metrics.json").write_text(
+        '{"average_precision":' + "9" * 1_000 + "}\n", encoding="utf-8"
+    )
+    with pytest.raises(TaskCAggregationError, match="average_precision"):
+        aggregate_task_c_runs([huge])
+
+
+def test_precision_values_numpy_array_gets_clear_domain_error() -> None:
+    with pytest.raises(TaskCAggregationError, match="precision values"):
+        evaluate_declared_references(
+            _complete_scores(),
+            pooled_reference={("A", "B")},
+            directed_chip_reference=set(),
+            eligible_sources={"A"},
+            directed_reference_context_match=False,
+            precision_values=np.asarray([1, 2]),
+        )
 
 
 def test_aggregation_rejects_symlinked_or_hard_linked_evidence(tmp_path: Path) -> None:

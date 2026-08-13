@@ -86,7 +86,7 @@ _STATUS_FIELDS = frozenset(
         "seed",
         "run_identity_sha256",
         "status",
-        "validated_by_rehearsal_controller",
+        "controller_validation",
     }
 )
 _KNOWN_PASSED_FILES = _PASSED_FILES
@@ -198,6 +198,12 @@ def _validate_scores(scores: pd.DataFrame) -> tuple[set[str], set[tuple[str, str
             raise TaskCAggregationError(
                 "returned_by_method must contain only true or false values"
             )
+        returned = scores["returned_by_method"].to_numpy(dtype=bool)
+        unreturned_scores = numeric_scores[~returned]
+        if np.any(unreturned_scores != 0.0) or np.any(np.signbit(unreturned_scores)):
+            raise TaskCAggregationError(
+                "unreturned relations must use positive zero scores"
+            )
     return genes, relations
 
 
@@ -274,6 +280,30 @@ def _stable_precision_at_k(
     return float(selected_positive / effective_k), int(effective_k)
 
 
+def _tie_aware_precision_at_k(
+    scores: pd.DataFrame,
+    positives: set[tuple[str, str]],
+    requested_k: int,
+) -> float:
+    effective_k = min(requested_k, len(scores))
+    score_values = scores["score"].to_numpy(dtype=float)
+    cutoff_index = len(score_values) - effective_k
+    cutoff = float(np.partition(score_values, cutoff_index)[cutoff_index])
+    above = scores[scores["score"] > cutoff]
+    tied = scores[scores["score"] == cutoff]
+    above_positive = sum(
+        edge in positives
+        for edge in above[["source", "target"]].itertuples(index=False, name=None)
+    )
+    tied_positive = sum(
+        edge in positives
+        for edge in tied[["source", "target"]].itertuples(index=False, name=None)
+    )
+    remaining = effective_k - len(above)
+    expected_positive = above_positive + remaining * tied_positive / len(tied)
+    return float(expected_positive / effective_k)
+
+
 def evaluate_declared_references(
     scores: pd.DataFrame,
     *,
@@ -295,17 +325,32 @@ def evaluate_declared_references(
         raise TaskCAggregationError(
             "directed reference context match must be true or false"
         )
-    if isinstance(precision_values, (str, bytes)) or not precision_values:
+    if isinstance(precision_values, (str, bytes)):
+        raise TaskCAggregationError("precision values must be non-empty")
+    try:
+        precision_count = len(precision_values)
+    except (TypeError, OverflowError) as exc:
+        raise TaskCAggregationError(
+            "precision values must be a finite non-empty sequence"
+        ) from exc
+    if precision_count < 1:
         raise TaskCAggregationError("precision values must be non-empty")
     checked_k: list[int] = []
-    for value in precision_values:
-        if type(value) is not int or value < 1:
-            raise TaskCAggregationError(
-                "precision values must be positive whole numbers"
-            )
-        if value in checked_k:
-            raise TaskCAggregationError("precision values must be unique")
-        checked_k.append(value)
+    try:
+        for value in precision_values:
+            if type(value) is not int or value < 1:
+                raise TaskCAggregationError(
+                    "precision values must be positive whole numbers"
+                )
+            if value in checked_k:
+                raise TaskCAggregationError("precision values must be unique")
+            checked_k.append(value)
+    except TaskCAggregationError:
+        raise
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TaskCAggregationError(
+            "precision values must be positive whole numbers"
+        ) from exc
 
     scored = scores[scores["source"].isin(allowed_sources)].copy()
     if scored.empty:
@@ -333,11 +378,20 @@ def evaluate_declared_references(
             scored, pooled_in_scope, requested_k
         )
         metrics[f"precision_at_{requested_k}"] = precision
+        metrics[f"precision_at_{requested_k}_tie_aware_sensitivity"] = (
+            _tie_aware_precision_at_k(scored, pooled_in_scope, requested_k)
+        )
         if index == 0:
             metrics["precision_at_k"] = precision
             metrics["precision_k"] = effective_k
     metrics["precision_tie_policy"] = (
         "score descending, then source and target alphabetical order"
+    )
+    metrics["precision_metric_role"] = "sensitivity_analysis"
+    metrics["primary_ranking_metric"] = "average_precision"
+    metrics["precision_tie_limitation"] = (
+        "ordered precision can depend on gene names at a cutoff tie; the "
+        "tie-aware sensitivity reports expected credit within that tie"
     )
 
     score_map = {
@@ -638,7 +692,10 @@ def _validate_method_status(status_payload: dict[str, Any]) -> bool:
         or any(character not in "0123456789abcdef" for character in identity[7:])
     ):
         raise TaskCAggregationError("method status run identity is invalid")
-    if status_payload.get("validated_by_rehearsal_controller") is not True:
+    if (
+        status_payload.get("controller_validation")
+        != "verified_task_c_rehearsal_bundle_v1"
+    ):
         raise TaskCAggregationError(
             "method status lacks the rehearsal controller validation declaration"
         )
@@ -654,11 +711,18 @@ def _validate_metrics(metrics: dict[str, Any]) -> None:
     if not metrics:
         raise TaskCAggregationError("completed run metrics must not be empty")
     average_precision = metrics.get("average_precision")
+    try:
+        finite_average_precision = math.isfinite(float(average_precision))
+        in_range = 0.0 <= float(average_precision) <= 1.0
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TaskCAggregationError(
+            "completed run average_precision must be finite and between zero and one"
+        ) from exc
     if (
         isinstance(average_precision, bool)
         or not isinstance(average_precision, (int, float))
-        or not math.isfinite(float(average_precision))
-        or not 0.0 <= float(average_precision) <= 1.0
+        or not finite_average_precision
+        or not in_range
     ):
         raise TaskCAggregationError(
             "completed run average_precision must be finite and between zero and one"
@@ -688,6 +752,8 @@ def _run_directory_identity(path: Path) -> tuple[int, int, tuple[int, int, int, 
 
 def aggregate_task_c_runs(
     run_directories: Sequence[str | Path],
+    *,
+    allow_legacy_minimal: bool = False,
 ) -> Mapping[str, object]:
     """保留成功和失败尝试，并核对固定的预演结果文件集合。
 
@@ -696,6 +762,8 @@ def aggregate_task_c_runs(
     每个方法的原始结果包和运行身份。
     """
 
+    if type(allow_legacy_minimal) is not bool:
+        raise TaskCAggregationError("allow_legacy_minimal must be true or false")
     if isinstance(run_directories, (str, bytes)) or not isinstance(
         run_directories, Sequence
     ):
@@ -710,6 +778,8 @@ def aggregate_task_c_runs(
     seen_method_clusters: set[tuple[str, str, int]] = set()
     run_records: list[dict[str, Any]] = []
     statuses: list[str] = []
+    verified_completed = 0
+    legacy_structural_completed = 0
 
     for raw_directory in run_directories:
         if not isinstance(raw_directory, (str, Path)):
@@ -733,11 +803,17 @@ def aggregate_task_c_runs(
         seen_file_inodes.add(status_inode)
         method_status = _parse_json_object(status_bytes, "method status")
         extended_status = _validate_method_status(method_status)
+        if not extended_status and not allow_legacy_minimal:
+            raise TaskCAggregationError(
+                "legacy minimal method status requires explicit legacy mode"
+            )
 
         status_name = str(method_status["status"])
         if status_name == _PASSED_STATUS:
             required_files = frozenset({"method_status.json", "metrics.json"})
             allowed_files = _KNOWN_PASSED_FILES
+            if extended_status:
+                required_files = _PASSED_FILES
         else:
             required_files = frozenset({"method_status.json"})
             allowed_files = _KNOWN_FAILED_FILES
@@ -785,24 +861,37 @@ def aggregate_task_c_runs(
             seen_method_clusters.add(cluster)
 
         record = dict(method_status)
+        record["controller_validation_status"] = (
+            "verified_task_c_rehearsal_bundle_v1"
+            if extended_status
+            else "unverified_legacy_record"
+        )
         if status_name == _PASSED_STATUS:
             metrics = captured_json["metrics.json"]
             _validate_metrics(metrics)
             record["metrics"] = metrics
+            if extended_status:
+                verified_completed += 1
+            else:
+                legacy_structural_completed += 1
         run_records.append(record)
         statuses.append(status_name)
 
     counts = Counter(statuses)
-    completed = counts.get(_PASSED_STATUS, 0)
+    structural_completed = counts.get(_PASSED_STATUS, 0)
     result = {
         "attempted_run_count": len(run_records),
-        "completed_run_count": completed,
-        "failed_or_unavailable_count": len(run_records) - completed,
+        "completed_run_count": verified_completed,
+        "verified_completed_run_count": verified_completed,
+        "legacy_structural_completed_count": legacy_structural_completed,
+        "structural_completed_run_count": structural_completed,
+        "not_formally_completed_count": len(run_records) - verified_completed,
+        "failed_or_unavailable_count": len(run_records) - structural_completed,
         "status_counts": dict(sorted(counts.items())),
         "runs": run_records,
         "validation_scope": (
-            "structural checks; extended records also require a controller "
-            "validation declaration"
+            "formal completion requires the verified Task C rehearsal bundle "
+            "declaration; explicit legacy mode is structural only"
         ),
         "independent_bundle_verification": False,
     }
