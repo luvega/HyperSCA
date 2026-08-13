@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -7,11 +8,87 @@ import pytest
 from src.evaluation.task_c_data import (
     CAUSALBENCH_COMMIT,
     TaskCDataError,
+    TaskCDataset,
+    build_shared_task_c_split,
+    validate_task_c_split,
     build_task_c_provenance,
     build_task_c_reference_provenance,
     load_task_c_dataset,
     write_json,
 )
+
+
+def dataset_for_split(context_id: str) -> TaskCDataset:
+    genes = ("A", "B", "C", "D", "E", "F", "Z")
+    labels = ["non-targeting"] * 10
+    for source in ("A", "B", "C", "D", "E"):
+        labels.extend([source] * 5)
+    expression = np.arange(len(labels) * len(genes), dtype=np.float32).reshape(
+        len(labels), len(genes)
+    )
+    return TaskCDataset(
+        expression=expression,
+        interventions=np.asarray(labels, dtype=str),
+        gene_names=genes,
+        context_id=context_id,
+        source_path=Path(f"{context_id}.npz"),
+        source_sha256="sha256:test",
+    )
+
+
+def test_shared_split_is_reproducible_disjoint_and_validated():
+    k562, rpe1 = dataset_for_split("k562"), dataset_for_split("rpe1")
+    first = build_shared_task_c_split(k562, rpe1, seed=11)
+    second = build_shared_task_c_split(k562, rpe1, seed=11)
+    assert first == second
+    assert (len(first.train_sources), len(first.tune_sources), len(first.holdout_sources)) == (3, 1, 1)
+    validate_task_c_split(first, k562, rpe1)
+
+
+def test_shared_split_rejects_overlapping_source_partitions():
+    k562, rpe1 = dataset_for_split("k562"), dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+    corrupt = replace(split, tune_sources=(split.train_sources[0],))
+    with pytest.raises(TaskCDataError, match="source partitions overlap"):
+        validate_task_c_split(corrupt, k562, rpe1)
+
+
+def test_shared_split_holdout_sources_are_observed_in_both_contexts():
+    k562, rpe1 = dataset_for_split("k562"), dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=23)
+    assert set(split.holdout_sources) <= set(k562.interventions)
+    assert set(split.holdout_sources) <= set(rpe1.interventions)
+
+
+def test_shared_split_rejects_invalid_seed():
+    k562, rpe1 = dataset_for_split("k562"), dataset_for_split("rpe1")
+    with pytest.raises(TaskCDataError, match="seed"):
+        build_shared_task_c_split(k562, rpe1, seed=13)
+
+
+def test_shared_split_rejects_wrong_context_order():
+    with pytest.raises(TaskCDataError, match="context"):
+        build_shared_task_c_split(dataset_for_split("rpe1"), dataset_for_split("k562"), seed=11)
+
+
+def test_shared_split_rejects_duplicate_control_index():
+    k562, rpe1 = dataset_for_split("k562"), dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+    controls = dict(split.control_indices)
+    controls["k562"] = dict(controls["k562"])
+    controls["k562"]["train"] = (controls["k562"]["train"][0],) * 2
+    with pytest.raises(TaskCDataError, match="duplicate|control partitions"):
+        validate_task_c_split(replace(split, control_indices=controls), k562, rpe1)
+
+
+def test_shared_split_rejects_intervention_row_in_controls():
+    k562, rpe1 = dataset_for_split("k562"), dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+    controls = dict(split.control_indices)
+    controls["k562"] = dict(controls["k562"])
+    controls["k562"]["train"] = (10,) + controls["k562"]["train"][1:]
+    with pytest.raises(TaskCDataError, match="control|intervention"):
+        validate_task_c_split(replace(split, control_indices=controls), k562, rpe1)
 
 
 def write_dataset(path: Path, genes: list[str], labels: list[str]) -> None:

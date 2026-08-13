@@ -11,7 +11,8 @@ import zipfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from numbers import Integral
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -32,6 +33,137 @@ class TaskCDataset:
     context_id: str
     source_path: Path
     source_sha256: str
+
+
+@dataclass(frozen=True)
+class TaskCSplit:
+    schema_version: str
+    split_id: str
+    seed: int
+    train_sources: tuple[str, ...]
+    tune_sources: tuple[str, ...]
+    holdout_sources: tuple[str, ...]
+    control_indices: Mapping[str, Mapping[str, tuple[int, ...]]]
+    min_cells_per_intervention: int
+
+
+_TASK_C_SPLIT_SEEDS = frozenset({11, 23, 47, 71, 97})
+
+
+def _eligible_sources(dataset: TaskCDataset, min_cells: int) -> set[str]:
+    counts = Counter(dataset.interventions.tolist())
+    genes = set(dataset.gene_names)
+    return {label for label, count in counts.items() if label != CONTROL_LABEL and label in genes and count >= min_cells}
+
+
+def _control_partitions(dataset: TaskCDataset, seed: int) -> dict[str, tuple[int, ...]]:
+    controls = np.flatnonzero(dataset.interventions == CONTROL_LABEL)
+    if len(controls) < 5:
+        raise TaskCDataError("at least 5 control cells are required")
+    shuffled = np.random.default_rng(seed).permutation(controls)
+    train_end = int(len(shuffled) * 0.6)
+    tune_end = train_end + int(len(shuffled) * 0.2)
+    return {
+        "train": tuple(sorted(int(i) for i in shuffled[:train_end])),
+        "tune": tuple(sorted(int(i) for i in shuffled[train_end:tune_end])),
+        "holdout": tuple(sorted(int(i) for i in shuffled[tune_end:])),
+    }
+
+
+def build_shared_task_c_split(
+    k562: TaskCDataset,
+    rpe1: TaskCDataset,
+    *,
+    seed: int,
+    min_cells: int = 5,
+) -> TaskCSplit:
+    if k562.context_id != "k562" or rpe1.context_id != "rpe1":
+        raise TaskCDataError("datasets must be provided in k562, rpe1 context order")
+    if isinstance(min_cells, bool) or not isinstance(min_cells, Integral) or min_cells <= 0:
+        raise TaskCDataError("min_cells must be a positive integer")
+    if isinstance(seed, bool) or not isinstance(seed, Integral) or seed not in _TASK_C_SPLIT_SEEDS:
+        raise TaskCDataError("seed must be one of 11, 23, 47, 71, 97")
+    seed = int(seed)
+    min_cells = int(min_cells)
+    common = sorted(_eligible_sources(k562, min_cells) & _eligible_sources(rpe1, min_cells))
+    if len(common) < 5:
+        raise TaskCDataError("at least 5 shared eligible intervention sources are required")
+    shuffled = np.random.default_rng(seed).permutation(np.asarray(common, dtype=str))
+    train_end = int(len(shuffled) * 0.6)
+    tune_end = train_end + int(len(shuffled) * 0.2)
+    split = TaskCSplit(
+        schema_version="1.0",
+        split_id=f"C-context-intervention-holdout-v1-seed-{seed}",
+        seed=seed,
+        train_sources=tuple(sorted(str(x) for x in shuffled[:train_end])),
+        tune_sources=tuple(sorted(str(x) for x in shuffled[train_end:tune_end])),
+        holdout_sources=tuple(sorted(str(x) for x in shuffled[tune_end:])),
+        control_indices={"k562": _control_partitions(k562, seed), "rpe1": _control_partitions(rpe1, seed)},
+        min_cells_per_intervention=min_cells,
+    )
+    validate_task_c_split(split, k562, rpe1)
+    return split
+
+
+def validate_task_c_split(split: TaskCSplit, k562: TaskCDataset, rpe1: TaskCDataset) -> None:
+    if split.schema_version != "1.0":
+        raise TaskCDataError("unsupported Task C split schema")
+    if isinstance(split.seed, bool) or not isinstance(split.seed, Integral) or split.seed not in _TASK_C_SPLIT_SEEDS:
+        raise TaskCDataError("split seed is not registered")
+    expected_id = f"C-context-intervention-holdout-v1-seed-{int(split.seed)}"
+    if split.split_id != expected_id:
+        raise TaskCDataError("split id is inconsistent with seed")
+    if isinstance(split.min_cells_per_intervention, bool) or not isinstance(split.min_cells_per_intervention, Integral) or split.min_cells_per_intervention <= 0:
+        raise TaskCDataError("min_cells_per_intervention must be positive")
+    if k562.context_id != "k562" or rpe1.context_id != "rpe1":
+        raise TaskCDataError("datasets must have k562, rpe1 context identities")
+
+    source_parts = (split.train_sources, split.tune_sources, split.holdout_sources)
+    names = ("train", "tune", "holdout")
+    seen: set[str] = set()
+    for name, part in zip(names, source_parts):
+        if not isinstance(part, tuple) or not part:
+            raise TaskCDataError(f"{name} source partition must be a nonempty tuple")
+        if any(not isinstance(value, str) for value in part):
+            raise TaskCDataError("source partitions must contain strings")
+        if len(set(part)) != len(part):
+            raise TaskCDataError("source partition contains duplicate sources")
+        if seen.intersection(part):
+            raise TaskCDataError("source partitions overlap")
+        seen.update(part)
+    expected_sources = _eligible_sources(k562, int(split.min_cells_per_intervention)) & _eligible_sources(rpe1, int(split.min_cells_per_intervention))
+    if seen != expected_sources:
+        raise TaskCDataError("source partition union differs from exact shared eligible sources")
+
+    if not isinstance(split.control_indices, Mapping) or set(split.control_indices) != {"k562", "rpe1"}:
+        raise TaskCDataError("control indices must contain exactly k562 and rpe1 contexts")
+    for context, dataset in (("k562", k562), ("rpe1", rpe1)):
+        partitions = split.control_indices[context]
+        if not isinstance(partitions, Mapping) or set(partitions) != {"train", "tune", "holdout"}:
+            raise TaskCDataError(f"{context} control partitions must contain exactly train, tune, holdout")
+        controls = set(np.flatnonzero(dataset.interventions == CONTROL_LABEL).tolist())
+        all_indices: set[int] = set()
+        for name in ("train", "tune", "holdout"):
+            part = partitions[name]
+            if not isinstance(part, tuple):
+                raise TaskCDataError("control partitions must be tuples")
+            values: list[int] = []
+            for index in part:
+                if isinstance(index, bool) or not isinstance(index, Integral):
+                    raise TaskCDataError("control indices must be integers")
+                index = int(index)
+                if index < 0 or index >= dataset.expression.shape[0]:
+                    raise TaskCDataError("control index is out of range")
+                if index not in controls:
+                    raise TaskCDataError("control indices must point only to control rows")
+                values.append(index)
+            if len(set(values)) != len(values):
+                raise TaskCDataError("control partition contains duplicate indices")
+            if all_indices.intersection(values):
+                raise TaskCDataError("control partitions overlap")
+            all_indices.update(values)
+        if all_indices != controls:
+            raise TaskCDataError(f"{context} control partition union differs from all controls")
 
 
 def sha256_path(path: Path | str, chunked: int = 1024 * 1024) -> str:
