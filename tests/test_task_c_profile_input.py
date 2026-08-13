@@ -726,6 +726,56 @@ def test_comprehensive_stratified_selector_enforces_twenty_thousand_cell_cap() -
     assert set(labels[first]) == {"non-targeting", "G000"}
 
 
+def test_profile_helpers_reject_nonfinite_derived_variance_and_zscore() -> None:
+    import src.evaluation.task_c_profile_input as profile_module
+
+    class Snapshot:
+        sha256 = "sha256:" + "0" * 64
+
+    overflowing = np.asarray([[-1e308, 1.0], [1e308, 2.0]])
+    inventory = {
+        "within/k562/train.npz": Snapshot(),
+        "within/rpe1/train.npz": Snapshot(),
+    }
+
+    def load_parent(snapshot: object) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
+        del snapshot
+        return (
+            overflowing,
+            np.asarray(["non-targeting", "non-targeting"]),
+            ("A", "B"),
+        )
+
+    with pytest.raises(TaskCProfileInputError, match="derived gene variance"):
+        profile_module._selected_genes(
+            inventory,
+            2,
+            load_parent=load_parent,
+        )
+
+    same_sign = np.asarray([[1e308, 1.0], [1e308, 2.0], [1e308, 3.0]])
+    with pytest.raises(TaskCProfileInputError, match="derived control statistics"):
+        profile_module._control_zscore(
+            same_sign,
+            np.asarray([True, True, False]),
+            "k562",
+        )
+
+
+def test_profile_text_and_returned_arrays_are_hard_read_only() -> None:
+    import src.evaluation.task_c_profile_input as profile_module
+
+    with pytest.raises(TaskCProfileInputError, match="UTF-8"):
+        profile_module._text_vector(np.asarray(["\ud800"]), "gene names")
+    with pytest.raises(TaskCProfileInputError, match="text limit"):
+        profile_module._text_vector(np.asarray(["X" * 5_000]), "gene names")
+
+    frozen = profile_module._immutable_array(np.arange(4).reshape(2, 2))
+    assert not frozen.flags.writeable
+    with pytest.raises(ValueError):
+        frozen.setflags(write=True)
+
+
 def test_hypersca_uses_the_same_capped_profile_cells(
     large_public_bundle: dict[str, object],
     tmp_path: Path,

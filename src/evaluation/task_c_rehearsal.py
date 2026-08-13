@@ -8,17 +8,29 @@ way to prepare real data.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
+from itertools import islice
 import json
 import math
+import os
 from pathlib import Path
+import stat
 from types import MappingProxyType
 from typing import Any
 import unicodedata
 
 import numpy as np
+
+from src.evaluation.task_c_profile_input import (
+    MAXIMUM_DISTINCT_LABELS,
+    MAXIMUM_PARENT_CELLS,
+    MAXIMUM_PARENT_GENES,
+    MAXIMUM_TEXT_ITEM_BYTES,
+    MAXIMUM_TOTAL_TEXT_BYTES,
+)
 
 
 MAXIMUM_CONFIG_BYTES = 64 * 1024
@@ -81,12 +93,12 @@ class TaskCRehearsalError(ValueError):
 
 
 def _fixed_positive_integer(value: object, label: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+    if type(value) is not int or value < 1:
         raise TaskCRehearsalError(f"{label} must be a positive whole number")
     return value
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RehearsalProfile:
     """The maximum data size and time allowed for one rehearsal profile."""
 
@@ -104,7 +116,7 @@ class RehearsalProfile:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TaskCRehearsalConfig:
     """Read-only, pre-agreed rules for the Task C real-data rehearsal."""
 
@@ -120,29 +132,38 @@ class TaskCRehearsalConfig:
     full_run_seeds: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        if self.schema_version != "1.0":
+        if type(self.schema_version) is not str or self.schema_version != "1.0":
             raise TaskCRehearsalError("rehearsal configuration schema changed")
-        if isinstance(self.seed, bool) or type(self.seed) is not int or self.seed != 11:
+        if type(self.seed) is not int or self.seed != 11:
             raise TaskCRehearsalError("rehearsal seed must remain 11")
         if self.promotion_eligible is not False:
             raise TaskCRehearsalError(
                 "rehearsal results cannot be treated as evidence for advancement"
             )
-        if self.feature_selection != FEATURE_SELECTION:
+        if (
+            type(self.feature_selection) is not str
+            or self.feature_selection != FEATURE_SELECTION
+        ):
             raise TaskCRehearsalError(
                 "gene selection must remain based on training-control variance"
             )
 
         if not isinstance(self.profiles, Mapping):
             raise TaskCRehearsalError("profiles must contain the two fixed profiles")
-        copied_profiles = dict(self.profiles)
-        if tuple(copied_profiles) != tuple(_PROFILE_VALUES):
+        reported_profile_count = len(self.profiles)
+        profile_keys = tuple(islice(iter(self.profiles), len(_PROFILE_VALUES) + 1))
+        if (
+            reported_profile_count != len(_PROFILE_VALUES)
+            or len(profile_keys) != len(_PROFILE_VALUES)
+            or profile_keys != tuple(_PROFILE_VALUES)
+        ):
             raise TaskCRehearsalError(
                 "profiles must remain connection then comprehensive"
             )
+        copied_profiles: dict[str, RehearsalProfile] = {}
         for name, expected in _PROFILE_VALUES.items():
-            profile = copied_profiles[name]
-            if not isinstance(profile, RehearsalProfile) or (
+            profile = self.profiles[name]
+            if type(profile) is not RehearsalProfile or (
                 profile.maximum_genes,
                 profile.maximum_cells_per_context,
                 profile.timeout_seconds_per_method,
@@ -150,14 +171,23 @@ class TaskCRehearsalConfig:
                 raise TaskCRehearsalError(
                     f"{name} must keep the fixed profile values"
                 )
+            copied_profiles[name] = RehearsalProfile(*expected)
 
         if not isinstance(self.null_controls, Mapping):
             raise TaskCRehearsalError("null controls must keep the fixed checks")
-        copied_nulls = dict(self.null_controls)
-        if tuple(copied_nulls) != _NULL_CONTROL_FIELDS:
+        reported_null_count = len(self.null_controls)
+        null_keys = tuple(
+            islice(iter(self.null_controls), len(_NULL_CONTROL_FIELDS) + 1)
+        )
+        if (
+            reported_null_count != len(_NULL_CONTROL_FIELDS)
+            or len(null_keys) != len(_NULL_CONTROL_FIELDS)
+            or null_keys != _NULL_CONTROL_FIELDS
+        ):
             raise TaskCRehearsalError(
                 "null-control fields or their order changed"
             )
+        copied_nulls = {name: self.null_controls[name] for name in null_keys}
         if type(copied_nulls["repeats"]) is not int:
             raise TaskCRehearsalError("null-control repeats must be a whole number")
         for name in (
@@ -211,7 +241,10 @@ class TaskCRehearsalConfig:
 def _fixed_text_tuple(values: object, label: str) -> tuple[str, ...]:
     if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
         raise TaskCRehearsalError(f"{label} must be an ordered text list")
-    copied = tuple(values)
+    reported_count = len(values)
+    if reported_count > 64:
+        raise TaskCRehearsalError(f"{label} contains too many values")
+    copied = tuple(values[index] for index in range(reported_count))
     if not copied or any(type(value) is not str or not value for value in copied):
         raise TaskCRehearsalError(f"{label} must contain only non-empty text")
     return copied
@@ -220,7 +253,10 @@ def _fixed_text_tuple(values: object, label: str) -> tuple[str, ...]:
 def _fixed_integer_tuple(values: object, label: str) -> tuple[int, ...]:
     if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
         raise TaskCRehearsalError(f"{label} must be an ordered whole-number list")
-    copied = tuple(values)
+    reported_count = len(values)
+    if reported_count > 64:
+        raise TaskCRehearsalError(f"{label} contains too many values")
+    copied = tuple(values[index] for index in range(reported_count))
     if not copied or any(type(value) is not int for value in copied):
         raise TaskCRehearsalError(f"{label} must contain only whole numbers")
     return copied
@@ -267,26 +303,96 @@ def _reject_nonfinite_numbers(value: object) -> None:
             pending.extend(current)
 
 
-def _load_json_object(path: Path) -> dict[str, Any]:
+def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+        int(metadata.st_nlink),
+    )
+
+
+def _read_limited_regular_file(path: Path) -> bytes:
+    absolute = Path(os.path.abspath(os.fspath(path)))
     try:
-        payload = Path(path).read_bytes()
+        descriptor = os.open(
+            absolute,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
     except OSError as exc:
         raise TaskCRehearsalError(
-            "rehearsal configuration could not be read"
+            "rehearsal configuration must be a readable regular file"
         ) from exc
-    if len(payload) > MAXIMUM_CONFIG_BYTES:
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise TaskCRehearsalError(
+                "rehearsal configuration must be a regular file"
+            )
+        if before.st_size > MAXIMUM_CONFIG_BYTES:
+            raise TaskCRehearsalError("rehearsal configuration is too large")
+        collected = bytearray()
+        while len(collected) <= MAXIMUM_CONFIG_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, MAXIMUM_CONFIG_BYTES + 1 - len(collected)),
+            )
+            if not chunk:
+                break
+            collected.extend(chunk)
+        after = os.fstat(descriptor)
+    except TaskCRehearsalError:
+        raise
+    except OSError as exc:
+        raise TaskCRehearsalError(
+            "rehearsal configuration could not be read from its regular file"
+        ) from exc
+    finally:
+        os.close(descriptor)
+    if len(collected) > MAXIMUM_CONFIG_BYTES:
         raise TaskCRehearsalError("rehearsal configuration is too large")
     try:
+        current = os.lstat(absolute)
+    except OSError as exc:
+        raise TaskCRehearsalError(
+            "rehearsal configuration changed while it was being read"
+        ) from exc
+    if (
+        len(collected) != before.st_size
+        or _file_identity(before) != _file_identity(after)
+        or _file_identity(after) != _file_identity(current)
+    ):
+        raise TaskCRehearsalError(
+            "rehearsal configuration changed while it was being read"
+        )
+    return bytes(collected)
+
+
+def _load_json_object(path: Path) -> dict[str, Any]:
+    payload = _read_limited_regular_file(Path(path))
+    try:
+        decoded = payload.decode("utf-8", errors="strict")
+    except UnicodeError as exc:
+        raise TaskCRehearsalError(
+            "rehearsal configuration is not valid UTF-8 text"
+        ) from exc
+    try:
         value = json.loads(
-            payload.decode("utf-8", errors="strict"),
+            decoded,
             object_pairs_hook=_unique_json_object,
             parse_constant=_reject_nonfinite_json,
         )
     except TaskCRehearsalError:
         raise
-    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+    except RecursionError as exc:
         raise TaskCRehearsalError(
-            "rehearsal configuration is not valid UTF-8 JSON"
+            "rehearsal configuration is too deeply nested"
+        ) from exc
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise TaskCRehearsalError(
+            "rehearsal configuration is not valid JSON"
         ) from exc
     try:
         depth = _json_depth(value)
@@ -361,6 +467,7 @@ def _canonical_texts(
     label: str,
     *,
     require_unique: bool,
+    maximum_items: int,
 ) -> tuple[str, ...]:
     if isinstance(values, (str, bytes)):
         raise TaskCRehearsalError(f"{label} must be a one-dimensional text list")
@@ -369,19 +476,43 @@ def _canonical_texts(
             raise TaskCRehearsalError(
                 f"{label} must be a one-dimensional text list"
             )
+        if len(values) > maximum_items:
+            raise TaskCRehearsalError(f"{label} contains too many values")
         copied = tuple(values.tolist())
     else:
-        try:
-            copied = tuple(values)  # type: ignore[arg-type]
-        except TypeError as exc:
+        if not isinstance(values, Sequence):
             raise TaskCRehearsalError(
                 f"{label} must be a one-dimensional text list"
-            ) from exc
+            )
+        reported_count = len(values)
+        if reported_count > maximum_items:
+            raise TaskCRehearsalError(f"{label} contains too many values")
+        copied = tuple(values[index] for index in range(reported_count))
     if not copied:
         raise TaskCRehearsalError(f"{label} must not be empty")
+    if len(copied) > maximum_items:
+        raise TaskCRehearsalError(f"{label} contains too many values")
+    total_bytes = 0
+    maximum_characters = 0
     for value in copied:
         if type(value) is not str:
             raise TaskCRehearsalError(f"{label} must contain only text")
+        try:
+            encoded = value.encode("utf-8", errors="strict")
+        except UnicodeError as exc:
+            raise TaskCRehearsalError(f"{label} must use valid UTF-8 text") from exc
+        if len(encoded) > MAXIMUM_TEXT_ITEM_BYTES:
+            raise TaskCRehearsalError(f"{label} exceeds the per-item text limit")
+        total_bytes += len(encoded)
+        maximum_characters = max(maximum_characters, len(value))
+        projected_array_bytes = (
+            len(copied) * maximum_characters * np.dtype("U1").itemsize
+        )
+        if (
+            total_bytes > MAXIMUM_TOTAL_TEXT_BYTES
+            or projected_array_bytes > MAXIMUM_TOTAL_TEXT_BYTES
+        ):
+            raise TaskCRehearsalError(f"{label} exceeds the total text limit")
         if (
             not value
             or value != value.strip()
@@ -394,6 +525,22 @@ def _canonical_texts(
     if require_unique and len(set(copied)) != len(copied):
         raise TaskCRehearsalError(f"{label} must be unique")
     return copied
+
+
+def _immutable_array(values: np.ndarray) -> np.ndarray:
+    contiguous = np.ascontiguousarray(values)
+    if contiguous.dtype.hasobject:
+        raise TaskCRehearsalError("returned arrays cannot contain Python objects")
+    frozen = np.frombuffer(contiguous.tobytes(order="C"), dtype=contiguous.dtype)
+    return frozen.reshape(contiguous.shape)
+
+
+def _immutable_text_array(values: tuple[str, ...]) -> np.ndarray:
+    width = max(len(value) for value in values)
+    projected = len(values) * width * np.dtype("U1").itemsize
+    if projected > MAXIMUM_TOTAL_TEXT_BYTES:
+        raise TaskCRehearsalError("returned labels exceed the total text limit")
+    return _immutable_array(np.asarray(values, dtype=f"U{width}"))
 
 
 def _numeric_matrix(
@@ -410,6 +557,8 @@ def _numeric_matrix(
         raw.ndim != 2
         or raw.shape[0] < 1
         or raw.shape[1] < 2
+        or raw.shape[0] > MAXIMUM_PARENT_CELLS
+        or raw.shape[1] > MAXIMUM_PARENT_GENES
         or raw.dtype.kind not in {"i", "u", "f"}
     ):
         raise TaskCRehearsalError(
@@ -429,8 +578,14 @@ def _numeric_matrix(
 def _require_context_keys(contexts: object) -> Mapping[str, object]:
     if not isinstance(contexts, Mapping):
         raise TaskCRehearsalError("contexts must contain k562 and rpe1")
-    keys = tuple(contexts)
-    if any(type(key) is not str for key in keys) or set(keys) != {"k562", "rpe1"}:
+    reported_count = len(contexts)
+    keys = tuple(islice(iter(contexts), 3))
+    if (
+        reported_count != 2
+        or len(keys) != 2
+        or any(type(key) is not str for key in keys)
+        or set(keys) != {"k562", "rpe1"}
+    ):
         raise TaskCRehearsalError("contexts must contain exactly k562 and rpe1")
     return contexts
 
@@ -447,11 +602,17 @@ def choose_rehearsal_genes(
     """
 
     contexts = _require_context_keys(allowed_control_expression)
-    genes = _canonical_texts(gene_names, "gene names", require_unique=True)
+    genes = _canonical_texts(
+        gene_names,
+        "gene names",
+        require_unique=True,
+        maximum_items=MAXIMUM_PARENT_GENES,
+    )
     if (
         isinstance(maximum_genes, bool)
         or type(maximum_genes) is not int
         or maximum_genes < 2
+        or maximum_genes > MAXIMUM_PARENT_GENES
     ):
         raise TaskCRehearsalError("maximum_genes must be a whole number of at least two")
 
@@ -466,8 +627,17 @@ def choose_rehearsal_genes(
             raise TaskCRehearsalError(
                 f"{context_id} needs at least two control cells"
             )
-        variances.append(values.var(axis=0, ddof=0))
-    mean_variance = np.mean(np.stack(variances, axis=0), axis=0)
+        with np.errstate(over="ignore", invalid="ignore"):
+            variance = values.var(axis=0, ddof=0)
+        if not np.isfinite(variance).all():
+            raise TaskCRehearsalError(
+                f"{context_id} derived gene variance is not finite"
+            )
+        variances.append(variance)
+    with np.errstate(over="ignore", invalid="ignore"):
+        mean_variance = np.mean(np.stack(variances, axis=0), axis=0)
+    if not np.isfinite(mean_variance).all():
+        raise TaskCRehearsalError("mean derived gene variance is not finite")
     order = sorted(
         range(len(genes)),
         key=lambda index: (-float(mean_variance[index]), genes[index]),
@@ -480,10 +650,11 @@ def _stratified_quotas(
     maximum_cells: int,
     minimum_cells_per_group: int,
 ) -> dict[str, int]:
-    unique, counts = np.unique(np.asarray(labels, dtype=str), return_counts=True)
-    count_by_label = {
-        str(label): int(count) for label, count in zip(unique, counts, strict=True)
-    }
+    count_by_label = dict(sorted(Counter(labels).items()))
+    if len(count_by_label) > MAXIMUM_DISTINCT_LABELS:
+        raise TaskCRehearsalError(
+            "distinct cell-label groups exceed the public profile limit"
+        )
     if any(count < minimum_cells_per_group for count in count_by_label.values()):
         raise TaskCRehearsalError(
             "every cell-label group must meet the requested minimum"
@@ -530,12 +701,16 @@ def choose_rehearsal_cells(
     """Choose cells reproducibly while preserving every retained label group."""
 
     labels = _canonical_texts(
-        interventions, "cell labels", require_unique=False
+        interventions,
+        "cell labels",
+        require_unique=False,
+        maximum_items=MAXIMUM_PARENT_CELLS,
     )
     if (
         isinstance(maximum_cells, bool)
         or type(maximum_cells) is not int
         or maximum_cells < 1
+        or maximum_cells > MAXIMUM_PARENT_CELLS
     ):
         raise TaskCRehearsalError("maximum_cells must be a positive whole number")
     if isinstance(seed, bool) or type(seed) is not int or not 0 <= seed <= MAXIMUM_SEED:
@@ -557,21 +732,21 @@ def choose_rehearsal_cells(
         minimum_cells_per_group,
     )
     if maximum_cells >= len(labels):
-        selected_all = np.arange(len(labels), dtype=np.int64)
-        selected_all.setflags(write=False)
-        return selected_all
+        return _immutable_array(np.arange(len(labels), dtype=np.int64))
 
-    labels_array = np.asarray(labels, dtype=str)
+    indices_by_label: dict[str, list[int]] = {
+        label: [] for label in quotas
+    }
+    for index, label in enumerate(labels):
+        indices_by_label[label].append(index)
     selected: list[int] = []
     for label in sorted(quotas):
-        candidates = np.flatnonzero(labels_array == label)
+        candidates = np.asarray(indices_by_label[label], dtype=np.int64)
         digest = hashlib.sha256(f"{seed}\0{label}".encode("utf-8")).digest()
         rng = np.random.default_rng(int.from_bytes(digest[:8], "big"))
         chosen = rng.choice(candidates, size=quotas[label], replace=False)
         selected.extend(int(index) for index in chosen.tolist())
-    result = np.asarray(sorted(selected), dtype=np.int64)
-    result.setflags(write=False)
-    return result
+    return _immutable_array(np.asarray(sorted(selected), dtype=np.int64))
 
 
 def center_and_merge_allowed_contexts(
@@ -588,11 +763,14 @@ def center_and_merge_allowed_contexts(
 
     context_map = _require_context_keys(contexts)
     canonical_control = _canonical_texts(
-        (control_label,), "control label", require_unique=True
+        (control_label,),
+        "control label",
+        require_unique=True,
+        maximum_items=1,
     )[0]
     centered: list[np.ndarray] = []
-    labels_out: list[np.ndarray] = []
-    environments: list[np.ndarray] = []
+    labels_out: list[tuple[str, ...]] = []
+    environments: list[tuple[str, ...]] = []
     expected_genes: int | None = None
     for context_id in ("k562", "rpe1"):
         entry = context_map[context_id]
@@ -603,7 +781,10 @@ def center_and_merge_allowed_contexts(
         raw_expression, raw_labels = entry
         values = _numeric_matrix(raw_expression, f"{context_id} expression")
         context_labels = _canonical_texts(
-            raw_labels, f"{context_id} labels", require_unique=False
+            raw_labels,
+            f"{context_id} labels",
+            require_unique=False,
+            maximum_items=MAXIMUM_PARENT_CELLS,
         )
         if values.shape[0] != len(context_labels):
             raise TaskCRehearsalError(
@@ -613,22 +794,44 @@ def center_and_merge_allowed_contexts(
             expected_genes = values.shape[1]
         elif values.shape[1] != expected_genes:
             raise TaskCRehearsalError("cross-context expression must use the same genes")
-        label_array = np.asarray(context_labels, dtype=str)
-        controls = label_array == canonical_control
+        controls = np.fromiter(
+            (label == canonical_control for label in context_labels),
+            dtype=bool,
+            count=len(context_labels),
+        )
         if int(np.count_nonzero(controls)) < 2:
             raise TaskCRehearsalError(
                 f"{context_id} needs at least two controls"
             )
         control_values = values[controls]
-        center = control_values.mean(axis=0)
-        scale = control_values.std(axis=0, ddof=0)
-        centered.append((values - center) / np.where(scale <= 1e-6, 1.0, scale))
-        labels_out.append(label_array)
-        environments.append(np.asarray([context_id] * len(label_array), dtype=str))
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            center = control_values.mean(axis=0)
+            scale = control_values.std(axis=0, ddof=0)
+        if not np.isfinite(center).all() or not np.isfinite(scale).all():
+            raise TaskCRehearsalError(
+                f"{context_id} derived control statistics are not finite"
+            )
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            standardized = (values - center) / np.where(
+                scale <= 1e-6, 1.0, scale
+            )
+        if not np.isfinite(standardized).all():
+            raise TaskCRehearsalError(
+                f"{context_id} standardized expression is not finite"
+            )
+        centered.append(standardized)
+        labels_out.append(context_labels)
+        environments.append(tuple(context_id for _ in context_labels))
 
     merged = np.concatenate(centered, axis=0)
-    merged_labels = np.concatenate(labels_out)
-    merged_environments = np.concatenate(environments)
-    for values in (merged, merged_labels, merged_environments):
-        values.setflags(write=False)
-    return merged, merged_labels, merged_environments
+    if not np.isfinite(merged).all():
+        raise TaskCRehearsalError("merged standardized expression is not finite")
+    merged_labels = tuple(label for group in labels_out for label in group)
+    merged_environments = tuple(
+        environment for group in environments for environment in group
+    )
+    return (
+        _immutable_array(merged),
+        _immutable_text_array(merged_labels),
+        _immutable_text_array(merged_environments),
+    )

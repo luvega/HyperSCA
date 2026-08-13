@@ -46,6 +46,9 @@ MAXIMUM_NPY_HEADER_BYTES = 64 * 1024
 MAXIMUM_PARENT_CELLS = 1_000_000
 MAXIMUM_PARENT_GENES = 1_000
 MAXIMUM_PARENT_EXPRESSION_ELEMENTS = MAXIMUM_PARENT_CELLS * MAXIMUM_PARENT_GENES
+MAXIMUM_TEXT_ITEM_BYTES = 4 * 1024
+MAXIMUM_TOTAL_TEXT_BYTES = 64 * 1024 * 1024
+MAXIMUM_DISTINCT_LABELS = MAXIMUM_PARENT_GENES + 2
 
 _PUBLIC_MANIFEST_FIELDS = frozenset(
     {
@@ -394,21 +397,49 @@ def _load_public_manifest(
 def _text_vector(values: np.ndarray, label: str) -> tuple[str, ...]:
     if values.ndim != 1 or values.dtype.kind not in {"U", "S"}:
         raise TaskCProfileInputError(f"{label} must be a one-dimensional text array")
-    try:
-        result = tuple(
-            value.decode("utf-8", errors="strict") if isinstance(value, bytes) else str(value)
-            for value in values.tolist()
-        )
-    except UnicodeError as exc:
-        raise TaskCProfileInputError(f"{label} must use UTF-8") from exc
-    if any(
-        not value
-        or value != value.strip()
-        or not unicodedata.is_normalized("NFC", value)
-        for value in result
-    ):
-        raise TaskCProfileInputError(f"{label} contains invalid text")
+    result_list: list[str] = []
+    total_bytes = 0
+    maximum_characters = 0
+    for raw in values.tolist():
+        try:
+            value = (
+                raw.decode("utf-8", errors="strict")
+                if isinstance(raw, bytes)
+                else str(raw)
+            )
+            encoded = value.encode("utf-8", errors="strict")
+        except UnicodeError as exc:
+            raise TaskCProfileInputError(f"{label} must use UTF-8") from exc
+        if len(encoded) > MAXIMUM_TEXT_ITEM_BYTES:
+            raise TaskCProfileInputError(f"{label} exceeds the per-item text limit")
+        total_bytes += len(encoded)
+        maximum_characters = max(maximum_characters, len(value))
+        if (
+            total_bytes > MAXIMUM_TOTAL_TEXT_BYTES
+            or len(values) * maximum_characters * np.dtype("U1").itemsize
+            > MAXIMUM_TOTAL_TEXT_BYTES
+        ):
+            raise TaskCProfileInputError(f"{label} exceeds the total text limit")
+        if (
+            not value
+            or value != value.strip()
+            or not unicodedata.is_normalized("NFC", value)
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            raise TaskCProfileInputError(f"{label} contains invalid text")
+        result_list.append(value)
+    result = tuple(result_list)
     return result
+
+
+def _immutable_array(values: np.ndarray) -> np.ndarray:
+    """Copy an array onto an immutable bytes buffer."""
+
+    contiguous = np.ascontiguousarray(values)
+    if contiguous.dtype.hasobject:
+        raise TaskCProfileInputError("profile arrays must not contain Python objects")
+    frozen = np.frombuffer(contiguous.tobytes(order="C"), dtype=contiguous.dtype)
+    return frozen.reshape(contiguous.shape)
 
 
 def _preflight_parent_archive(payload: bytes) -> None:
@@ -630,10 +661,15 @@ def _selected_genes(
         raise TaskCProfileInputError("gene-selection parents use different gene orders")
     if len(genes) < 2:
         raise TaskCProfileInputError("profile needs at least two common expression genes")
-    mean_variance = np.mean(
-        np.stack([values.var(axis=0, ddof=0) for _, values in loaded], axis=0),
-        axis=0,
-    )
+    with np.errstate(over="ignore", invalid="ignore"):
+        context_variances = np.stack(
+            [values.var(axis=0, ddof=0) for _, values in loaded], axis=0
+        )
+        mean_variance = np.mean(context_variances, axis=0)
+    if not np.isfinite(context_variances).all() or not np.isfinite(
+        mean_variance
+    ).all():
+        raise TaskCProfileInputError("derived gene variance is not finite")
     ranked = sorted(
         range(len(genes)),
         key=lambda index: (-mean_variance[index], genes[index]),
@@ -730,6 +766,30 @@ def _stratified_cell_indices(
 def _counts(labels: np.ndarray) -> dict[str, int]:
     unique, counts = np.unique(labels, return_counts=True)
     return {str(label): int(count) for label, count in zip(unique, counts)}
+
+
+def _control_zscore(
+    values: np.ndarray,
+    controls: np.ndarray,
+    context_id: str,
+) -> np.ndarray:
+    """Apply the registered population-control z-score with finite checks."""
+
+    control_values = values[controls]
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        center = control_values.mean(axis=0)
+        scale = control_values.std(axis=0, ddof=0)
+    if not np.isfinite(center).all() or not np.isfinite(scale).all():
+        raise TaskCProfileInputError(
+            f"{context_id} derived control statistics are not finite"
+        )
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        standardized = (values - center) / np.where(scale <= 1e-6, 1.0, scale)
+    if not np.isfinite(standardized).all():
+        raise TaskCProfileInputError(
+            f"{context_id} standardized expression is not finite"
+        )
+    return standardized
 
 
 def _actual_parent_records(
@@ -901,11 +961,10 @@ def _build_profile(
                 raise TaskCProfileInputError(
                     f"{spec['context_id']} profile needs at least two selected controls"
                 )
-            control_values = selected_expression[controls]
-            mean = control_values.mean(axis=0)
-            scale = control_values.std(axis=0, ddof=0)
-            selected_expression = (selected_expression - mean) / np.where(
-                scale <= 1e-6, 1.0, scale
+            selected_expression = _control_zscore(
+                selected_expression,
+                controls,
+                str(spec["context_id"]),
             )
         expressions.append(selected_expression)
         labels_out.append(selected_labels)
@@ -933,6 +992,8 @@ def _build_profile(
         actual_snapshots.append(snapshot)
     expression_out = np.concatenate(expressions, axis=0)
     interventions_out = np.concatenate(labels_out)
+    if not np.isfinite(expression_out).all():
+        raise TaskCProfileInputError("profile expression output is not finite")
     final_counts = Counter(interventions_out.tolist())
     stage_sources = (
         set(public_manifest["train_sources"])
@@ -1019,9 +1080,10 @@ def _build_profile(
         ][0]
         for inventory_snapshot in used_inventory_snapshots
     }
-    for values in (expression_out, interventions_out, environments):
-        if values is not None:
-            values.setflags(write=False)
+    expression_out = _immutable_array(expression_out)
+    interventions_out = _immutable_array(interventions_out)
+    if environments is not None:
+        environments = _immutable_array(environments)
     return _BuiltProfile(
         input_bytes=input_bytes,
         manifest=manifest,

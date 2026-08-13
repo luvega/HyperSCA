@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator, Mapping
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -84,6 +86,7 @@ def test_direct_construction_copies_nested_inputs_and_rejects_relaxation() -> No
         "connection": RehearsalProfile(64, 2_000, 1_800),
         "comprehensive": RehearsalProfile(256, 20_000, 14_400),
     }
+    original_connection = profiles["connection"]
     null_controls: dict[str, float | int] = {
         "repeats": 20,
         "minimum_empirical_advantage": 0.0,
@@ -105,6 +108,11 @@ def test_direct_construction_copies_nested_inputs_and_rejects_relaxation() -> No
     null_controls["repeats"] = 1
     assert tuple(config.profiles) == ("connection", "comprehensive")
     assert config.null_controls["repeats"] == 20
+    assert not hasattr(config, "__dict__")
+    assert not hasattr(config.profiles["connection"], "__dict__")
+
+    object.__setattr__(original_connection, "maximum_genes", 999)
+    assert config.profiles["connection"].maximum_genes == 64
 
     relaxed = dict(config.profiles)
     relaxed["connection"] = RehearsalProfile(65, 2_000, 1_800)
@@ -121,6 +129,36 @@ def test_direct_construction_copies_nested_inputs_and_rejects_relaxation() -> No
             required_artifacts=EXPECTED_ARTIFACTS,
             full_run_seeds=EXPECTED_SEEDS,
         )
+
+
+def test_direct_construction_rejects_scalar_subclasses_and_duplicate_mapping_keys() -> None:
+    config = load_task_c_rehearsal_config(CONFIG_PATH)
+
+    class DisguisedInteger(int):
+        pass
+
+    class DisguisedText(str):
+        pass
+
+    with pytest.raises(TaskCRehearsalError, match="maximum_genes"):
+        RehearsalProfile(DisguisedInteger(64), 2_000, 1_800)
+    with pytest.raises(TaskCRehearsalError, match="schema"):
+        replace(config, schema_version=DisguisedText("1.0"))
+    with pytest.raises(TaskCRehearsalError, match="gene selection"):
+        replace(config, feature_selection=DisguisedText(config.feature_selection))
+
+    class DuplicateProfileMapping(Mapping[str, RehearsalProfile]):
+        def __getitem__(self, key: str) -> RehearsalProfile:
+            return config.profiles[key]
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(("connection", "connection", "comprehensive"))
+
+        def __len__(self) -> int:
+            return 3
+
+    with pytest.raises(TaskCRehearsalError, match="connection then comprehensive"):
+        replace(config, profiles=DuplicateProfileMapping())
 
 
 @pytest.mark.parametrize(
@@ -191,6 +229,33 @@ def test_config_rejects_oversized_input_before_json_decoding(tmp_path: Path) -> 
         load_task_c_rehearsal_config(path)
 
 
+def test_config_rejects_symlink_special_file_huge_integer_and_parser_recursion(
+    tmp_path: Path,
+) -> None:
+    symlink = tmp_path / "linked.json"
+    symlink.symlink_to(CONFIG_PATH)
+    with pytest.raises(TaskCRehearsalError, match="regular file"):
+        load_task_c_rehearsal_config(symlink)
+
+    with pytest.raises(TaskCRehearsalError, match="regular file"):
+        load_task_c_rehearsal_config(Path("/dev/zero"))
+
+    huge_integer = tmp_path / "huge-integer.json"
+    huge_integer.write_text('{"value":' + "9" * 5_000 + "}\n")
+    with pytest.raises(TaskCRehearsalError, match="valid JSON"):
+        load_task_c_rehearsal_config(huge_integer)
+
+    recursive = tmp_path / "recursive.json"
+    recursive.write_text("[" * 2_000 + "0" + "]" * 2_000)
+    with pytest.raises(TaskCRehearsalError, match="deeply nested"):
+        load_task_c_rehearsal_config(recursive)
+
+    invalid_utf8 = tmp_path / "invalid-utf8.json"
+    invalid_utf8.write_bytes(b"{\xff}")
+    with pytest.raises(TaskCRehearsalError, match="UTF-8"):
+        load_task_c_rehearsal_config(invalid_utf8)
+
+
 def test_gene_selection_uses_population_variance_and_gene_name_ties() -> None:
     k562 = np.asarray(
         [[0.0, 0.0, 0.0], [1.0, 5.0, 2.0], [2.0, 10.0, 4.0]]
@@ -209,6 +274,18 @@ def test_gene_selection_uses_population_variance_and_gene_name_ties() -> None:
     assert selected == ("B", "A", "C")
     np.testing.assert_array_equal(k562, before["k562"])
     np.testing.assert_array_equal(rpe1, before["rpe1"])
+
+
+def test_gene_selection_rejects_nonfinite_derived_variance() -> None:
+    overflowing = np.asarray(
+        [[-1e308, 1.0], [1e308, 2.0]], dtype=np.float64
+    )
+    with pytest.raises(TaskCRehearsalError, match="derived gene variance"):
+        choose_rehearsal_genes(
+            {"k562": overflowing, "rpe1": overflowing.copy()},
+            gene_names=["A", "B"],
+            maximum_genes=2,
+        )
 
 
 @pytest.mark.parametrize(
@@ -275,6 +352,34 @@ def test_gene_selection_requires_the_two_registered_contexts() -> None:
         )
 
 
+def test_gene_and_cell_text_rejects_unencodable_or_oversized_values() -> None:
+    controls = {"k562": np.ones((2, 2)), "rpe1": np.ones((2, 2))}
+    with pytest.raises(TaskCRehearsalError, match="UTF-8"):
+        choose_rehearsal_genes(
+            controls,
+            gene_names=["A", "\ud800"],
+            maximum_genes=2,
+        )
+    with pytest.raises(TaskCRehearsalError, match="text limit"):
+        choose_rehearsal_cells(
+            ["non-targeting", "X" * 5_000],
+            maximum_cells=2,
+            seed=11,
+        )
+    with pytest.raises(TaskCRehearsalError, match="UTF-8"):
+        choose_rehearsal_cells(
+            ["non-targeting", "\ud800"],
+            maximum_cells=2,
+            seed=11,
+        )
+    with pytest.raises(TaskCRehearsalError, match="one-dimensional text list"):
+        choose_rehearsal_cells(
+            (label for label in ("non-targeting", "A")),  # type: ignore[arg-type]
+            maximum_cells=2,
+            seed=11,
+        )
+
+
 def test_cell_selection_matches_registered_stratified_quota_and_is_reproducible() -> None:
     labels = np.asarray(["non-targeting"] * 6 + ["A"] * 6 + ["B"] * 6)
     before = labels.copy()
@@ -293,6 +398,8 @@ def test_cell_selection_matches_registered_stratified_quota_and_is_reproducible(
 
     assert first.tolist() == second.tolist()
     assert np.all(first[:-1] < first[1:])
+    with pytest.raises(ValueError):
+        first.setflags(write=True)
     selected_labels = labels[first]
     assert {
         label: int((selected_labels == label).sum())
@@ -321,6 +428,16 @@ def test_cell_selection_reserves_the_minimum_and_does_not_create_small_groups() 
             maximum_cells=8,
             seed=11,
             minimum_cells_per_group=3,
+        )
+
+
+def test_cell_selection_limits_distinct_groups_to_the_public_profile_universe() -> None:
+    labels = [f"G{index}" for index in range(1_003)]
+    with pytest.raises(TaskCRehearsalError, match="distinct cell-label groups"):
+        choose_rehearsal_cells(
+            labels,
+            maximum_cells=len(labels),
+            seed=11,
         )
 
 
@@ -389,12 +506,50 @@ def test_cross_context_merge_uses_population_control_zscore_and_fixed_order() ->
     assert not merged.flags.writeable
     assert not labels.flags.writeable
     assert not environments.flags.writeable
+    for values in (merged, labels, environments):
+        with pytest.raises(ValueError):
+            values.setflags(write=True)
     np.testing.assert_array_equal(k562, k562_before)
     np.testing.assert_array_equal(rpe1, rpe1_before)
     random_after = np.random.get_state()
     assert random_before[0] == random_after[0]
     np.testing.assert_array_equal(random_before[1], random_after[1])
     assert random_before[2:] == random_after[2:]
+
+
+def test_cross_context_merge_rejects_nonfinite_derived_statistics() -> None:
+    expression = np.asarray(
+        [[1e308, 1.0], [1e308, 2.0], [1e308, 3.0]], dtype=np.float64
+    )
+    labels = np.asarray(["non-targeting", "non-targeting", "A"])
+    with pytest.raises(TaskCRehearsalError, match="derived control statistics"):
+        center_and_merge_allowed_contexts(
+            {
+                "k562": (expression, labels),
+                "rpe1": (expression.copy(), labels.copy()),
+            }
+        )
+
+
+def test_cross_context_merge_rejects_duplicate_context_iteration() -> None:
+    entry = (np.ones((2, 2)), np.asarray(["non-targeting"] * 2))
+
+    class DuplicateContextMapping(
+        Mapping[str, tuple[np.ndarray, np.ndarray]]
+    ):
+        def __getitem__(self, key: str) -> tuple[np.ndarray, np.ndarray]:
+            if key not in {"k562", "rpe1"}:
+                raise KeyError(key)
+            return entry
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(("k562", "k562", "rpe1"))
+
+        def __len__(self) -> int:
+            return 3
+
+    with pytest.raises(TaskCRehearsalError, match="exactly k562 and rpe1"):
+        center_and_merge_allowed_contexts(DuplicateContextMapping())
 
 
 @pytest.mark.parametrize(
