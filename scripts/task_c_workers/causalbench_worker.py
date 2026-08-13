@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
+from contextlib import contextmanager
 import csv
+import importlib
 import io
 import os
 from pathlib import Path
+import secrets
+import site
 import stat
-import tempfile
+import subprocess
+import sys
 from typing import Any, Sequence
 import unicodedata
 import zipfile
@@ -46,12 +51,64 @@ MODEL_OUTPUT_SEMANTICS = {
     "sortnregress": "official_unranked_edges",
 }
 """Fixed evidence boundary for ranked versus unranked official results."""
+MODEL_TRAINING_INFORMATION = {
+    "random1000": "observational",
+    "grnboost": "observational",
+    "pc": "observational",
+    "ges": "observational",
+    "gies": "partial_interventional",
+    "gsp": "observational",
+    "igsp": "partial_interventional",
+    "notears-lin-sparse": "observational",
+    "DCDI-G": "partial_interventional",
+    "DCDI-DSF": "partial_interventional",
+    "DCDFG-LIN": "partial_interventional",
+    "DCDFG-MLP": "partial_interventional",
+    "sortnregress": "observational",
+}
+MODEL_IMPORTS = {
+    "random1000": (
+        "causalscbench.models.random_network",
+        "RandomWithSize",
+        (1000,),
+        {},
+    ),
+    "grnboost": ("causalscbench.models.arboreto_baselines", "GRNBoost", (), {}),
+    "pc": ("causalscbench.models.causallearn_models", "PC", (), {"missing_value": False}),
+    "ges": ("causalscbench.models.causallearn_models", "GES", (), {}),
+    "gies": ("causalscbench.models.gies", "GIES", (), {}),
+    "gsp": (
+        "causalscbench.models.sparsest_permutations",
+        "GreedySparsestPermutation",
+        (),
+        {},
+    ),
+    "igsp": (
+        "causalscbench.models.sparsest_permutations",
+        "InterventionalGreedySparsestPermutation",
+        (),
+        {},
+    ),
+    "notears-lin-sparse": (
+        "causalscbench.models.notears",
+        "NotearsLin",
+        (),
+        {"lambda1": 0.001},
+    ),
+    "DCDI-G": ("causalscbench.models.dcdi_models", "DCDI", ("DCDI-G",), {}),
+    "DCDI-DSF": ("causalscbench.models.dcdi_models", "DCDI", ("DCDI-DSF",), {}),
+    "DCDFG-LIN": ("causalscbench.models.dcdi_models", "DCDFG", ("linear",), {}),
+    "DCDFG-MLP": ("causalscbench.models.dcdi_models", "DCDFG", ("mlplr",), {}),
+    "sortnregress": ("causalscbench.models.varsortability", "Sortnregress", (), {}),
+}
 TRAINING_INFORMATION = ("observational", "partial_interventional")
 MAXIMUM_INPUT_BYTES = 512 * 1024 * 1024
 MAXIMUM_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAXIMUM_CELLS = 1_000_000
 MAXIMUM_GENES = 1_000
 CONTROL_LABEL = "non-targeting"
+EXPECTED_CAUSALBENCH_COMMIT = "1a2143cffdc85f835b41ce8d52034be1bf903e71"
+EXPECTED_CAUSALBENCH_REPOSITORY = "https://github.com/causalbench/causalbench.git"
 
 
 class WorkerContractError(ValueError):
@@ -78,6 +135,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="新建的基因关系结果；已有文件不会被覆盖。",
     )
     parser.add_argument("--model-name", choices=MODEL_NAMES, required=True)
+    parser.add_argument(
+        "--causalbench-source",
+        type=Path,
+        required=True,
+        help="固定提交且没有本地改动的 CausalBench 官方源码目录。",
+    )
     parser.add_argument(
         "--training-information",
         choices=TRAINING_INFORMATION,
@@ -149,6 +212,17 @@ def _canonical_text_vector(values: Any, name: str) -> tuple[str, ...]:
         items = tuple(array.tolist())
     if any(not item for item in items):
         raise WorkerContractError(f"{name} must contain non-empty strings")
+    if any(
+        any(ord(character) < 32 or ord(character) == 127 for character in item)
+        for item in items
+    ):
+        raise WorkerContractError(f"{name} must not contain an ASCII control character")
+    # These values are written to CSV later.  A formula marker is unsafe only
+    # at the beginning; an internal hyphen remains a valid part of a gene name.
+    if any(item[0] in "=+-@" for item in items):
+        raise WorkerContractError(
+            f"{name} must not begin with a spreadsheet formula marker"
+        )
     if any(item != item.strip() for item in items):
         raise WorkerContractError(f"{name} must not contain surrounding whitespace")
     if any(not unicodedata.is_normalized("NFC", item) for item in items):
@@ -307,132 +381,368 @@ def validate_model_output_semantics(model_name: str, output_semantics: str) -> N
         )
 
 
-def _ensure_safe_parent(destination: Path) -> None:
-    parent = destination.parent
-    missing: list[Path] = []
-    cursor = parent
-    while not os.path.lexists(cursor):
-        missing.append(cursor)
-        if cursor == cursor.parent:
-            break
-        cursor = cursor.parent
-    if os.path.lexists(cursor):
-        metadata = os.lstat(cursor)
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            raise WorkerContractError("output parent must be a real directory")
-    for directory in reversed(missing):
-        directory.mkdir()
-    cursor = parent
-    while cursor != cursor.parent:
-        metadata = os.lstat(cursor)
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            raise WorkerContractError("output parent must not use symbolic links")
-        cursor = cursor.parent
+def validate_model_training_information(
+    model_name: str, training_information: str
+) -> None:
+    expected = MODEL_TRAINING_INFORMATION[model_name]
+    if training_information != expected:
+        raise WorkerContractError(
+            "requested training information does not match the registered "
+            f"data boundary for {model_name}"
+        )
+
+
+def _git_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return environment
+
+
+def _git(source: Path, *arguments: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "--no-replace-objects", "-C", str(source), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=_git_environment(),
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise SystemExit(
+            "CausalBench source cannot be verified as a fixed Git checkout"
+        ) from exc
+    return completed.stdout.strip()
+
+
+def _assert_no_symlink_components(path: Path, message: str) -> None:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    cursor = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        cursor /= component
+        try:
+            metadata = os.lstat(cursor)
+        except OSError as exc:
+            raise SystemExit(message) from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise SystemExit(message)
+
+
+def _reject_git_history_rewrites(source: Path, label: str) -> None:
+    replacement_refs = _git(
+        source, "for-each-ref", "--format=%(refname)", "refs/replace"
+    )
+    if replacement_refs:
+        raise SystemExit(f"{label} source must not contain Git replace refs")
+    grafts_text = _git(source, "rev-parse", "--git-path", "info/grafts")
+    grafts = Path(grafts_text)
+    if not grafts.is_absolute():
+        grafts = source / grafts
+    if os.path.lexists(grafts):
+        raise SystemExit(f"{label} source must not contain Git grafts")
+
+
+def validate_causalbench_source(
+    source_path: Path, expected_commit: str | None = None
+) -> Path:
+    """Return the exact verified root of the fixed official source checkout."""
+    if expected_commit is None:
+        expected_commit = EXPECTED_CAUSALBENCH_COMMIT
+    source = Path(os.path.abspath(os.fspath(Path(source_path).expanduser())))
+    try:
+        metadata = os.lstat(source)
+    except OSError as exc:
+        raise SystemExit("CausalBench source directory does not exist") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise SystemExit("CausalBench source directory must not be a symbolic link")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit("CausalBench source must be a directory")
+    _assert_no_symlink_components(
+        source, "CausalBench source path must not use a symbolic link"
+    )
+    source = source.resolve(strict=True)
+    _reject_git_history_rewrites(source, "CausalBench")
+    top_level = Path(_git(source, "rev-parse", "--show-toplevel")).resolve(strict=True)
+    if top_level != source:
+        raise SystemExit("CausalBench source must be the verified repository root")
+    if _git(source, "rev-parse", "HEAD") != expected_commit:
+        raise SystemExit("CausalBench source revision does not match the registered commit")
+    if _git(source, "remote", "get-url", "origin") != EXPECTED_CAUSALBENCH_REPOSITORY:
+        raise SystemExit("CausalBench source repository does not match the registered source")
+    if _git(source, "status", "--porcelain", "--untracked-files=all"):
+        raise SystemExit("CausalBench source must have a clean working tree")
+    tracked_entries = _git(source, "ls-files", "--stage").splitlines()
+    if any(entry.startswith("120000 ") for entry in tracked_entries):
+        raise SystemExit("CausalBench source must not contain a symbolic link")
+    package = source / "causalscbench"
+    try:
+        package_metadata = os.lstat(package)
+    except OSError as exc:
+        raise SystemExit("CausalBench fixed package is missing") from exc
+    if stat.S_ISLNK(package_metadata.st_mode) or not stat.S_ISDIR(
+        package_metadata.st_mode
+    ):
+        raise SystemExit(
+            "CausalBench fixed package must be a real directory, not a symbolic link"
+        )
+    return source
+
+
+def _module_is_within_source(module: object, source: Path) -> bool:
+    filename = getattr(module, "__file__", None)
+    if not isinstance(filename, str):
+        return False
+    try:
+        module_path = Path(filename).resolve(strict=True)
+        module_path.relative_to(source)
+        relative = module_path.relative_to(source)
+        cursor = source
+        for component in relative.parts:
+            cursor /= component
+            if stat.S_ISLNK(os.lstat(cursor).st_mode):
+                return False
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _assert_causalbench_modules_are_verified(source: Path) -> None:
+    for name, module in tuple(sys.modules.items()):
+        if name == "causalscbench" or name.startswith("causalscbench."):
+            if module is None or not _module_is_within_source(module, source):
+                raise WorkerContractError(
+                    "CausalBench imported code outside the verified source directory"
+                )
+
+
+@contextmanager
+def _verified_causalbench_imports(source: Path) -> Any:
+    """Temporarily make the verified checkout the only CausalBench source."""
+    previous_path = list(sys.path)
+    environment_names = (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONUSERBASE",
+        "PYTHONNOUSERSITE",
+        "PYTHONDONTWRITEBYTECODE",
+    )
+    previous_environment = {name: os.environ.get(name) for name in environment_names}
+    previous_dont_write_bytecode = sys.dont_write_bytecode
+    previous_modules = {
+        name: module
+        for name, module in tuple(sys.modules.items())
+        if name == "causalscbench" or name.startswith("causalscbench.")
+    }
+    for name in previous_modules:
+        sys.modules.pop(name, None)
+
+    user_site = site.getusersitepackages()
+    user_sites = {user_site} if isinstance(user_site, str) else set(user_site)
+    injected = set(os.environ.get("PYTHONPATH", "").split(os.pathsep))
+    clean_path: list[str] = []
+    for entry in previous_path:
+        candidate = entry or os.getcwd()
+        if candidate in user_sites or candidate in injected:
+            continue
+        clean_path.append(entry)
+    sys.path[:] = [str(source), *clean_path]
+    for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE"):
+        os.environ.pop(name, None)
+    os.environ["PYTHONNOUSERSITE"] = "1"
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    sys.dont_write_bytecode = True
+    try:
+        yield
+        _assert_causalbench_modules_are_verified(source)
+    finally:
+        for name in tuple(sys.modules):
+            if name == "causalscbench" or name.startswith("causalscbench."):
+                sys.modules.pop(name, None)
+        sys.modules.update(previous_modules)
+        sys.path[:] = previous_path
+        sys.dont_write_bytecode = previous_dont_write_bytecode
+        for name, value in previous_environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _build_selected_model(model_name: str) -> object:
+    module_name, class_name, arguments, keywords = MODEL_IMPORTS[model_name]
+    module = importlib.import_module(module_name)
+    model_class = getattr(module, class_name)
+    return model_class(*arguments, **keywords)
+
+
+def _absolute_destination(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+
+
+def _open_output_parent(destination: Path) -> tuple[Path, int, tuple[int, int]]:
+    """Open/create an absolute parent without following directory symlinks (Linux)."""
+    destination = _absolute_destination(destination)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(destination.anchor, flags)
+    try:
+        for component in destination.parent.parts[1:]:
+            try:
+                os.mkdir(component, mode=0o755, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        metadata = os.fstat(descriptor)
+        return destination, descriptor, (metadata.st_dev, metadata.st_ino)
+    except OSError as exc:
+        os.close(descriptor)
+        raise WorkerContractError(
+            "output parent must be a real directory without symbolic links"
+        ) from exc
+
+
+def _parent_path_matches(parent: Path, identity: tuple[int, int]) -> bool:
+    try:
+        metadata = os.lstat(parent)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and (metadata.st_dev, metadata.st_ino) == identity
+    )
+
+
+def _name_exists(parent_descriptor: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _unlink_same_inode(
+    parent_descriptor: int, name: str, identity: tuple[int, int]
+) -> bool:
+    try:
+        metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (metadata.st_dev, metadata.st_ino) == identity:
+            os.unlink(name, dir_fd=parent_descriptor)
+            return True
+    except OSError:
+        pass
+    return False
 
 
 def write_ranked_csv(path: Path, rows: Sequence[tuple[str, str, float]]) -> None:
-    destination = Path(path).expanduser()
-    validate_output_destination(destination)
+    destination, parent_descriptor, parent_identity = _open_output_parent(path)
+    target_name = destination.name
     temporary: str | None = None
+    temporary_identity: tuple[int, int] | None = None
     linked = False
+    completed = False
     try:
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+        if _name_exists(parent_descriptor, target_name):
+            raise WorkerContractError("output CSV must not already exist")
+        if not _parent_path_matches(destination.parent, parent_identity):
+            raise WorkerContractError("output parent directory changed")
+        temporary = f".{target_name}.{secrets.token_hex(16)}.tmp"
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_descriptor,
         )
+        metadata = os.fstat(descriptor)
+        temporary_identity = (metadata.st_dev, metadata.st_ino)
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle, lineterminator="\n")
             writer.writerow(("source", "target", "score"))
             writer.writerows(rows)
             handle.flush()
             os.fsync(handle.fileno())
-        os.link(temporary, destination, follow_symlinks=False)
+        if not _parent_path_matches(destination.parent, parent_identity):
+            raise WorkerContractError("output parent directory changed")
+        os.link(
+            temporary,
+            target_name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
         linked = True
-        os.unlink(temporary)
-        temporary = None
-        directory_descriptor = os.open(destination.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+        if not _parent_path_matches(destination.parent, parent_identity):
+            raise WorkerContractError("output parent directory changed")
+        if _unlink_same_inode(parent_descriptor, temporary, temporary_identity):
+            temporary = None
+        else:
+            raise WorkerContractError("temporary output could not be removed safely")
+        os.fsync(parent_descriptor)
+        if not _parent_path_matches(destination.parent, parent_identity):
+            raise WorkerContractError("output parent directory changed")
+        completed = True
     except FileExistsError as exc:
         raise WorkerContractError("output CSV must not already exist") from exc
-    except WorkerContractError:
-        raise
     except OSError as exc:
-        if linked:
-            try:
-                os.unlink(destination)
-            except OSError:
-                pass
         raise WorkerContractError("output CSV could not be written atomically") from exc
     finally:
-        if temporary is not None:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
+        if linked and not completed and temporary_identity is not None:
+            _unlink_same_inode(parent_descriptor, target_name, temporary_identity)
+        if temporary is not None and temporary_identity is not None:
+            _unlink_same_inode(parent_descriptor, temporary, temporary_identity)
+        os.close(parent_descriptor)
 
 
 def validate_output_destination(path: Path) -> None:
     """Reject overwrite attempts before an expensive external method is run."""
-    destination = Path(path).expanduser()
-    if os.path.lexists(destination):
-        raise WorkerContractError("output CSV must not already exist")
-    _ensure_safe_parent(destination)
+    destination, parent_descriptor, parent_identity = _open_output_parent(path)
+    try:
+        if _name_exists(parent_descriptor, destination.name):
+            raise WorkerContractError("output CSV must not already exist")
+        if not _parent_path_matches(destination.parent, parent_identity):
+            raise WorkerContractError("output parent directory changed")
+    finally:
+        os.close(parent_descriptor)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     try:
         validate_model_output_semantics(args.model_name, args.output_semantics)
+        validate_model_training_information(args.model_name, args.training_information)
         validate_output_destination(args.output_csv)
-        # External imports deliberately occur only after argument parsing, so
-        # ``--help`` remains available before the dedicated environment exists.
-        from causalscbench.models.arboreto_baselines import GRNBoost
-        from causalscbench.models.causallearn_models import GES, PC
-        from causalscbench.models.dcdi_models import DCDI, DCDFG
-        from causalscbench.models.gies import GIES
-        from causalscbench.models.notears import NotearsLin
-        from causalscbench.models.random_network import RandomWithSize
-        from causalscbench.models.sparsest_permutations import (
-            GreedySparsestPermutation,
-            InterventionalGreedySparsestPermutation,
-        )
-        from causalscbench.models.training_regimes import TrainingRegime
-        from causalscbench.models.varsortability import Sortnregress
-
-        model_builders = {
-            "random1000": lambda: RandomWithSize(1000),
-            "grnboost": GRNBoost,
-            "pc": lambda: PC(missing_value=False),
-            "ges": GES,
-            "gies": GIES,
-            "gsp": GreedySparsestPermutation,
-            "igsp": InterventionalGreedySparsestPermutation,
-            "notears-lin-sparse": lambda: NotearsLin(lambda1=0.001),
-            "DCDI-G": lambda: DCDI("DCDI-G"),
-            "DCDI-DSF": lambda: DCDI("DCDI-DSF"),
-            "DCDFG-LIN": lambda: DCDFG("linear"),
-            "DCDFG-MLP": lambda: DCDFG("mlplr"),
-            "sortnregress": Sortnregress,
-        }
+        source = validate_causalbench_source(args.causalbench_source)
         expression, interventions, genes = load_fixed_npz(args.input_npz)
+        if args.model_name == "random1000" and len(genes) * (len(genes) - 1) < 1000:
+            raise WorkerContractError(
+                "random1000 requires at least 1000 possible directed gene relations"
+            )
         expression, interventions = select_training_cells(
             expression, interventions, args.training_information
         )
-        regime = (
-            TrainingRegime.Observational
-            if args.training_information == "observational"
-            else TrainingRegime.PartialIntervational
-        )
-        model = model_builders[args.model_name]()
-        returned = model(
-            expression,
-            interventions.tolist(),
-            list(genes),
-            regime,
-            args.seed,
-        )
+        # Only the selected method module is imported after the checkout and
+        # data boundaries are verified; unrelated optional dependencies do not
+        # prevent another registered method from running.
+        with _verified_causalbench_imports(source):
+            training_module = importlib.import_module(
+                "causalscbench.models.training_regimes"
+            )
+            training_regime = training_module.TrainingRegime
+            regime = (
+                training_regime.Observational
+                if args.training_information == "observational"
+                else training_regime.PartialIntervational
+            )
+            model = _build_selected_model(args.model_name)
+            _assert_causalbench_modules_are_verified(source)
+            returned = model(
+                expression,
+                interventions.tolist(),
+                list(genes),
+                regime,
+                args.seed,
+            )
+            _assert_causalbench_modules_are_verified(source)
         rows = scored_edges(
             returned,
             genes,
