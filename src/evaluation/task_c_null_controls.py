@@ -258,7 +258,12 @@ _RESULT_FIELDS = (
 
 @dataclass(frozen=True, slots=True)
 class EmpiricalNullCheck(Mapping[str, float | bool | int | str]):
-    """Read-only result of the pre-agreed rehearsal-only null comparison."""
+    """Validated, read-only result of the rehearsal-only null comparison.
+
+    Use :func:`null_check_to_json_record` to make the ordinary dictionary that
+    is written to a JSON analysis record.  Keeping that conversion explicit
+    prevents an internally inconsistent result from being reported.
+    """
 
     real_metric: float
     null_median: float
@@ -272,6 +277,96 @@ class EmpiricalNullCheck(Mapping[str, float | bool | int | str]):
     evidence_scope: str = "workflow_rehearsal_only"
     promotion_eligible: bool = False
 
+    def __post_init__(self) -> None:
+        numeric_fields = (
+            "real_metric",
+            "null_median",
+            "null_maximum",
+            "empirical_advantage",
+            "empirical_p_value",
+            "minimum_empirical_advantage",
+            "maximum_empirical_p_value",
+        )
+        for field in numeric_fields:
+            value = getattr(self, field)
+            if type(value) is not float or not math.isfinite(value):
+                raise TaskCNullControlError(
+                    f"{field} must be a finite built-in decimal value"
+                )
+        if (
+            type(self.repeat_count) is not int
+            or self.repeat_count != NULL_REPEAT_COUNT
+        ):
+            raise TaskCNullControlError("repeat_count must remain 20")
+        if self.minimum_empirical_advantage != MINIMUM_EMPIRICAL_ADVANTAGE:
+            raise TaskCNullControlError(
+                "minimum_empirical_advantage must remain 0.0"
+            )
+        if self.maximum_empirical_p_value != MAXIMUM_EMPIRICAL_P_VALUE:
+            raise TaskCNullControlError(
+                "maximum_empirical_p_value must remain 0.05"
+            )
+        if type(self.evidence_scope) is not str or self.evidence_scope != (
+            "workflow_rehearsal_only"
+        ):
+            raise TaskCNullControlError(
+                "evidence_scope must remain workflow_rehearsal_only"
+            )
+        if self.promotion_eligible is not False:
+            raise TaskCNullControlError(
+                "a zero-effect rehearsal result cannot advance a claim"
+            )
+        if type(self.passed) is not bool:
+            raise TaskCNullControlError("passed must be a true or false value")
+        if self.null_median > self.null_maximum:
+            raise TaskCNullControlError(
+                "null median cannot exceed the reported null maximum"
+            )
+
+        with np.errstate(over="ignore", invalid="ignore"):
+            expected_advantage = float(self.real_metric - self.null_maximum)
+        if (
+            not math.isfinite(expected_advantage)
+            or self.empirical_advantage != expected_advantage
+        ):
+            raise TaskCNullControlError(
+                "empirical advantage must equal real_metric minus null_maximum"
+            )
+
+        scaled_p_value = self.empirical_p_value * (self.repeat_count + 1)
+        rounded_exceedance_count = round(scaled_p_value)
+        if (
+            not 1 <= rounded_exceedance_count <= self.repeat_count + 1
+            or not math.isclose(
+                scaled_p_value,
+                float(rounded_exceedance_count),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise TaskCNullControlError(
+                "empirical_p_value must use the fixed add-one formula"
+            )
+        if self.empirical_advantage > 0.0 and self.empirical_p_value != (
+            1.0 / (self.repeat_count + 1)
+        ):
+            raise TaskCNullControlError(
+                "a positive advantage requires the minimum empirical p-value"
+            )
+        if self.empirical_advantage <= 0.0 and rounded_exceedance_count < 2:
+            raise TaskCNullControlError(
+                "ties and lower real metrics must count conservatively"
+            )
+
+        expected_passed = bool(
+            self.empirical_advantage > self.minimum_empirical_advantage
+            and self.empirical_p_value <= self.maximum_empirical_p_value
+        )
+        if self.passed is not expected_passed:
+            raise TaskCNullControlError(
+                "passed does not agree with the pre-agreed null rule"
+            )
+
     def __getitem__(self, key: str) -> float | bool | int | str:
         if key not in _RESULT_FIELDS:
             raise KeyError(key)
@@ -282,6 +377,31 @@ class EmpiricalNullCheck(Mapping[str, float | bool | int | str]):
 
     def __len__(self) -> int:
         return len(_RESULT_FIELDS)
+
+
+def null_check_to_json_record(
+    result: EmpiricalNullCheck,
+) -> dict[str, float | bool | int | str]:
+    """Return a freshly validated plain dictionary for a JSON analysis record."""
+
+    if type(result) is not EmpiricalNullCheck:
+        raise TaskCNullControlError(
+            "the JSON record needs one validated empirical null result"
+        )
+    checked = EmpiricalNullCheck(
+        real_metric=result.real_metric,
+        null_median=result.null_median,
+        null_maximum=result.null_maximum,
+        empirical_advantage=result.empirical_advantage,
+        empirical_p_value=result.empirical_p_value,
+        repeat_count=result.repeat_count,
+        minimum_empirical_advantage=result.minimum_empirical_advantage,
+        maximum_empirical_p_value=result.maximum_empirical_p_value,
+        passed=result.passed,
+        evidence_scope=result.evidence_scope,
+        promotion_eligible=result.promotion_eligible,
+    )
+    return {field: checked[field] for field in _RESULT_FIELDS}
 
 
 def _finite_metric(value: object, label: str) -> float:
@@ -338,7 +458,12 @@ def empirical_null_check(
     maximum_p_value: float,
     minimum_empirical_advantage: float = MINIMUM_EMPIRICAL_ADVANTAGE,
 ) -> EmpiricalNullCheck:
-    """Apply the frozen 20-repeat rule used only to rehearse the workflow."""
+    """Apply the frozen 20-repeat rule used only to rehearse the workflow.
+
+    The returned result is intentionally read-only.  Convert it with
+    :func:`null_check_to_json_record` only at the point where a JSON analysis
+    record is written.
+    """
 
     real = _finite_metric(real_metric, "real metric")
     null = _null_metric_vector(null_metrics)

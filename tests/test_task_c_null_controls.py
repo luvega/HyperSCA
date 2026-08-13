@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import FrozenInstanceError
+import json
 
 import numpy as np
 import pytest
 
+import src.evaluation.task_c_null_controls as null_controls
 from src.evaluation.task_c_null_controls import (
     EmpiricalNullCheck,
     TaskCNullControlError,
@@ -270,6 +272,73 @@ def test_empirical_null_check_counts_ties_conservatively() -> None:
     )
     assert result["empirical_p_value"] == 2.0 / 21.0
     assert result["passed"] is False
+
+
+def _valid_null_result_fields() -> dict[str, object]:
+    return {
+        "real_metric": 0.5,
+        "null_median": 0.25,
+        "null_maximum": 0.4,
+        "empirical_advantage": 0.09999999999999998,
+        "empirical_p_value": 1.0 / 21.0,
+        "repeat_count": 20,
+        "minimum_empirical_advantage": 0.0,
+        "maximum_empirical_p_value": 0.05,
+        "passed": True,
+        "evidence_scope": "workflow_rehearsal_only",
+        "promotion_eligible": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("real_metric", np.float64(0.5), "real_metric"),
+        ("null_median", np.nan, "finite"),
+        ("null_median", 0.45, "median"),
+        ("empirical_advantage", 0.2, "advantage"),
+        ("empirical_p_value", 0.06, "empirical_p_value"),
+        ("empirical_p_value", 2.0 / 21.0, "positive advantage"),
+        ("repeat_count", 19, "repeat_count"),
+        ("repeat_count", True, "repeat_count"),
+        ("minimum_empirical_advantage", -0.1, "remain 0.0"),
+        ("maximum_empirical_p_value", 0.1, "remain 0.05"),
+        ("passed", False, "passed"),
+        ("evidence_scope", "publication_evidence", "workflow_rehearsal_only"),
+        ("promotion_eligible", True, "cannot advance"),
+    ],
+)
+def test_empirical_null_result_rejects_directly_forged_fields(
+    field: str, value: object, message: str
+) -> None:
+    fields = _valid_null_result_fields()
+    fields[field] = value
+
+    with pytest.raises(TaskCNullControlError, match=message):
+        EmpiricalNullCheck(**fields)  # type: ignore[arg-type]
+
+
+def test_null_result_has_an_explicit_independent_json_record() -> None:
+    result = empirical_null_check(
+        0.5, np.linspace(0.1, 0.4, 20), maximum_p_value=0.05
+    )
+
+    record = null_controls.null_check_to_json_record(result)
+
+    assert type(record) is dict
+    assert json.loads(json.dumps(record, allow_nan=False)) == record
+    record["passed"] = False
+    assert result["passed"] is True
+
+
+def test_json_record_rechecks_a_result_changed_by_low_level_bypass() -> None:
+    result = empirical_null_check(
+        0.5, np.linspace(0.1, 0.4, 20), maximum_p_value=0.05
+    )
+    object.__setattr__(result, "passed", False)
+
+    with pytest.raises(TaskCNullControlError, match="passed"):
+        null_controls.null_check_to_json_record(result)
 
 
 @pytest.mark.parametrize(
