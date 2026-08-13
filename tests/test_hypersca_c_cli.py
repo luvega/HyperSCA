@@ -160,6 +160,18 @@ def _snapshot(directory: Path) -> dict[str, tuple[bytes, int]]:
     }
 
 
+def _rewrite_run_manifest(
+    path: Path,
+    payload: dict[str, object],
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+    from src.evaluation.task_c_data import write_json
+
+    payload.pop("run_manifest_content_sha256", None)
+    payload["run_manifest_content_sha256"] = run_module._payload_sha256(payload)
+    write_json(path, payload)
+
+
 def _all_failed_stability_result(
     *, context_ids: tuple[str, ...] = ("k562", "rpe1")
 ) -> object:
@@ -746,6 +758,189 @@ def test_selected_public_data_must_match_manifest_biology_before_fit(
     assert not called
 
 
+def test_fresh_run_hashes_public_inventory_once_per_inode_plus_selected_postcheck(
+    prepared_run: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+    import src.evaluation.task_c_data as data_module
+
+    manifest_path = Path(prepared_run["public_manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    public_paths = {
+        (manifest_path.parent / relative).resolve()
+        for relative in manifest["files"]
+    }
+    unique_inodes = {
+        (path.stat().st_dev, path.stat().st_ino) for path in public_paths
+    }
+    selected_inodes = {
+        (Path(prepared_run[name]).stat().st_dev, Path(prepared_run[name]).stat().st_ino)
+        for name in ("k562", "rpe1")
+    }
+    original_capture = run_module._capture_file_snapshot
+    original_load = data_module.np.load
+    original_sha256 = data_module.sha256_path
+    reads_by_inode: dict[tuple[int, int], int] = {}
+
+    def count_path(path: object) -> None:
+        if not isinstance(path, (str, os.PathLike)):
+            return
+        candidate = Path(path).resolve()
+        if candidate not in public_paths:
+            return
+        stat = candidate.stat()
+        inode = (stat.st_dev, stat.st_ino)
+        reads_by_inode[inode] = reads_by_inode.get(inode, 0) + 1
+
+    def counted_capture(*args: object, **kwargs: object) -> object:
+        result = original_capture(*args, **kwargs)
+        count_path(args[0])
+        return result
+
+    def counted_load(source: object, *args: object, **kwargs: object) -> object:
+        count_path(source)
+        return original_load(source, *args, **kwargs)
+
+    def counted_sha256(path: Path | str) -> str:
+        count_path(path)
+        return original_sha256(path)
+
+    monkeypatch.setattr(run_module, "_capture_file_snapshot", counted_capture)
+    monkeypatch.setattr(data_module.np, "load", counted_load)
+    monkeypatch.setattr(data_module, "sha256_path", counted_sha256)
+    monkeypatch.setattr(
+        run_module,
+        "fit_stable_hypersca_c",
+        lambda *args, **kwargs: _all_failed_stability_result(),
+    )
+    run_module.run_hypersca_c(
+        context_values=[
+            f"k562={prepared_run['k562']}",
+            f"rpe1={prepared_run['rpe1']}",
+        ],
+        config_path=Path(prepared_run["config"]),
+        gene_list_path=Path(prepared_run["gene_list"]),
+        public_manifest_path=manifest_path,
+        output_dir=tmp_path / "counted-fresh-run",
+        seed=11,
+        device="cpu",
+    )
+
+    assert set(reads_by_inode) == unique_inodes
+    assert sum(reads_by_inode.values()) <= len(unique_inodes) + len(selected_inodes)
+    assert all(
+        count <= (2 if inode in selected_inodes else 1)
+        for inode, count in reads_by_inode.items()
+    )
+
+
+def test_exact_reuse_hashes_public_inventory_at_most_once_per_inode(
+    prepared_run: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+    import src.evaluation.task_c_data as data_module
+
+    monkeypatch.setattr(
+        run_module,
+        "fit_stable_hypersca_c",
+        lambda *args, **kwargs: _all_failed_stability_result(),
+    )
+    output = tmp_path / "counted-reuse"
+    arguments = {
+        "context_values": [
+            f"k562={prepared_run['k562']}",
+            f"rpe1={prepared_run['rpe1']}",
+        ],
+        "config_path": Path(prepared_run["config"]),
+        "gene_list_path": Path(prepared_run["gene_list"]),
+        "public_manifest_path": Path(prepared_run["public_manifest"]),
+        "output_dir": output,
+        "seed": 11,
+        "device": "cpu",
+    }
+    run_module.run_hypersca_c(**arguments)
+
+    manifest_path = Path(prepared_run["public_manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    public_paths = {
+        (manifest_path.parent / relative).resolve()
+        for relative in manifest["files"]
+    }
+    unique_inodes = {
+        (path.stat().st_dev, path.stat().st_ino) for path in public_paths
+    }
+    original_capture = run_module._capture_file_snapshot
+    original_load = data_module.np.load
+    original_sha256 = data_module.sha256_path
+    reads_by_inode: dict[tuple[int, int], int] = {}
+
+    def count_path(path: object) -> None:
+        if not isinstance(path, (str, os.PathLike)):
+            return
+        candidate = Path(path).resolve()
+        if candidate not in public_paths:
+            return
+        stat = candidate.stat()
+        inode = (stat.st_dev, stat.st_ino)
+        reads_by_inode[inode] = reads_by_inode.get(inode, 0) + 1
+
+    def counted_capture(*args: object, **kwargs: object) -> object:
+        result = original_capture(*args, **kwargs)
+        count_path(args[0])
+        return result
+
+    def counted_load(source: object, *args: object, **kwargs: object) -> object:
+        count_path(source)
+        return original_load(source, *args, **kwargs)
+
+    def counted_sha256(path: Path | str) -> str:
+        count_path(path)
+        return original_sha256(path)
+
+    monkeypatch.setattr(run_module, "_capture_file_snapshot", counted_capture)
+    monkeypatch.setattr(data_module.np, "load", counted_load)
+    monkeypatch.setattr(data_module, "sha256_path", counted_sha256)
+    run_module.run_hypersca_c(**arguments)
+
+    assert set(reads_by_inode) == unique_inodes
+    assert all(count == 1 for count in reads_by_inode.values())
+
+
+def test_unselected_public_file_changed_during_fit_is_rejected_by_post_stat(
+    prepared_run: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+
+    unselected = Path(prepared_run["cross_target_train"])
+
+    def mutate_unselected(*args: object, **kwargs: object) -> object:
+        unselected.write_bytes(unselected.read_bytes() + b"\n")
+        return _all_failed_stability_result()
+
+    monkeypatch.setattr(run_module, "fit_stable_hypersca_c", mutate_unselected)
+    output = tmp_path / "unselected-public-changed"
+    with pytest.raises(HyperSCACError, match="公开库存|变化|改变"):
+        run_module.run_hypersca_c(
+            context_values=[
+                f"k562={prepared_run['k562']}",
+                f"rpe1={prepared_run['rpe1']}",
+            ],
+            config_path=Path(prepared_run["config"]),
+            gene_list_path=Path(prepared_run["gene_list"]),
+            public_manifest_path=Path(prepared_run["public_manifest"]),
+            output_dir=output,
+            seed=11,
+            device="cpu",
+        )
+    assert not output.exists()
+
+
 def test_gene_list_is_strict_and_selected_gene_must_exist(
     prepared_run: dict[str, object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -988,6 +1183,147 @@ def test_reuse_rejects_semantic_tampering_even_with_synchronized_hashes(
 
     with pytest.raises(HyperSCACError):
         run_module.run_hypersca_c(**arguments)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "schema",
+        "method",
+        "status",
+        "seed",
+        "device",
+        "contexts",
+        "config",
+        "gene_order",
+        "public_manifest",
+        "code_commit",
+        "condition",
+        "extra_field",
+        "reverse_time",
+        "duration_string",
+        "duration_nan",
+        "duration_huge_integer",
+    ],
+)
+def test_reuse_cross_checks_complete_run_manifest_semantics(
+    prepared_run: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+
+    monkeypatch.setattr(
+        run_module,
+        "fit_stable_hypersca_c",
+        lambda *args, **kwargs: _all_failed_stability_result(),
+    )
+    output = tmp_path / f"manifest-static-tamper-{tamper}"
+    arguments = {
+        "context_values": [
+            f"k562={prepared_run['k562']}",
+            f"rpe1={prepared_run['rpe1']}",
+        ],
+        "config_path": Path(prepared_run["config"]),
+        "gene_list_path": Path(prepared_run["gene_list"]),
+        "public_manifest_path": Path(prepared_run["public_manifest"]),
+        "output_dir": output,
+        "seed": 11,
+        "device": "cpu",
+    }
+    run_module.run_hypersca_c(**arguments)
+    before = _snapshot(output)
+    manifest_path = output / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    if tamper == "schema":
+        manifest["schema_version"] = "9.0"
+    elif tamper == "method":
+        manifest["method_id"] = "other_method"
+    elif tamper == "status":
+        manifest["status"] = "passed_real_rehearsal"
+    elif tamper == "seed":
+        manifest["seed"] = 12
+    elif tamper == "device":
+        manifest["device"] = "cuda"
+    elif tamper == "contexts":
+        manifest["contexts"][0]["content_sha256"] = f"sha256:{'0' * 64}"
+    elif tamper == "config":
+        manifest["config"]["values"]["learning_rate"] = 0.02
+    elif tamper == "gene_order":
+        manifest["gene_selection"]["ordered_genes"] = ["X", "Y", "Z"]
+    elif tamper == "public_manifest":
+        manifest["public_manifest"]["path"] = "/tmp/other-public-manifest.json"
+    elif tamper == "code_commit":
+        manifest["code"]["git_commit"] = "0" * 40
+    elif tamper == "condition":
+        manifest["stage"] = "train"
+    elif tamper == "extra_field":
+        manifest["unregistered_claim"] = "validated"
+    elif tamper == "reverse_time":
+        manifest["started_utc"] = "2026-08-13T12:00:02Z"
+        manifest["completed_utc"] = "2026-08-13T12:00:01Z"
+    elif tamper == "duration_string":
+        manifest["duration_seconds"] = "NaN"
+    elif tamper == "duration_nan":
+        manifest["duration_seconds"] = float("nan")
+    else:
+        manifest["duration_seconds"] = 10**400
+
+    if tamper == "duration_nan":
+        manifest_path.write_text(
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                allow_nan=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    else:
+        _rewrite_run_manifest(manifest_path, manifest)
+
+    tampered_snapshot = _snapshot(output)
+    with pytest.raises(HyperSCACError):
+        run_module.run_hypersca_c(**arguments)
+    assert tampered_snapshot != before
+    assert _snapshot(output) == tampered_snapshot
+
+
+def test_new_output_rejects_reversed_run_timestamps(
+    prepared_run: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+
+    timestamps = iter(
+        ["2026-08-13T12:00:02Z", "2026-08-13T12:00:01Z"]
+    )
+    monkeypatch.setattr(run_module, "_utc_now", lambda: next(timestamps))
+    monkeypatch.setattr(
+        run_module,
+        "fit_stable_hypersca_c",
+        lambda *args, **kwargs: _all_failed_stability_result(),
+    )
+    output = tmp_path / "reversed-new-run-time"
+    with pytest.raises(HyperSCACError, match="时间|UTC|时长"):
+        run_module.run_hypersca_c(
+            context_values=[
+                f"k562={prepared_run['k562']}",
+                f"rpe1={prepared_run['rpe1']}",
+            ],
+            config_path=Path(prepared_run["config"]),
+            gene_list_path=Path(prepared_run["gene_list"]),
+            public_manifest_path=Path(prepared_run["public_manifest"]),
+            output_dir=output,
+            seed=11,
+            device="cpu",
+        )
+    assert not output.exists()
 
 
 def test_all_bootstrap_failures_remain_visible_and_unusable(

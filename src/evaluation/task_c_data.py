@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import errno
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -339,13 +340,17 @@ def _text_vector(values: np.ndarray, kind: str) -> tuple[str, ...]:
     return tuple(result)
 
 
-def load_task_c_dataset(path: Path | str, *, context_id: str) -> TaskCDataset:
+def _load_task_c_dataset_archive(
+    archive_source: Path | io.BytesIO,
+    *,
+    source_path: Path,
+    source_sha256: str,
+    context_id: str,
+) -> TaskCDataset:
     if context_id not in {"k562", "rpe1"}:
         raise TaskCDataError("context_id must be exactly k562 or rpe1")
-    source_path = Path(path).expanduser().resolve()
-    before = _file_signature(source_path)
     try:
-        with np.load(source_path, allow_pickle=False) as archive:
+        with np.load(archive_source, allow_pickle=False) as archive:
             required = {"expression_matrix", "interventions", "var_names"}
             missing = required.difference(archive.files)
             if missing:
@@ -387,7 +392,48 @@ def load_task_c_dataset(path: Path | str, *, context_id: str) -> TaskCDataset:
         gene_names=genes,
         context_id=context_id,
         source_path=source_path,
+        source_sha256=source_sha256,
+    )
+
+
+def load_task_c_dataset(path: Path | str, *, context_id: str) -> TaskCDataset:
+    source_path = Path(path).expanduser().resolve()
+    before = _file_signature(source_path)
+    dataset = _load_task_c_dataset_archive(
+        source_path,
+        source_path=source_path,
         source_sha256=_consistent_sha256(source_path, before),
+        context_id=context_id,
+    )
+    if _file_signature(source_path) != before:
+        raise TaskCDataError(f"dataset changed while being loaded: {source_path}")
+    return dataset
+
+
+def load_task_c_dataset_from_verified_bytes(
+    path: Path | str,
+    *,
+    context_id: str,
+    source_bytes: bytes,
+    source_sha256: str,
+) -> TaskCDataset:
+    """Parse bytes whose file identity and hash were verified by the caller."""
+
+    source_path = Path(path).expanduser().resolve()
+    if not isinstance(source_bytes, bytes) or not source_bytes:
+        raise TaskCDataError("captured dataset bytes must be nonempty bytes")
+    if (
+        not isinstance(source_sha256, str)
+        or not source_sha256.startswith("sha256:")
+        or len(source_sha256) != 71
+        or any(character not in "0123456789abcdef" for character in source_sha256[7:])
+    ):
+        raise TaskCDataError("captured dataset source_sha256 is malformed")
+    return _load_task_c_dataset_archive(
+        io.BytesIO(source_bytes),
+        source_path=source_path,
+        source_sha256=source_sha256,
+        context_id=context_id,
     )
 
 
