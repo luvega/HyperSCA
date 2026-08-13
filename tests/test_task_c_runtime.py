@@ -12,12 +12,20 @@ import sys
 import threading
 import time
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from src.evaluation import task_c_runtime as runtime_module
 from src.evaluation.task_c_method_registry import (
     TaskCMethodRegistryError,
     load_task_c_method_registry,
+)
+from src.evaluation.task_c_predictions import normalize_task_c_predictions
+from src.evaluation.task_c_data import (
+    build_shared_task_c_split,
+    load_task_c_dataset,
+    materialize_task_c_split,
 )
 from src.evaluation.task_c_runtime import (
     TaskCRuntimeError,
@@ -26,6 +34,13 @@ from src.evaluation.task_c_runtime import (
     bootstrap_task_c_methods,
     classify_publication_only_method,
     run_isolated_method,
+)
+from src.evaluation.task_c_method_run import (
+    MAXIMUM_TASK_C_RUN_GENES,
+    TaskCMethodRunError,
+    build_task_c_method_command,
+    read_task_c_raw_predictions,
+    run_task_c_method,
 )
 
 
@@ -1405,3 +1420,517 @@ def test_bootstrap_cli_reports_a_bad_registry_without_a_traceback(
     assert "无法准备比较方法" in completed.stderr
     assert "Traceback" not in completed.stderr
     assert not (tmp_path / "cache").exists()
+
+
+def _write_method_input(path: Path, *, gene_count: int = 2) -> None:
+    genes = [chr(ord("A") + index) if index < 26 else f"G{index}" for index in range(gene_count)]
+    expression = np.zeros((6, gene_count), dtype=np.float32)
+    if gene_count >= 2:
+        expression[3:, 1] = np.asarray([1.0, 1.2, 0.8], dtype=np.float32)
+    np.savez(
+        path,
+        expression_matrix=expression,
+        interventions=np.asarray(
+            ["non-targeting", "non-targeting", "non-targeting", "A", "A", "A"]
+        ),
+        var_names=np.asarray(genes),
+    )
+
+
+def _materialized_public_bundle(tmp_path: Path) -> dict[str, object]:
+    raw_paths: dict[str, Path] = {}
+    for context, seed in (("k562", 11), ("rpe1", 23)):
+        path = tmp_path / f"raw_{context}.npz"
+        rng = np.random.default_rng(seed)
+        labels = ["non-targeting"] * 10 + [
+            source for source in ("A", "B", "C", "D", "E") for _ in range(5)
+        ]
+        np.savez(
+            path,
+            expression_matrix=rng.normal(size=(len(labels), 5)).astype(np.float32),
+            interventions=np.asarray(labels),
+            var_names=np.asarray(["A", "B", "C", "D", "E"]),
+        )
+        raw_paths[context] = path
+    k562 = load_task_c_dataset(raw_paths["k562"], context_id="k562")
+    rpe1 = load_task_c_dataset(raw_paths["rpe1"], context_id="rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+    return materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
+
+
+def _run_method_cli(*arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(ROOT / "scripts/run_task_c_method.py"), *arguments],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_mean_difference_unified_cli_writes_a_complete_verified_bundle(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "allowed_train.npz"
+    _write_method_input(input_path)
+    output = tmp_path / "run"
+
+    completed = _run_method_cli(
+        "--method-id",
+        "mean_difference",
+        "--input-npz",
+        str(input_path),
+        "--output-dir",
+        str(output),
+        "--seed",
+        "11",
+        "--registry",
+        str(REGISTRY),
+        "--asset-root",
+        str(tmp_path / "method_assets"),
+        "--data-status",
+        "synthetic_smoke",
+        "--context-id",
+        "synthetic",
+        "--min-cells",
+        "2",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    raw = pd.read_csv(output / "raw_predictions.csv")
+    predictions = pd.read_csv(output / "predictions.csv")
+    assert list(raw.columns) == ["source", "target", "score"]
+    assert len(predictions) == 2
+    assert set(predictions.columns) == {
+        "source",
+        "target",
+        "score",
+        "returned_by_method",
+    }
+    status = json.loads((output / "method_status.json").read_text(encoding="utf-8"))
+    environment = json.loads(
+        (output / "environment_manifest.json").read_text(encoding="utf-8")
+    )
+    assert status["status"] == "completed_standardized_output"
+    assert status["method_id"] == "mean_difference"
+    assert status["artifacts"]["predictions.csv"]["sha256"].startswith("sha256:")
+    assert environment["training_information"] == "partial_interventional"
+    assert environment["data_status"] == "synthetic_smoke"
+    assert "passed_real_rehearsal" not in (output / "method_status.json").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_publication_only_cli_needs_no_data_and_never_writes_predictions(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "publication"
+
+    completed = _run_method_cli(
+        "--method-id",
+        "betterboost",
+        "--output-dir",
+        str(output),
+        "--seed",
+        "11",
+        "--registry",
+        str(REGISTRY),
+        "--asset-root",
+        str(tmp_path / "missing-assets"),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    status = json.loads((output / "method_status.json").read_text(encoding="utf-8"))
+    environment = json.loads(
+        (output / "environment_manifest.json").read_text(encoding="utf-8")
+    )
+    assert status["status"] == "official_assets_unavailable"
+    assert environment["method_id"] == "betterboost"
+    assert environment["registry_sha256"].startswith("sha256:")
+    assert not (output / "raw_predictions.csv").exists()
+    assert not (output / "predictions.csv").exists()
+
+
+def test_external_commands_bind_registered_source_environment_and_permissions(
+    tmp_path: Path,
+) -> None:
+    registry = load_task_c_method_registry(REGISTRY)
+    input_path = tmp_path / "input.npz"
+    output_csv = tmp_path / "raw.csv"
+    assets = tmp_path / "assets"
+
+    causalbench = build_task_c_method_command(
+        registry.methods["pc"],
+        input_path=input_path,
+        output_csv=output_csv,
+        asset_root=assets,
+        seed=17,
+        project_root=ROOT,
+    )
+    psgrn = build_task_c_method_command(
+        registry.methods["guanlab_psgrn"],
+        input_path=input_path,
+        output_csv=output_csv,
+        asset_root=assets,
+        seed=17,
+        project_root=ROOT,
+    )
+
+    assert causalbench[:6] == (
+        "conda",
+        "run",
+        "-n",
+        "hypersca-task-c-causalbench",
+        "python",
+        str(ROOT / "scripts/task_c_workers/causalbench_worker.py"),
+    )
+    assert causalbench[causalbench.index("--causalbench-source") + 1] == str(
+        assets / "sources/causalbench"
+    )
+    assert causalbench[causalbench.index("--training-information") + 1] == "observational"
+    assert causalbench[causalbench.index("--output-semantics") + 1] == "official_unranked_edges"
+    assert psgrn[psgrn.index("--psgrn-source") + 1] == str(
+        assets / "sources/guanlab_psgrn"
+    )
+    assert psgrn[psgrn.index("--training-information") + 1] == "partial_interventional"
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (b"source,target\nA,B\n", "exactly source, target, and score"),
+        (b"source,target,score\nA,UNKNOWN,1\n", "outside the fixed gene set"),
+        (b"source,target,score\nA,B,-1\n", "non-negative"),
+        (b"source,target,score\nA,B,NaN\n", "finite"),
+    ],
+)
+def test_raw_prediction_reader_rejects_invalid_method_output(
+    tmp_path: Path, payload: bytes, message: str
+) -> None:
+    path = tmp_path / "raw.csv"
+    path.write_bytes(payload)
+
+    with pytest.raises(TaskCMethodRunError, match=message):
+        read_task_c_raw_predictions(path, ("A", "B"))
+
+
+def test_raw_prediction_reader_rejects_large_symbolic_and_hard_linked_files(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target.csv"
+    target.write_text("source,target,score\nA,B,1\n", encoding="utf-8")
+    linked = tmp_path / "linked.csv"
+    linked.symlink_to(target)
+    with pytest.raises(TaskCMethodRunError, match="symbolic link"):
+        read_task_c_raw_predictions(linked, ("A", "B"))
+
+    hardlink = tmp_path / "hardlink.csv"
+    os.link(target, hardlink)
+    with pytest.raises(TaskCMethodRunError, match="hard link"):
+        read_task_c_raw_predictions(target, ("A", "B"))
+
+    target.unlink()
+    hardlink.unlink()
+    too_large = tmp_path / "large.csv"
+    too_large.write_bytes(b"source,target,score\n" + b"A,B,1\n" * 200_000)
+    with pytest.raises(TaskCMethodRunError, match="too large"):
+        read_task_c_raw_predictions(too_large, ("A", "B"), maximum_bytes=1024)
+
+
+def test_gene_limit_is_checked_before_mean_difference_computation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_path = tmp_path / "too_many_genes.npz"
+    _write_method_input(input_path, gene_count=MAXIMUM_TASK_C_RUN_GENES + 1)
+    called = False
+
+    def forbidden_score(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called = True
+        raise AssertionError("gene limit must be checked first")
+
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run.score_mean_difference_network",
+        forbidden_score,
+    )
+    with pytest.raises(TaskCMethodRunError, match="at most 256"):
+        run_task_c_method(
+            method_id="mean_difference",
+            input_npz=input_path,
+            output_dir=tmp_path / "run",
+            seed=11,
+            registry_path=REGISTRY,
+            asset_root=tmp_path / "assets",
+            data_status="synthetic_smoke",
+            context_id="synthetic",
+            min_cells=2,
+            project_root=ROOT,
+        )
+    assert called is False
+
+
+def test_unified_run_reuses_only_an_exact_scientifically_valid_bundle(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.npz"
+    _write_method_input(input_path)
+    arguments = {
+        "method_id": "mean_difference",
+        "input_npz": input_path,
+        "output_dir": tmp_path / "run",
+        "seed": 11,
+        "registry_path": REGISTRY,
+        "asset_root": tmp_path / "assets",
+        "data_status": "synthetic_smoke",
+        "context_id": "synthetic",
+        "min_cells": 2,
+        "project_root": ROOT,
+    }
+
+    first = run_task_c_method(**arguments)
+    second = run_task_c_method(**arguments)
+    assert first["status"] == "completed_standardized_output"
+    assert second["reuse"] == "verified_existing_output"
+
+    predictions = Path(arguments["output_dir"]) / "predictions.csv"
+    predictions.write_text(
+        predictions.read_text(encoding="utf-8").replace(",True", ",False", 1),
+        encoding="utf-8",
+    )
+    with pytest.raises(TaskCMethodRunError, match="changed|hash|semantic"):
+        run_task_c_method(**arguments)
+
+
+def test_partial_output_and_private_or_symbolic_inputs_fail_closed(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.npz"
+    _write_method_input(input_path)
+    partial = tmp_path / "partial"
+    partial.mkdir()
+    (partial / "method_status.json").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(TaskCMethodRunError, match="incomplete|unrecognized"):
+        run_task_c_method(
+            method_id="mean_difference",
+            input_npz=input_path,
+            output_dir=partial,
+            seed=11,
+            registry_path=REGISTRY,
+            asset_root=tmp_path / "assets",
+            data_status="synthetic_smoke",
+            context_id="synthetic",
+            min_cells=2,
+            project_root=ROOT,
+        )
+
+    private_dir = tmp_path / "private"
+    private_dir.mkdir()
+    private_input = private_dir / "input.npz"
+    _write_method_input(private_input)
+    with pytest.raises(TaskCMethodRunError, match="private"):
+        run_task_c_method(
+            method_id="mean_difference",
+            input_npz=private_input,
+            output_dir=tmp_path / "private-run",
+            seed=11,
+            registry_path=REGISTRY,
+            asset_root=tmp_path / "assets",
+            data_status="synthetic_smoke",
+            context_id="synthetic",
+            min_cells=2,
+            project_root=ROOT,
+        )
+
+    symlink = tmp_path / "input-link.npz"
+    symlink.symlink_to(input_path)
+    with pytest.raises(TaskCMethodRunError, match="symbolic link"):
+        run_task_c_method(
+            method_id="mean_difference",
+            input_npz=symlink,
+            output_dir=tmp_path / "symlink-run",
+            seed=11,
+            registry_path=REGISTRY,
+            asset_root=tmp_path / "assets",
+            data_status="synthetic_smoke",
+            context_id="synthetic",
+            min_cells=2,
+            project_root=ROOT,
+        )
+
+
+def test_reuse_recomputes_the_mean_difference_scientific_result(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.npz"
+    _write_method_input(input_path)
+    output = tmp_path / "run"
+    arguments = {
+        "method_id": "mean_difference",
+        "input_npz": input_path,
+        "output_dir": output,
+        "seed": 11,
+        "registry_path": REGISTRY,
+        "asset_root": tmp_path / "assets",
+        "data_status": "synthetic_smoke",
+        "context_id": "synthetic",
+        "min_cells": 2,
+        "project_root": ROOT,
+    }
+    run_task_c_method(**arguments)
+
+    raw = pd.read_csv(output / "raw_predictions.csv")
+    raw.loc[0, "score"] = 9.0
+    raw.to_csv(output / "raw_predictions.csv", index=False)
+    normalized = normalize_task_c_predictions(raw, ["A", "B"])
+    normalized.to_csv(output / "predictions.csv", index=False)
+    status_path = output / "method_status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    for name in ("raw_predictions.csv", "predictions.csv"):
+        payload = (output / name).read_bytes()
+        status["artifacts"][name] = {
+            "sha256": f"sha256:{hashlib.sha256(payload).hexdigest()}",
+            "size_bytes": len(payload),
+        }
+    status_path.write_text(
+        json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TaskCMethodRunError, match="scientific semantics"):
+        run_task_c_method(**arguments)
+
+
+def test_formal_run_rejects_an_incomplete_public_inventory(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    input_path = bundle / "train.npz"
+    _write_method_input(input_path)
+    input_hash = f"sha256:{hashlib.sha256(input_path.read_bytes()).hexdigest()}"
+    identity = {
+        "schema_version": "1.0",
+        "split_id": "test-split",
+        "seed": 11,
+        "min_cells_per_intervention": 2,
+        "input_sha256": {"k562": input_hash, "rpe1": input_hash},
+        "content_sha256": {"k562": input_hash, "rpe1": input_hash},
+        "gene_names_sha256": input_hash,
+    }
+    manifest = {
+        **identity,
+        "train_sources": ["A"],
+        "tune_sources": [],
+        "holdout_source_count": 0,
+        "materialization_identity": identity,
+        "files": {"train.npz": input_hash},
+    }
+    manifest_path = bundle / "public_manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TaskCMethodRunError, match="complete public file inventory"):
+        run_task_c_method(
+            method_id="mean_difference",
+            input_npz=input_path,
+            output_dir=tmp_path / "run",
+            seed=11,
+            registry_path=REGISTRY,
+            asset_root=tmp_path / "assets",
+            data_status="external_benchmark",
+            context_id="k562",
+            min_cells=2,
+            public_manifest_path=manifest_path,
+            project_root=ROOT,
+        )
+
+
+def test_reuse_rejects_a_rewritten_environment_record_even_with_updated_hash(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.npz"
+    _write_method_input(input_path)
+    output = tmp_path / "run"
+    arguments = {
+        "method_id": "mean_difference",
+        "input_npz": input_path,
+        "output_dir": output,
+        "seed": 11,
+        "registry_path": REGISTRY,
+        "asset_root": tmp_path / "assets",
+        "data_status": "synthetic_smoke",
+        "context_id": "synthetic",
+        "min_cells": 2,
+        "project_root": ROOT,
+    }
+    run_task_c_method(**arguments)
+
+    environment_path = output / "environment_manifest.json"
+    environment = json.loads(environment_path.read_text(encoding="utf-8"))
+    environment["role"] = "rewritten-role"
+    environment_path.write_text(
+        json.dumps(environment, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    status_path = output / "method_status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    payload = environment_path.read_bytes()
+    status["artifacts"]["environment_manifest.json"] = {
+        "sha256": f"sha256:{hashlib.sha256(payload).hexdigest()}",
+        "size_bytes": len(payload),
+    }
+    status_path.write_text(
+        json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TaskCMethodRunError, match="environment.*changed"):
+        run_task_c_method(**arguments)
+
+
+def test_formal_run_rejects_a_context_label_that_disagrees_with_public_path(
+    tmp_path: Path,
+) -> None:
+    bundle = _materialized_public_bundle(tmp_path)
+
+    with pytest.raises(TaskCMethodRunError, match="context.*public path"):
+        run_task_c_method(
+            method_id="mean_difference",
+            input_npz=Path(bundle["within"]["k562"]["train"]),
+            output_dir=tmp_path / "run",
+            seed=11,
+            registry_path=REGISTRY,
+            asset_root=tmp_path / "assets",
+            data_status="external_benchmark",
+            context_id="rpe1",
+            min_cells=5,
+            public_manifest_path=Path(bundle["public_manifest"]),
+            project_root=ROOT,
+        )
+
+
+def test_formal_run_rejects_a_public_manifest_with_split_identity_drift(
+    tmp_path: Path,
+) -> None:
+    bundle = _materialized_public_bundle(tmp_path)
+    manifest_path = Path(bundle["public_manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["materialization_identity"]["seed"] = 23
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TaskCMethodRunError, match="materialization identity"):
+        run_task_c_method(
+            method_id="mean_difference",
+            input_npz=Path(bundle["within"]["k562"]["train"]),
+            output_dir=tmp_path / "run",
+            seed=11,
+            registry_path=REGISTRY,
+            asset_root=tmp_path / "assets",
+            data_status="external_benchmark",
+            context_id="k562",
+            min_cells=5,
+            public_manifest_path=manifest_path,
+            project_root=ROOT,
+        )

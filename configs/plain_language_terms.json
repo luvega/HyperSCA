@@ -7,6 +7,7 @@
     "docs/research/benchmark_contract_v1.md",
     "docs/research/hypersca_c_method_v1.md",
     "docs/research/task_c_mean_difference_baseline_v1.md",
+    "docs/research/task_c_method_compatibility_v1.md",
     "docs/research/task_s_simple_baselines_v1.md"
   ],
   "rules": [
