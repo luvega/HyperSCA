@@ -91,6 +91,19 @@ def prepared_run(tmp_path: Path) -> dict[str, object]:
     return {
         "k562": Path(bundle["within"]["k562"]["refit"]),
         "rpe1": Path(bundle["within"]["rpe1"]["refit"]),
+        "k562_train": Path(bundle["within"]["k562"]["train"]),
+        "cross_source": Path(
+            bundle["cross"]["k562_to_rpe1"]["source_refit"]
+        ),
+        "cross_target": Path(
+            bundle["cross"]["k562_to_rpe1"]["target_adapt_refit"]
+        ),
+        "cross_target_train": Path(
+            bundle["cross"]["k562_to_rpe1"]["target_adapt_train"]
+        ),
+        "reverse_source": Path(
+            bundle["cross"]["rpe1_to_k562"]["source_refit"]
+        ),
         "public_manifest": Path(bundle["public_manifest"]),
         "config": config_path,
         "gene_list": gene_path,
@@ -169,9 +182,19 @@ def test_hypersca_c_cli_writes_traced_raw_results_and_reuses_exact_run(
     )
     assert status["coverage"] == summary["coverage"]
     assert manifest["status"] == "completed_raw_inference"
+    assert manifest["condition"] == "within_refit_k562_rpe1"
+    assert manifest["mode"] == "within"
+    assert manifest["direction"] is None
+    assert manifest["stage"] == "refit"
+    for field in ("condition", "mode", "direction", "stage"):
+        assert manifest["run_identity"][field] == manifest[field]
     assert manifest["contexts"][0]["context_id"] == "k562"
     assert Path(manifest["contexts"][0]["input_path"]).is_absolute()
     assert manifest["config"]["values"]["prior_discount"] == 0.0
+    assert (
+        manifest["run_identity"]["config_sha256"]
+        == manifest["config"]["sha256"]
+    )
     assert manifest["gene_selection"]["ordered_genes"] == ["C", "A", "B"]
     assert manifest["gene_selection"]["gene_count"] == 3
     assert manifest["gene_selection"]["selection_id"] == "small-check-v1"
@@ -179,9 +202,25 @@ def test_hypersca_c_cli_writes_traced_raw_results_and_reuses_exact_run(
     assert manifest["gene_selection"]["sha256"] == sha256_path(
         Path(prepared_run["gene_list"])
     )
+    assert (
+        manifest["run_identity"]["gene_list_sha256"]
+        == manifest["gene_selection"]["sha256"]
+    )
     assert manifest["public_manifest"]["sha256"] == sha256_path(
         Path(prepared_run["public_manifest"])
     )
+    assert (
+        manifest["run_identity"]["public_manifest_sha256"]
+        == manifest["public_manifest"]["sha256"]
+    )
+    for context in manifest["contexts"]:
+        identity_context = next(
+            item
+            for item in manifest["run_identity"]["contexts"]
+            if item["context_id"] == context["context_id"]
+        )
+        assert identity_context["input_sha256"] == context["input_sha256"]
+        assert identity_context["content_sha256"] == context["content_sha256"]
     assert manifest["artifacts"]["raw_predictions.csv"]["sha256"] == sha256_path(
         output / "raw_predictions.csv"
     )
@@ -353,6 +392,114 @@ def test_context_identifiers_are_strict_before_fit(
         )
     assert not called
     assert not (tmp_path / "invalid-context").exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "within_label_swap",
+        "within_mixed_stages",
+        "cross_label_swap",
+        "cross_target_only",
+        "cross_source_only",
+        "cross_mixed_directions",
+        "cross_mixed_stages",
+        "within_cross_mixed",
+    ],
+)
+def test_context_files_must_form_one_complete_registered_condition_before_fit(
+    prepared_run: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+
+    called = False
+
+    def forbidden_fit(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called = True
+        raise AssertionError("fit must not be called")
+
+    monkeypatch.setattr(run_module, "fit_stable_hypersca_c", forbidden_fit)
+    cases = {
+        "within_label_swap": [f"rpe1={prepared_run['k562']}"],
+        "within_mixed_stages": [
+            f"k562={prepared_run['k562_train']}",
+            f"rpe1={prepared_run['rpe1']}",
+        ],
+        "cross_label_swap": [
+            f"k562={prepared_run['cross_target']}",
+            f"rpe1={prepared_run['cross_source']}",
+        ],
+        "cross_target_only": [f"rpe1={prepared_run['cross_target']}"],
+        "cross_source_only": [f"k562={prepared_run['cross_source']}"],
+        "cross_mixed_directions": [
+            f"k562={prepared_run['cross_source']}",
+            f"rpe1={prepared_run['reverse_source']}",
+        ],
+        "cross_mixed_stages": [
+            f"k562={prepared_run['cross_source']}",
+            f"rpe1={prepared_run['cross_target_train']}",
+        ],
+        "within_cross_mixed": [
+            f"k562={prepared_run['k562']}",
+            f"rpe1={prepared_run['cross_target']}",
+        ],
+    }
+    with pytest.raises(HyperSCACError, match="condition|组合|匹配|绑定|完整"):
+        run_module.run_hypersca_c(
+            context_values=cases[case],
+            config_path=Path(prepared_run["config"]),
+            gene_list_path=Path(prepared_run["gene_list"]),
+            public_manifest_path=Path(prepared_run["public_manifest"]),
+            output_dir=tmp_path / f"invalid-condition-{case}",
+            seed=11,
+            device="cpu",
+        )
+    assert not called
+    assert not (tmp_path / f"invalid-condition-{case}").exists()
+
+
+@pytest.mark.parametrize("case", ["within_single", "within_joint", "cross"])
+def test_complete_within_and_cross_conditions_reach_fit(
+    prepared_run: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+
+    class FitReached(RuntimeError):
+        pass
+
+    def reached_fit(*args: object, **kwargs: object) -> object:
+        raise FitReached
+
+    monkeypatch.setattr(run_module, "fit_stable_hypersca_c", reached_fit)
+    cases = {
+        "within_single": [f"k562={prepared_run['k562']}"],
+        "within_joint": [
+            f"k562={prepared_run['k562']}",
+            f"rpe1={prepared_run['rpe1']}",
+        ],
+        "cross": [
+            f"k562={prepared_run['cross_source']}",
+            f"rpe1={prepared_run['cross_target']}",
+        ],
+    }
+    with pytest.raises(FitReached):
+        run_module.run_hypersca_c(
+            context_values=cases[case],
+            config_path=Path(prepared_run["config"]),
+            gene_list_path=Path(prepared_run["gene_list"]),
+            public_manifest_path=Path(prepared_run["public_manifest"]),
+            output_dir=tmp_path / f"legal-condition-{case}",
+            seed=11,
+            device="cpu",
+        )
+    assert not (tmp_path / f"legal-condition-{case}").exists()
 
 
 def test_public_only_contract_rejects_private_and_symbolic_link_inputs_before_fit(
@@ -527,6 +674,66 @@ def test_gene_list_is_strict_and_selected_gene_must_exist(
                 device="cpu",
             )
         assert not (tmp_path / f"invalid_output_{index}").exists()
+
+
+@pytest.mark.parametrize(
+    "changed_input", ["config", "gene_list", "public_manifest", "context"]
+)
+def test_input_changed_during_fit_is_rejected_before_any_artifact_is_written(
+    prepared_run: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_input: str,
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+    from src.causal.hypersca_c_stability import (
+        HyperSCAStabilityResult,
+        build_stability_table,
+    )
+
+    predictions, summary = build_stability_table(
+        [],
+        ("C", "A", "B"),
+        selection_threshold=0.1,
+        requested_repeats=2,
+        minimum_success_fraction=0.8,
+        source_variance={"C": 1.0, "A": 1.0, "B": 1.0},
+        minimum_source_variance=1e-8,
+        expected_contexts=("k562", "rpe1"),
+    )
+    result = HyperSCAStabilityResult(
+        predictions=predictions,
+        summary=summary,
+        failures=("repeat_0:failed", "repeat_1:failed"),
+    )
+    paths = {
+        "config": Path(prepared_run["config"]),
+        "gene_list": Path(prepared_run["gene_list"]),
+        "public_manifest": Path(prepared_run["public_manifest"]),
+        "context": Path(prepared_run["k562"]),
+    }
+
+    def mutate_then_return(*args: object, **kwargs: object) -> object:
+        target = paths[changed_input]
+        target.write_bytes(target.read_bytes() + b"\n")
+        return result
+
+    monkeypatch.setattr(run_module, "fit_stable_hypersca_c", mutate_then_return)
+    output = tmp_path / f"changed-during-fit-{changed_input}"
+    with pytest.raises(HyperSCACError, match="变化|改变|输入"):
+        run_module.run_hypersca_c(
+            context_values=[
+                f"k562={prepared_run['k562']}",
+                f"rpe1={prepared_run['rpe1']}",
+            ],
+            config_path=Path(prepared_run["config"]),
+            gene_list_path=Path(prepared_run["gene_list"]),
+            public_manifest_path=Path(prepared_run["public_manifest"]),
+            output_dir=output,
+            seed=11,
+            device="cpu",
+        )
+    assert not output.exists()
 
 
 def test_all_bootstrap_failures_remain_visible_and_unusable(

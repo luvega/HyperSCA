@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -85,6 +85,17 @@ _PUBLIC_TASK_C_PATHS = frozenset(
 _SHA256_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
+@dataclass(frozen=True)
+class _FileSnapshot:
+    path: Path
+    sha256: str
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+
 def _required_no_whitespace(value: object, name: str) -> str:
     if not isinstance(value, str) or not value or any(ch.isspace() for ch in value):
         raise HyperSCACError(f"{name} 必须是非空且不含空白的文字")
@@ -112,9 +123,74 @@ def _reject_json_constant(value: str) -> object:
     raise HyperSCACError(f"JSON 不能含有非有限数字：{value}")
 
 
-def _read_strict_json(path: Path, description: str) -> dict[str, object]:
+def _stat_identity(stat: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(stat.st_ctime_ns),
+    )
+
+
+def _capture_file_snapshot(
+    path: Path,
+    description: str,
+    *,
+    collect_bytes: bool,
+) -> tuple[_FileSnapshot, bytes | None]:
+    absolute = _regular_file(path, description, reject_symlink=True)
+    digest = hashlib.sha256()
+    chunks: list[bytes] | None = [] if collect_bytes else None
     try:
-        raw = path.read_text(encoding="utf-8")
+        with absolute.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+                if chunks is not None:
+                    chunks.append(chunk)
+            after = os.fstat(handle.fileno())
+        current = absolute.stat()
+    except OSError as exc:
+        raise HyperSCACError(f"无法固定{description}的输入快照：{path}") from exc
+    if _stat_identity(before) != _stat_identity(after) or _stat_identity(
+        after
+    ) != _stat_identity(current):
+        raise HyperSCACError(f"{description}在读取期间发生变化")
+    snapshot = _FileSnapshot(
+        path=absolute,
+        sha256=f"sha256:{digest.hexdigest()}",
+        device=int(after.st_dev),
+        inode=int(after.st_ino),
+        size=int(after.st_size),
+        modified_ns=int(after.st_mtime_ns),
+        changed_ns=int(after.st_ctime_ns),
+    )
+    return snapshot, b"".join(chunks) if chunks is not None else None
+
+
+def _verify_file_snapshot(snapshot: _FileSnapshot, description: str) -> None:
+    current, _ = _capture_file_snapshot(
+        snapshot.path,
+        description,
+        collect_bytes=False,
+    )
+    if current != snapshot:
+        raise HyperSCACError(f"{description}在拟合期间发生变化")
+
+
+def _read_strict_json_snapshot(
+    path: Path,
+    description: str,
+) -> tuple[dict[str, object], _FileSnapshot]:
+    snapshot, raw_bytes = _capture_file_snapshot(
+        path,
+        description,
+        collect_bytes=True,
+    )
+    assert raw_bytes is not None
+    try:
+        raw = raw_bytes.decode("utf-8", errors="strict")
         payload = json.loads(
             raw,
             object_pairs_hook=_pairs_to_unique_dict,
@@ -122,10 +198,15 @@ def _read_strict_json(path: Path, description: str) -> dict[str, object]:
         )
     except HyperSCACError:
         raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise HyperSCACError(f"无法严格读取{description}：{path}") from exc
     if not isinstance(payload, dict):
         raise HyperSCACError(f"{description}顶层必须是 JSON 对象")
+    return payload, snapshot
+
+
+def _read_strict_json(path: Path, description: str) -> dict[str, object]:
+    payload, _ = _read_strict_json_snapshot(path, description)
     return payload
 
 
@@ -170,9 +251,11 @@ def _validated_text_list(value: object, name: str) -> list[str]:
     return normalized
 
 
-def _load_gene_selection(path: Path) -> tuple[Path, dict[str, object]]:
+def _load_gene_selection(
+    path: Path,
+) -> tuple[Path, dict[str, object], _FileSnapshot]:
     absolute = _regular_file(path, "基因清单", reject_symlink=True)
-    payload = _read_strict_json(absolute, "基因清单")
+    payload, snapshot = _read_strict_json_snapshot(absolute, "基因清单")
     if set(payload) != _GENE_LIST_FIELDS:
         missing = sorted(_GENE_LIST_FIELDS - set(payload))
         extra = sorted(set(payload) - _GENE_LIST_FIELDS)
@@ -195,12 +278,16 @@ def _load_gene_selection(path: Path) -> tuple[Path, dict[str, object]]:
             f"基因清单超过当前核验运行上限 {MAX_VERIFIED_GENES}；"
             "该上限用于控制本轮核验，不表示科学上最优的基因数"
         )
-    return absolute, {
-        "schema_version": "1.0",
-        "selection_id": selection_id,
-        "selection_basis": selection_basis,
-        "genes": genes,
-    }
+    return (
+        absolute,
+        {
+            "schema_version": "1.0",
+            "selection_id": selection_id,
+            "selection_basis": selection_basis,
+            "genes": genes,
+        },
+        snapshot,
+    )
 
 
 def _parse_context_values(values: Sequence[str]) -> list[tuple[str, Path]]:
@@ -284,14 +371,16 @@ def _validate_public_manifest_record(payload: Mapping[str, object]) -> dict[str,
     return normalized
 
 
-def _load_public_manifest(path: Path) -> tuple[Path, dict[str, object], dict[str, str]]:
+def _load_public_manifest(
+    path: Path,
+) -> tuple[Path, dict[str, object], dict[str, str], _FileSnapshot]:
     lexical = _lexical_absolute(path)
     if _contains_private_component(lexical):
         raise HyperSCACError("公开清单路径不能包含 private 目录")
     absolute = _regular_file(lexical, "公开清单", reject_symlink=True)
-    payload = _read_strict_json(absolute, "公开清单")
+    payload, snapshot = _read_strict_json_snapshot(absolute, "公开清单")
     files = _validate_public_manifest_record(payload)
-    return absolute, payload, files
+    return absolute, payload, files, snapshot
 
 
 def _match_public_input(
@@ -299,7 +388,7 @@ def _match_public_input(
     *,
     manifest_path: Path,
     files: Mapping[str, str],
-) -> tuple[Path, str, str]:
+) -> tuple[Path, str, _FileSnapshot]:
     absolute = _regular_file(path, "context 输入文件", reject_symlink=True)
     root = manifest_path.parent.resolve(strict=True)
     resolved = absolute.resolve(strict=True)
@@ -311,19 +400,102 @@ def _match_public_input(
         raise HyperSCACError("context 输入文件不能来自 private 目录")
     if relative not in files:
         raise HyperSCACError("context 输入文件未登记在公开清单 files 中")
-    observed_hash = sha256_path(resolved)
-    if observed_hash != files[relative]:
+    snapshot, _ = _capture_file_snapshot(
+        resolved,
+        "context 输入文件",
+        collect_bytes=False,
+    )
+    if snapshot.sha256 != files[relative]:
         raise HyperSCACError("context 输入文件与公开清单 SHA-256 不一致")
-    return resolved, relative, observed_hash
+    return resolved, relative, snapshot
 
 
-def _load_config(path: Path) -> tuple[Path, HyperSCACConfig, dict[str, object]]:
+def _condition_record(
+    matched_inputs: Sequence[tuple[str, Path, str, _FileSnapshot]],
+) -> dict[str, object]:
+    """Bind context labels to one complete public Task C training condition."""
+
+    kinds = {Path(relative).parts[0] for _, _, relative, _ in matched_inputs}
+    if kinds == {"within"}:
+        stages: set[str] = set()
+        context_names: list[str] = []
+        for context_id, _, relative, _ in matched_inputs:
+            parts = Path(relative).parts
+            if len(parts) != 3 or parts[0] != "within":
+                raise HyperSCACError("within condition 文件路径不符合固定格式")
+            registered_context = parts[1]
+            filename = parts[2]
+            if registered_context != context_id:
+                raise HyperSCACError("within condition 文件与 context 名称没有正确绑定")
+            if not filename.endswith(".npz"):
+                raise HyperSCACError("within condition 文件名不符合固定格式")
+            stage = filename[: -len(".npz")]
+            if stage not in {"train", "tune", "refit"}:
+                raise HyperSCACError("within condition stage 不在固定范围内")
+            stages.add(stage)
+            context_names.append(context_id)
+        if len(stages) != 1:
+            raise HyperSCACError("联合 within condition 必须使用相同 stage")
+        stage = next(iter(stages))
+        return {
+            "condition": f"within_{stage}_{'_'.join(context_names)}",
+            "mode": "within",
+            "direction": None,
+            "stage": stage,
+        }
+
+    if kinds != {"cross"}:
+        raise HyperSCACError("context 文件必须组成单一 within 或 cross condition")
+    if len(matched_inputs) != 2:
+        raise HyperSCACError("cross condition 必须包含完整的来源和目标适配文件")
+
+    parsed: list[tuple[str, str, str, str]] = []
+    for context_id, _, relative, _ in matched_inputs:
+        parts = Path(relative).parts
+        if len(parts) != 3 or parts[0] != "cross":
+            raise HyperSCACError("cross condition 文件路径不符合固定格式")
+        direction = parts[1]
+        filename = parts[2]
+        match = re.fullmatch(
+            r"(source|target_adapt)_(train|tune|refit)\.npz",
+            filename,
+        )
+        if direction not in {"k562_to_rpe1", "rpe1_to_k562"} or match is None:
+            raise HyperSCACError("cross condition 文件名不符合固定格式")
+        role, stage = match.groups()
+        source_context, target_context = direction.split("_to_", 1)
+        expected_context = source_context if role == "source" else target_context
+        if context_id != expected_context:
+            raise HyperSCACError("cross condition 文件与 context 名称没有正确绑定")
+        parsed.append((direction, role, stage, context_id))
+
+    directions = {item[0] for item in parsed}
+    roles = {item[1] for item in parsed}
+    stages = {item[2] for item in parsed}
+    if len(directions) != 1 or roles != {"source", "target_adapt"} or len(stages) != 1:
+        raise HyperSCACError("cross condition 必须是同一方向、同一 stage 的完整组合")
+    direction = next(iter(directions))
+    stage = next(iter(stages))
+    return {
+        "condition": f"cross_{stage}_{direction}",
+        "mode": "cross",
+        "direction": direction,
+        "stage": stage,
+    }
+
+
+def _load_config(
+    path: Path,
+) -> tuple[Path, HyperSCACConfig, dict[str, object], _FileSnapshot]:
     absolute = _regular_file(path, "HyperSCA-C 设置文件", reject_symlink=True)
-    payload = _read_strict_json(absolute, "HyperSCA-C 设置文件")
+    payload, snapshot = _read_strict_json_snapshot(
+        absolute,
+        "HyperSCA-C 设置文件",
+    )
     config = HyperSCACConfig.from_mapping(payload)
     if config.prior_discount != 0.0:
         raise HyperSCACError("本轮主分析不开放先验折扣，prior_discount 必须是 0")
-    return absolute, config, asdict(config)
+    return absolute, config, asdict(config), snapshot
 
 
 def _validated_seed(seed: object) -> int:
@@ -469,8 +641,12 @@ def _build_identity(
     seed: int,
     device: str,
     code: Mapping[str, object],
+    condition: Mapping[str, object],
+    config_sha256: str,
+    gene_sha256: str,
+    public_manifest_sha256: str,
 ) -> dict[str, object]:
-    return {
+    identity = {
         "schema_version": "1.0",
         "method_id": "hypersca_c",
         "contexts": [
@@ -484,17 +660,46 @@ def _build_identity(
             for record in context_records
         ],
         "config_path": str(config_path),
-        "config_sha256": sha256_path(config_path),
+        "config_sha256": config_sha256,
         "gene_list_path": str(gene_path),
-        "gene_list_sha256": sha256_path(gene_path),
+        "gene_list_sha256": gene_sha256,
         "public_manifest_path": str(public_manifest_path),
-        "public_manifest_sha256": sha256_path(public_manifest_path),
+        "public_manifest_sha256": public_manifest_sha256,
         "seed": seed,
         "device": device,
         "git_commit": code["git_commit"],
         "code_dirty": code["dirty"],
         "code_state_sha256": code["code_state_sha256"],
     }
+    identity.update(condition)
+    return identity
+
+
+def _verify_run_input_snapshots(
+    *,
+    config_snapshot: _FileSnapshot,
+    gene_snapshot: _FileSnapshot,
+    public_manifest_snapshot: _FileSnapshot,
+    context_snapshots: Sequence[tuple[str, _FileSnapshot, str]],
+    code: Mapping[str, object],
+) -> None:
+    for snapshot, description in (
+        (config_snapshot, "HyperSCA-C 设置文件"),
+        (gene_snapshot, "基因清单"),
+        (public_manifest_snapshot, "公开清单"),
+    ):
+        _verify_file_snapshot(snapshot, description)
+    for context_id, snapshot, content_sha256 in context_snapshots:
+        _verify_file_snapshot(snapshot, f"{context_id} context 输入文件")
+        dataset = load_task_c_dataset(snapshot.path, context_id=context_id)
+        if (
+            dataset.source_sha256 != snapshot.sha256
+            or dataset.content_sha256 != content_sha256
+        ):
+            raise HyperSCACError(f"{context_id} context 输入内容在拟合期间发生变化")
+        _verify_file_snapshot(snapshot, f"{context_id} context 输入文件")
+    if _git_state() != dict(code):
+        raise HyperSCACError("运行代码在拟合期间发生变化")
 
 
 def _reuse_existing_output(
@@ -625,23 +830,34 @@ def run_hypersca_c(
     """Validate one registered run, fit it, and safely materialize four artifacts."""
 
     parsed_contexts = _parse_context_values(context_values)
-    gene_path, gene_selection = _load_gene_selection(gene_list_path)
-    config_file, config, config_values = _load_config(config_path)
+    gene_path, gene_selection, gene_snapshot = _load_gene_selection(gene_list_path)
+    config_file, config, config_values, config_snapshot = _load_config(config_path)
     normalized_seed = _validated_seed(seed)
     normalized_device = _validated_device(device)
-    manifest_path, _, public_files = _load_public_manifest(public_manifest_path)
+    manifest_path, _, public_files, public_manifest_snapshot = _load_public_manifest(
+        public_manifest_path
+    )
 
-    datasets = []
-    context_records: list[dict[str, object]] = []
-    expected_raw_genes: tuple[str, ...] | None = None
-    selected_genes = tuple(gene_selection["genes"])
+    matched_inputs: list[tuple[str, Path, str, _FileSnapshot]] = []
     for context_id, raw_path in parsed_contexts:
-        input_path, relative, input_hash = _match_public_input(
+        input_path, relative, input_snapshot = _match_public_input(
             raw_path,
             manifest_path=manifest_path,
             files=public_files,
         )
+        matched_inputs.append((context_id, input_path, relative, input_snapshot))
+    condition = _condition_record(matched_inputs)
+
+    datasets = []
+    context_records: list[dict[str, object]] = []
+    context_snapshots: list[tuple[str, _FileSnapshot, str]] = []
+    expected_raw_genes: tuple[str, ...] | None = None
+    selected_genes = tuple(gene_selection["genes"])
+    for context_id, input_path, relative, input_snapshot in matched_inputs:
         dataset = load_task_c_dataset(input_path, context_id=context_id)
+        if dataset.source_sha256 != input_snapshot.sha256:
+            raise HyperSCACError(f"{context_id} context 输入在加载期间发生变化")
+        _verify_file_snapshot(input_snapshot, f"{context_id} context 输入文件")
         if expected_raw_genes is None:
             expected_raw_genes = dataset.gene_names
         elif dataset.gene_names != expected_raw_genes:
@@ -663,10 +879,13 @@ def run_hypersca_c(
             {
                 "context_id": context_id,
                 "input_path": str(input_path),
-                "input_sha256": input_hash,
+                "input_sha256": input_snapshot.sha256,
                 "content_sha256": dataset.content_sha256,
                 "public_relative_path": relative,
             }
+        )
+        context_snapshots.append(
+            (context_id, input_snapshot, dataset.content_sha256)
         )
 
     code = _git_state()
@@ -678,6 +897,10 @@ def run_hypersca_c(
         seed=normalized_seed,
         device=normalized_device,
         code=code,
+        condition=condition,
+        config_sha256=config_snapshot.sha256,
+        gene_sha256=gene_snapshot.sha256,
+        public_manifest_sha256=public_manifest_snapshot.sha256,
     )
     existing = _reuse_existing_output(output_dir, identity)
     if existing is not None:
@@ -690,6 +913,13 @@ def run_hypersca_c(
         config,
         seed=normalized_seed,
         device=normalized_device,
+    )
+    _verify_run_input_snapshots(
+        config_snapshot=config_snapshot,
+        gene_snapshot=gene_snapshot,
+        public_manifest_snapshot=public_manifest_snapshot,
+        context_snapshots=context_snapshots,
+        code=code,
     )
     summary = thaw_json_record(result.summary)
     summary["failures"] = list(result.failures)
@@ -709,6 +939,7 @@ def run_hypersca_c(
         "claim_level": "raw_inference_only",
         "seed": normalized_seed,
         "contexts": [record["context_id"] for record in context_records],
+        **condition,
         "requested_bootstraps": requested,
         "successful_bootstraps": successful,
         "failure_count": len(result.failures),
@@ -718,7 +949,7 @@ def run_hypersca_c(
     }
     gene_record: dict[str, object] = {
         "path": str(gene_path),
-        "sha256": sha256_path(gene_path),
+        "sha256": gene_snapshot.sha256,
         "selection_id": gene_selection["selection_id"],
         "selection_basis": gene_selection["selection_basis"],
         "gene_count": len(selected_genes),
@@ -731,15 +962,16 @@ def run_hypersca_c(
         "seed": normalized_seed,
         "device": normalized_device,
         "contexts": context_records,
+        **condition,
         "config": {
             "path": str(config_file),
-            "sha256": sha256_path(config_file),
+            "sha256": config_snapshot.sha256,
             "values": config_values,
         },
         "gene_selection": gene_record,
         "public_manifest": {
             "path": str(manifest_path),
-            "sha256": sha256_path(manifest_path),
+            "sha256": public_manifest_snapshot.sha256,
         },
         "code": dict(code),
         "run_identity": identity,
