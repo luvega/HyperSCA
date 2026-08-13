@@ -421,7 +421,17 @@ def test_materialized_training_files_exclude_holdout_sources(tmp_path: Path) -> 
     assert "holdout_sources" not in public
     assert "control_indices" not in public
     assert all("private" not in value for value in _walk_text_values(public))
-    assert not set(split.holdout_sources) & set(_walk_text_values(public))
+    public_without_gene_provenance = dict(public)
+    public_without_gene_provenance.pop("gene_projection")
+    public_without_gene_provenance["materialization_identity"] = dict(
+        public_without_gene_provenance["materialization_identity"]
+    )
+    public_without_gene_provenance["materialization_identity"].pop(
+        "gene_projection"
+    )
+    assert not set(split.holdout_sources) & set(
+        _walk_text_values(public_without_gene_provenance)
+    )
 
     private = json.loads(Path(result["private_manifest"]).read_text(encoding="utf-8"))
     assert private["holdout_sources"] == list(split.holdout_sources)
@@ -506,14 +516,130 @@ def test_materialized_manifests_use_relative_paths_and_verified_hashes(tmp_path:
     assert set(private["files"]) == expected_private
 
 
-def test_materialization_rejects_incompatible_gene_order(tmp_path: Path) -> None:
-    k562 = dataset_for_split("k562")
-    rpe1 = replace(
-        dataset_for_split("rpe1"),
-        gene_names=("B", "A", "C", "D", "E", "F", "Z"),
+def test_materialization_projects_both_contexts_to_sorted_common_genes(
+    tmp_path: Path,
+) -> None:
+    k562_base = dataset_for_split("k562")
+    rpe1_base = dataset_for_split("rpe1")
+    k562_genes = ("K_ONLY", "B", "A", "C", "D", "E", "F", "Z")
+    rpe1_genes = ("Z", "R_ONLY", "F", "E", "D", "C", "B", "A")
+    k562_expression = np.column_stack(
+        (
+            np.full(len(k562_base.interventions), -1.0),
+            k562_base.expression[:, 1],
+            k562_base.expression[:, 0],
+            k562_base.expression[:, 2],
+            k562_base.expression[:, 3],
+            k562_base.expression[:, 4],
+            k562_base.expression[:, 5],
+            k562_base.expression[:, 6],
+        )
     )
+    rpe1_expression = np.column_stack(
+        (
+            rpe1_base.expression[:, 6],
+            np.full(len(rpe1_base.interventions), -2.0),
+            rpe1_base.expression[:, 5],
+            rpe1_base.expression[:, 4],
+            rpe1_base.expression[:, 3],
+            rpe1_base.expression[:, 2],
+            rpe1_base.expression[:, 1],
+            rpe1_base.expression[:, 0],
+        )
+    )
+    k562 = replace(k562_base, expression=k562_expression, gene_names=k562_genes)
+    rpe1 = replace(rpe1_base, expression=rpe1_expression, gene_names=rpe1_genes)
     split = build_shared_task_c_split(k562, rpe1, seed=11)
-    with pytest.raises(TaskCDataError, match="gene names|gene order"):
+    result = materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
+
+    common = ("A", "B", "C", "D", "E", "F", "Z")
+    k562_refit = load_task_c_dataset(
+        result["within"]["k562"]["refit"], context_id="k562"
+    )
+    rpe1_refit = load_task_c_dataset(
+        result["within"]["rpe1"]["refit"], context_id="rpe1"
+    )
+    assert k562_refit.gene_names == common
+    assert rpe1_refit.gene_names == common
+    assert "K_ONLY" not in k562_refit.gene_names
+    assert "R_ONLY" not in rpe1_refit.gene_names
+    refit_sources = split.train_sources + split.tune_sources
+    k562_rows = np.sort(
+        np.concatenate(
+            (
+                np.flatnonzero(np.isin(k562.interventions, refit_sources)),
+                np.asarray(
+                    split.control_indices["k562"]["train"]
+                    + split.control_indices["k562"]["tune"]
+                ),
+            )
+        )
+    )
+    rpe1_rows = np.sort(
+        np.concatenate(
+            (
+                np.flatnonzero(np.isin(rpe1.interventions, refit_sources)),
+                np.asarray(
+                    split.control_indices["rpe1"]["train"]
+                    + split.control_indices["rpe1"]["tune"]
+                ),
+            )
+        )
+    )
+    np.testing.assert_array_equal(
+        k562_refit.expression, k562_expression[np.ix_(k562_rows, [2, 1, 3, 4, 5, 6, 7])]
+    )
+    np.testing.assert_array_equal(
+        rpe1_refit.expression, rpe1_expression[np.ix_(rpe1_rows, [7, 6, 5, 4, 3, 2, 0])]
+    )
+    public = json.loads(Path(result["public_manifest"]).read_text(encoding="utf-8"))
+    projection = public["gene_projection"]
+    assert projection["projection_rule"] == "sorted_common_gene_intersection_v1"
+    assert projection["common"]["ordered_genes"] == list(common)
+    assert projection["contexts"]["k562"]["selected_original_indices"] == [
+        2,
+        1,
+        3,
+        4,
+        5,
+        6,
+        7,
+    ]
+    assert projection["contexts"]["rpe1"]["selected_original_indices"] == [
+        7,
+        6,
+        5,
+        4,
+        3,
+        2,
+        0,
+    ]
+    assert k562.gene_names == k562_genes
+    assert rpe1.gene_names == rpe1_genes
+    np.testing.assert_array_equal(k562.expression, k562_expression)
+    np.testing.assert_array_equal(rpe1.expression, rpe1_expression)
+
+
+def test_materialization_reuse_rejects_tampered_gene_projection(
+    tmp_path: Path,
+) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+    result = materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
+    manifest_path = Path(result["public_manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["gene_projection"]["contexts"]["k562"][
+        "selected_original_indices"
+    ] = list(reversed(manifest["gene_projection"]["contexts"]["k562"][
+        "selected_original_indices"
+    ]))
+    manifest["materialization_identity"]["gene_projection"] = manifest[
+        "gene_projection"
+    ]
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(TaskCDataError, match="identity|semantic|projection"):
         materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
 
 

@@ -13,12 +13,14 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from src.evaluation import task_c_runtime as runtime_module
+from src.evaluation import task_c_method_run as method_run_module
 from src.evaluation.task_c_method_registry import (
     TaskCMethodRegistryError,
     load_task_c_method_registry,
@@ -41,6 +43,7 @@ from src.evaluation.task_c_method_run import (
     MAXIMUM_TASK_C_RUN_GENES,
     TaskCMethodRunError,
     _standardize_and_concatenate,
+    _capture_live_conda_environment,
     _validate_hypersca_inner_bundle,
     build_task_c_method_command,
     materialize_task_c_derived_input,
@@ -118,6 +121,213 @@ def test_hypersca_inner_validation_recomputes_only_for_reuse(
     )
 
     assert calls == ["validate", "recompute"]
+
+
+def test_live_conda_environment_identity_is_canonical_and_bounded() -> None:
+    calls: list[tuple[tuple[str, ...], object]] = []
+
+    def fake_runner(command: Sequence[str], **kwargs: object) -> object:
+        calls.append((tuple(command), kwargs.get("timeout")))
+        return SimpleNamespace(
+            stdout=json.dumps(
+                [
+                    {"name": "zlib", "version": "1.3", "build_string": "h1"},
+                    {"name": "numpy", "version": "2.0", "build_string": "py310"},
+                ]
+            ),
+            stderr="",
+            returncode=0,
+        )
+
+    captured = _capture_live_conda_environment(
+        "hypersca-task-c-causalbench", run_command=fake_runner
+    )
+
+    assert captured["packages"] == [
+        {"name": "numpy", "version": "2.0", "build_string": "py310"},
+        {"name": "zlib", "version": "1.3", "build_string": "h1"},
+    ]
+    assert str(captured["sha256"]).startswith("sha256:")
+    assert calls == [
+        (
+            (
+                "conda",
+                "list",
+                "-n",
+                "hypersca-task-c-causalbench",
+                "--json",
+            ),
+            60,
+        )
+    ]
+    assert "/" not in json.dumps(captured)
+
+
+def _live_environment_record(version: str) -> dict[str, object]:
+    packages = [{"name": "python", "version": version, "build_string": "h0"}]
+    canonical = {
+        "schema_version": "1.0",
+        "environment": "hypersca-task-c-causalbench",
+        "packages": packages,
+    }
+    encoded = (
+        json.dumps(canonical, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    return {
+        "environment": canonical["environment"],
+        "packages": packages,
+        "sha256": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
+    }
+
+
+def _fake_external_asset_snapshots(
+    tmp_path: Path,
+    *,
+    packages: list[dict[str, str]],
+) -> dict[str, object]:
+    root = tmp_path / "fake-assets"
+    environment_root = root / "environment_manifests"
+    environment_root.mkdir(parents=True)
+    registry_hash = f"sha256:{hashlib.sha256(REGISTRY.read_bytes()).hexdigest()}"
+    records = {
+        "bootstrap_identity.json": {"registry_sha256": registry_hash},
+        "bootstrap_manifest.json": {"schema_version": "1.0"},
+        "bootstrap_status.json": {
+            "schema_version": "1.0",
+            "status": "assets_and_environments_recorded",
+        },
+        "environment_manifests/hypersca-task-c-causalbench.json": {
+            "schema_version": "1.0",
+            "environment": "hypersca-task-c-causalbench",
+            "packages": packages,
+        },
+    }
+    snapshots: dict[str, object] = {}
+    for relative, payload in records.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        snapshots[relative] = method_run_module._capture_file(
+            path,
+            f"fake asset {relative}",
+            maximum_bytes=method_run_module.MAXIMUM_RECORD_BYTES,
+            require_single_link=True,
+        )
+    return snapshots
+
+
+def _patch_external_assets_and_run(
+    monkeypatch: pytest.MonkeyPatch,
+    snapshots: dict[str, object],
+) -> None:
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run._asset_snapshots",
+        lambda *args, **kwargs: snapshots,
+    )
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run._external_source_digest",
+        lambda *args, **kwargs: None,
+    )
+
+    def fake_run(
+        command: Sequence[str], *, output_dir: Path, timeout_seconds: object
+    ) -> dict[str, object]:
+        del command, timeout_seconds
+        output_dir.mkdir()
+        (output_dir / "worker_predictions.csv").write_text(
+            "source,target,score\nA,B,1\n", encoding="utf-8"
+        )
+        inner = {"schema_version": "1.0", "status": "completed_raw_inference"}
+        (output_dir / "method_status.json").write_text(
+            json.dumps(inner) + "\n", encoding="utf-8"
+        )
+        (output_dir / "resource_usage.json").write_text(
+            '{"schema_version":"1.0"}\n', encoding="utf-8"
+        )
+        return inner
+
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run.run_isolated_method", fake_run
+    )
+
+
+def _synthetic_external_arguments(tmp_path: Path) -> dict[str, object]:
+    input_path = tmp_path / "input.npz"
+    _write_method_input(input_path)
+    return {
+        "method_id": "pc",
+        "input_npz": input_path,
+        "output_dir": tmp_path / "run",
+        "seed": 11,
+        "registry_path": REGISTRY,
+        "asset_root": tmp_path / "unused-assets",
+        "data_status": "synthetic_smoke",
+        "context_id": "synthetic",
+        "min_cells": 2,
+        "project_root": ROOT,
+    }
+
+
+def test_external_run_rejects_live_environment_mismatch_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = _live_environment_record("3.10")
+    snapshots = _fake_external_asset_snapshots(
+        tmp_path, packages=expected["packages"]
+    )
+    _patch_external_assets_and_run(monkeypatch, snapshots)
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run._capture_live_conda_environment",
+        lambda name: _live_environment_record("3.11"),
+    )
+
+    with pytest.raises(TaskCMethodRunError, match="differs from the prepared"):
+        run_task_c_method(**_synthetic_external_arguments(tmp_path))
+    assert not (tmp_path / "run").exists()
+
+
+def test_external_reuse_rejects_a_changed_live_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = _live_environment_record("3.10")
+    snapshots = _fake_external_asset_snapshots(
+        tmp_path, packages=expected["packages"]
+    )
+    _patch_external_assets_and_run(monkeypatch, snapshots)
+    current = {"record": expected}
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run._capture_live_conda_environment",
+        lambda name: current["record"],
+    )
+    arguments = _synthetic_external_arguments(tmp_path)
+    run_task_c_method(**arguments)
+    current["record"] = _live_environment_record("3.11")
+
+    with pytest.raises(TaskCMethodRunError, match="differs from the prepared"):
+        run_task_c_method(**arguments)
+
+
+def test_external_run_rejects_live_environment_change_during_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = _live_environment_record("3.10")
+    snapshots = _fake_external_asset_snapshots(
+        tmp_path, packages=expected["packages"]
+    )
+    _patch_external_assets_and_run(monkeypatch, snapshots)
+    records = iter((expected, _live_environment_record("3.11")))
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run._capture_live_conda_environment",
+        lambda name: next(records),
+    )
+
+    with pytest.raises(TaskCMethodRunError, match="changed during the method run"):
+        run_task_c_method(**_synthetic_external_arguments(tmp_path))
+    status = json.loads(
+        (tmp_path / "run/method_status.json").read_text(encoding="utf-8")
+    )
+    assert status["status"] == "failed_runtime_unavailable"
+    assert not (tmp_path / "run/predictions.csv").exists()
 
 
 def test_timeout_is_not_mislabeled_and_terminates_the_process_group(
@@ -1866,6 +2076,10 @@ def test_formal_run_rejects_an_incomplete_public_inventory(tmp_path: Path) -> No
         "input_sha256": {"k562": input_hash, "rpe1": input_hash},
         "content_sha256": {"k562": input_hash, "rpe1": input_hash},
         "gene_names_sha256": input_hash,
+        "gene_projection": {
+            "rule": "sorted_common_gene_intersection_v1",
+            "common_gene_count": 2,
+        },
     }
     manifest = {
         **identity,
@@ -2187,6 +2401,7 @@ def _patch_external_runtime(
     *,
     inner_status: str,
     write_raw: bool,
+    raw_relation: tuple[str, str] = ("A", "B"),
 ) -> None:
     monkeypatch.setattr(
         "src.evaluation.task_c_method_run._asset_snapshots",
@@ -2208,7 +2423,8 @@ def _patch_external_runtime(
         destination.mkdir()
         if write_raw:
             (destination / "worker_predictions.csv").write_text(
-                "source,target,score\nA,B,1\n",
+                "source,target,score\n"
+                f"{raw_relation[0]},{raw_relation[1]},1\n",
                 encoding="utf-8",
             )
         status = {"schema_version": "1.0", "status": inner_status}
@@ -2412,10 +2628,13 @@ def test_external_method_accepts_a_recomputed_formal_cross_input(
         stage="refit",
         output_dir=tmp_path / "derived",
     )
+    derived_manifest = json.loads(Path(derived["manifest"]).read_text(encoding="utf-8"))
+    first_gene, second_gene = derived_manifest["gene_selection"]["ordered_genes"][:2]
     _patch_external_runtime(
         monkeypatch,
         inner_status="completed_raw_inference",
         write_raw=True,
+        raw_relation=(first_gene, second_gene),
     )
 
     status = run_task_c_method(
@@ -2526,13 +2745,86 @@ def test_hypersca_dispatches_the_exact_validated_profile_subset(
         )
 
     command = captured["command"]
-    assert command[command.index("--profile-input") + 1] == str(
+    dispatched_input = Path(command[command.index("--profile-input") + 1])
+    assert dispatched_input != Path(profile["input_npz"])
+    assert dispatched_input.name == "profile_input.npz"
+    assert command[command.index("--profile-identity-input") + 1] == str(
         profile["input_npz"]
     )
     assert command[command.index("--profile-manifest") + 1] == str(
         profile["manifest"]
     )
     assert "--context" not in command
+
+
+def test_external_worker_reads_a_staged_copy_of_validated_profile_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _materialized_public_bundle(tmp_path)
+    derived = materialize_task_c_derived_input(
+        public_manifest_path=Path(bundle["public_manifest"]),
+        direction="k562_to_rpe1",
+        stage="refit",
+        output_dir=tmp_path / "profile",
+    )
+    original_bytes = Path(derived["input_npz"]).read_bytes()
+    observed: dict[str, object] = {}
+
+    def fake_run(
+        command: Sequence[str],
+        *,
+        output_dir: Path,
+        timeout_seconds: object,
+    ) -> dict[str, object]:
+        del timeout_seconds
+        input_path = Path(command[command.index("--input-npz") + 1])
+        observed["input_path"] = input_path
+        observed["input_bytes"] = input_path.read_bytes()
+        with np.load(input_path, allow_pickle=False) as archive:
+            first, second = archive["var_names"][:2].tolist()
+        runtime = Path(output_dir)
+        runtime.mkdir()
+        (runtime / "worker_predictions.csv").write_text(
+            f"source,target,score\n{first},{second},1\n", encoding="utf-8"
+        )
+        inner = {"schema_version": "1.0", "status": "completed_raw_inference"}
+        (runtime / "method_status.json").write_text(
+            json.dumps(inner) + "\n", encoding="utf-8"
+        )
+        (runtime / "resource_usage.json").write_text(
+            '{"schema_version":"1.0"}\n', encoding="utf-8"
+        )
+        return inner
+
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run.run_isolated_method", fake_run
+    )
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run._asset_snapshots", lambda *args: {}
+    )
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run._external_source_digest",
+        lambda *args: None,
+    )
+    run_task_c_method(
+        method_id="pc",
+        input_npz=Path(derived["input_npz"]),
+        derived_input_manifest_path=Path(derived["manifest"]),
+        output_dir=tmp_path / "run",
+        seed=11,
+        registry_path=REGISTRY,
+        asset_root=tmp_path / "assets",
+        data_status="external_benchmark",
+        context_id="k562_to_rpe1",
+        min_cells=5,
+        public_manifest_path=Path(bundle["public_manifest"]),
+        project_root=ROOT,
+    )
+
+    assert observed["input_bytes"] == original_bytes
+    assert ".fixed-inputs-" in Path(observed["input_path"]).parent.name
+    assert Path(observed["input_path"]) != Path(derived["input_npz"])
 
 
 @pytest.mark.parametrize("nested_case", ["missing_raw", "missing_evidence_files"])

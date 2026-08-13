@@ -45,6 +45,7 @@ from src.evaluation.task_c_predictions import (
 from src.evaluation.task_c_runtime import run_isolated_method
 from src.evaluation.task_c_runtime import (
     TaskCRuntimeError,
+    _normalized_packages,
     _validate_source_checkout,
 )
 
@@ -81,6 +82,7 @@ _PUBLIC_MANIFEST_FIELDS = frozenset(
         "input_sha256",
         "content_sha256",
         "gene_names_sha256",
+        "gene_projection",
         "materialization_identity",
         "files",
     }
@@ -125,6 +127,59 @@ class TaskCMethodRunError(ValueError):
 
 class _InvalidMethodOutput(TaskCMethodRunError):
     """The external method finished but did not return an admissible relation table."""
+
+
+def _capture_live_conda_environment(
+    environment_name: str,
+    *,
+    run_command: Any = subprocess.run,
+) -> dict[str, object]:
+    """Read a bounded, path-free package identity from the named live environment."""
+
+    if (
+        not isinstance(environment_name, str)
+        or not environment_name
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyz0123456789-_"
+            for character in environment_name
+        )
+    ):
+        raise TaskCMethodRunError("conda environment name is invalid")
+    try:
+        completed = run_command(
+            ["conda", "list", "-n", environment_name, "--json"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        )
+        raw = json.loads(
+            completed.stdout,
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_constant,
+        )
+        packages = _normalized_packages(raw)
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        UnicodeError,
+        json.JSONDecodeError,
+        TaskCRuntimeError,
+    ) as exc:
+        raise TaskCMethodRunError(
+            "cannot verify the live conda environment package identity"
+        ) from exc
+    canonical = {
+        "schema_version": SCHEMA_VERSION,
+        "environment": environment_name,
+        "packages": packages,
+    }
+    return {
+        "environment": environment_name,
+        "packages": packages,
+        "sha256": f"sha256:{hashlib.sha256(_json_bytes(canonical)).hexdigest()}",
+    }
 
 
 @dataclass(frozen=True)
@@ -461,6 +516,7 @@ def _capture_public_input(
         "input_sha256",
         "content_sha256",
         "gene_names_sha256",
+        "gene_projection",
     }
     materialization_identity = payload.get("materialization_identity")
     if not isinstance(materialization_identity, dict) or set(
@@ -641,36 +697,31 @@ def _validate_derived_input(
         )
     except ValueError as exc:
         raise TaskCMethodRunError(str(exc)) from exc
-    input_snapshot = _capture_file(
-        validated.input_path,
-        "profile input NPZ",
-        maximum_bytes=MAXIMUM_INPUT_BYTES,
-        reject_private=True,
-        require_single_link=True,
+
+    def fixed_snapshot(value: object, label: str) -> _Snapshot:
+        payload = getattr(value, "payload", None)
+        if not isinstance(payload, bytes) or not payload:
+            raise TaskCMethodRunError(f"{label} has no fixed validated bytes")
+        return _Snapshot(
+            path=Path(getattr(value, "path")),
+            payload=payload,
+            device=int(getattr(value, "device")),
+            inode=int(getattr(value, "inode")),
+            size=int(getattr(value, "size")),
+            modified_ns=int(getattr(value, "modified_ns")),
+            changed_ns=int(getattr(value, "changed_ns")),
+            link_count=int(getattr(value, "link_count")),
+        )
+
+    input_snapshot = fixed_snapshot(validated.input_snapshot, "profile input")
+    derived_manifest = fixed_snapshot(
+        validated.manifest_snapshot, "profile input manifest"
     )
-    derived_manifest = _capture_file(
-        validated.manifest_path,
-        "profile input manifest",
-        maximum_bytes=MAXIMUM_RECORD_BYTES,
-        reject_private=True,
-        require_single_link=True,
-    )
-    public_snapshot = _capture_file(
-        public_manifest_path,
-        "public manifest",
-        maximum_bytes=MAXIMUM_RECORD_BYTES,
-        reject_private=True,
-        require_single_link=True,
-    )
+    public_snapshot = fixed_snapshot(validated.public_snapshot, "public manifest")
     public_payload = _parse_json(public_snapshot, "public manifest")
     captured_parents = tuple(
-        _capture_file(
-            path,
-            "profile parent",
-            maximum_bytes=MAXIMUM_INPUT_BYTES,
-            reject_private=True,
-        )
-        for path in validated.parent_paths
+        fixed_snapshot(snapshot, "profile parent")
+        for snapshot in validated.parent_snapshots
     )
     run_context_id = validated.direction or validated.context_id
     assert run_context_id is not None
@@ -699,6 +750,7 @@ def _build_hypersca_command(
     seed: int,
     device: str,
     profile_input_path: Path | None = None,
+    profile_identity_input_path: Path | None = None,
     profile_manifest_path: Path | None = None,
 ) -> tuple[str, ...]:
     context_arguments = tuple(
@@ -710,6 +762,8 @@ def _build_hypersca_command(
         (
             "--profile-input",
             str(profile_input_path),
+            "--profile-identity-input",
+            str(profile_identity_input_path or profile_input_path),
             "--profile-manifest",
             str(profile_manifest_path),
         )
@@ -864,6 +918,7 @@ def _safe_command_record(command: Sequence[str]) -> dict[str, object]:
         "--gene-list",
         "--public-manifest",
         "--profile-input",
+        "--profile-identity-input",
         "--profile-manifest",
         "--output-dir",
     }
@@ -1554,6 +1609,7 @@ def run_task_c_method(
     spec = registry.methods[method_id]
     code_snapshots = _code_snapshots(root, spec)
     asset_snapshots = _asset_snapshots(asset_root, registry, spec)
+    live_environment: dict[str, object] | None = None
     if asset_snapshots:
         asset_identity = _parse_json(
             asset_snapshots["bootstrap_identity.json"], "bootstrap identity"
@@ -1563,6 +1619,23 @@ def run_task_c_method(
         ) and asset_identity.get("registry_sha256") != registry_snapshot.sha256:
             raise TaskCMethodRunError(
                 "prepared method assets belong to a different registry snapshot"
+            )
+        environment_name = (
+            str(registry.causalbench["environment"])
+            if spec.source_kind == "causalbench"
+            else str(spec.environment)
+        )
+        expected_environment = _parse_json(
+            asset_snapshots[f"environment_manifests/{environment_name}.json"],
+            "prepared environment manifest",
+        )
+        live_environment = _capture_live_conda_environment(environment_name)
+        if (
+            expected_environment.get("environment") != environment_name
+            or expected_environment.get("packages") != live_environment["packages"]
+        ):
+            raise TaskCMethodRunError(
+                "live conda environment differs from the prepared package manifest"
             )
     external_source_sha256 = _external_source_digest(asset_root, registry, spec)
     input_snapshot: _Snapshot | None = None
@@ -1579,6 +1652,10 @@ def run_task_c_method(
     if external_source_sha256 is not None:
         hypersca_input_hashes["official_source_worktree_sha256"] = (
             external_source_sha256
+        )
+    if live_environment is not None:
+        hypersca_input_hashes["live_environment_sha256"] = str(
+            live_environment["sha256"]
         )
 
     if spec.source_kind == "publication_only":
@@ -1823,7 +1900,7 @@ def run_task_c_method(
             except TaskCBenchmarkError as exc:
                 raise TaskCMethodRunError(str(exc)) from exc
             expected_raw = expected_result.scores[["source", "target", "score"]].copy()
-        return _validate_existing_output(
+        reused_status = _validate_existing_output(
             output_dir,
             expected_environment=expected_environment,
             spec=spec,
@@ -1832,6 +1909,15 @@ def run_task_c_method(
             hypersca_validation_inputs=hypersca_validation_inputs,
             recompute_hypersca=(spec.method_id == "hypersca_c"),
         )
+        if live_environment is not None:
+            refreshed_environment = _capture_live_conda_environment(
+                str(live_environment["environment"])
+            )
+            if refreshed_environment != live_environment:
+                raise TaskCMethodRunError(
+                    "live conda environment changed during result reuse"
+                )
+        return reused_status
 
     staging = Path(
         tempfile.mkdtemp(
@@ -1839,15 +1925,28 @@ def run_task_c_method(
             dir=staging_parent,
         )
     )
+    fixed_input_root: Path | None = None
     published = False
     inner_status_name: str | None = None
     status_origin = "local"
     try:
+        fixed_input_path: Path | None = None
+        execution_hypersca_validation_inputs = hypersca_validation_inputs
+        if derived_input_manifest_snapshot is not None:
+            assert input_snapshot is not None
+            fixed_input_root = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{_lexical_absolute(output_dir).name}.fixed-inputs-",
+                    dir=staging_parent,
+                )
+            )
+            fixed_input_path = fixed_input_root / "profile_input.npz"
+            _write_new(fixed_input_path, input_snapshot.payload)
         if spec.source_kind in {"causalbench", "git"}:
             assert input_snapshot is not None
             command = build_task_c_method_command(
                 spec,
-                input_path=input_snapshot.path,
+                input_path=fixed_input_path or input_snapshot.path,
                 output_csv=staging / "raw_runtime/worker_predictions.csv",
                 asset_root=_lexical_absolute(asset_root),
                 seed=seed,
@@ -1866,11 +1965,21 @@ def run_task_c_method(
                 output_dir=staging / "raw_method_output",
                 seed=seed,
                 device=device,
-                profile_input_path=(input_npz if profile_mode else None),
+                profile_input_path=(fixed_input_path if profile_mode else None),
+                profile_identity_input_path=(
+                    input_snapshot.path if profile_mode and input_snapshot is not None else None
+                ),
                 profile_manifest_path=(
                     derived_input_manifest_path if profile_mode else None
                 ),
             )
+            if profile_mode:
+                assert fixed_input_path is not None
+                execution_hypersca_validation_inputs = {
+                    **(hypersca_validation_inputs or {}),
+                    "profile_input_path": fixed_input_path,
+                    "profile_identity_path": input_snapshot.path,
+                }
         command_record = _safe_command_record(command) if command else None
         environment = _environment_manifest(
             spec=spec,
@@ -1944,7 +2053,7 @@ def run_task_c_method(
 
                         validate_hypersca_c_output_bundle(
                             staging / "raw_method_output",
-                            **(hypersca_validation_inputs or {}),
+                            **(execution_hypersca_validation_inputs or {}),
                         )
                         snapshot = _capture_file(
                             raw_source,
@@ -1996,6 +2105,14 @@ def run_task_c_method(
             asset_snapshots,
             extra_snapshots,
         )
+        if live_environment is not None:
+            refreshed_environment = _capture_live_conda_environment(
+                str(live_environment["environment"])
+            )
+            if refreshed_environment != live_environment:
+                raise TaskCMethodRunError(
+                    "live conda environment changed during the method run"
+                )
         if external_source_sha256 is not None and _external_source_digest(
             asset_root, registry, spec
         ) != external_source_sha256:
@@ -2071,5 +2188,7 @@ def run_task_c_method(
             published = True
         raise
     finally:
+        if fixed_input_root is not None and fixed_input_root.exists():
+            shutil.rmtree(fixed_input_root)
         if not published and staging.exists() and not staging.is_symlink():
             shutil.rmtree(staging)

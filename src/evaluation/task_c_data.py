@@ -67,6 +67,24 @@ class TaskCSplit:
         object.__setattr__(self, "control_indices", MappingProxyType(frozen_controls))
 
 
+@dataclass(frozen=True)
+class _CommonGeneProjection:
+    gene_names: tuple[str, ...]
+    column_indices: Mapping[str, tuple[int, ...]]
+    record: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "gene_names", tuple(self.gene_names))
+        object.__setattr__(
+            self,
+            "column_indices",
+            MappingProxyType(
+                {context: tuple(indices) for context, indices in self.column_indices.items()}
+            ),
+        )
+        object.__setattr__(self, "record", MappingProxyType(dict(self.record)))
+
+
 _TASK_C_SPLIT_SEEDS = frozenset({11, 23, 47, 71, 97})
 
 _WITHIN_ARTIFACTS = {
@@ -618,9 +636,18 @@ def _write_dataset_subset(
     dataset: TaskCDataset,
     indices: Sequence[int] | np.ndarray,
     path: Path,
+    *,
+    gene_names: tuple[str, ...] | None = None,
+    column_indices: Sequence[int] | None = None,
 ) -> str:
     """Atomically write one validated, self-describing dataset subset."""
     selected = _validated_row_indices(dataset, indices)
+    written_genes = dataset.gene_names if gene_names is None else tuple(gene_names)
+    written_columns = (
+        tuple(range(len(dataset.gene_names)))
+        if column_indices is None
+        else tuple(column_indices)
+    )
     destination = Path(path).expanduser()
     temporary: str | None = None
     try:
@@ -633,9 +660,11 @@ def _write_dataset_subset(
         os.close(fd)
         np.savez_compressed(
             temporary,
-            expression_matrix=dataset.expression[selected],
+            expression_matrix=dataset.expression[
+                np.ix_(selected, np.asarray(written_columns, dtype=int))
+            ],
             interventions=dataset.interventions[selected],
-            var_names=np.asarray(dataset.gene_names),
+            var_names=np.asarray(written_genes),
         )
         with open(temporary, "rb") as handle:
             os.fsync(handle.fileno())
@@ -754,10 +783,61 @@ def _gene_names_sha256(gene_names: tuple[str, ...]) -> str:
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def _canonical_sha256(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _common_gene_projection(
+    k562: TaskCDataset,
+    rpe1: TaskCDataset,
+) -> _CommonGeneProjection:
+    common_genes = tuple(sorted(set(k562.gene_names) & set(rpe1.gene_names)))
+    if len(common_genes) < 2:
+        raise TaskCDataError("K562 and RPE1 need at least two common genes")
+    contexts: dict[str, dict[str, object]] = {}
+    column_indices: dict[str, tuple[int, ...]] = {}
+    for dataset in (k562, rpe1):
+        lookup = {gene: index for index, gene in enumerate(dataset.gene_names)}
+        indices = tuple(int(lookup[gene]) for gene in common_genes)
+        column_indices[dataset.context_id] = indices
+        mapping_payload = {
+            "common_ordered_genes": list(common_genes),
+            "selected_original_indices": list(indices),
+        }
+        contexts[dataset.context_id] = {
+            "original_gene_count": len(dataset.gene_names),
+            "original_gene_names_sha256": _gene_names_sha256(dataset.gene_names),
+            "selected_original_indices": list(indices),
+            "mapping_sha256": _canonical_sha256(mapping_payload),
+        }
+    record = {
+        "projection_rule": "sorted_common_gene_intersection_v1",
+        "common": {
+            "count": len(common_genes),
+            "ordered_genes": list(common_genes),
+            "sha256": _gene_names_sha256(common_genes),
+        },
+        "contexts": contexts,
+    }
+    return _CommonGeneProjection(
+        gene_names=common_genes,
+        column_indices=column_indices,
+        record=record,
+    )
+
+
 def _materialization_identity(
     k562: TaskCDataset,
     rpe1: TaskCDataset,
     split: TaskCSplit,
+    projection: _CommonGeneProjection,
 ) -> dict[str, Any]:
     return {
         "schema_version": split.schema_version,
@@ -772,7 +852,8 @@ def _materialization_identity(
             "k562": k562.content_sha256,
             "rpe1": rpe1.content_sha256,
         },
-        "gene_names_sha256": _gene_names_sha256(k562.gene_names),
+        "gene_names_sha256": _gene_names_sha256(projection.gene_names),
+        "gene_projection": dict(projection.record),
     }
 
 
@@ -791,6 +872,7 @@ def _public_split_payload(
         "input_sha256": identity["input_sha256"],
         "content_sha256": identity["content_sha256"],
         "gene_names_sha256": identity["gene_names_sha256"],
+        "gene_projection": identity["gene_projection"],
     }
 
 
@@ -919,22 +1001,29 @@ def _task_c_materialization_records(
     output_dir: str | Path,
     *,
     content_prevalidated: bool,
-) -> tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]:
+) -> tuple[
+    Path,
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    _CommonGeneProjection,
+]:
     if not content_prevalidated:
         _validate_task_c_dataset_pair_content(k562, rpe1)
     validate_task_c_split(split, k562, rpe1)
-    if k562.gene_names != rpe1.gene_names:
-        raise TaskCDataError("K562 and RPE1 gene names and gene order must match")
     if k562.expression.shape[1] != len(k562.gene_names) or rpe1.expression.shape[
         1
     ] != len(rpe1.gene_names):
         raise TaskCDataError("dataset gene names do not match expression columns")
+    projection = _common_gene_projection(k562, rpe1)
     root = Path(output_dir).expanduser().resolve()
-    identity = _materialization_identity(k562, rpe1, split)
+    identity = _materialization_identity(k562, rpe1, split, projection)
     public_split_payload = _public_split_payload(split, identity)
     private_split_payload = _private_split_payload(split)
     private_split_payload["content_sha256"] = identity["content_sha256"]
-    return root, identity, public_split_payload, private_split_payload
+    private_split_payload["gene_names_sha256"] = identity["gene_names_sha256"]
+    private_split_payload["gene_projection"] = identity["gene_projection"]
+    return root, identity, public_split_payload, private_split_payload, projection
 
 
 def _check_task_c_materialization(
@@ -945,7 +1034,7 @@ def _check_task_c_materialization(
     *,
     content_prevalidated: bool,
 ) -> str:
-    root, identity, public_payload, private_payload = _task_c_materialization_records(
+    root, identity, public_payload, private_payload, _ = _task_c_materialization_records(
         k562,
         rpe1,
         split,
@@ -1004,7 +1093,7 @@ def _materialize_task_c_split(
     *,
     content_prevalidated: bool,
 ) -> dict[str, Any]:
-    root, identity, public_split_payload, private_split_payload = (
+    root, identity, public_split_payload, private_split_payload, projection = (
         _task_c_materialization_records(
             k562,
             rpe1,
@@ -1042,6 +1131,8 @@ def _materialize_task_c_split(
                 dataset,
                 _indices_for_sources(dataset, sources, control_indices),
                 path,
+                gene_names=projection.gene_names,
+                column_indices=projection.column_indices[context],
             )
 
     for source_name, target_name in (("k562", "rpe1"), ("rpe1", "k562")):
@@ -1066,12 +1157,16 @@ def _materialize_task_c_split(
                 target,
                 np.sort(_validated_row_indices(target, control_indices)),
                 _bundle_path(root, _CROSS_ARTIFACTS[direction][partition]),
+                gene_names=projection.gene_names,
+                column_indices=projection.column_indices[target_name],
             )
         all_sources = split.train_sources + split.tune_sources + split.holdout_sources
         _write_dataset_subset(
             target,
             _indices_for_sources(target, all_sources, target_controls["holdout"]),
             _bundle_path(root, _CROSS_ARTIFACTS[direction]["target_holdout"]),
+            gene_names=projection.gene_names,
+            column_indices=projection.column_indices[target_name],
         )
 
     private_payload = dict(private_split_payload)

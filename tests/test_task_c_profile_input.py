@@ -26,7 +26,7 @@ def large_public_bundle(tmp_path_factory: pytest.TempPathFactory) -> dict[str, o
     root = tmp_path_factory.mktemp("task-c-large-profile")
     genes = tuple(f"G{index:03d}" for index in range(270))
     labels = ["non-targeting"] * 1_000 + [
-        gene for gene in genes[:5] for _ in range(400)
+        gene for gene in genes[:90] for _ in range(30)
     ]
     loaded = {}
     for context, seed in (("k562", 11), ("rpe1", 23)):
@@ -85,7 +85,7 @@ def test_profiles_freeze_gene_and_cell_limits_for_within_and_cross(
         }
         assert archive["expression_matrix"].shape == (2_000, 64)
     with np.load(comprehensive["input_npz"], allow_pickle=False) as archive:
-        assert archive["expression_matrix"].shape == (2_400, 256)
+        assert archive["expression_matrix"].shape == (2_960, 72)
     with np.load(cross["input_npz"], allow_pickle=False) as archive:
         assert set(archive.files) == {
             "expression_matrix",
@@ -127,6 +127,21 @@ def test_profiles_freeze_gene_and_cell_limits_for_within_and_cross(
     }
     assert len(connection_manifest["gene_selection"]["ordered_genes"]) == 64
     assert len(connection_manifest["gene_selection"]["ordered_indices"]) == 64
+    selected_genes = set(connection_manifest["gene_selection"]["ordered_genes"])
+    with np.load(connection["input_npz"], allow_pickle=False) as archive:
+        labels = set(archive["interventions"].tolist())
+        assert labels <= {"non-targeting", *selected_genes}
+        assert "excluded" not in labels
+        assert archive["expression_matrix"].shape[0] <= 2_000
+    context_record = connection_manifest["contexts"][0]
+    assert context_record["row_filter_rule"] == (
+        "retain_control_and_selected_gene_interventions_v1"
+    )
+    assert context_record["dropped_original_row_count"] > 0
+    assert context_record["dropped_original_row_indices"] == sorted(
+        context_record["dropped_original_row_indices"]
+    )
+    assert not selected_genes & set(context_record["dropped_by_label"])
     cross_manifest = json.loads(
         Path(cross["manifest"]).read_text(encoding="utf-8")
     )
@@ -175,6 +190,79 @@ def test_profile_materialization_is_deterministic_and_validator_recomputes_paren
             input_path=Path(first["input_npz"]),
             profile_manifest_path=manifest_path,
             public_manifest_path=arguments["public_manifest_path"],
+        )
+
+
+def test_public_inventory_hashes_unique_files_without_retaining_all_bytes(
+    large_public_bundle: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.evaluation.task_c_profile_input as profile_module
+
+    original_capture = profile_module._capture
+    registered_reads: list[tuple[int, int]] = []
+
+    def recording_capture(*args: object, **kwargs: object) -> object:
+        snapshot = original_capture(*args, **kwargs)
+        if str(args[1]).startswith("registered public file"):
+            registered_reads.append((snapshot.device, snapshot.inode))
+        return snapshot
+
+    monkeypatch.setattr(profile_module, "_capture", recording_capture)
+    _, _, inventory = profile_module._load_public_manifest(
+        Path(large_public_bundle["public_manifest"])
+    )
+
+    assert len(registered_reads) == len(set(registered_reads))
+    assert all(snapshot.payload is None for snapshot in inventory.values())
+
+
+def test_profile_rejects_selected_parents_whose_arrays_expand_past_budget(
+    large_public_bundle: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.evaluation.task_c_profile_input as profile_module
+
+    monkeypatch.setattr(profile_module, "MAXIMUM_TOTAL_EXPANDED_PARENT_BYTES", 1)
+    with pytest.raises(TaskCProfileInputError, match="expanded arrays"):
+        materialize_task_c_profile_input(
+            public_manifest_path=Path(large_public_bundle["public_manifest"]),
+            profile="connection",
+            condition="within_environment",
+            context_id="k562",
+            output_dir=tmp_path / "too-expanded",
+        )
+
+
+def test_validator_rejects_manifest_replacement_after_initial_capture(
+    large_public_bundle: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.evaluation.task_c_profile_input as profile_module
+
+    created = materialize_task_c_profile_input(
+        public_manifest_path=Path(large_public_bundle["public_manifest"]),
+        profile="connection",
+        condition="within_environment",
+        context_id="k562",
+        output_dir=tmp_path / "profile",
+    )
+    manifest_path = Path(created["manifest"])
+    original_build = profile_module._build_profile
+
+    def replacing_build(*args: object, **kwargs: object) -> object:
+        built = original_build(*args, **kwargs)
+        manifest_path.write_bytes(manifest_path.read_bytes() + b" ")
+        return built
+
+    monkeypatch.setattr(profile_module, "_build_profile", replacing_build)
+    with pytest.raises(TaskCProfileInputError, match="changed|manifest"):
+        validate_task_c_profile_input(
+            input_path=Path(created["input_npz"]),
+            profile_manifest_path=manifest_path,
+            public_manifest_path=Path(large_public_bundle["public_manifest"]),
         )
 
 

@@ -62,6 +62,7 @@ _PUBLIC_MANIFEST_FIELDS = {
     "input_sha256",
     "content_sha256",
     "gene_names_sha256",
+    "gene_projection",
     "materialization_identity",
     "files",
 }
@@ -420,6 +421,7 @@ def _validate_public_manifest_record(payload: Mapping[str, object]) -> dict[str,
         "input_sha256",
         "content_sha256",
         "gene_names_sha256",
+        "gene_projection",
     }
     if not isinstance(identity, dict) or set(identity) != identity_fields:
         raise HyperSCACError("公开清单 materialization_identity 不符合固定格式")
@@ -1500,6 +1502,7 @@ def validate_hypersca_c_output_bundle(
     *,
     context_values: Sequence[str] = (),
     profile_input_path: Path | None = None,
+    profile_identity_path: Path | None = None,
     profile_manifest_path: Path | None = None,
     config_path: Path,
     gene_list_path: Path,
@@ -1512,6 +1515,7 @@ def validate_hypersca_c_output_bundle(
     return run_hypersca_c(
         context_values=context_values,
         profile_input_path=profile_input_path,
+        profile_identity_path=profile_identity_path,
         profile_manifest_path=profile_manifest_path,
         config_path=config_path,
         gene_list_path=gene_list_path,
@@ -1527,6 +1531,7 @@ def recompute_hypersca_c_output_bundle(
     *,
     context_values: Sequence[str] = (),
     profile_input_path: Path | None = None,
+    profile_identity_path: Path | None = None,
     profile_manifest_path: Path | None = None,
     config_path: Path,
     gene_list_path: Path,
@@ -1545,6 +1550,7 @@ def recompute_hypersca_c_output_bundle(
     arguments = {
         "context_values": context_values,
         "profile_input_path": profile_input_path,
+        "profile_identity_path": profile_identity_path,
         "profile_manifest_path": profile_manifest_path,
         "config_path": config_path,
         "gene_list_path": gene_list_path,
@@ -1620,6 +1626,7 @@ def run_hypersca_c(
     *,
     context_values: Sequence[str] = (),
     profile_input_path: Path | None = None,
+    profile_identity_path: Path | None = None,
     profile_manifest_path: Path | None = None,
     config_path: Path,
     gene_list_path: Path,
@@ -1630,7 +1637,11 @@ def run_hypersca_c(
 ) -> dict[str, object]:
     """Validate one registered run, fit it, and safely materialize four artifacts."""
 
-    profile_requested = profile_input_path is not None or profile_manifest_path is not None
+    profile_requested = (
+        profile_input_path is not None
+        or profile_identity_path is not None
+        or profile_manifest_path is not None
+    )
     if profile_requested and (
         profile_input_path is None
         or profile_manifest_path is None
@@ -1679,6 +1690,9 @@ def run_hypersca_c(
             raise HyperSCACError("统一比较范围记录不属于当前公开清单")
         if selected_genes != profile_data.gene_names:
             raise HyperSCACError("基因清单必须精确等于统一比较范围记录的固定顺序")
+        logical_profile_input = _lexical_absolute(
+            profile_identity_path or profile_data.input_path
+        )
         if profile_data.condition == "within_environment":
             assert profile_data.context_id is not None
             context_order = (profile_data.context_id,)
@@ -1727,7 +1741,7 @@ def run_hypersca_c(
             context_records.append(
                 {
                     "context_id": context_id,
-                    "input_path": str(profile_data.input_path),
+                    "input_path": str(logical_profile_input),
                     "input_sha256": profile_data.input_sha256,
                     "content_sha256": _profile_context_content_sha256(
                         expression, interventions, selected_genes
@@ -1736,7 +1750,7 @@ def run_hypersca_c(
                 }
             )
         profile_record = {
-            "input_path": str(profile_data.input_path),
+            "input_path": str(logical_profile_input),
             "input_sha256": profile_data.input_sha256,
             "manifest_path": str(profile_data.manifest_path),
             "manifest_sha256": profile_data.manifest_sha256,

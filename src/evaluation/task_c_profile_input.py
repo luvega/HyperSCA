@@ -35,6 +35,9 @@ GENE_SELECTION_RULE = (
 CELL_SELECTION_RULE = "label_stratified_without_replacement_seed_11_v1"
 MAXIMUM_FILE_BYTES = 512 * 1024 * 1024
 MAXIMUM_MANIFEST_BYTES = 4 * 1024 * 1024
+MAXIMUM_TOTAL_PARENT_BYTES = 1024 * 1024 * 1024
+MAXIMUM_TOTAL_EXPANDED_PARENT_BYTES = 2 * 1024 * 1024 * 1024
+MAXIMUM_PROFILE_INPUT_BYTES = 512 * 1024 * 1024
 
 _PUBLIC_MANIFEST_FIELDS = frozenset(
     {
@@ -48,6 +51,7 @@ _PUBLIC_MANIFEST_FIELDS = frozenset(
         "input_sha256",
         "content_sha256",
         "gene_names_sha256",
+        "gene_projection",
         "materialization_identity",
         "files",
     }
@@ -95,7 +99,8 @@ class TaskCProfileInputError(ValueError):
 @dataclass(frozen=True)
 class _FileSnapshot:
     path: Path
-    payload: bytes
+    payload: bytes | None
+    sha256_value: str
     device: int
     inode: int
     size: int
@@ -105,7 +110,7 @@ class _FileSnapshot:
 
     @property
     def sha256(self) -> str:
-        return f"sha256:{hashlib.sha256(self.payload).hexdigest()}"
+        return self.sha256_value
 
 
 @dataclass(frozen=True)
@@ -126,6 +131,10 @@ class TaskCProfileInput:
     parent_paths: tuple[Path, ...]
     parent_sha256: tuple[str, ...]
     manifest: Mapping[str, object]
+    input_snapshot: _FileSnapshot
+    manifest_snapshot: _FileSnapshot
+    public_snapshot: _FileSnapshot
+    parent_snapshots: tuple[_FileSnapshot, ...]
 
 
 @dataclass(frozen=True)
@@ -178,6 +187,7 @@ def _capture(
     *,
     maximum_bytes: int,
     single_link: bool = False,
+    collect_bytes: bool = True,
 ) -> _FileSnapshot:
     absolute = _absolute(path)
     if _has_private_part(absolute):
@@ -195,12 +205,20 @@ def _capture(
             raise TaskCProfileInputError(f"{label} is too large")
         if single_link and before.st_nlink != 1:
             raise TaskCProfileInputError(f"{label} must not be a hard link")
-        payload = bytearray()
-        while len(payload) <= maximum_bytes:
-            chunk = os.read(descriptor, min(1024 * 1024, maximum_bytes + 1 - len(payload)))
+        payload = bytearray() if collect_bytes else None
+        digest = hashlib.sha256()
+        bytes_read = 0
+        while bytes_read <= maximum_bytes:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, maximum_bytes + 1 - bytes_read),
+            )
             if not chunk:
                 break
-            payload.extend(chunk)
+            digest.update(chunk)
+            bytes_read += len(chunk)
+            if payload is not None:
+                payload.extend(chunk)
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
@@ -209,15 +227,16 @@ def _capture(
     except OSError as exc:
         raise TaskCProfileInputError(f"{label} changed while being read") from exc
     if (
-        len(payload) != before.st_size
-        or len(payload) > maximum_bytes
+        bytes_read != before.st_size
+        or bytes_read > maximum_bytes
         or _identity(before) != _identity(after)
         or _identity(after) != _identity(current)
     ):
         raise TaskCProfileInputError(f"{label} changed while being read")
     return _FileSnapshot(
         path=absolute,
-        payload=bytes(payload),
+        payload=bytes(payload) if payload is not None else None,
+        sha256_value=f"sha256:{digest.hexdigest()}",
         device=int(after.st_dev),
         inode=int(after.st_ino),
         size=int(after.st_size),
@@ -241,6 +260,8 @@ def _reject_constant(value: str) -> object:
 
 
 def _json(snapshot: _FileSnapshot, label: str) -> dict[str, Any]:
+    if snapshot.payload is None:
+        raise TaskCProfileInputError(f"{label} bytes were not retained")
     try:
         value = json.loads(
             snapshot.payload.decode("utf-8", errors="strict"),
@@ -289,6 +310,7 @@ def _load_public_manifest(
         "input_sha256",
         "content_sha256",
         "gene_names_sha256",
+        "gene_projection",
     }
     identity = payload.get("materialization_identity")
     if not isinstance(identity, dict) or set(identity) != identity_fields or any(
@@ -297,6 +319,7 @@ def _load_public_manifest(
         raise TaskCProfileInputError("public manifest identity changed")
     root = manifest.path.parent
     inventory: dict[str, _FileSnapshot] = {}
+    snapshots_by_inode: dict[tuple[int, int], _FileSnapshot] = {}
     inode_counts: Counter[tuple[int, int]] = Counter()
     for relative, expected_hash in sorted(files.items()):
         relative_path = Path(relative)
@@ -307,10 +330,45 @@ def _load_public_manifest(
             or not isinstance(expected_hash, str)
         ):
             raise TaskCProfileInputError("public manifest contains an unsafe path")
-        snapshot = _capture(
-            root / relative,
-            f"registered public file {relative}",
-            maximum_bytes=MAXIMUM_FILE_BYTES,
+        candidate = _absolute(root / relative)
+        _reject_symlink_parts(candidate, f"registered public file {relative}")
+        try:
+            metadata = os.lstat(candidate)
+        except OSError as exc:
+            raise TaskCProfileInputError(
+                f"registered public file is missing: {relative}"
+            ) from exc
+        inode = (int(metadata.st_dev), int(metadata.st_ino))
+        canonical = snapshots_by_inode.get(inode)
+        if canonical is None:
+            canonical = _capture(
+                candidate,
+                f"registered public file {relative}",
+                maximum_bytes=MAXIMUM_FILE_BYTES,
+                collect_bytes=False,
+            )
+            if _identity(metadata) != (
+                canonical.device,
+                canonical.inode,
+                canonical.size,
+                canonical.modified_ns,
+                canonical.changed_ns,
+                canonical.link_count,
+            ):
+                raise TaskCProfileInputError(
+                    f"registered public file changed before capture: {relative}"
+                )
+            snapshots_by_inode[inode] = canonical
+        snapshot = _FileSnapshot(
+            path=candidate,
+            payload=None,
+            sha256_value=canonical.sha256,
+            device=canonical.device,
+            inode=canonical.inode,
+            size=canonical.size,
+            modified_ns=canonical.modified_ns,
+            changed_ns=canonical.changed_ns,
+            link_count=canonical.link_count,
         )
         if snapshot.sha256 != expected_hash:
             raise TaskCProfileInputError(f"registered public hash changed: {relative}")
@@ -347,6 +405,8 @@ def _text_vector(values: np.ndarray, label: str) -> tuple[str, ...]:
 def _load_parent(
     snapshot: _FileSnapshot,
 ) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
+    if snapshot.payload is None:
+        raise TaskCProfileInputError("selected public parent bytes were not retained")
     try:
         with np.load(io.BytesIO(snapshot.payload), allow_pickle=False) as archive:
             if set(archive.files) != {
@@ -399,13 +459,17 @@ def _profile_limits(profile: str) -> tuple[int, int]:
 def _selected_genes(
     inventory: Mapping[str, _FileSnapshot],
     gene_limit: int,
+    *,
+    eligible_sources: Sequence[str],
+    minimum_cells: int,
+    load_parent: Any,
 ) -> tuple[tuple[str, ...], tuple[int, ...], tuple[dict[str, object], ...]]:
     loaded = []
     parents = []
     for context in ("k562", "rpe1"):
         relative = f"within/{context}/refit.npz"
         snapshot = inventory[relative]
-        expression, labels, genes = _load_parent(snapshot)
+        expression, labels, genes = load_parent(snapshot)
         controls = labels == CONTROL_LABEL
         if int(np.count_nonzero(controls)) < 2:
             raise TaskCProfileInputError(
@@ -422,11 +486,28 @@ def _selected_genes(
     genes = loaded[0][0]
     if loaded[1][0] != genes:
         raise TaskCProfileInputError("gene-selection parents use different gene orders")
+    counts_by_context = []
+    for context in ("k562", "rpe1"):
+        _, labels, _ = load_parent(inventory[f"within/{context}/refit.npz"])
+        counts_by_context.append(Counter(labels.tolist()))
+    candidates = {
+        source
+        for source in eligible_sources
+        if source in genes
+        and all(counts.get(source, 0) >= minimum_cells for counts in counts_by_context)
+    }
+    if len(candidates) < 2:
+        raise TaskCProfileInputError(
+            "profile needs at least two shared intervention sources with enough cells"
+        )
     mean_variance = np.mean(
         np.stack([values.var(axis=0, ddof=0) for _, values in loaded], axis=0),
         axis=0,
     )
-    ranked = sorted(range(len(genes)), key=lambda index: (-mean_variance[index], genes[index]))
+    ranked = sorted(
+        (index for index, gene in enumerate(genes) if gene in candidates),
+        key=lambda index: (-mean_variance[index], genes[index]),
+    )
     selected_indices = tuple(int(index) for index in ranked[: min(gene_limit, len(ranked))])
     if len(selected_indices) < 2:
         raise TaskCProfileInputError("profile needs at least two selected genes")
@@ -570,8 +651,74 @@ def _build_profile(
     parent_specs = _actual_parent_records(
         condition=condition, context_id=context_id, direction=direction
     )
-    public_snapshot, _, inventory = _load_public_manifest(public_manifest_path)
-    genes, gene_indices, gene_parents = _selected_genes(inventory, gene_limit)
+    public_snapshot, public_manifest, inventory = _load_public_manifest(
+        public_manifest_path
+    )
+    parent_cache: dict[
+        tuple[int, int],
+        tuple[_FileSnapshot, tuple[np.ndarray, np.ndarray, tuple[str, ...]]],
+    ] = {}
+    total_parent_bytes = 0
+    total_expanded_parent_bytes = 0
+
+    def load_parent(
+        inventory_snapshot: _FileSnapshot,
+    ) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
+        nonlocal total_parent_bytes, total_expanded_parent_bytes
+        key = (inventory_snapshot.device, inventory_snapshot.inode)
+        cached = parent_cache.get(key)
+        if cached is None:
+            captured = _capture(
+                inventory_snapshot.path,
+                "selected public profile parent",
+                maximum_bytes=MAXIMUM_FILE_BYTES,
+                collect_bytes=True,
+            )
+            if (
+                captured.sha256 != inventory_snapshot.sha256
+                or captured.device != inventory_snapshot.device
+                or captured.inode != inventory_snapshot.inode
+                or captured.size != inventory_snapshot.size
+            ):
+                raise TaskCProfileInputError(
+                    "selected public profile parent changed after inventory check"
+                )
+            total_parent_bytes += captured.size
+            if total_parent_bytes > MAXIMUM_TOTAL_PARENT_BYTES:
+                raise TaskCProfileInputError("selected profile parents are too large together")
+            loaded_parent = _load_parent(captured)
+            expression, labels, genes = loaded_parent
+            expanded_bytes = (
+                int(expression.nbytes)
+                + int(labels.nbytes)
+                + sum(len(gene.encode("utf-8")) for gene in genes)
+            )
+            total_expanded_parent_bytes += expanded_bytes
+            if total_expanded_parent_bytes > MAXIMUM_TOTAL_EXPANDED_PARENT_BYTES:
+                raise TaskCProfileInputError(
+                    "selected profile parent expanded arrays are too large together"
+                )
+            parent_cache[key] = (captured, loaded_parent)
+            return loaded_parent
+        return cached[1]
+
+    eligible_sources = tuple(public_manifest["train_sources"]) + tuple(
+        public_manifest["tune_sources"]
+    )
+    minimum_cells = public_manifest["min_cells_per_intervention"]
+    if (
+        isinstance(minimum_cells, bool)
+        or not isinstance(minimum_cells, int)
+        or minimum_cells < 1
+    ):
+        raise TaskCProfileInputError("public minimum cell count is invalid")
+    genes, gene_indices, gene_parents = _selected_genes(
+        inventory,
+        gene_limit,
+        eligible_sources=eligible_sources,
+        minimum_cells=minimum_cells,
+        load_parent=load_parent,
+    )
     expressions: list[np.ndarray] = []
     labels_out: list[np.ndarray] = []
     environment_out: list[np.ndarray] = []
@@ -579,10 +726,15 @@ def _build_profile(
     actual_snapshots: list[_FileSnapshot] = []
     for spec in parent_specs:
         snapshot = inventory[spec["public_relative_path"]]
-        expression, labels, parent_genes = _load_parent(snapshot)
+        expression, labels, parent_genes = load_parent(snapshot)
         if any(parent_genes[index] != gene for index, gene in zip(gene_indices, genes)):
             raise TaskCProfileInputError("actual parent gene order differs from selection parents")
-        rows = _stratified_cell_indices(labels, limit=cell_limit)
+        retained = np.isin(labels, np.asarray((CONTROL_LABEL, *genes), dtype=str))
+        retained_indices = np.flatnonzero(retained)
+        dropped_indices = np.flatnonzero(~retained)
+        retained_labels = labels[retained_indices]
+        relative_rows = _stratified_cell_indices(retained_labels, limit=cell_limit)
+        rows = retained_indices[relative_rows]
         selected_expression = np.asarray(
             expression[np.ix_(rows, np.asarray(gene_indices, dtype=int))],
             dtype=np.float64,
@@ -609,9 +761,16 @@ def _build_profile(
             {
                 **spec,
                 "parent_sha256": snapshot.sha256,
+                "row_filter_rule": (
+                    "retain_control_and_selected_gene_interventions_v1"
+                ),
+                "dropped_original_row_indices": dropped_indices.tolist(),
+                "dropped_original_row_count": int(len(dropped_indices)),
+                "dropped_by_label": _counts(labels[dropped_indices]),
                 "cell_selection_rule": CELL_SELECTION_RULE,
                 "selected_sorted_indices": rows.tolist(),
                 "label_counts_before": _counts(labels),
+                "retained_label_counts_before_sampling": _counts(retained_labels),
                 "label_counts_after": _counts(selected_labels),
             }
         )
@@ -638,6 +797,8 @@ def _build_profile(
             },
         }
     input_bytes = _deterministic_npz(arrays)
+    if len(input_bytes) > MAXIMUM_PROFILE_INPUT_BYTES:
+        raise TaskCProfileInputError("profile output is too large")
     output = {
         "sha256": f"sha256:{hashlib.sha256(input_bytes).hexdigest()}",
         "size_bytes": len(input_bytes),
@@ -668,12 +829,15 @@ def _build_profile(
         "transformation": transformation,
         "output": output,
     }
+    used_inventory_snapshots = [
+        *(inventory[record["public_relative_path"]] for record in gene_parents),
+        *actual_snapshots,
+    ]
     parent_by_path = {
-        snapshot.path: snapshot
-        for snapshot in [
-            *(inventory[record["public_relative_path"]] for record in gene_parents),
-            *actual_snapshots,
-        ]
+        inventory_snapshot.path: parent_cache[
+            (inventory_snapshot.device, inventory_snapshot.inode)
+        ][0]
+        for inventory_snapshot in used_inventory_snapshots
     }
     for values in (expression_out, interventions_out, environments):
         if values is not None:
@@ -808,6 +972,11 @@ def validate_task_c_profile_input(
         raise TaskCProfileInputError(
             "profile input bytes do not match the recomputed public subset"
         )
+    _verify(manifest_snapshot, "profile input manifest")
+    _verify(input_snapshot, "profile input NPZ")
+    _verify(built.public_snapshot, "public manifest")
+    for index, parent_snapshot in enumerate(built.parent_snapshots):
+        _verify(parent_snapshot, f"profile parent {index + 1}")
     return TaskCProfileInput(
         profile=profile,
         condition=condition,
@@ -825,4 +994,8 @@ def validate_task_c_profile_input(
         parent_paths=tuple(snapshot.path for snapshot in built.parent_snapshots),
         parent_sha256=tuple(snapshot.sha256 for snapshot in built.parent_snapshots),
         manifest=observed,
+        input_snapshot=input_snapshot,
+        manifest_snapshot=manifest_snapshot,
+        public_snapshot=built.public_snapshot,
+        parent_snapshots=built.parent_snapshots,
     )
