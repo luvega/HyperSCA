@@ -1,4 +1,6 @@
+import errno
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
@@ -57,6 +59,25 @@ def dataset_with_four_cell_f(context_id: str) -> TaskCDataset:
         source_path=Path(f"{context_id}.npz"),
         source_sha256=f"sha256:{context_id}-four-cell-f",
     )
+
+
+@pytest.mark.parametrize("array_name", ["expression", "interventions"])
+def test_task_c_dataset_arrays_are_read_only(array_name: str) -> None:
+    dataset = dataset_for_split("k562")
+    array = getattr(dataset, array_name)
+    with pytest.raises(ValueError, match="read-only|writeable"):
+        array.flat[0] = array.flat[0]
+
+
+def test_materialization_rejects_in_memory_expression_tampering(tmp_path: Path) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+    k562.expression.setflags(write=True)
+    k562.expression[0, 0] += 1
+
+    with pytest.raises(TaskCDataError, match="content|changed|integrity"):
+        materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
 
 
 def test_shared_split_is_reproducible_disjoint_and_validated():
@@ -443,6 +464,14 @@ def test_materialized_manifests_use_relative_paths_and_verified_hashes(tmp_path:
     private = json.loads(Path(result["private_manifest"]).read_text(encoding="utf-8"))
     assert public["min_cells_per_intervention"] == split.min_cells_per_intervention
     assert private["min_cells_per_intervention"] == split.min_cells_per_intervention
+    assert public["content_sha256"] == {
+        "k562": k562.content_sha256,
+        "rpe1": rpe1.content_sha256,
+    }
+    assert private["content_sha256"] == public["content_sha256"]
+    assert public["materialization_identity"]["content_sha256"] == public[
+        "content_sha256"
+    ]
     assert public["files"]
     assert private["files"]
     assert set(public["files"]).isdisjoint(private["files"])
@@ -532,6 +561,22 @@ def test_materialization_identity_rejects_changed_minimum_cell_threshold(
         materialize_task_c_split(k562, rpe1, four_cell_split, root)
 
 
+def test_materialization_identity_rejects_changed_content_with_same_source_hash(
+    tmp_path: Path,
+) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+    root = tmp_path / "bundle"
+    materialize_task_c_split(k562, rpe1, split, root)
+    changed_expression = k562.expression.copy()
+    changed_expression[0, 0] += 1
+    changed = replace(k562, expression=changed_expression)
+
+    with pytest.raises(TaskCDataError, match="identity|content|different"):
+        materialize_task_c_split(changed, rpe1, split, root)
+
+
 def test_materialization_rejects_tampered_public_semantic_fields(tmp_path: Path) -> None:
     k562 = dataset_for_split("k562")
     rpe1 = dataset_for_split("rpe1")
@@ -610,6 +655,186 @@ def test_materialization_rejects_tampered_existing_artifact(tmp_path: Path) -> N
         materialize_task_c_split(k562, rpe1, split, root)
 
 
+def test_materialization_rejects_public_symlink_to_private_artifact(tmp_path: Path) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+    root = tmp_path / "bundle"
+    result = materialize_task_c_split(k562, rpe1, split, root)
+    public_artifact = Path(result["within"]["k562"]["train"])
+    private_artifact = Path(result["within"]["k562"]["holdout"])
+    public_artifact.unlink()
+    public_artifact.symlink_to(private_artifact)
+    public_manifest_path = Path(result["public_manifest"])
+    public_manifest = json.loads(public_manifest_path.read_text(encoding="utf-8"))
+    relative = public_artifact.relative_to(root).as_posix()
+    public_manifest["files"][relative] = sha256_path(private_artifact)
+    write_json(public_manifest_path, public_manifest)
+
+    with pytest.raises(TaskCDataError, match="symbolic|symlink"):
+        materialize_task_c_split(k562, rpe1, split, root)
+
+
+def test_materialization_rejects_public_hardlink_to_private_artifact(tmp_path: Path) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=23)
+    root = tmp_path / "bundle"
+    result = materialize_task_c_split(k562, rpe1, split, root)
+    public_artifact = Path(result["within"]["k562"]["train"])
+    private_artifact = Path(result["within"]["k562"]["holdout"])
+    public_artifact.unlink()
+    os.link(private_artifact, public_artifact)
+    public_manifest_path = Path(result["public_manifest"])
+    public_manifest = json.loads(public_manifest_path.read_text(encoding="utf-8"))
+    relative = public_artifact.relative_to(root).as_posix()
+    public_manifest["files"][relative] = sha256_path(private_artifact)
+    write_json(public_manifest_path, public_manifest)
+
+    with pytest.raises(TaskCDataError, match="hard link|inode|private"):
+        materialize_task_c_split(k562, rpe1, split, root)
+
+
+def test_materialization_rejects_symlinked_manifest(tmp_path: Path) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=47)
+    root = tmp_path / "bundle"
+    result = materialize_task_c_split(k562, rpe1, split, root)
+    manifest_path = Path(result["public_manifest"])
+    outside = tmp_path / "outside-public-manifest.json"
+    outside.write_bytes(manifest_path.read_bytes())
+    manifest_path.unlink()
+    manifest_path.symlink_to(outside)
+
+    with pytest.raises(TaskCDataError, match="symbolic|symlink"):
+        materialize_task_c_split(k562, rpe1, split, root)
+
+
+def test_materialization_rejects_symlinked_bundle_parent_before_writing(
+    tmp_path: Path,
+) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=71)
+    root = tmp_path / "bundle"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "within").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(TaskCDataError, match="symbolic|symlink"):
+        materialize_task_c_split(k562, rpe1, split, root)
+
+
+def test_materialization_preflight_does_not_create_missing_output(tmp_path: Path) -> None:
+    from src.evaluation.task_c_data import check_task_c_materialization
+
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=71)
+    output = tmp_path / "missing"
+
+    assert check_task_c_materialization(k562, rpe1, split, output) == "missing"
+    assert not output.exists()
+
+
+def test_cross_source_files_reuse_public_within_artifacts(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=97)
+    original_savez = np.savez_compressed
+    calls = []
+
+    def count_savez(*args, **kwargs):
+        calls.append(args[0])
+        return original_savez(*args, **kwargs)
+
+    monkeypatch.setattr(np, "savez_compressed", count_savez)
+    result = materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
+
+    assert len(calls) == 16
+    for context, direction in (
+        ("k562", "k562_to_rpe1"),
+        ("rpe1", "rpe1_to_k562"),
+    ):
+        for within_name, cross_name in (
+            ("train", "source_train"),
+            ("tune", "source_tune"),
+            ("refit", "source_refit"),
+        ):
+            within_stat = Path(result["within"][context][within_name]).stat()
+            cross_stat = Path(result["cross"][direction][cross_name]).stat()
+            assert (within_stat.st_dev, within_stat.st_ino) == (
+                cross_stat.st_dev,
+                cross_stat.st_ino,
+            )
+
+    public_manifest = json.loads(
+        Path(result["public_manifest"]).read_text(encoding="utf-8")
+    )
+    private_manifest = json.loads(
+        Path(result["private_manifest"]).read_text(encoding="utf-8")
+    )
+
+    def inode(relative: str) -> tuple[int, int]:
+        stat = (tmp_path / "bundle" / relative).stat()
+        return stat.st_dev, stat.st_ino
+
+    public_inodes = {
+        inode(path) for path in public_manifest["files"]
+    }
+    private_inodes = {
+        inode(path) for path in private_manifest["files"]
+    }
+    assert public_inodes.isdisjoint(private_inodes)
+
+
+def test_cross_source_copy_fallback_preserves_bytes_and_cleans_temporary_files(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+
+    def cross_device_link(source, destination):
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    monkeypatch.setattr(os, "link", cross_device_link)
+    result = materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
+    within = Path(result["within"]["k562"]["train"])
+    cross = Path(result["cross"]["k562_to_rpe1"]["source_train"])
+    assert cross.read_bytes() == within.read_bytes()
+    assert sha256_path(cross) == sha256_path(within)
+    assert (cross.stat().st_dev, cross.stat().st_ino) != (
+        within.stat().st_dev,
+        within.stat().st_ino,
+    )
+    assert not [
+        path
+        for path in (tmp_path / "bundle").rglob("*")
+        if path.name.startswith(".source_")
+    ]
+
+
+def test_output_directory_symlink_is_resolved_once_but_inner_symlinks_are_not(
+    tmp_path: Path,
+) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+    real_root = tmp_path / "real-bundle"
+    alias = tmp_path / "bundle-alias"
+    alias.symlink_to(real_root, target_is_directory=True)
+
+    result = materialize_task_c_split(k562, rpe1, split, alias)
+    assert Path(result["public_manifest"]).parent == real_root.resolve()
+
+
 def test_failed_npz_write_leaves_no_final_or_temporary_file(tmp_path, monkeypatch):
     import src.evaluation.task_c_data as task_c_data
 
@@ -622,6 +847,46 @@ def test_failed_npz_write_leaves_no_final_or_temporary_file(tmp_path, monkeypatc
 
     monkeypatch.setattr(np, "savez_compressed", fail_after_partial_write)
     with pytest.raises(TaskCDataError, match="write"):
+        task_c_data._write_dataset_subset(dataset, np.asarray([0, 1]), destination)
+    assert not destination.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_runtime_error_during_npz_write_still_removes_temporary_file(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import src.evaluation.task_c_data as task_c_data
+
+    dataset = dataset_for_split("k562")
+    destination = tmp_path / "part.npz"
+
+    def fail_after_partial_write(path, **arrays):
+        Path(path).write_bytes(b"partial")
+        raise RuntimeError("simulated library failure")
+
+    monkeypatch.setattr(np, "savez_compressed", fail_after_partial_write)
+    with pytest.raises(TaskCDataError, match="write"):
+        task_c_data._write_dataset_subset(dataset, np.asarray([0, 1]), destination)
+    assert not destination.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_keyboard_interrupt_during_npz_write_propagates_after_cleanup(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import src.evaluation.task_c_data as task_c_data
+
+    dataset = dataset_for_split("k562")
+    destination = tmp_path / "part.npz"
+
+    def interrupt_after_partial_write(path, **arrays):
+        Path(path).write_bytes(b"partial")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(np, "savez_compressed", interrupt_after_partial_write)
+    with pytest.raises(KeyboardInterrupt):
         task_c_data._write_dataset_subset(dataset, np.asarray([0, 1]), destination)
     assert not destination.exists()
     assert list(tmp_path.iterdir()) == []

@@ -201,7 +201,7 @@ def _write_cli_dataset(path: Path) -> None:
     )
 
 
-def test_prepare_cli_writes_five_reproducible_splits(tmp_path: Path) -> None:
+def _prepare_cli_inputs(tmp_path: Path):
     k562 = tmp_path / "k562.npz"
     rpe1 = tmp_path / "rpe1.npz"
     _write_cli_dataset(k562)
@@ -218,27 +218,41 @@ def test_prepare_cli_writes_five_reproducible_splits(tmp_path: Path) -> None:
             path.write_text(rows, encoding="utf-8")
             references[f"{context}_{reference_id}"] = path
     output = tmp_path / "prepared"
+    command = [
+        sys.executable,
+        str(ROOT / "scripts/prepare_task_c_data.py"),
+        "--k562-npz",
+        str(k562),
+        "--rpe1-npz",
+        str(rpe1),
+        "--k562-pooled-reference",
+        str(references["k562_pooled"]),
+        "--k562-chipseq-reference",
+        str(references["k562_chipseq"]),
+        "--rpe1-pooled-reference",
+        str(references["rpe1_pooled"]),
+        "--rpe1-chipseq-reference",
+        str(references["rpe1_chipseq"]),
+        "--output-dir",
+        str(output),
+        "--min-cells-per-intervention",
+        "5",
+    ]
+    return k562, rpe1, references, output, command
+
+
+def _output_snapshot(output: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(output).as_posix(): path.read_bytes()
+        for path in output.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_prepare_cli_writes_five_reproducible_splits(tmp_path: Path) -> None:
+    _, _, references, output, command = _prepare_cli_inputs(tmp_path)
     completed = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "scripts/prepare_task_c_data.py"),
-            "--k562-npz",
-            str(k562),
-            "--rpe1-npz",
-            str(rpe1),
-            "--k562-pooled-reference",
-            str(references["k562_pooled"]),
-            "--k562-chipseq-reference",
-            str(references["k562_chipseq"]),
-            "--rpe1-pooled-reference",
-            str(references["rpe1_pooled"]),
-            "--rpe1-chipseq-reference",
-            str(references["rpe1_chipseq"]),
-            "--output-dir",
-            str(output),
-            "--min-cells-per-intervention",
-            "5",
-        ],
+        command,
         cwd=ROOT,
         check=True,
         capture_output=True,
@@ -265,3 +279,50 @@ def test_prepare_cli_writes_five_reproducible_splits(tmp_path: Path) -> None:
             source = references[f"{context}_{reference_id}"].resolve()
             assert provenance["files"][reference_id]["path"] == str(source)
             assert provenance["files"][reference_id]["sha256"] == sha256_path(source)
+
+
+def test_prepare_cli_changed_dataset_does_not_modify_existing_output(tmp_path: Path) -> None:
+    k562, _, _, output, command = _prepare_cli_inputs(tmp_path)
+    subprocess.run(command, cwd=ROOT, check=True, capture_output=True, text=True)
+    before = _output_snapshot(output)
+    with np.load(k562, allow_pickle=False) as archive:
+        expression = archive["expression_matrix"].copy()
+        interventions = archive["interventions"].copy()
+        genes = archive["var_names"].copy()
+    expression[0, 0] += 1
+    np.savez(
+        k562,
+        expression_matrix=expression,
+        interventions=interventions,
+        var_names=genes,
+    )
+
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 2
+    assert _output_snapshot(output) == before
+
+
+def test_prepare_cli_changed_reference_does_not_modify_existing_output(tmp_path: Path) -> None:
+    _, _, references, output, command = _prepare_cli_inputs(tmp_path)
+    subprocess.run(command, cwd=ROOT, check=True, capture_output=True, text=True)
+    before = _output_snapshot(output)
+    references["k562_pooled"].write_text(
+        "source,target\nA,B\nB,A\nC,D\nD,C\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 2
+    assert _output_snapshot(output) == before

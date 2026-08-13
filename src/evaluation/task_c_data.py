@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import csv
+import errno
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 import zipfile
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from numbers import Integral
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -34,6 +36,13 @@ class TaskCDataset:
     context_id: str
     source_path: Path
     source_sha256: str
+    content_sha256: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "gene_names", tuple(self.gene_names))
+        object.__setattr__(self, "content_sha256", _dataset_content_sha256(self))
+        self.expression.setflags(write=False)
+        self.interventions.setflags(write=False)
 
 
 @dataclass(frozen=True)
@@ -58,6 +67,100 @@ class TaskCSplit:
 
 
 _TASK_C_SPLIT_SEEDS = frozenset({11, 23, 47, 71, 97})
+
+_WITHIN_ARTIFACTS = {
+    context: {
+        "train": f"within/{context}/train.npz",
+        "tune": f"within/{context}/tune.npz",
+        "refit": f"within/{context}/refit.npz",
+        "holdout": f"private/within/{context}/holdout.npz",
+    }
+    for context in ("k562", "rpe1")
+}
+_CROSS_ARTIFACTS = {
+    direction: {
+        "source_train": f"cross/{direction}/source_train.npz",
+        "source_tune": f"cross/{direction}/source_tune.npz",
+        "source_refit": f"cross/{direction}/source_refit.npz",
+        "target_adapt_train": f"cross/{direction}/target_adapt_train.npz",
+        "target_adapt_tune": f"cross/{direction}/target_adapt_tune.npz",
+        "target_adapt_refit": f"cross/{direction}/target_adapt_refit.npz",
+        "target_holdout": f"private/cross/{direction}/target_holdout.npz",
+    }
+    for direction in ("k562_to_rpe1", "rpe1_to_k562")
+}
+_PUBLIC_MANIFEST = "public_manifest.json"
+_PRIVATE_MANIFEST = "private/private_manifest.json"
+_PUBLIC_ARTIFACT_PATHS = frozenset(
+    relative
+    for partitions in _WITHIN_ARTIFACTS.values()
+    for name, relative in partitions.items()
+    if name != "holdout"
+) | frozenset(
+    relative
+    for partitions in _CROSS_ARTIFACTS.values()
+    for name, relative in partitions.items()
+    if name != "target_holdout"
+)
+_PRIVATE_ARTIFACT_PATHS = frozenset(
+    partitions["holdout"] for partitions in _WITHIN_ARTIFACTS.values()
+) | frozenset(
+    partitions["target_holdout"] for partitions in _CROSS_ARTIFACTS.values()
+)
+
+
+def _update_array_digest(digest: Any, name: str, values: np.ndarray) -> None:
+    metadata = json.dumps(
+        {"name": name, "dtype": values.dtype.str, "shape": list(values.shape)},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest.update(len(metadata).to_bytes(8, "big"))
+    digest.update(metadata)
+    if values.flags.c_contiguous:
+        digest.update(memoryview(values).cast("B"))
+        return
+    iterator = np.nditer(
+        values,
+        flags=["external_loop", "buffered", "zerosize_ok"],
+        op_flags=["readonly"],
+        order="C",
+        buffersize=1024 * 1024,
+    )
+    for chunk in iterator:
+        contiguous = np.ascontiguousarray(chunk)
+        digest.update(memoryview(contiguous).cast("B"))
+
+
+def _dataset_content_sha256(dataset: TaskCDataset) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"TaskCDataset-content-v1\0")
+    _update_array_digest(digest, "expression", dataset.expression)
+    _update_array_digest(digest, "interventions", dataset.interventions)
+    genes = json.dumps(
+        dataset.gene_names,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest.update(len(genes).to_bytes(8, "big"))
+    digest.update(genes)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def validate_task_c_dataset_content(dataset: TaskCDataset) -> None:
+    current = _dataset_content_sha256(dataset)
+    if current != dataset.content_sha256:
+        raise TaskCDataError(f"{dataset.context_id} dataset content changed in memory")
+    if dataset.expression.flags.writeable or dataset.interventions.flags.writeable:
+        raise TaskCDataError(f"{dataset.context_id} dataset arrays are no longer read-only")
+
+
+def _validate_task_c_dataset_pair_content(
+    k562: TaskCDataset,
+    rpe1: TaskCDataset,
+) -> None:
+    validate_task_c_dataset_content(k562)
+    validate_task_c_dataset_content(rpe1)
 
 
 def _eligible_sources(dataset: TaskCDataset, min_cells: int) -> set[str]:
@@ -426,6 +529,30 @@ def write_json(path: Path | str, payload: Any) -> None:
         raise TaskCDataError(f"cannot write provenance JSON: {destination}") from exc
 
 
+def check_task_c_json_record(path: Path | str, payload: Mapping[str, Any]) -> str:
+    """Check whether a provenance record is absent or exactly reusable, without writing."""
+    destination = Path(path)
+    if destination.is_symlink():
+        raise TaskCDataError(f"provenance record must not be a symbolic link: {destination}")
+    if not destination.exists():
+        return "missing"
+    if not destination.is_file():
+        raise TaskCDataError(f"provenance record is not a regular file: {destination}")
+    existing = _read_manifest(destination)
+    if existing != payload:
+        raise TaskCDataError(f"existing provenance record differs: {destination}")
+    return "reusable"
+
+
+def write_task_c_json_record(path: Path | str, payload: Mapping[str, Any]) -> str:
+    """Write a missing record, or leave an exactly matching record byte-for-byte intact."""
+    status = check_task_c_json_record(path, payload)
+    if status == "missing":
+        write_json(path, payload)
+        return "written"
+    return status
+
+
 def _validated_row_indices(
     dataset: TaskCDataset,
     indices: Sequence[int] | np.ndarray,
@@ -448,7 +575,7 @@ def _write_dataset_subset(
 ) -> str:
     """Atomically write one validated, self-describing dataset subset."""
     selected = _validated_row_indices(dataset, indices)
-    destination = Path(path).expanduser().resolve()
+    destination = Path(path).expanduser()
     temporary: str | None = None
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -467,13 +594,51 @@ def _write_dataset_subset(
         with open(temporary, "rb") as handle:
             os.fsync(handle.fileno())
         os.replace(temporary, destination)
-    except (OSError, ValueError, TypeError) as exc:
+    except Exception as exc:
+        raise TaskCDataError(f"cannot atomically write dataset subset: {destination}") from exc
+    finally:
         if temporary is not None:
             try:
                 os.unlink(temporary)
             except OSError:
                 pass
-        raise TaskCDataError(f"cannot atomically write dataset subset: {destination}") from exc
+    return str(destination)
+
+
+def _atomic_link_or_copy(source: Path, destination: Path) -> str:
+    """Reuse an immutable public artifact without recompressing its rows."""
+    temporary: str | None = None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            dir=destination.parent,
+        )
+        os.close(fd)
+        os.unlink(temporary)
+        try:
+            os.link(source, temporary)
+        except OSError as exc:
+            if exc.errno not in {
+                errno.EXDEV,
+                errno.EPERM,
+                errno.EACCES,
+                errno.ENOTSUP,
+                errno.EOPNOTSUPP,
+            }:
+                raise
+            shutil.copyfile(source, temporary)
+            with open(temporary, "rb") as handle:
+                os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except Exception as exc:
+        raise TaskCDataError(f"cannot atomically reuse dataset subset: {destination}") from exc
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
     return str(destination)
 
 
@@ -517,17 +682,22 @@ def _private_split_payload(split: TaskCSplit) -> dict[str, Any]:
     }
 
 
-def _relative_to_root(path: str | Path, root: Path) -> str:
-    try:
-        return Path(path).resolve().relative_to(root).as_posix()
-    except ValueError as exc:
-        raise TaskCDataError("materialized artifact is outside its bundle") from exc
+def _bundle_path(root: Path, relative: str) -> Path:
+    lexical = Path(relative)
+    if lexical.is_absolute() or not lexical.parts or ".." in lexical.parts:
+        raise TaskCDataError("bundle artifact path must be a safe relative path")
+    candidate = root
+    for part in lexical.parts:
+        candidate = candidate / part
+        if candidate.is_symlink():
+            raise TaskCDataError(f"bundle path contains a symbolic link: {relative}")
+    return root / lexical
 
 
-def _artifact_inventory(paths: Sequence[str], root: Path) -> dict[str, str]:
+def _artifact_inventory(paths: Iterable[str], root: Path) -> dict[str, str]:
     return {
-        relative: sha256_path(root / relative)
-        for relative in sorted(_relative_to_root(path, root) for path in paths)
+        relative: sha256_path(_bundle_path(root, relative))
+        for relative in sorted(paths)
     }
 
 
@@ -552,6 +722,10 @@ def _materialization_identity(
             "k562": k562.source_sha256,
             "rpe1": rpe1.source_sha256,
         },
+        "content_sha256": {
+            "k562": k562.content_sha256,
+            "rpe1": rpe1.content_sha256,
+        },
         "gene_names_sha256": _gene_names_sha256(k562.gene_names),
     }
 
@@ -569,6 +743,7 @@ def _public_split_payload(
         "tune_sources": list(split.tune_sources),
         "holdout_source_count": len(split.holdout_sources),
         "input_sha256": identity["input_sha256"],
+        "content_sha256": identity["content_sha256"],
         "gene_names_sha256": identity["gene_names_sha256"],
     }
 
@@ -576,38 +751,23 @@ def _public_split_payload(
 def _materialized_result(root: Path) -> dict[str, Any]:
     within = {
         context: {
-            name: str((root / relative).resolve())
-            for name, relative in {
-                "train": f"within/{context}/train.npz",
-                "tune": f"within/{context}/tune.npz",
-                "refit": f"within/{context}/refit.npz",
-                "holdout": f"private/within/{context}/holdout.npz",
-            }.items()
+            name: str(root / relative)
+            for name, relative in _WITHIN_ARTIFACTS[context].items()
         }
         for context in ("k562", "rpe1")
     }
     cross = {
         direction: {
-            name: str((root / relative).resolve())
-            for name, relative in {
-                "source_train": f"cross/{direction}/source_train.npz",
-                "source_tune": f"cross/{direction}/source_tune.npz",
-                "source_refit": f"cross/{direction}/source_refit.npz",
-                "target_adapt_train": f"cross/{direction}/target_adapt_train.npz",
-                "target_adapt_tune": f"cross/{direction}/target_adapt_tune.npz",
-                "target_adapt_refit": f"cross/{direction}/target_adapt_refit.npz",
-                "target_holdout": f"private/cross/{direction}/target_holdout.npz",
-            }.items()
+            name: str(root / relative)
+            for name, relative in _CROSS_ARTIFACTS[direction].items()
         }
         for direction in ("k562_to_rpe1", "rpe1_to_k562")
     }
     return {
         "within": within,
         "cross": cross,
-        "public_manifest": str((root / "public_manifest.json").resolve()),
-        "private_manifest": str(
-            (root / "private" / "private_manifest.json").resolve()
-        ),
+        "public_manifest": str(root / _PUBLIC_MANIFEST),
+        "private_manifest": str(root / _PRIVATE_MANIFEST),
     }
 
 
@@ -621,33 +781,6 @@ def _read_manifest(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _expected_artifact_paths(
-    result: Mapping[str, Any],
-    root: Path,
-) -> tuple[set[str], set[str]]:
-    public_paths = {
-        _relative_to_root(path, root)
-        for partitions in result["within"].values()
-        for name, path in partitions.items()
-        if name != "holdout"
-    }
-    public_paths.update(
-        _relative_to_root(path, root)
-        for partitions in result["cross"].values()
-        for name, path in partitions.items()
-        if name != "target_holdout"
-    )
-    private_paths = {
-        _relative_to_root(partitions["holdout"], root)
-        for partitions in result["within"].values()
-    }
-    private_paths.update(
-        _relative_to_root(partitions["target_holdout"], root)
-        for partitions in result["cross"].values()
-    )
-    return public_paths, private_paths
-
-
 def _verify_artifact_inventory(
     root: Path,
     manifest: Mapping[str, Any],
@@ -659,13 +792,31 @@ def _verify_artifact_inventory(
     for relative, expected_hash in files.items():
         if not isinstance(relative, str) or not isinstance(expected_hash, str):
             raise TaskCDataError("existing artifact inventory is malformed")
-        candidate = (root / relative).resolve()
-        try:
-            candidate.relative_to(root)
-        except ValueError as exc:
-            raise TaskCDataError("existing artifact path escapes its bundle") from exc
+        candidate = _bundle_path(root, relative)
         if not candidate.is_file() or sha256_path(candidate) != expected_hash:
             raise TaskCDataError(f"existing artifact hash changed: {relative}")
+
+
+def _reject_public_private_inode_overlap(root: Path) -> None:
+    def identities(paths: Iterable[str]) -> set[tuple[int, int]]:
+        result: set[tuple[int, int]] = set()
+        for relative in paths:
+            stat = _bundle_path(root, relative).stat()
+            result.add((stat.st_dev, stat.st_ino))
+        return result
+
+    if identities(_PUBLIC_ARTIFACT_PATHS) & identities(_PRIVATE_ARTIFACT_PATHS):
+        raise TaskCDataError("public artifact uses a private artifact hard link inode")
+
+
+def _reject_bundle_symlinks(root: Path) -> None:
+    for relative in (
+        _PUBLIC_MANIFEST,
+        _PRIVATE_MANIFEST,
+        *_PUBLIC_ARTIFACT_PATHS,
+        *_PRIVATE_ARTIFACT_PATHS,
+    ):
+        _bundle_path(root, relative)
 
 
 def _reuse_existing_materialization(
@@ -674,10 +825,11 @@ def _reuse_existing_materialization(
     public_split_payload: Mapping[str, Any],
     private_split_payload: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    public_path = root / "public_manifest.json"
-    private_path = root / "private" / "private_manifest.json"
+    public_path = root / _PUBLIC_MANIFEST
+    private_path = root / _PRIVATE_MANIFEST
     if not root.exists():
         return None
+    _reject_bundle_symlinks(root)
     try:
         has_entries = next(root.iterdir(), None) is not None
     except OSError as exc:
@@ -708,20 +860,22 @@ def _reuse_existing_materialization(
         raise TaskCDataError("existing public manifest semantic record differs from split")
     if any(private.get(key) != value for key, value in private_split_payload.items()):
         raise TaskCDataError("existing private manifest semantic record differs from split")
-    result = _materialized_result(root)
-    public_paths, private_paths = _expected_artifact_paths(result, root)
-    _verify_artifact_inventory(root, public, public_paths)
-    _verify_artifact_inventory(root, private, private_paths)
-    return result
+    _verify_artifact_inventory(root, public, set(_PUBLIC_ARTIFACT_PATHS))
+    _verify_artifact_inventory(root, private, set(_PRIVATE_ARTIFACT_PATHS))
+    _reject_public_private_inode_overlap(root)
+    return _materialized_result(root)
 
 
-def materialize_task_c_split(
+def _task_c_materialization_records(
     k562: TaskCDataset,
     rpe1: TaskCDataset,
     split: TaskCSplit,
     output_dir: str | Path,
-) -> dict[str, Any]:
-    """Write allowed model-building data separately from sealed evaluation data."""
+    *,
+    content_prevalidated: bool,
+) -> tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    if not content_prevalidated:
+        _validate_task_c_dataset_pair_content(k562, rpe1)
     validate_task_c_split(split, k562, rpe1)
     if k562.gene_names != rpe1.gene_names:
         raise TaskCDataError("K562 and RPE1 gene names and gene order must match")
@@ -729,11 +883,90 @@ def materialize_task_c_split(
         1
     ] != len(rpe1.gene_names):
         raise TaskCDataError("dataset gene names do not match expression columns")
-
     root = Path(output_dir).expanduser().resolve()
     identity = _materialization_identity(k562, rpe1, split)
     public_split_payload = _public_split_payload(split, identity)
     private_split_payload = _private_split_payload(split)
+    private_split_payload["content_sha256"] = identity["content_sha256"]
+    return root, identity, public_split_payload, private_split_payload
+
+
+def _check_task_c_materialization(
+    k562: TaskCDataset,
+    rpe1: TaskCDataset,
+    split: TaskCSplit,
+    output_dir: str | Path,
+    *,
+    content_prevalidated: bool,
+) -> str:
+    root, identity, public_payload, private_payload = _task_c_materialization_records(
+        k562,
+        rpe1,
+        split,
+        output_dir,
+        content_prevalidated=content_prevalidated,
+    )
+    reused = _reuse_existing_materialization(
+        root,
+        identity,
+        public_payload,
+        private_payload,
+    )
+    return "reusable" if reused is not None else "missing"
+
+
+def check_task_c_materialization(
+    k562: TaskCDataset,
+    rpe1: TaskCDataset,
+    split: TaskCSplit,
+    output_dir: str | Path,
+) -> str:
+    """Check a prospective bundle without creating directories or replacing files."""
+    return _check_task_c_materialization(
+        k562,
+        rpe1,
+        split,
+        output_dir,
+        content_prevalidated=False,
+    )
+
+
+def check_task_c_materializations(
+    k562: TaskCDataset,
+    rpe1: TaskCDataset,
+    requests: Sequence[tuple[TaskCSplit, str | Path]],
+) -> tuple[str, ...]:
+    """Validate dataset content once, then preflight several fixed-seed bundles."""
+    _validate_task_c_dataset_pair_content(k562, rpe1)
+    return tuple(
+        _check_task_c_materialization(
+            k562,
+            rpe1,
+            split,
+            output_dir,
+            content_prevalidated=True,
+        )
+        for split, output_dir in requests
+    )
+
+
+def _materialize_task_c_split(
+    k562: TaskCDataset,
+    rpe1: TaskCDataset,
+    split: TaskCSplit,
+    output_dir: str | Path,
+    *,
+    content_prevalidated: bool,
+) -> dict[str, Any]:
+    root, identity, public_split_payload, private_split_payload = (
+        _task_c_materialization_records(
+            k562,
+            rpe1,
+            split,
+            output_dir,
+            content_prevalidated=content_prevalidated,
+        )
+    )
     reused = _reuse_existing_materialization(
         root,
         identity,
@@ -742,11 +975,10 @@ def materialize_task_c_split(
     )
     if reused is not None:
         return reused
+    _reject_bundle_symlinks(root)
 
     datasets = {"k562": k562, "rpe1": rpe1}
     result = _materialized_result(root)
-    public_paths: list[str] = []
-    private_paths: list[str] = []
 
     for context, dataset in datasets.items():
         controls = split.control_indices[context]
@@ -759,39 +991,22 @@ def materialize_task_c_split(
             control_indices = tuple(
                 index for part in control_parts for index in controls[part]
             )
-            path = result["within"][context][partition]
-            written = _write_dataset_subset(
+            path = _bundle_path(root, _WITHIN_ARTIFACTS[context][partition])
+            _write_dataset_subset(
                 dataset,
                 _indices_for_sources(dataset, sources, control_indices),
-                Path(path),
+                path,
             )
-            (private_paths if partition == "holdout" else public_paths).append(written)
 
     for source_name, target_name in (("k562", "rpe1"), ("rpe1", "k562")):
-        source = datasets[source_name]
         target = datasets[target_name]
-        source_controls = split.control_indices[source_name]
         target_controls = split.control_indices[target_name]
         direction = f"{source_name}_to_{target_name}"
-        direction_paths = result["cross"][direction]
-        for partition, sources, control_parts in (
-            ("source_train", split.train_sources, ("train",)),
-            ("source_tune", split.tune_sources, ("tune",)),
-            (
-                "source_refit",
-                split.train_sources + split.tune_sources,
-                ("train", "tune"),
-            ),
-        ):
-            control_indices = tuple(
-                index for part in control_parts for index in source_controls[part]
-            )
-            public_paths.append(
-                _write_dataset_subset(
-                    source,
-                    _indices_for_sources(source, sources, control_indices),
-                    Path(direction_paths[partition]),
-                )
+        for partition in ("source_train", "source_tune", "source_refit"):
+            within_name = partition.removeprefix("source_")
+            _atomic_link_or_copy(
+                _bundle_path(root, _WITHIN_ARTIFACTS[source_name][within_name]),
+                _bundle_path(root, _CROSS_ARTIFACTS[direction][partition]),
             )
         for partition, control_parts in (
             ("target_adapt_train", ("train",)),
@@ -801,38 +1016,75 @@ def materialize_task_c_split(
             control_indices = tuple(
                 index for part in control_parts for index in target_controls[part]
             )
-            public_paths.append(
-                _write_dataset_subset(
-                    target,
-                    np.sort(_validated_row_indices(target, control_indices)),
-                    Path(direction_paths[partition]),
-                )
-            )
-        all_sources = split.train_sources + split.tune_sources + split.holdout_sources
-        private_paths.append(
             _write_dataset_subset(
                 target,
-                _indices_for_sources(
-                    target, all_sources, target_controls["holdout"]
-                ),
-                Path(direction_paths["target_holdout"]),
+                np.sort(_validated_row_indices(target, control_indices)),
+                _bundle_path(root, _CROSS_ARTIFACTS[direction][partition]),
             )
+        all_sources = split.train_sources + split.tune_sources + split.holdout_sources
+        _write_dataset_subset(
+            target,
+            _indices_for_sources(target, all_sources, target_controls["holdout"]),
+            _bundle_path(root, _CROSS_ARTIFACTS[direction]["target_holdout"]),
         )
 
     private_payload = dict(private_split_payload)
     private_payload.update(
         {
             "materialization_identity": identity,
-            "files": _artifact_inventory(private_paths, root),
+            "files": _artifact_inventory(_PRIVATE_ARTIFACT_PATHS, root),
         }
     )
     public_payload = dict(public_split_payload)
     public_payload.update(
         {
             "materialization_identity": identity,
-            "files": _artifact_inventory(public_paths, root),
+            "files": _artifact_inventory(_PUBLIC_ARTIFACT_PATHS, root),
         }
     )
-    write_json(result["private_manifest"], private_payload)
-    write_json(result["public_manifest"], public_payload)
+    write_json(_bundle_path(root, _PRIVATE_MANIFEST), private_payload)
+    write_json(_bundle_path(root, _PUBLIC_MANIFEST), public_payload)
     return result
+
+
+def materialize_task_c_split(
+    k562: TaskCDataset,
+    rpe1: TaskCDataset,
+    split: TaskCSplit,
+    output_dir: str | Path,
+) -> dict[str, Any]:
+    """Write allowed model-building data separately from sealed evaluation data."""
+    return _materialize_task_c_split(
+        k562,
+        rpe1,
+        split,
+        output_dir,
+        content_prevalidated=False,
+    )
+
+
+def materialize_task_c_splits(
+    k562: TaskCDataset,
+    rpe1: TaskCDataset,
+    requests: Sequence[tuple[TaskCSplit, str | Path]],
+) -> tuple[dict[str, Any], ...]:
+    """Preflight all requested bundles, then materialize them after one content check."""
+    _validate_task_c_dataset_pair_content(k562, rpe1)
+    for split, output_dir in requests:
+        _check_task_c_materialization(
+            k562,
+            rpe1,
+            split,
+            output_dir,
+            content_prevalidated=True,
+        )
+    return tuple(
+        _materialize_task_c_split(
+            k562,
+            rpe1,
+            split,
+            output_dir,
+            content_prevalidated=True,
+        )
+        for split, output_dir in requests
+    )

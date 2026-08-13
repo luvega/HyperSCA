@@ -15,9 +15,11 @@ from src.evaluation.task_c_data import (  # noqa: E402
     build_shared_task_c_split,
     build_task_c_provenance,
     build_task_c_reference_provenance,
+    check_task_c_json_record,
+    check_task_c_materializations,
     load_task_c_dataset,
-    materialize_task_c_split,
-    write_json,
+    materialize_task_c_splits,
+    write_task_c_json_record,
 )
 
 
@@ -43,18 +45,22 @@ def main(argv: list[str] | None = None) -> int:
         k562 = load_task_c_dataset(args.k562_npz, context_id="k562")
         rpe1 = load_task_c_dataset(args.rpe1_npz, context_id="rpe1")
         provenance_dir = args.output_dir / "provenance"
-        write_json(provenance_dir / "k562.json", build_task_c_provenance(k562))
-        write_json(provenance_dir / "rpe1.json", build_task_c_provenance(rpe1))
+        provenance_records = [
+            (provenance_dir / "k562.json", build_task_c_provenance(k562)),
+            (provenance_dir / "rpe1.json", build_task_c_provenance(rpe1)),
+        ]
         for context_id in ("k562", "rpe1"):
-            write_json(
-                provenance_dir / f"{context_id}_references.json",
-                build_task_c_reference_provenance(
-                    context_id=context_id,
-                    pooled_path=getattr(args, f"{context_id}_pooled_reference"),
-                    chipseq_path=getattr(args, f"{context_id}_chipseq_reference"),
-                ),
+            provenance_records.append(
+                (
+                    provenance_dir / f"{context_id}_references.json",
+                    build_task_c_reference_provenance(
+                        context_id=context_id,
+                        pooled_path=getattr(args, f"{context_id}_pooled_reference"),
+                        chipseq_path=getattr(args, f"{context_id}_chipseq_reference"),
+                    ),
+                )
             )
-        summaries = []
+        requests = []
         for seed in (11, 23, 47, 71, 97):
             split = build_shared_task_c_split(
                 k562,
@@ -62,15 +68,20 @@ def main(argv: list[str] | None = None) -> int:
                 seed=seed,
                 min_cells=args.min_cells_per_intervention,
             )
-            result = materialize_task_c_split(
-                k562,
-                rpe1,
-                split,
-                args.output_dir / "splits" / f"seed_{seed}",
-            )
+            requests.append((split, args.output_dir / "splits" / f"seed_{seed}"))
+
+        for path, payload in provenance_records:
+            check_task_c_json_record(path, payload)
+        check_task_c_materializations(k562, rpe1, requests)
+        for path, payload in provenance_records:
+            write_task_c_json_record(path, payload)
+        results = materialize_task_c_splits(k562, rpe1, requests)
+
+        summaries = []
+        for (split, _), result in zip(requests, results):
             summaries.append(
                 {
-                    "seed": seed,
+                    "seed": split.seed,
                     "split_id": split.split_id,
                     "public_manifest": result["public_manifest"],
                 }
