@@ -20,7 +20,7 @@ PSGRN_WORKER = ROOT / "scripts/task_c_workers/psgrn_worker.py"
 EXPECTED_CAUSALBENCH_COMMIT = "1a2143cffdc85f835b41ce8d52034be1bf903e71"
 EXPECTED_PSGRN_COMMIT = "74aa640f7c472b23a69811f6795bb17678efd344"
 PROVEN_ORDER_MODELS = {"grnboost"}
-UNPROVEN_ORDER_MODELS = {
+OFFICIAL_UNRANKED_MODELS = {
     "random1000",
     "pc",
     "ges",
@@ -124,6 +124,10 @@ def _fake_causalbench(tmp_path: Path) -> Path:
                     return [("A", "NOT_IN_FIXED_GENES")]
                 if kind == "numpy_string":
                     return [(np.str_("A"), np.str_("B"))]
+                if kind == "list_reversed":
+                    return list(reversed(edges))
+                if kind == "tuple":
+                    return tuple(edges)
                 return edges
         """,
     )
@@ -157,6 +161,7 @@ def _run_causalbench(
     input_path: Path | None = None,
     output_path: Path | None = None,
     return_kind: str = "list",
+    output_semantics: str | None = None,
     check: bool = True,
 ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -170,6 +175,12 @@ def _run_causalbench(
     env["PYTHONPATH"] = str(fake_modules)
     env["FAKE_CALL_RECORD"] = str(record)
     env["FAKE_RETURN_KIND"] = return_kind
+    if output_semantics is None:
+        output_semantics = (
+            "official_return_order"
+            if model_name in PROVEN_ORDER_MODELS
+            else "official_unranked_edges"
+        )
     completed = subprocess.run(
         [
             sys.executable,
@@ -185,7 +196,7 @@ def _run_causalbench(
             "--seed",
             "17",
             "--output-semantics",
-            "official_return_order",
+            output_semantics,
         ],
         cwd=ROOT,
         env=env,
@@ -345,25 +356,31 @@ def test_causalbench_uses_the_pinned_official_constructor_contract(
     assert record["class_name"] == expected_class
     assert record["init_args"] == expected_args
     assert record["init_kwargs"] == expected_kwargs
-    if model_name in PROVEN_ORDER_MODELS:
-        assert completed.returncode == 0
-        assert destination.exists()
+    assert completed.returncode == 0, completed.stderr
+    assert destination.exists()
+    with destination.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if model_name in OFFICIAL_UNRANKED_MODELS:
+        assert {float(row["score"]) for row in rows} == {1.0}
     else:
-        assert model_name in UNPROVEN_ORDER_MODELS
-        assert completed.returncode != 0
-        assert "failed_invalid_output" in completed.stderr
-        assert not destination.exists()
+        assert model_name in PROVEN_ORDER_MODELS
 
 
-def test_only_grnboost_has_a_provable_ranked_return_in_the_pinned_adapter() -> None:
+def test_worker_has_a_fixed_ranked_and_unranked_semantics_boundary() -> None:
     worker = _load_worker(CAUSALBENCH_WORKER, "test_causalbench_order_boundary")
 
-    assert set(worker.PROVEN_OFFICIAL_RETURN_ORDER) == PROVEN_ORDER_MODELS
-    assert set(worker.MODEL_NAMES) == PROVEN_ORDER_MODELS | UNPROVEN_ORDER_MODELS
+    assert worker.MODEL_OUTPUT_SEMANTICS == {
+        **{model: "official_return_order" for model in PROVEN_ORDER_MODELS},
+        **{
+            model: "official_unranked_edges"
+            for model in OFFICIAL_UNRANKED_MODELS
+        },
+    }
+    assert set(worker.MODEL_NAMES) == PROVEN_ORDER_MODELS | OFFICIAL_UNRANKED_MODELS
 
 
-@pytest.mark.parametrize("model_name", sorted(UNPROVEN_ORDER_MODELS))
-def test_causalbench_rejects_unproven_order_even_when_the_object_is_a_list(
+@pytest.mark.parametrize("model_name", sorted(OFFICIAL_UNRANKED_MODELS))
+def test_causalbench_unranked_methods_assign_equal_positive_scores(
     tmp_path: Path, model_name: str
 ) -> None:
     completed, destination, _ = _run_causalbench(
@@ -379,9 +396,71 @@ def test_causalbench_rejects_unproven_order_even_when_the_object_is_a_list(
         check=False,
     )
 
+    assert completed.returncode == 0, completed.stderr
+    with destination.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 3
+    assert [float(row["score"]) for row in rows] == [1.0, 1.0, 1.0]
+
+
+def test_unranked_scores_do_not_depend_on_the_official_list_permutation(
+    tmp_path: Path,
+) -> None:
+    _, forward_path, _ = _run_causalbench(
+        tmp_path / "forward", model_name="pc", return_kind="list"
+    )
+    _, reverse_path, _ = _run_causalbench(
+        tmp_path / "reverse", model_name="pc", return_kind="list_reversed"
+    )
+
+    with forward_path.open(encoding="utf-8", newline="") as handle:
+        forward = list(csv.DictReader(handle))
+    with reverse_path.open(encoding="utf-8", newline="") as handle:
+        reverse = list(csv.DictReader(handle))
+    assert {
+        (row["source"], row["target"], float(row["score"])) for row in forward
+    } == {
+        (row["source"], row["target"], float(row["score"])) for row in reverse
+    }
+
+
+def test_unranked_tuple_relations_receive_the_same_positive_score(
+    tmp_path: Path,
+) -> None:
+    completed, destination, _ = _run_causalbench(
+        tmp_path,
+        model_name="pc",
+        return_kind="tuple",
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    with destination.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [float(row["score"]) for row in rows] == [1.0, 1.0, 1.0]
+
+
+@pytest.mark.parametrize(
+    ("model_name", "output_semantics"),
+    [
+        ("grnboost", "official_unranked_edges"),
+        ("pc", "official_return_order"),
+    ],
+)
+def test_semantics_mismatch_fails_before_the_model_is_called(
+    tmp_path: Path, model_name: str, output_semantics: str
+) -> None:
+    completed, destination, record = _run_causalbench(
+        tmp_path,
+        model_name=model_name,
+        output_semantics=output_semantics,
+        check=False,
+    )
+
     assert completed.returncode != 0
     assert "failed_invalid_output" in completed.stderr
-    assert "not proven" in completed.stderr
+    assert "does not match" in completed.stderr
+    assert not record.exists()
     assert not destination.exists()
 
 
@@ -420,17 +499,20 @@ def test_partial_interventional_worker_keeps_every_allowed_cell(tmp_path: Path) 
     assert record["shape"] == [3, 2]
     assert record["interventions"] == ["non-targeting", "A", "non-targeting"]
     assert record["regime_name"] == "PartialIntervational"
-    assert completed.returncode != 0
-    assert "failed_invalid_output" in completed.stderr
-    assert not destination.exists()
+    assert completed.returncode == 0, completed.stderr
+    with destination.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert {float(row["score"]) for row in rows} == {1.0}
 
 
+@pytest.mark.parametrize("model_name", ["grnboost", "pc"])
 @pytest.mark.parametrize("return_kind", ["set", "mapping", "generator"])
 def test_ambiguous_causalbench_return_order_fails_closed(
-    tmp_path: Path, return_kind: str
+    tmp_path: Path, return_kind: str, model_name: str
 ) -> None:
     completed, destination, _ = _run_causalbench(
         tmp_path,
+        model_name=model_name,
         return_kind=return_kind,
         check=False,
     )
@@ -559,7 +641,7 @@ def test_npz_contract_rejects_missing_array_object_dtype_and_non_regular_paths(
                 "--seed",
                 "1",
                 "--output-semantics",
-                "official_return_order",
+                "official_unranked_edges",
             ],
             cwd=ROOT,
             env=env,

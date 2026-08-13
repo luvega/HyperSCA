@@ -30,13 +30,22 @@ MODEL_NAMES = (
     "DCDFG-MLP",
     "sortnregress",
 )
-PROVEN_OFFICIAL_RETURN_ORDER = frozenset({"grnboost"})
-"""Methods whose fixed adapter preserves a documented ranked result.
-
-GRNBoost receives Arboreto's importance-sorted table.  The other registered
-models expose graph storage order or convert a set to a list, so their list
-objects do not carry a scientifically meaningful ranking.
-"""
+MODEL_OUTPUT_SEMANTICS = {
+    "random1000": "official_unranked_edges",
+    "grnboost": "official_return_order",
+    "pc": "official_unranked_edges",
+    "ges": "official_unranked_edges",
+    "gies": "official_unranked_edges",
+    "gsp": "official_unranked_edges",
+    "igsp": "official_unranked_edges",
+    "notears-lin-sparse": "official_unranked_edges",
+    "DCDI-G": "official_unranked_edges",
+    "DCDI-DSF": "official_unranked_edges",
+    "DCDFG-LIN": "official_unranked_edges",
+    "DCDFG-MLP": "official_unranked_edges",
+    "sortnregress": "official_unranked_edges",
+}
+"""Fixed evidence boundary for ranked versus unranked official results."""
 TRAINING_INFORMATION = ("observational", "partial_interventional")
 MAXIMUM_INPUT_BYTES = 512 * 1024 * 1024
 MAXIMUM_ARCHIVE_BYTES = 512 * 1024 * 1024
@@ -78,9 +87,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, required=True, help="固定随机种子。")
     parser.add_argument(
         "--output-semantics",
-        choices=("official_return_order",),
+        choices=("official_return_order", "official_unranked_edges"),
         required=True,
-        help="按官方返回顺序赋予递减正分，不改变关系选择。",
+        help=(
+            "有官方强弱顺序时赋予递减正分；只有关系集合时全部记为 1.0，"
+            "不把容器位置解释为强弱。"
+        ),
     )
     return parser
 
@@ -220,11 +232,17 @@ def select_training_cells(
     return expression, interventions
 
 
-def ranked_edges(raw: object, genes: Sequence[str], *, limit: int | None = None) -> list[tuple[str, str, float]]:
-    """Validate a provably ordered edge list and attach decreasing positive scores."""
+def scored_edges(
+    raw: object,
+    genes: Sequence[str],
+    *,
+    output_semantics: str,
+    limit: int | None = None,
+) -> list[tuple[str, str, float]]:
+    """Validate official edges and attach only the supported strength evidence."""
     if isinstance(raw, (set, frozenset, Mapping)) or not isinstance(raw, (list, tuple)):
         raise WorkerContractError(
-            "failed_invalid_output: official return order is not provable"
+            "failed_invalid_output: official relations must be an explicit list or tuple"
         )
     chosen = raw if limit is None else raw[:limit]
     fixed_genes = set(genes)
@@ -257,11 +275,36 @@ def ranked_edges(raw: object, genes: Sequence[str], *, limit: int | None = None)
                 "failed_invalid_output: relation endpoint is outside the fixed gene set"
             )
         endpoints.append((source, target))
-    count = len(endpoints)
-    return [
-        (source, target, float(count - index))
-        for index, (source, target) in enumerate(endpoints)
-    ]
+    if output_semantics == "official_return_order":
+        count = len(endpoints)
+        return [
+            (source, target, float(count - index))
+            for index, (source, target) in enumerate(endpoints)
+        ]
+    if output_semantics == "official_unranked_edges":
+        return [(source, target, 1.0) for source, target in endpoints]
+    raise WorkerContractError("failed_invalid_output: output semantics are not supported")
+
+
+def ranked_edges(
+    raw: object, genes: Sequence[str], *, limit: int | None = None
+) -> list[tuple[str, str, float]]:
+    """Validate a provably ordered edge list and attach decreasing positive scores."""
+    return scored_edges(
+        raw,
+        genes,
+        output_semantics="official_return_order",
+        limit=limit,
+    )
+
+
+def validate_model_output_semantics(model_name: str, output_semantics: str) -> None:
+    expected = MODEL_OUTPUT_SEMANTICS[model_name]
+    if output_semantics != expected:
+        raise WorkerContractError(
+            "failed_invalid_output: requested output semantics does not match "
+            f"the registered evidence boundary for {model_name}"
+        )
 
 
 def _ensure_safe_parent(destination: Path) -> None:
@@ -341,6 +384,7 @@ def validate_output_destination(path: Path) -> None:
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     try:
+        validate_model_output_semantics(args.model_name, args.output_semantics)
         validate_output_destination(args.output_csv)
         # External imports deliberately occur only after argument parsing, so
         # ``--help`` remains available before the dedicated environment exists.
@@ -389,12 +433,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             regime,
             args.seed,
         )
-        if args.model_name not in PROVEN_OFFICIAL_RETURN_ORDER:
-            raise WorkerContractError(
-                "failed_invalid_output: official return order is not proven "
-                f"for {args.model_name} at the registered source version"
-            )
-        rows = ranked_edges(returned, genes)
+        rows = scored_edges(
+            returned,
+            genes,
+            output_semantics=args.output_semantics,
+        )
         write_ranked_csv(args.output_csv, rows)
     except WorkerContractError as exc:
         raise SystemExit(str(exc)) from exc

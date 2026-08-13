@@ -21,6 +21,27 @@ REGISTRY_PATH = ROOT / "configs/task_c_methods_v1.json"
 OFFICIAL_RETURN_ORDER = (
     "hypersca_c",
     "mean_difference",
+    "grnboost",
+    "guanlab_psgrn",
+)
+OFFICIAL_UNRANKED_EDGES = (
+    "random1000",
+    "pc",
+    "ges",
+    "gies",
+    "gsp",
+    "igsp",
+    "notears_linear",
+    "dcdi_g",
+    "dcdi_dsf",
+    "dcdfg_linear",
+    "dcdfg_mlp",
+    "sortnregress",
+)
+NO_OUTPUT_ORDER = ("betterboost", "sparse_rc", "catran")
+METHOD_ORDER = (
+    "hypersca_c",
+    "mean_difference",
     "random1000",
     "grnboost",
     "pc",
@@ -35,8 +56,10 @@ OFFICIAL_RETURN_ORDER = (
     "dcdfg_mlp",
     "sortnregress",
     "guanlab_psgrn",
+    "betterboost",
+    "sparse_rc",
+    "catran",
 )
-NO_OUTPUT_ORDER = ("betterboost", "sparse_rc", "catran")
 
 
 def _payload() -> dict[str, object]:
@@ -52,12 +75,17 @@ def _write_payload(tmp_path: Path, payload: object) -> Path:
 def test_registry_covers_confirmed_comparison_methods_in_fixed_order() -> None:
     registry = load_task_c_method_registry(REGISTRY_PATH)
 
-    assert tuple(registry.methods) == OFFICIAL_RETURN_ORDER + NO_OUTPUT_ORDER
+    assert tuple(registry.methods) == METHOD_ORDER
     assert tuple(
         method_id
         for method_id, method in registry.methods.items()
         if method.output_semantics == "official_return_order"
     ) == OFFICIAL_RETURN_ORDER
+    assert tuple(
+        method_id
+        for method_id, method in registry.methods.items()
+        if method.output_semantics == "official_unranked_edges"
+    ) == OFFICIAL_UNRANKED_EDGES
     assert tuple(
         method_id
         for method_id, method in registry.methods.items()
@@ -80,9 +108,11 @@ def test_every_method_has_explicit_output_semantics() -> None:
     registry = load_task_c_method_registry(REGISTRY_PATH)
 
     assert all(
-        method.output_semantics in {"official_return_order", "no_output"}
+        method.output_semantics
+        in {"official_return_order", "official_unranked_edges", "no_output"}
         for method in registry.methods.values()
     )
+    assert registry.methods["pc"].output_semantics == "official_unranked_edges"
     assert registry.methods["guanlab_psgrn"].output_semantics == (
         "official_return_order"
     )
@@ -111,7 +141,7 @@ def test_directly_constructed_registry_defensively_copies_mappings() -> None:
     source_methods.clear()
     source_causalbench["commit"] = "changed-after-construction"
 
-    assert tuple(registry.methods) == OFFICIAL_RETURN_ORDER + NO_OUTPUT_ORDER
+    assert tuple(registry.methods) == METHOD_ORDER
     assert registry.causalbench["commit"] == loaded.causalbench["commit"]
     with pytest.raises(TypeError):
         registry.methods["pc"] = loaded.methods["ges"]  # type: ignore[index]
@@ -194,10 +224,10 @@ def test_registry_requires_the_fixed_method_set(tmp_path: Path, change: str) -> 
     semantics = payload["output_semantics"]  # type: ignore[index]
     if change == "missing":
         del methods["pc"]  # type: ignore[index]
-        semantics["official_return_order"].remove("pc")  # type: ignore[index]
+        semantics["official_unranked_edges"].remove("pc")  # type: ignore[index]
     else:
         methods["invented_method"] = methods["pc"]  # type: ignore[index]
-        semantics["official_return_order"].append("invented_method")  # type: ignore[index]
+        semantics["official_unranked_edges"].append("invented_method")  # type: ignore[index]
 
     with pytest.raises(TaskCMethodRegistryError, match="fixed method set"):
         load_task_c_method_registry(_write_payload(tmp_path, payload))
@@ -209,8 +239,9 @@ def test_registry_requires_the_fixed_method_set(tmp_path: Path, change: str) -> 
         ("missing_group", "output_semantics fields"),
         ("unknown_group", "output_semantics fields"),
         ("duplicate_membership", "must contain exactly 3 methods"),
-        ("uncovered", "must contain exactly 16 methods"),
+        ("uncovered", "must contain exactly 12 methods"),
         ("changed_order", "official_return_order must remain"),
+        ("changed_unranked_order", "official_unranked_edges must remain"),
     ],
 )
 def test_registry_rejects_incomplete_or_changed_output_groups(
@@ -225,7 +256,9 @@ def test_registry_rejects_incomplete_or_changed_output_groups(
     elif mutation == "duplicate_membership":
         groups["no_output"].append("pc")  # type: ignore[index]
     elif mutation == "uncovered":
-        groups["official_return_order"].remove("pc")  # type: ignore[index]
+        groups["official_unranked_edges"].remove("pc")  # type: ignore[index]
+    elif mutation == "changed_unranked_order":
+        groups["official_unranked_edges"][0:2] = ["pc", "random1000"]  # type: ignore[index]
     else:
         groups["official_return_order"][0:2] = [  # type: ignore[index]
             "mean_difference",
@@ -346,7 +379,7 @@ def test_output_group_lengths_are_rejected_before_member_scanning(
 
     with pytest.raises(
         TaskCMethodRegistryError,
-        match="official_return_order must contain exactly 16 methods",
+        match="official_return_order must contain exactly 4 methods",
     ):
         load_task_c_method_registry(_write_payload(tmp_path, payload))
 

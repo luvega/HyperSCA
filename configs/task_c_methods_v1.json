@@ -9,8 +9,11 @@
     "official_return_order": [
       "hypersca_c",
       "mean_difference",
-      "random1000",
       "grnboost",
+      "guanlab_psgrn"
+    ],
+    "official_unranked_edges": [
+      "random1000",
       "pc",
       "ges",
       "gies",
@@ -21,8 +24,7 @@
       "dcdi_dsf",
       "dcdfg_linear",
       "dcdfg_mlp",
-      "sortnregress",
-      "guanlab_psgrn"
+      "sortnregress"
     ],
     "no_output": [
       "betterboost",

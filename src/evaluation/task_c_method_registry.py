@@ -51,6 +51,27 @@ class TaskCMethodRegistry:
 _OFFICIAL_RETURN_ORDER = (
     "hypersca_c",
     "mean_difference",
+    "grnboost",
+    "guanlab_psgrn",
+)
+_OFFICIAL_UNRANKED_EDGES = (
+    "random1000",
+    "pc",
+    "ges",
+    "gies",
+    "gsp",
+    "igsp",
+    "notears_linear",
+    "dcdi_g",
+    "dcdi_dsf",
+    "dcdfg_linear",
+    "dcdfg_mlp",
+    "sortnregress",
+)
+_NO_OUTPUT_ORDER = ("betterboost", "sparse_rc", "catran")
+_METHOD_ORDER = (
+    "hypersca_c",
+    "mean_difference",
     "random1000",
     "grnboost",
     "pc",
@@ -65,9 +86,10 @@ _OFFICIAL_RETURN_ORDER = (
     "dcdfg_mlp",
     "sortnregress",
     "guanlab_psgrn",
+    "betterboost",
+    "sparse_rc",
+    "catran",
 )
-_NO_OUTPUT_ORDER = ("betterboost", "sparse_rc", "catran")
-_METHOD_ORDER = _OFFICIAL_RETURN_ORDER + _NO_OUTPUT_ORDER
 _MAX_REGISTRY_BYTES = 64 * 1024
 _MAX_JSON_NESTING = 32
 
@@ -223,6 +245,8 @@ _METHODS: dict[str, dict[str, object]] = {
 def _expected_output_semantics(method_id: str) -> str:
     if method_id in _OFFICIAL_RETURN_ORDER:
         return "official_return_order"
+    if method_id in _OFFICIAL_UNRANKED_EDGES:
+        return "official_unranked_edges"
     return "no_output"
 
 
@@ -384,11 +408,12 @@ def _validate_output_groups(
     groups = _require_object(raw, "output_semantics")
     _require_exact_fields(
         groups,
-        {"official_return_order", "no_output"},
+        {"official_return_order", "official_unranked_edges", "no_output"},
         "output_semantics",
     )
     expected_lengths = {
         "official_return_order": len(_OFFICIAL_RETURN_ORDER),
+        "official_unranked_edges": len(_OFFICIAL_UNRANKED_EDGES),
         "no_output": len(_NO_OUTPUT_ORDER),
     }
     for group_name, expected_length in expected_lengths.items():
@@ -404,7 +429,11 @@ def _validate_output_groups(
 
     method_semantics: dict[str, str] = {}
     duplicates: list[str] = []
-    for group_name in ("official_return_order", "no_output"):
+    for group_name in (
+        "official_return_order",
+        "official_unranked_edges",
+        "no_output",
+    ):
         for method_id in groups[group_name]:
             if not isinstance(method_id, str):
                 raise TaskCMethodRegistryError(
@@ -425,6 +454,8 @@ def _validate_output_groups(
         )
     if tuple(groups["official_return_order"]) != _OFFICIAL_RETURN_ORDER:
         raise TaskCMethodRegistryError("official_return_order must remain fixed")
+    if tuple(groups["official_unranked_edges"]) != _OFFICIAL_UNRANKED_EDGES:
+        raise TaskCMethodRegistryError("official_unranked_edges must remain fixed")
     if tuple(groups["no_output"]) != _NO_OUTPUT_ORDER:
         raise TaskCMethodRegistryError("no_output order must remain fixed")
     return method_semantics
