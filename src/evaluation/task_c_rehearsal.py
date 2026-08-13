@@ -837,3 +837,90 @@ def center_and_merge_allowed_contexts(
         _immutable_text_array(merged_labels),
         _immutable_text_array(merged_environments),
     )
+
+
+def _real_private_directory(private_root: str | Path) -> Path:
+    """Return a private scoring directory without accepting path aliases."""
+
+    try:
+        private = Path(
+            os.path.abspath(os.fspath(Path(private_root).expanduser()))
+        )
+    except (TypeError, ValueError, OSError) as exc:
+        raise TaskCRehearsalError(
+            "private scoring root must be a real directory"
+        ) from exc
+    cursor = Path(private.anchor)
+    try:
+        for component in private.parts[1:]:
+            cursor /= component
+            metadata = os.lstat(cursor)
+            if stat.S_ISLNK(metadata.st_mode):
+                raise TaskCRehearsalError(
+                    "private scoring root must be a real directory without symbolic links"
+                )
+        metadata = os.lstat(private)
+    except TaskCRehearsalError:
+        raise
+    except OSError as exc:
+        raise TaskCRehearsalError(
+            "private scoring root must be a real directory"
+        ) from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise TaskCRehearsalError(
+            "private scoring root must be a real directory"
+        )
+    return private.resolve(strict=True)
+
+
+def _command_path_candidates(argument: str) -> tuple[str, ...]:
+    candidates = [argument]
+    if "=" in argument:
+        candidates.append(argument.split("=", 1)[1])
+    if argument.startswith("-") and not argument.startswith("--") and len(argument) > 2:
+        candidates.append(argument[2:])
+    if argument.startswith("file://"):
+        candidates.append(argument.removeprefix("file://"))
+    return tuple(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+
+def validate_private_scoring_command(
+    command: Sequence[str],
+    *,
+    private_root: str | Path,
+) -> None:
+    """Prove that a method process receives no path into sealed scoring data.
+
+    Relative paths, option assignments and symbolic-link aliases are resolved
+    before comparison.  The independently run scoring process is allowed to
+    read this directory; a method-training process is not.
+    """
+
+    if isinstance(command, (str, bytes)) or not isinstance(command, Sequence):
+        raise TaskCRehearsalError("method command must be an ordered list of text")
+    try:
+        count = len(command)
+        arguments = tuple(command[index] for index in range(count))
+    except (IndexError, KeyError, TypeError, OverflowError) as exc:
+        raise TaskCRehearsalError(
+            "method command must be an ordered list of text"
+        ) from exc
+    if not arguments or any(type(argument) is not str for argument in arguments):
+        raise TaskCRehearsalError("method command must be an ordered list of text")
+    if any("\x00" in argument for argument in arguments):
+        raise TaskCRehearsalError("method command text must not contain NUL")
+
+    private = _real_private_directory(private_root)
+    for argument in arguments:
+        for candidate_text in _command_path_candidates(argument):
+            try:
+                candidate = Path(candidate_text).expanduser()
+                if not candidate.is_absolute():
+                    candidate = Path.cwd() / candidate
+                resolved = candidate.resolve(strict=False)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if resolved == private or private in resolved.parents:
+                raise TaskCRehearsalError(
+                    "method command contains a private scoring path"
+                )

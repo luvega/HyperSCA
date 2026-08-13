@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import csv
+from contextlib import redirect_stderr
+import importlib.util
+import io
 import json
 from collections.abc import Iterator, Mapping
 from dataclasses import replace
@@ -7,7 +11,9 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import textwrap
 from types import MappingProxyType
+import uuid
 
 import numpy as np
 import pytest
@@ -20,11 +26,15 @@ from src.evaluation.task_c_rehearsal import (
     choose_rehearsal_cells,
     choose_rehearsal_genes,
     load_task_c_rehearsal_config,
+    validate_private_scoring_command,
 )
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "configs/task_c_rehearsal_v1.json"
+EVALUATION_WORKER = (
+    ROOT / "scripts/task_c_workers/causalbench_evaluation_worker.py"
+)
 
 EXPECTED_METHODS = (
     "hypersca_c",
@@ -53,6 +63,180 @@ def _write_payload(path: Path, payload: object) -> None:
         json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n",
         encoding="utf-8",
     )
+
+
+def _write_python(path: Path, source: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(textwrap.dedent(source), encoding="utf-8")
+
+
+def _load_evaluation_worker() -> object:
+    module_name = f"test_task_c_evaluation_worker_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, EVALUATION_WORKER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _fake_evaluation_source(tmp_path: Path) -> tuple[Path, str]:
+    source = tmp_path / "causalbench-fixed-source"
+    _write_python(source / "causalscbench/__init__.py", "")
+    _write_python(source / "causalscbench/evaluation/__init__.py", "")
+    _write_python(
+        source / "causalscbench/evaluation/statistical_evaluation.py",
+        """
+        from collections.abc import Mapping
+        import json
+        import os
+        import numpy as np
+
+        class DuplicateMetrics(Mapping):
+            def __len__(self):
+                return 2
+            def __iter__(self):
+                return iter(("metric", "metric"))
+            def __getitem__(self, key):
+                return 1.0
+            def items(self):
+                return (("metric", 1.0), ("metric", 2.0))
+
+        class Evaluator:
+            def __init__(self, expression, interventions, genes):
+                self.record = {
+                    "shape": list(expression.shape),
+                    "interventions": list(interventions),
+                    "genes": list(genes),
+                }
+
+            def evaluate_network(self, edges, **kwargs):
+                self.record["edges"] = [list(edge) for edge in edges]
+                self.record["kwargs"] = kwargs
+                with open(os.environ["FAKE_EVALUATION_RECORD"], "w", encoding="utf-8") as handle:
+                    json.dump(self.record, handle)
+                kind = os.environ.get("FAKE_METRIC_KIND", "valid")
+                if kind == "nonfinite":
+                    return {"false_omission_rate": float("nan")}
+                if kind == "duplicate_mapping":
+                    return DuplicateMetrics()
+                if kind == "deep":
+                    value = 1.0
+                    for _ in range(40):
+                        value = [value]
+                    return {"too_deep": value}
+                if kind == "raises":
+                    raise RuntimeError("simulated official evaluator failure")
+                return {
+                    "false_discovery_rate": np.float64(0.25),
+                    "counts": np.asarray([2, 1], dtype=np.int64),
+                }
+        """,
+    )
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.name", "Test only"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/causalbench/causalbench.git",
+        ],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(source), "add", "causalscbench"], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "commit", "-q", "-m", "test evaluator"],
+        check=True,
+    )
+    revision = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return source, revision
+
+
+def _write_heldout_and_predictions(tmp_path: Path) -> tuple[Path, Path]:
+    heldout = tmp_path / "sealed holdout.npz"
+    np.savez(
+        heldout,
+        expression_matrix=np.asarray(
+            [[0.0, 1.0, 2.0], [1.0, 0.0, 3.0], [2.0, 2.0, 1.0], [3.0, 1.0, 0.0]]
+        ),
+        interventions=np.asarray(["non-targeting", "A", "excluded", "B"]),
+        var_names=np.asarray(["A", "B", "C"]),
+    )
+    predictions = tmp_path / "predictions.csv"
+    rows = [
+        ("C", "B", 0.0, False),
+        ("A", "C", 0.7, True),
+        ("B", "A", 0.9, True),
+        ("A", "B", 0.9, True),
+        ("C", "A", 0.0, False),
+        ("B", "C", 0.7, True),
+    ]
+    with predictions.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(("source", "target", "score", "returned_by_method"))
+        writer.writerows(rows)
+    return heldout, predictions
+
+
+def _run_evaluation_worker(
+    tmp_path: Path,
+    *,
+    metric_kind: str = "valid",
+    output: Path | None = None,
+) -> tuple[int, str, Path, Path]:
+    source, revision = _fake_evaluation_source(tmp_path)
+    heldout, predictions = _write_heldout_and_predictions(tmp_path)
+    output_path = output or tmp_path / "official metrics.json"
+    record = tmp_path / "evaluation-call.json"
+    worker = _load_evaluation_worker()
+    worker.EXPECTED_CAUSALBENCH_COMMIT = revision
+    previous_record = os.environ.get("FAKE_EVALUATION_RECORD")
+    previous_kind = os.environ.get("FAKE_METRIC_KIND")
+    os.environ["FAKE_EVALUATION_RECORD"] = str(record)
+    os.environ["FAKE_METRIC_KIND"] = metric_kind
+    stderr = io.StringIO()
+    try:
+        with redirect_stderr(stderr):
+            return_code = worker.main(
+                [
+                    "--prediction-csv",
+                    str(predictions),
+                    "--heldout-npz",
+                    str(heldout),
+                    "--output-json",
+                    str(output_path),
+                    "--seed",
+                    "17",
+                    "--causalbench-source",
+                    str(source),
+                ]
+            )
+    finally:
+        if previous_record is None:
+            os.environ.pop("FAKE_EVALUATION_RECORD", None)
+        else:
+            os.environ["FAKE_EVALUATION_RECORD"] = previous_record
+        if previous_kind is None:
+            os.environ.pop("FAKE_METRIC_KIND", None)
+        else:
+            os.environ["FAKE_METRIC_KIND"] = previous_kind
+    return return_code, stderr.getvalue(), output_path, record
 
 
 def test_rehearsal_profiles_are_frozen_and_never_promotion_eligible() -> None:
@@ -636,3 +820,333 @@ def test_cross_context_merge_rejects_unsafe_or_inconsistent_inputs(
 ) -> None:
     with pytest.raises(TaskCRehearsalError, match=message):
         center_and_merge_allowed_contexts(contexts)
+
+
+@pytest.mark.parametrize(
+    "command_builder",
+    [
+        lambda private, _alias: ["python", "worker.py", str(private / "test.npz")],
+        lambda private, _alias: [
+            "python",
+            "worker.py",
+            f"--input={private / 'test.npz'}",
+        ],
+        lambda private, _alias: [
+            "python",
+            "worker.py",
+            f"-I{private / 'test.npz'}",
+        ],
+        lambda private, _alias: [
+            "python",
+            "worker.py",
+            os.path.relpath(private / "test.npz", Path.cwd()),
+        ],
+        lambda _private, alias: ["python", "worker.py", str(alias / "test.npz")],
+    ],
+)
+def test_method_command_cannot_receive_private_paths(
+    tmp_path: Path, command_builder
+) -> None:
+    private_root = tmp_path / "private scoring data"
+    private_root.mkdir()
+    (private_root / "test.npz").write_bytes(b"private")
+    alias = tmp_path / "innocent alias"
+    alias.symlink_to(private_root, target_is_directory=True)
+
+    with pytest.raises(TaskCRehearsalError, match="private scoring path"):
+        validate_private_scoring_command(
+            command_builder(private_root, alias),
+            private_root=private_root,
+        )
+
+
+def test_private_command_check_rejects_ambiguous_inputs_and_bad_private_root(
+    tmp_path: Path,
+) -> None:
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    with pytest.raises(TaskCRehearsalError, match="ordered list"):
+        validate_private_scoring_command(
+            "python worker.py",  # type: ignore[arg-type]
+            private_root=private_root,
+        )
+    with pytest.raises(TaskCRehearsalError, match="NUL"):
+        validate_private_scoring_command(
+            ["python", "worker.py\x00--input"],
+            private_root=private_root,
+        )
+
+    alias = tmp_path / "private-alias"
+    alias.symlink_to(private_root, target_is_directory=True)
+    with pytest.raises(TaskCRehearsalError, match="real directory"):
+        validate_private_scoring_command(
+            ["python", "worker.py"],
+            private_root=alias,
+        )
+
+
+def test_method_command_without_private_paths_is_accepted(tmp_path: Path) -> None:
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    public_input = tmp_path / "public input.npz"
+
+    validate_private_scoring_command(
+        ["python", "worker.py", "--input", str(public_input)],
+        private_root=private_root,
+    )
+
+
+def test_official_evaluation_worker_exposes_help_without_external_imports(
+    tmp_path: Path,
+) -> None:
+    blockers = tmp_path / "blocked_external_imports"
+    blockers.mkdir()
+    for module_name in ("numpy", "pandas", "causalscbench"):
+        (blockers / f"{module_name}.py").write_text(
+            f"raise RuntimeError('{module_name} imported during help')\n",
+            encoding="utf-8",
+        )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(blockers)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/task_c_workers/causalbench_evaluation_worker.py",
+            "--help",
+        ],
+        cwd=ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "封存" in completed.stdout
+    assert "--prediction-csv" in completed.stdout
+    assert "--causalbench-source" in completed.stdout
+
+
+def test_official_evaluation_worker_uses_fixed_signature_and_stable_order(
+    tmp_path: Path,
+) -> None:
+    return_code, stderr, output, record_path = _run_evaluation_worker(tmp_path)
+
+    assert return_code == 0, stderr
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert list(payload) == [
+        "eligible_source_count",
+        "metrics",
+        "schema_version",
+        "seed",
+        "status",
+    ]
+    assert payload == {
+        "eligible_source_count": 2,
+        "metrics": {"counts": [2, 1], "false_discovery_rate": 0.25},
+        "schema_version": "1.0",
+        "seed": 17,
+        "status": "supplementary_official_metrics",
+    }
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["shape"] == [4, 3]
+    assert record["genes"] == ["A", "B", "C"]
+    assert record["edges"] == [
+        ["A", "B"],
+        ["B", "A"],
+        ["A", "C"],
+        ["B", "C"],
+    ]
+    assert record["kwargs"] == {
+        "max_path_length": 1,
+        "check_false_omission_rate": False,
+        "omission_estimation_size": 0,
+        "seed": 17,
+    }
+    assert not list(output.parent.glob(f".{output.name}.*.tmp"))
+
+
+@pytest.mark.parametrize("metric_kind", ["nonfinite", "duplicate_mapping", "deep"])
+def test_official_evaluation_worker_records_invalid_metrics_without_partial_success(
+    tmp_path: Path, metric_kind: str
+) -> None:
+    return_code, stderr, output, _ = _run_evaluation_worker(
+        tmp_path, metric_kind=metric_kind
+    )
+
+    assert return_code != 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == "1.0"
+    assert payload["status"] == "failed_invalid_output"
+    assert payload["seed"] == 17
+    assert "metrics" not in payload
+    assert "failed_invalid_output" in stderr
+    assert not list(output.parent.glob(f".{output.name}.*.tmp"))
+
+
+def test_official_evaluation_worker_records_an_evaluator_exception(
+    tmp_path: Path,
+) -> None:
+    return_code, stderr, output, _ = _run_evaluation_worker(
+        tmp_path, metric_kind="raises"
+    )
+
+    assert return_code != 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed_private_scoring"
+    assert "simulated official evaluator failure" not in payload["error"]
+    assert "Traceback" not in stderr
+
+
+def test_official_evaluation_worker_never_overwrites_an_existing_result(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "already exists.json"
+    output.write_text("keep this result\n", encoding="utf-8")
+    return_code, stderr, returned, record = _run_evaluation_worker(
+        tmp_path / "run", output=output
+    )
+
+    assert return_code != 0
+    assert "already exist" in stderr
+    assert returned.read_text(encoding="utf-8") == "keep this result\n"
+    assert not record.exists()
+
+
+def test_official_evaluation_worker_rejects_incomplete_or_false_nonzero_predictions(
+    tmp_path: Path,
+) -> None:
+    source, revision = _fake_evaluation_source(tmp_path)
+    heldout, predictions = _write_heldout_and_predictions(tmp_path)
+    worker = _load_evaluation_worker()
+    worker.EXPECTED_CAUSALBENCH_COMMIT = revision
+    lines = predictions.read_text(encoding="utf-8").splitlines()
+    predictions.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+    output = tmp_path / "failed.json"
+    return_code = worker.main(
+        [
+            "--prediction-csv",
+            str(predictions),
+            "--heldout-npz",
+            str(heldout),
+            "--output-json",
+            str(output),
+            "--seed",
+            "17",
+            "--causalbench-source",
+            str(source),
+        ]
+    )
+    assert return_code != 0
+    assert json.loads(output.read_text(encoding="utf-8"))["status"] == (
+        "failed_private_scoring"
+    )
+
+    third_root = tmp_path / "third"
+    third_root.mkdir()
+    source, revision = _fake_evaluation_source(third_root)
+    heldout, predictions = _write_heldout_and_predictions(third_root)
+    predictions.write_text(
+        predictions.read_text(encoding="utf-8").replace(
+            "C,B,0.0,False", "C,B,-0.0,False"
+        ),
+        encoding="utf-8",
+    )
+    worker = _load_evaluation_worker()
+    worker.EXPECTED_CAUSALBENCH_COMMIT = revision
+    output = third_root / "failed.json"
+    assert worker.main(
+        [
+            "--prediction-csv",
+            str(predictions),
+            "--heldout-npz",
+            str(heldout),
+            "--output-json",
+            str(output),
+            "--seed",
+            "17",
+            "--causalbench-source",
+            str(source),
+        ]
+    ) != 0
+    assert json.loads(output.read_text(encoding="utf-8"))["status"] == (
+        "failed_private_scoring"
+    )
+
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    source, revision = _fake_evaluation_source(second_root)
+    heldout, predictions = _write_heldout_and_predictions(second_root)
+    content = predictions.read_text(encoding="utf-8").replace(
+        "C,B,0.0,False", "C,B,0.1,False"
+    )
+    predictions.write_text(content, encoding="utf-8")
+    worker = _load_evaluation_worker()
+    worker.EXPECTED_CAUSALBENCH_COMMIT = revision
+    output = second_root / "failed.json"
+    assert worker.main(
+        [
+            "--prediction-csv",
+            str(predictions),
+            "--heldout-npz",
+            str(heldout),
+            "--output-json",
+            str(output),
+            "--seed",
+            "17",
+            "--causalbench-source",
+            str(source),
+        ]
+    ) != 0
+    assert json.loads(output.read_text(encoding="utf-8"))["status"] == (
+        "failed_private_scoring"
+    )
+
+
+def test_official_evaluation_worker_rejects_input_aliases_and_bad_seed(
+    tmp_path: Path,
+) -> None:
+    source, revision = _fake_evaluation_source(tmp_path)
+    heldout, predictions = _write_heldout_and_predictions(tmp_path)
+    linked = tmp_path / "linked-heldout.npz"
+    linked.symlink_to(heldout)
+    worker = _load_evaluation_worker()
+    worker.EXPECTED_CAUSALBENCH_COMMIT = revision
+
+    for seed in ("-1", "true", str(2**32)):
+        output = tmp_path / f"failed-seed-{seed}.json"
+        assert worker.main(
+            [
+                "--prediction-csv",
+                str(predictions),
+                "--heldout-npz",
+                str(heldout),
+                "--output-json",
+                str(output),
+                "--seed",
+                seed,
+                "--causalbench-source",
+                str(source),
+            ]
+        ) != 0
+        assert json.loads(output.read_text(encoding="utf-8"))["status"] == (
+            "failed_private_scoring"
+        )
+
+    output = tmp_path / "failed-link.json"
+    assert worker.main(
+        [
+            "--prediction-csv",
+            str(predictions),
+            "--heldout-npz",
+            str(linked),
+            "--output-json",
+            str(output),
+            "--seed",
+            "17",
+            "--causalbench-source",
+            str(source),
+        ]
+    ) != 0
+    assert json.loads(output.read_text(encoding="utf-8"))["status"] == (
+        "failed_private_scoring"
+    )
