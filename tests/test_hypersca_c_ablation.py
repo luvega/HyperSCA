@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import subprocess
 import sys
@@ -276,6 +277,41 @@ def test_separate_contexts_calls_one_fit_per_context_and_returns_complete_table(
     assert result.summary["requested_repeats"] == 2
 
 
+def test_separate_contexts_attempts_later_context_after_an_earlier_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.causal.hypersca_c_ablation as module
+
+    calls: list[str] = []
+
+    def fake_fit_once(
+        contexts: tuple[HyperSCACContext, ...] | list[HyperSCACContext],
+        config: HyperSCACConfig,
+        *,
+        seed: int,
+        device: str,
+        prior_mask: np.ndarray | None = None,
+    ) -> object:
+        del config, seed, device, prior_mask
+        context = contexts[0]
+        calls.append(context.context_id)
+        if context.context_id == "k562":
+            raise HyperSCACError("k562 独立拟合失败")
+        matrix = np.zeros((3, 3), dtype=np.float32)
+        return SimpleNamespace(context_adjacencies={context.context_id: matrix})
+
+    monkeypatch.setattr(module, "fit_hypersca_c_once", fake_fit_once)
+    result = module.fit_separate_contexts_stable(
+        (_context("k562"), _context("rpe1")),
+        _config(bootstrap_repeats=1),
+        seed=17,
+        device="cpu",
+    )
+    assert calls == ["k562", "rpe1"]
+    assert result.summary["successful_repeats"] == 0
+    assert result.failures == ("repeat_0:k562:k562 独立拟合失败",)
+
+
 def test_primary_ablation_delegates_to_the_same_stability_fit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -304,16 +340,28 @@ def test_primary_ablation_delegates_to_the_same_stability_fit(
     ]
 
 
-def _prior_manifest(
-    edges: Path, relation_fingerprint: str | None = None
-) -> dict[str, object]:
-    fingerprint = relation_fingerprint or sha256_path(edges)
+def _expected_relation_fingerprint(rows: list[tuple[str, str]]) -> str:
+    ordered = sorted(set(rows), key=lambda edge: (edge[0].encode(), edge[1].encode()))
+    canonical = b"directed_edge_set_v1\0" + json.dumps(
+        [[source, target] for source, target in ordered],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+
+
+def _prior_manifest(edges: Path) -> dict[str, object]:
+    frame = pd.read_csv(edges, dtype=str, keep_default_na=False)
+    rows = list(frame[["source", "target"]].itertuples(index=False, name=None))
+    fingerprint = _expected_relation_fingerprint(rows)
     return {
         "schema_version": "1.0",
         "prior_id": "independent-pathway-v1",
         "source_uri": "https://example.org/independent-pathway-v1",
         "source_description": "独立于任务 C 评分关系的预登记通路关系",
         "prior_edges_sha256": sha256_path(edges),
+        "relation_fingerprint_schema": "directed_edge_set_v1",
         "relation_fingerprint": fingerprint,
         "scoring_reference_fingerprints": {
             "pooled_essentiality": "sha256:" + "2" * 64,
@@ -346,6 +394,30 @@ def test_prior_edges_form_ordered_mask_only_with_independent_registered_source(
     assert len(snapshots) == 2
 
 
+def test_relation_fingerprint_is_independent_of_csv_row_order(tmp_path: Path) -> None:
+    from src.causal.hypersca_c_ablation import load_registered_prior
+
+    rows = [("C", "A"), ("A", "B")]
+    first = tmp_path / "first.csv"
+    second = tmp_path / "second.csv"
+    pd.DataFrame(rows, columns=["source", "target"]).to_csv(first, index=False)
+    pd.DataFrame(list(reversed(rows)), columns=["source", "target"]).to_csv(
+        second, index=False
+    )
+    first_manifest = tmp_path / "first.json"
+    second_manifest = tmp_path / "second.json"
+    _write_json(first_manifest, _prior_manifest(first))
+    _write_json(second_manifest, _prior_manifest(second))
+    _, first_record, _ = load_registered_prior(first, first_manifest, ("C", "A", "B"))
+    _, second_record, _ = load_registered_prior(
+        second, second_manifest, ("C", "A", "B")
+    )
+    expected = _expected_relation_fingerprint(rows)
+    assert first_record["relation_fingerprint"] == expected
+    assert second_record["relation_fingerprint"] == expected
+    assert sha256_path(first) != sha256_path(second)
+
+
 @pytest.mark.parametrize(
     "case", ["overlap", "self_edge", "unknown_gene", "extra_column"]
 )
@@ -365,9 +437,9 @@ def test_prior_rejects_scoring_overlap_and_invalid_relations(
     pd.DataFrame([row]).to_csv(edges, index=False)
     payload = _prior_manifest(edges)
     if case == "overlap":
-        payload["relation_fingerprint"] = payload["scoring_reference_fingerprints"][  # type: ignore[index]
+        payload["scoring_reference_fingerprints"][  # type: ignore[index]
             "pooled_essentiality"
-        ]
+        ] = payload["relation_fingerprint"]
     manifest = tmp_path / f"{case}.json"
     _write_json(manifest, payload)
     with pytest.raises(HyperSCACError, match="重用|重叠|自身|基因|列"):
@@ -535,6 +607,35 @@ def _resign_item_and_batch(root: Path, ablation_id: str) -> None:
     write_json(batch_path, batch)
 
 
+def _resign_changed_status_and_batch(root: Path, ablation_id: str) -> None:
+    import src.causal.hypersca_c_run as run_module
+    from src.evaluation.task_c_data import write_json
+
+    status_path = root / ablation_id / "method_status.json"
+    item_path = root / ablation_id / "run_manifest.json"
+    item = json.loads(item_path.read_text(encoding="utf-8"))
+    item["artifacts"]["method_status.json"]["sha256"] = sha256_path(status_path)
+    item.pop("run_manifest_content_sha256", None)
+    item["run_manifest_content_sha256"] = run_module._payload_sha256(item)
+    write_json(item_path, item)
+    _resign_item_and_batch(root, ablation_id)
+
+
+def _resign_batch_item_hashes(root: Path) -> None:
+    import src.causal.hypersca_c_run as run_module
+    from src.evaluation.task_c_data import write_json
+
+    batch_path = root / "ablation_batch_manifest.json"
+    batch = json.loads(batch_path.read_text(encoding="utf-8"))
+    for record in batch["ablations"]:
+        record["run_manifest_sha256"] = sha256_path(
+            root / record["ablation_id"] / "run_manifest.json"
+        )
+    batch.pop("batch_manifest_content_sha256", None)
+    batch["batch_manifest_content_sha256"] = run_module._payload_sha256(batch)
+    write_json(batch_path, batch)
+
+
 def test_batch_runs_all_eight_in_order_discloses_missing_prior_and_reuses_exact_run(
     prepared_batch: dict[str, Path],
 ) -> None:
@@ -697,6 +798,70 @@ def test_reuse_rejects_resigned_item_with_changed_effective_config(
     assert _tree_snapshot(root) == before
 
 
+def test_reuse_rejects_swapped_ablation_directories_even_after_resigning_batch(
+    prepared_batch: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.causal.hypersca_c_ablation as module
+
+    _install_fast_ablation_fit(module, monkeypatch)
+    kwargs = _batch_kwargs(prepared_batch)
+    module.run_hypersca_c_ablations(**kwargs)
+    root = prepared_batch["output"]
+    temporary = root / "swap-temporary"
+    (root / "primary").rename(temporary)
+    (root / "shared_only").rename(root / "primary")
+    temporary.rename(root / "shared_only")
+    _resign_batch_item_hashes(root)
+    before = _tree_snapshot(root)
+    with pytest.raises(HyperSCACError, match="登记|目录|身份"):
+        module.run_hypersca_c_ablations(**kwargs)
+    assert _tree_snapshot(root) == before
+
+
+@pytest.mark.parametrize(
+    ("field", "tampered"),
+    [
+        ("ablation_id", "primary"),
+        ("ablation_mode", "joint"),
+        ("configuration_changes", {}),
+        ("interpretation", "未登记的解释"),
+        ("seed", 12),
+        ("contexts", ["k562"]),
+        ("condition", "unexpected_condition"),
+        ("requested_bootstraps", 99),
+        ("successful_bootstraps", 1),
+        ("failure_count", 99),
+        ("coverage", 0.5),
+        ("usable_for_ranking", True),
+        ("condition_mode", "cross"),
+        ("direction", "k562_to_rpe1"),
+        ("stage", "train"),
+    ],
+)
+def test_reuse_rejects_resigned_unavailable_static_or_count_change(
+    prepared_batch: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    tampered: object,
+) -> None:
+    import src.causal.hypersca_c_ablation as module
+    from src.evaluation.task_c_data import write_json
+
+    _install_fast_ablation_fit(module, monkeypatch)
+    kwargs = _batch_kwargs(prepared_batch)
+    module.run_hypersca_c_ablations(**kwargs)
+    root = prepared_batch["output"]
+    status_path = root / "prior_on_secondary/method_status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status[field] = tampered
+    write_json(status_path, status)
+    _resign_changed_status_and_batch(root, "prior_on_secondary")
+    before = _tree_snapshot(root)
+    with pytest.raises(HyperSCACError, match="状态|批次|固定|设置|计数|登记|排序"):
+        module.run_hypersca_c_ablations(**kwargs)
+    assert _tree_snapshot(root) == before
+
+
 def test_reuse_rejects_resigned_unavailable_status_with_extra_field(
     prepared_batch: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -822,6 +987,53 @@ def test_one_failed_ablation_does_not_hide_other_results(
     assert failed["status"] == "failed_ablation"
     assert failed["failures"] == ["预先登记的单项核验失败"]
     assert failed["usable_for_ranking"] is False
+
+
+def test_transform_failure_does_not_hide_later_ablation_results(
+    prepared_batch: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.causal.hypersca_c_ablation as module
+
+    original_apply = module.apply_hypersca_c_ablation
+    attempted: list[str] = []
+
+    def fail_one_transform(
+        contexts: tuple[HyperSCACContext, ...],
+        config: HyperSCACConfig,
+        ablation_id: str,
+        **kwargs: object,
+    ) -> object:
+        attempted.append(ablation_id)
+        if ablation_id == "shared_only":
+            raise HyperSCACError("共享成分消融变换失败")
+        return original_apply(contexts, config, ablation_id, **kwargs)
+
+    def fast_fit(
+        contexts: tuple[HyperSCACContext, ...],
+        config: HyperSCACConfig,
+        ablation_id: str,
+        **kwargs: object,
+    ) -> object:
+        del ablation_id, kwargs
+        return _fast_stability_result(contexts, config)
+
+    monkeypatch.setattr(module, "apply_hypersca_c_ablation", fail_one_transform)
+    monkeypatch.setattr(module, "fit_hypersca_c_ablation", fast_fit)
+    summary = module.run_hypersca_c_ablations(**_batch_kwargs(prepared_batch))
+
+    assert attempted == list(ABLATION_IDS)
+    assert summary["shared_only"] == "failed_ablation"
+    assert summary["separate_contexts"] == "completed_raw_inference"
+    assert summary["prior_on_secondary"] == "official_assets_unavailable"
+    assert {
+        path.name for path in prepared_batch["output"].iterdir() if path.is_dir()
+    } == set(ABLATION_IDS)
+    failed = json.loads(
+        (prepared_batch["output"] / "shared_only/method_status.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert failed["failures"] == ["共享成分消融变换失败"]
 
 
 def test_batch_reuses_task_c_public_boundary_and_rejects_private_input_before_fit(

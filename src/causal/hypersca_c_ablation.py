@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import math
@@ -88,10 +89,12 @@ _PRIOR_MANIFEST_FIELDS = {
     "source_uri",
     "source_description",
     "prior_edges_sha256",
+    "relation_fingerprint_schema",
     "relation_fingerprint",
     "scoring_reference_fingerprints",
     "independence_attestation",
 }
+_RELATION_FINGERPRINT_SCHEMA = "directed_edge_set_v1"
 _ITEM_ARTIFACTS = {
     "raw_predictions.csv",
     "fit_summary.json",
@@ -271,11 +274,17 @@ def apply_hypersca_c_ablation(
                 )
             )
         transformed = tuple(control_only)
+    return transformed, _effective_ablation_config(config, spec)
+
+
+def _effective_ablation_config(
+    config: HyperSCACConfig, spec: Mapping[str, object]
+) -> HyperSCACConfig:
     values = asdict(config)
     changes = spec["configuration_changes"]
     assert isinstance(changes, Mapping)
     values.update(dict(changes))
-    return transformed, HyperSCACConfig.from_mapping(values)
+    return HyperSCACConfig.from_mapping(values)
 
 
 def _source_variance(
@@ -297,11 +306,11 @@ def _source_variance(
     }
 
 
-def _compact_failure(repeat: int, error: HyperSCACError) -> str:
+def _compact_failure(error: HyperSCACError) -> str:
     message = " ".join(str(error).split()) or error.__class__.__name__
     if len(message) > 200:
         message = message[:197] + "..."
-    return f"repeat_{repeat}:{message}"
+    return message
 
 
 def fit_separate_contexts_stable(
@@ -336,8 +345,9 @@ def fit_separate_contexts_stable(
             for context in normalized_contexts
         ]
         current: dict[str, np.ndarray] = {}
-        try:
-            for context in sampled:
+        context_failures: list[str] = []
+        for context in sampled:
+            try:
                 fitted = fit_hypersca_c_once(
                     (context,),
                     config,
@@ -348,8 +358,10 @@ def fit_separate_contexts_stable(
                 current[context.context_id] = fitted.context_adjacencies[
                     context.context_id
                 ]
-        except HyperSCACError as exc:
-            failures.append(_compact_failure(repeat, exc))
+            except HyperSCACError as exc:
+                context_failures.append(f"{context.context_id}:{_compact_failure(exc)}")
+        if context_failures:
+            failures.append(f"repeat_{repeat}:{';'.join(context_failures)}")
             continue
         matrices.append(current)
 
@@ -435,6 +447,22 @@ def _strict_csv_rows(raw_bytes: bytes, path: Path) -> list[tuple[str, str]]:
     return rows
 
 
+def _directed_relation_fingerprint(rows: Sequence[tuple[str, str]]) -> str:
+    """生成与 CSV 排列无关的有向关系集合指纹。"""
+
+    ordered = sorted(
+        set(rows), key=lambda edge: (edge[0].encode("utf-8"), edge[1].encode("utf-8"))
+    )
+    canonical = _RELATION_FINGERPRINT_SCHEMA.encode("ascii") + b"\0"
+    canonical += json.dumps(
+        [[source, target] for source, target in ordered],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
 def load_registered_prior(
     prior_edges_path: str | Path,
     prior_source_manifest_path: str | Path,
@@ -467,15 +495,18 @@ def load_registered_prior(
         edges_path, "外部先验关系", collect_bytes=True
     )
     assert raw_bytes is not None
+    rows = _strict_csv_rows(raw_bytes, edges_path)
     registered_sha = _run._sha256_text(
         manifest["prior_edges_sha256"], "prior_edges_sha256"
     )
+    if manifest["relation_fingerprint_schema"] != _RELATION_FINGERPRINT_SCHEMA:
+        raise HyperSCACError("外部先验关系指纹规则不符合固定格式")
     relation_fingerprint = _run._sha256_text(
         manifest["relation_fingerprint"], "relation_fingerprint"
     )
-    if (
-        registered_sha != edges_snapshot.sha256
-        or relation_fingerprint != registered_sha
+    expected_relation_fingerprint = _directed_relation_fingerprint(rows)
+    if registered_sha != edges_snapshot.sha256 or relation_fingerprint != (
+        expected_relation_fingerprint
     ):
         raise HyperSCACError(
             "外部先验关系 SHA 或关系指纹与来源清单不一致，无法排除重叠或重用"
@@ -503,7 +534,6 @@ def load_registered_prior(
     ):
         raise HyperSCACError("外部先验重用或重叠了任务 C 评分参考关系")
 
-    rows = _strict_csv_rows(raw_bytes, edges_path)
     gene_index = {gene: index for index, gene in enumerate(genes)}
     mask = np.zeros((len(genes), len(genes)), dtype=np.int8)
     for source, target in rows:
@@ -524,6 +554,7 @@ def load_registered_prior(
             "prior_source_manifest_path": str(manifest_path),
             "prior_edges_sha256": edges_snapshot.sha256,
             "prior_source_manifest_sha256": manifest_snapshot.sha256,
+            "relation_fingerprint_schema": _RELATION_FINGERPRINT_SCHEMA,
             "relation_fingerprint": relation_fingerprint,
             "scoring_reference_fingerprints": MappingProxyType(reference_hashes),
             "edge_count": len(rows),
@@ -936,7 +967,13 @@ def _validate_time_record(payload: Mapping[str, object], description: str) -> No
         raise HyperSCACError(f"{description}时长与 UTC 时间不一致")
 
 
-def _verify_item(directory: Path, expected_identity: Mapping[str, object]) -> str:
+def _verify_item(
+    directory: Path,
+    expected_identity: Mapping[str, object],
+    expected_ablation_id: str,
+) -> str:
+    if directory.name != expected_ablation_id:
+        raise HyperSCACError("已有单项消融目录与固定登记身份不一致")
     if directory.is_symlink() or not directory.is_dir():
         raise HyperSCACError("已有消融输出必须是普通目录")
     entries = tuple(directory.iterdir())
@@ -962,15 +999,15 @@ def _verify_item(directory: Path, expected_identity: Mapping[str, object]) -> st
         raise HyperSCACError("已有单项消融输出对应另一组输入或设置")
     ablation_id = manifest.get("ablation_id")
     if (
-        ablation_id not in ABLATION_IDS
+        ablation_id != expected_ablation_id
         or not isinstance(identity, dict)
         or set(identity) != _ITEM_IDENTITY_FIELDS
     ):
         raise HyperSCACError("已有单项消融清单的登记身份无效")
-    spec = _EXPECTED_ABLATIONS[str(ablation_id)]
+    spec = _EXPECTED_ABLATIONS[expected_ablation_id]
     expected_config = dict(expected_identity.get("base_config_values", {}))
     expected_config.update(spec["configuration_changes"])  # type: ignore[arg-type]
-    if identity.get("ablation_id") != ablation_id:
+    if identity.get("ablation_id") != expected_ablation_id:
         raise HyperSCACError("已有单项消融身份与清单不一致")
     if identity.get("ablation_mode") != spec["mode"]:
         raise HyperSCACError("已有单项消融模式与固定登记不一致")
@@ -980,7 +1017,7 @@ def _verify_item(directory: Path, expected_identity: Mapping[str, object]) -> st
         raise HyperSCACError("已有单项消融 effective config 设置已改变")
     expected_prior = (
         expected_identity.get("registered_prior")
-        if ablation_id == "prior_on_secondary"
+        if expected_ablation_id == "prior_on_secondary"
         else None
     )
     if identity.get("registered_prior") != expected_prior:
@@ -1016,7 +1053,7 @@ def _verify_item(directory: Path, expected_identity: Mapping[str, object]) -> st
         or status["formal_score_status"] != "not_sealed"
     ):
         raise HyperSCACError("已有消融状态用途说明不符合固定格式")
-    if status.get("ablation_id") != ablation_id:
+    if status.get("ablation_id") != expected_ablation_id:
         raise HyperSCACError("已有消融状态与登记项目不一致")
     if (
         status.get("ablation_mode") != spec["mode"]
@@ -1029,9 +1066,21 @@ def _verify_item(directory: Path, expected_identity: Mapping[str, object]) -> st
     context_ids = [record["context_id"] for record in context_records]
     if status.get("contexts") != context_ids:
         raise HyperSCACError("已有消融状态与固定 context 不一致")
-    if status.get("seed") != expected_identity.get("seed") or status.get(
-        "condition"
-    ) != expected_identity.get("condition"):
+    expected_static_status = {
+        "interpretation": (
+            "单次拟合，不使用跨重复的稳定性权重"
+            if expected_ablation_id == "no_stability_weighting"
+            else "按预先登记设置运行"
+        ),
+        "seed": expected_identity.get("seed"),
+        "condition": expected_identity.get("condition"),
+        "condition_mode": expected_identity.get("condition_mode"),
+        "direction": expected_identity.get("direction"),
+        "stage": expected_identity.get("stage"),
+    }
+    if any(
+        status.get(field) != value for field, value in expected_static_status.items()
+    ):
         raise HyperSCACError("已有消融状态与批次身份不一致")
 
     summary = _run._read_output_json(directory / "fit_summary.json", "消融拟合摘要")
@@ -1087,19 +1136,51 @@ def _verify_item(directory: Path, expected_identity: Mapping[str, object]) -> st
         ).columns.tolist()
         if predictions.columns.tolist() != expected_columns or len(predictions) != 0:
             raise HyperSCACError("已有未完成消融必须保留精确空关系表")
-        if summary["ablation_id"] != ablation_id or summary["status"] != status_name:
+        if (
+            summary["ablation_id"] != expected_ablation_id
+            or summary["status"] != status_name
+        ):
             raise HyperSCACError("已有未完成消融摘要与状态不一致")
         if (
             summary["reason"] != status["reason"]
             or summary["failures"] != status["failures"]
         ):
             raise HyperSCACError("已有未完成消融原因或失败记录不一致")
-        if status["usable_for_ranking"] is not False or status["coverage"] != 0.0:
+        failures = status["failures"]
+        if not isinstance(failures, list) or any(
+            not isinstance(failure, str) or not failure for failure in failures
+        ):
+            raise HyperSCACError("已有未完成消融失败记录格式无效")
+        expected_repeats = int(expected_config["bootstrap_repeats"])
+        if (
+            isinstance(status["requested_bootstraps"], bool)
+            or not isinstance(status["requested_bootstraps"], int)
+            or status["requested_bootstraps"] != expected_repeats
+            or isinstance(status["successful_bootstraps"], bool)
+            or not isinstance(status["successful_bootstraps"], int)
+            or status["successful_bootstraps"] != 0
+            or isinstance(status["failure_count"], bool)
+            or not isinstance(status["failure_count"], int)
+            or status["failure_count"] != len(failures)
+        ):
+            raise HyperSCACError("已有未完成消融重复计数与固定设置不一致")
+        if (
+            isinstance(status["coverage"], bool)
+            or not isinstance(status["coverage"], (int, float))
+            or float(status["coverage"]) != 0.0
+            or status["usable_for_ranking"] is not False
+        ):
             raise HyperSCACError("已有未完成消融不能用于排序")
+        if status_name == "failed_ablation" and (
+            status.get("reason") != "ablation_fit_failed" or len(failures) != 1
+        ):
+            raise HyperSCACError("已有失败消融的原因或失败计数不符合固定格式")
         if status_name == "official_assets_unavailable" and status.get("reason") != (
             "no_nonoverlapping_preregistered_prior"
         ):
             raise HyperSCACError("已有外部资源不可用原因不符合固定格式")
+        if status_name == "official_assets_unavailable" and len(failures) > 1:
+            raise HyperSCACError("已有外部资源不可用记录的失败计数无效")
     else:
         raise HyperSCACError("已有消融状态不在固定范围内")
     return status_name
@@ -1157,7 +1238,7 @@ def _reuse_batch(
             "run_manifest_sha256"
         ):
             raise HyperSCACError("已有消融批次清单与单项清单不一致")
-        status = _verify_item(directory, identity)
+        status = _verify_item(directory, identity, ablation_id)
         item_manifest = _run._read_output_json(
             directory / "run_manifest.json", "消融运行清单"
         )
@@ -1278,23 +1359,26 @@ def run_hypersca_c_ablations(
             spec = registry[ablation_id]
             item_started_utc = _run._utc_now()
             item_clock = time.monotonic()
-            _, transformed_config = apply_hypersca_c_ablation(
-                prepared.contexts,
-                prepared.config,
-                ablation_id,
-                registry=registry,
-            )
-            if ablation_id == "prior_on_secondary" and prior_mask is None:
-                predictions, summary, status = _failure_payloads(
-                    status_name="official_assets_unavailable",
-                    reason="no_nonoverlapping_preregistered_prior",
-                    ablation_id=ablation_id,
-                    spec=spec,
-                    prepared=prepared,
-                    failure=prior_unavailable_detail,
+            transformed_config = _effective_ablation_config(prepared.config, spec)
+            try:
+                _, applied_config = apply_hypersca_c_ablation(
+                    prepared.contexts,
+                    prepared.config,
+                    ablation_id,
+                    registry=registry,
                 )
-            else:
-                try:
+                if applied_config != transformed_config:
+                    raise HyperSCACError("消融变换产生了未登记的设置")
+                if ablation_id == "prior_on_secondary" and prior_mask is None:
+                    predictions, summary, status = _failure_payloads(
+                        status_name="official_assets_unavailable",
+                        reason="no_nonoverlapping_preregistered_prior",
+                        ablation_id=ablation_id,
+                        spec=spec,
+                        prepared=prepared,
+                        failure=prior_unavailable_detail,
+                    )
+                else:
                     result = fit_hypersca_c_ablation(
                         prepared.contexts,
                         prepared.config,
@@ -1313,16 +1397,16 @@ def run_hypersca_c_ablations(
                         transformed_config=transformed_config,
                         prepared=prepared,
                     )
-                except HyperSCACError as exc:
-                    message = " ".join(str(exc).split()) or exc.__class__.__name__
-                    predictions, summary, status = _failure_payloads(
-                        status_name="failed_ablation",
-                        reason="ablation_fit_failed",
-                        ablation_id=ablation_id,
-                        spec=spec,
-                        prepared=prepared,
-                        failure=message[:200],
-                    )
+            except HyperSCACError as exc:
+                message = " ".join(str(exc).split()) or exc.__class__.__name__
+                predictions, summary, status = _failure_payloads(
+                    status_name="failed_ablation",
+                    reason="ablation_fit_failed",
+                    ablation_id=ablation_id,
+                    spec=spec,
+                    prepared=prepared,
+                    failure=message[:200],
+                )
             item_completed_utc = _run._utc_now()
             record = _write_item(
                 staging / ablation_id,
