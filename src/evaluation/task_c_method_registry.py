@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 
 class TaskCMethodRegistryError(ValueError):
@@ -37,6 +38,15 @@ class TaskCMethodRegistry:
     methods: Mapping[str, TaskCMethodSpec]
     causalbench: Mapping[str, str]
 
+    def __post_init__(self) -> None:
+        methods, causalbench = _freeze_and_validate_registry(
+            self.schema_version,
+            self.methods,
+            self.causalbench,
+        )
+        object.__setattr__(self, "methods", methods)
+        object.__setattr__(self, "causalbench", causalbench)
+
 
 _OFFICIAL_RETURN_ORDER = (
     "hypersca_c",
@@ -58,6 +68,8 @@ _OFFICIAL_RETURN_ORDER = (
 )
 _NO_OUTPUT_ORDER = ("betterboost", "sparse_rc", "catran")
 _METHOD_ORDER = _OFFICIAL_RETURN_ORDER + _NO_OUTPUT_ORDER
+_MAX_REGISTRY_BYTES = 64 * 1024
+_MAX_JSON_NESTING = 32
 
 _CAUSALBENCH = {
     "repository": "https://github.com/causalbench/causalbench.git",
@@ -208,6 +220,87 @@ _METHODS: dict[str, dict[str, object]] = {
 }
 
 
+def _expected_output_semantics(method_id: str) -> str:
+    if method_id in _OFFICIAL_RETURN_ORDER:
+        return "official_return_order"
+    return "no_output"
+
+
+def _validate_causalbench_values(raw: Mapping[str, object]) -> Mapping[str, str]:
+    _require_exact_fields(raw, set(_CAUSALBENCH), "causalbench")
+    validated: dict[str, str] = {}
+    for field, expected in _CAUSALBENCH.items():
+        value = raw[field]
+        if not isinstance(value, str) or not value:
+            raise TaskCMethodRegistryError(
+                f"causalbench {field} must be a non-empty string"
+            )
+        if value != expected:
+            raise TaskCMethodRegistryError(f"causalbench {field} must remain fixed")
+        validated[field] = value
+    return MappingProxyType(validated)
+
+
+def _validate_constructed_method(
+    method_id: str, spec: object
+) -> TaskCMethodSpec:
+    if not isinstance(spec, TaskCMethodSpec):
+        raise TaskCMethodRegistryError(
+            f"{method_id} must be a TaskCMethodSpec record"
+        )
+    if spec.method_id != method_id:
+        raise TaskCMethodRegistryError(f"{method_id} method_id must remain fixed")
+    if type(spec.required_for_core_rehearsal) is not bool:
+        raise TaskCMethodRegistryError(
+            f"{method_id} required_for_core_rehearsal must be a real boolean"
+        )
+
+    expected = {
+        **_METHODS[method_id],
+        "output_semantics": _expected_output_semantics(method_id),
+        "repository": _METHODS[method_id].get("repository"),
+        "commit": _METHODS[method_id].get("commit"),
+        "environment": _METHODS[method_id].get("environment"),
+        "publication": _METHODS[method_id].get("publication"),
+    }
+    for field, expected_value in expected.items():
+        if getattr(spec, field) != expected_value:
+            raise TaskCMethodRegistryError(
+                f"{method_id} {field} must remain {expected_value!r}"
+            )
+    return spec
+
+
+def _freeze_and_validate_registry(
+    schema_version: object,
+    methods_value: object,
+    causalbench_value: object,
+) -> tuple[Mapping[str, TaskCMethodSpec], Mapping[str, str]]:
+    if schema_version != "1.0":
+        raise TaskCMethodRegistryError("schema_version must be 1.0")
+    if not isinstance(methods_value, Mapping):
+        raise TaskCMethodRegistryError("methods must be a mapping")
+    if len(methods_value) != len(_METHOD_ORDER) or set(methods_value) != set(
+        _METHOD_ORDER
+    ):
+        raise TaskCMethodRegistryError(
+            "method registry must contain the fixed method set"
+        )
+    if tuple(methods_value) != _METHOD_ORDER:
+        raise TaskCMethodRegistryError("method order must remain fixed")
+    if not isinstance(causalbench_value, Mapping):
+        raise TaskCMethodRegistryError("causalbench must be a mapping")
+
+    methods = {
+        method_id: _validate_constructed_method(
+            method_id, methods_value[method_id]
+        )
+        for method_id in _METHOD_ORDER
+    }
+    causalbench = _validate_causalbench_values(causalbench_value)
+    return MappingProxyType(methods), causalbench
+
+
 def _object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -215,6 +308,31 @@ def _object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, An
             raise TaskCMethodRegistryError(f"duplicate JSON key: {key}")
         result[key] = value
     return result
+
+
+def _reject_excessive_json_nesting(text: str) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > _MAX_JSON_NESTING:
+                raise TaskCMethodRegistryError(
+                    "cannot parse method registry: JSON is too deeply nested"
+                )
+        elif character in "]}":
+            depth -= 1
 
 
 def _require_object(value: object, label: str) -> Mapping[str, Any]:
@@ -237,10 +355,24 @@ def _require_exact_fields(
 
 def _read_payload(path: str | Path) -> Mapping[str, Any]:
     try:
-        text = Path(path).read_text(encoding="utf-8")
+        registry_path = Path(path)
+        if registry_path.stat().st_size > _MAX_REGISTRY_BYTES:
+            raise TaskCMethodRegistryError(
+                f"method registry is too large; maximum is {_MAX_REGISTRY_BYTES} bytes"
+            )
+        text = registry_path.read_text(encoding="utf-8")
+        if len(text.encode("utf-8")) > _MAX_REGISTRY_BYTES:
+            raise TaskCMethodRegistryError(
+                f"method registry is too large; maximum is {_MAX_REGISTRY_BYTES} bytes"
+            )
+        _reject_excessive_json_nesting(text)
         payload = json.loads(text, object_pairs_hook=_object_without_duplicate_keys)
     except TaskCMethodRegistryError:
         raise
+    except (RecursionError, OverflowError) as exc:
+        raise TaskCMethodRegistryError(
+            f"cannot parse method registry: {exc}"
+        ) from exc
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise TaskCMethodRegistryError(f"cannot read method registry: {exc}") from exc
     return _require_object(payload, "method registry")
@@ -255,23 +387,39 @@ def _validate_output_groups(
         {"official_return_order", "no_output"},
         "output_semantics",
     )
-    for group_name, members in groups.items():
-        if not isinstance(members, list) or not all(
-            isinstance(method_id, str) for method_id in members
-        ):
+    expected_lengths = {
+        "official_return_order": len(_OFFICIAL_RETURN_ORDER),
+        "no_output": len(_NO_OUTPUT_ORDER),
+    }
+    for group_name, expected_length in expected_lengths.items():
+        members = groups[group_name]
+        if not isinstance(members, list):
             raise TaskCMethodRegistryError(
                 f"output_semantics {group_name} must be a list of method names"
             )
+        if len(members) != expected_length:
+            raise TaskCMethodRegistryError(
+                f"{group_name} must contain exactly {expected_length} methods"
+            )
 
-    flattened = groups["official_return_order"] + groups["no_output"]
-    duplicates = sorted(
-        method_id for method_id in set(flattened) if flattened.count(method_id) > 1
-    )
+    method_semantics: dict[str, str] = {}
+    duplicates: list[str] = []
+    for group_name in ("official_return_order", "no_output"):
+        for method_id in groups[group_name]:
+            if not isinstance(method_id, str):
+                raise TaskCMethodRegistryError(
+                    f"output_semantics {group_name} must be a list of method names"
+                )
+            if method_id in method_semantics:
+                duplicates.append(method_id)
+            else:
+                method_semantics[method_id] = group_name
     if duplicates:
         raise TaskCMethodRegistryError(
-            f"methods listed more than once in output_semantics: {duplicates}"
+            "methods listed more than once in output_semantics: "
+            f"{sorted(set(duplicates))}"
         )
-    if set(flattened) != method_ids or len(flattened) != len(method_ids):
+    if set(method_semantics) != method_ids:
         raise TaskCMethodRegistryError(
             "every fixed method must be listed exactly once in output_semantics"
         )
@@ -279,25 +427,12 @@ def _validate_output_groups(
         raise TaskCMethodRegistryError("official_return_order must remain fixed")
     if tuple(groups["no_output"]) != _NO_OUTPUT_ORDER:
         raise TaskCMethodRegistryError("no_output order must remain fixed")
-    return {
-        method_id: group_name
-        for group_name, members in groups.items()
-        for method_id in members
-    }
+    return method_semantics
 
 
 def _validate_causalbench(raw: object) -> Mapping[str, str]:
     source = _require_object(raw, "causalbench")
-    _require_exact_fields(source, set(_CAUSALBENCH), "causalbench")
-    for field, expected in _CAUSALBENCH.items():
-        value = source[field]
-        if not isinstance(value, str) or not value:
-            raise TaskCMethodRegistryError(
-                f"causalbench {field} must be a non-empty string"
-            )
-        if value != expected:
-            raise TaskCMethodRegistryError(f"causalbench {field} must remain fixed")
-    return MappingProxyType(dict(source))
+    return _validate_causalbench_values(source)
 
 
 def _validate_method(

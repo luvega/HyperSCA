@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 from pathlib import Path
+import textwrap
 
 import pytest
 
+from src.evaluation import task_c_method_registry as registry_module
 from src.evaluation.task_c_method_registry import (
+    TaskCMethodRegistry,
     TaskCMethodRegistryError,
     load_task_c_method_registry,
 )
@@ -93,6 +98,69 @@ def test_loaded_registry_cannot_be_changed_by_a_runner() -> None:
         registry.causalbench["commit"] = "changed"  # type: ignore[index]
 
 
+def test_directly_constructed_registry_defensively_copies_mappings() -> None:
+    loaded = load_task_c_method_registry(REGISTRY_PATH)
+    source_methods = dict(loaded.methods)
+    source_causalbench = dict(loaded.causalbench)
+
+    registry = TaskCMethodRegistry(
+        schema_version=loaded.schema_version,
+        methods=source_methods,
+        causalbench=source_causalbench,
+    )
+    source_methods.clear()
+    source_causalbench["commit"] = "changed-after-construction"
+
+    assert tuple(registry.methods) == OFFICIAL_RETURN_ORDER + NO_OUTPUT_ORDER
+    assert registry.causalbench["commit"] == loaded.causalbench["commit"]
+    with pytest.raises(TypeError):
+        registry.methods["pc"] = loaded.methods["ges"]  # type: ignore[index]
+    with pytest.raises(TypeError):
+        registry.causalbench["commit"] = "changed"  # type: ignore[index]
+
+
+def test_direct_construction_cannot_bypass_method_identity_rules() -> None:
+    loaded = load_task_c_method_registry(REGISTRY_PATH)
+    methods = dict(loaded.methods)
+    pc = methods["pc"]
+    methods["pc"] = type(pc)(
+        method_id=pc.method_id,
+        role="candidate",
+        source_kind=pc.source_kind,
+        training_information=pc.training_information,
+        command=pc.command,
+        required_for_core_rehearsal=pc.required_for_core_rehearsal,
+        output_semantics=pc.output_semantics,
+    )
+
+    with pytest.raises(TaskCMethodRegistryError, match="pc role must remain"):
+        TaskCMethodRegistry(
+            schema_version="1.0",
+            methods=methods,
+            causalbench=loaded.causalbench,
+        )
+
+
+def test_direct_construction_cannot_bypass_source_or_order_rules() -> None:
+    loaded = load_task_c_method_registry(REGISTRY_PATH)
+    reversed_methods = dict(reversed(tuple(loaded.methods.items())))
+    changed_source = dict(loaded.causalbench)
+    changed_source["commit"] = "0" * 40
+
+    with pytest.raises(TaskCMethodRegistryError, match="method order must remain"):
+        TaskCMethodRegistry(
+            schema_version="1.0",
+            methods=reversed_methods,
+            causalbench=loaded.causalbench,
+        )
+    with pytest.raises(TaskCMethodRegistryError, match="causalbench commit must remain"):
+        TaskCMethodRegistry(
+            schema_version="1.0",
+            methods=loaded.methods,
+            causalbench=changed_source,
+        )
+
+
 @pytest.mark.parametrize(
     ("method_id", "replacement"),
     [
@@ -140,8 +208,8 @@ def test_registry_requires_the_fixed_method_set(tmp_path: Path, change: str) -> 
     [
         ("missing_group", "output_semantics fields"),
         ("unknown_group", "output_semantics fields"),
-        ("duplicate_membership", "listed more than once"),
-        ("uncovered", "listed exactly once"),
+        ("duplicate_membership", "must contain exactly 3 methods"),
+        ("uncovered", "must contain exactly 16 methods"),
         ("changed_order", "official_return_order must remain"),
     ],
 )
@@ -268,3 +336,55 @@ def test_registry_rejects_non_object_documents(
 ) -> None:
     with pytest.raises(TaskCMethodRegistryError, match="JSON object"):
         load_task_c_method_registry(_write_payload(tmp_path, bad_root))
+
+
+def test_output_group_lengths_are_rejected_before_member_scanning(
+    tmp_path: Path,
+) -> None:
+    payload = _payload()
+    payload["output_semantics"]["official_return_order"] = ["pc"] * 1_000  # type: ignore[index]
+
+    with pytest.raises(
+        TaskCMethodRegistryError,
+        match="official_return_order must contain exactly 16 methods",
+    ):
+        load_task_c_method_registry(_write_payload(tmp_path, payload))
+
+
+def test_duplicate_check_does_not_use_repeated_list_scans() -> None:
+    source = textwrap.dedent(
+        inspect.getsource(registry_module._validate_output_groups)
+    )
+    tree = ast.parse(source)
+    repeated_list_scans = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "count"
+    ]
+
+    assert repeated_list_scans == []
+
+
+def test_oversized_registry_is_rejected_before_json_decoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "oversized.json"
+    path.write_text('{"padding":"' + ("x" * 1_000_000) + '"}', encoding="utf-8")
+
+    def fail_if_called(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("oversized input reached the JSON decoder")
+
+    monkeypatch.setattr(registry_module.json, "loads", fail_if_called)
+    with pytest.raises(TaskCMethodRegistryError, match="too large"):
+        load_task_c_method_registry(path)
+
+
+def test_deeply_nested_json_reports_a_registry_error(tmp_path: Path) -> None:
+    depth = 2_000
+    path = tmp_path / "deep.json"
+    path.write_text(("[" * depth) + "0" + ("]" * depth), encoding="utf-8")
+
+    with pytest.raises(TaskCMethodRegistryError, match="cannot parse method registry"):
+        load_task_c_method_registry(path)
