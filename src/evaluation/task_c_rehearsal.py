@@ -319,7 +319,9 @@ def _read_limited_regular_file(path: Path) -> bytes:
     try:
         descriptor = os.open(
             absolute,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
         )
     except OSError as exc:
         raise TaskCRehearsalError(

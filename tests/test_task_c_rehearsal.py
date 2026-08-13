@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Mapping
 from dataclasses import replace
+import os
 from pathlib import Path
+import subprocess
+import sys
 from types import MappingProxyType
 
 import numpy as np
@@ -254,6 +257,35 @@ def test_config_rejects_symlink_special_file_huge_integer_and_parser_recursion(
     invalid_utf8.write_bytes(b"{\xff}")
     with pytest.raises(TaskCRehearsalError, match="UTF-8"):
         load_task_c_rehearsal_config(invalid_utf8)
+
+
+def test_config_rejects_fifo_without_waiting_for_a_writer(tmp_path: Path) -> None:
+    fifo = tmp_path / "configuration.pipe"
+    os.mkfifo(fifo)
+    script = "\n".join(
+        (
+            "import sys",
+            "from pathlib import Path",
+            "from src.evaluation.task_c_rehearsal import (",
+            "    TaskCRehearsalError, load_task_c_rehearsal_config,",
+            ")",
+            "try:",
+            "    load_task_c_rehearsal_config(Path(sys.argv[1]))",
+            "except TaskCRehearsalError:",
+            "    print('rejected without waiting')",
+            "else:",
+            "    raise SystemExit('FIFO was accepted')",
+        )
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(fifo)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=True,
+    )
+    assert completed.stdout.strip() == "rejected without waiting"
 
 
 def test_gene_selection_uses_population_variance_and_gene_name_ties() -> None:
