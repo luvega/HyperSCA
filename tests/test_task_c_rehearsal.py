@@ -8,6 +8,7 @@ from dataclasses import replace
 import os
 from pathlib import Path
 import subprocess
+import stat
 import sys
 import textwrap
 from types import MappingProxyType
@@ -23,6 +24,7 @@ from src.evaluation.task_c_rehearsal import (
     center_and_merge_allowed_contexts,
     choose_rehearsal_cells,
     choose_rehearsal_genes,
+    freeze_method_worker_entry,
     load_task_c_rehearsal_config,
     validate_private_scoring_command,
 )
@@ -864,41 +866,42 @@ def test_cross_context_merge_rejects_unsafe_or_inconsistent_inputs(
 
 
 @pytest.mark.parametrize(
-    "command_builder",
+    "argument_builder",
     [
-        lambda private, _alias, _cwd: ["python", "worker.py", str(private / "test.npz")],
-        lambda private, _alias, _cwd: [
-            "python",
-            "worker.py",
-            f"--input={private / 'test.npz'}",
-        ],
-        lambda private, _alias, _cwd: [
-            "python",
-            "worker.py",
-            f"-I{private / 'test.npz'}",
-        ],
+        lambda private, _alias, _cwd: [str(private / "test.npz")],
+        lambda private, _alias, _cwd: [f"--input={private / 'test.npz'}"],
+        lambda private, _alias, _cwd: [f"-I{private / 'test.npz'}"],
         lambda private, _alias, cwd: [
-            "python",
-            "worker.py",
-            os.path.relpath(private / "test.npz", cwd),
+            os.path.relpath(private / "test.npz", cwd)
         ],
-        lambda _private, alias, _cwd: ["python", "worker.py", str(alias / "test.npz")],
+        lambda _private, alias, _cwd: [str(alias / "test.npz")],
     ],
 )
 def test_method_command_cannot_receive_private_paths(
-    tmp_path: Path, command_builder
+    tmp_path: Path, argument_builder
 ) -> None:
     private_root = tmp_path / "private scoring data"
     private_root.mkdir()
     (private_root / "test.npz").write_bytes(b"private")
     alias = tmp_path / "innocent alias"
     alias.symlink_to(private_root, target_is_directory=True)
+    worker = tmp_path / "worker.py"
+    worker.write_text("# fixed worker\n", encoding="utf-8")
+    interpreter = Path(sys.executable).resolve(strict=True)
+    worker_snapshot = freeze_method_worker_entry(worker)
 
     with pytest.raises(TaskCRehearsalError, match="private scoring path"):
         validate_private_scoring_command(
-            command_builder(private_root, alias, tmp_path),
+            [
+                str(interpreter),
+                "-I",
+                str(worker),
+                *argument_builder(private_root, alias, tmp_path),
+            ],
             private_root=private_root,
             execution_cwd=tmp_path,
+            allowed_python_interpreters=(interpreter,),
+            allowed_worker_snapshots=(worker_snapshot,),
         )
 
 
@@ -936,12 +939,15 @@ def test_method_command_without_private_paths_is_accepted(tmp_path: Path) -> Non
     public_input = tmp_path / "public input.npz"
     worker = tmp_path / "worker.py"
     worker.write_text("# fixed worker\n", encoding="utf-8")
+    interpreter = Path(sys.executable).resolve(strict=True)
+    worker_snapshot = freeze_method_worker_entry(worker)
 
     validate_private_scoring_command(
-        ["python", str(worker), "--input", str(public_input)],
+        [str(interpreter), "-I", str(worker), "--input", str(public_input)],
         private_root=private_root,
         execution_cwd=tmp_path,
-        allowed_worker_paths=(worker,),
+        allowed_python_interpreters=(interpreter,),
+        allowed_worker_snapshots=(worker_snapshot,),
     )
 
 
@@ -972,19 +978,33 @@ def test_private_command_check_decodes_file_uri_and_uses_execution_cwd(
 ) -> None:
     private_root = tmp_path / "private scoring data"
     private_root.mkdir()
+    worker = tmp_path / "worker.py"
+    worker.write_text("# fixed worker\n", encoding="utf-8")
+    interpreter = Path(sys.executable).resolve(strict=True)
+    worker_snapshot = freeze_method_worker_entry(worker)
     encoded = "file://" + str(private_root / "sealed.npz").replace(" ", "%20")
     with pytest.raises(TaskCRehearsalError, match="private scoring path"):
         validate_private_scoring_command(
-            ["python", "worker.py", f"--input={encoded}"],
+            [str(interpreter), "-I", str(worker), f"--input={encoded}"],
             private_root=private_root,
             execution_cwd=tmp_path,
+            allowed_python_interpreters=(interpreter,),
+            allowed_worker_snapshots=(worker_snapshot,),
         )
 
     with pytest.raises(TaskCRehearsalError, match="private scoring path"):
         validate_private_scoring_command(
-            ["python", "worker.py", "--input", "private scoring data/sealed.npz"],
+            [
+                str(interpreter),
+                "-I",
+                str(worker),
+                "--input",
+                "private scoring data/sealed.npz",
+            ],
             private_root=private_root,
             execution_cwd=tmp_path,
+            allowed_python_interpreters=(interpreter,),
+            allowed_worker_snapshots=(worker_snapshot,),
         )
 
 
@@ -997,13 +1017,64 @@ def test_private_command_check_requires_registered_worker_when_requested(
     unregistered = tmp_path / "unregistered.py"
     registered.write_text("# registered\n", encoding="utf-8")
     unregistered.write_text("# unregistered\n", encoding="utf-8")
+    interpreter = Path(sys.executable).resolve(strict=True)
+    registered_snapshot = freeze_method_worker_entry(registered)
 
     with pytest.raises(TaskCRehearsalError, match="registered worker"):
         validate_private_scoring_command(
-            ["python", str(unregistered)],
+            [
+                str(interpreter),
+                "-I",
+                str(unregistered),
+                str(registered),
+            ],
             private_root=private_root,
             execution_cwd=tmp_path,
-            allowed_worker_paths=(registered,),
+            allowed_python_interpreters=(interpreter,),
+            allowed_worker_snapshots=(registered_snapshot,),
+        )
+
+
+def test_private_command_check_binds_entry_extension_and_frozen_identity(
+    tmp_path: Path,
+) -> None:
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    worker = tmp_path / "registered.py"
+    worker.write_text("# version one\n", encoding="utf-8")
+    snapshot = freeze_method_worker_entry(worker)
+    interpreter = Path(sys.executable).resolve(strict=True)
+
+    extensionless = tmp_path / "entry"
+    extensionless.write_text(worker.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(TaskCRehearsalError, match="Python worker entry"):
+        validate_private_scoring_command(
+            [str(interpreter), "-I", str(extensionless), str(worker)],
+            private_root=private_root,
+            execution_cwd=tmp_path,
+            allowed_python_interpreters=(interpreter,),
+            allowed_worker_snapshots=(snapshot,),
+        )
+
+    linked = tmp_path / "linked.py"
+    linked.symlink_to(worker)
+    with pytest.raises(TaskCRehearsalError, match="symbolic links"):
+        validate_private_scoring_command(
+            [str(interpreter), "-I", str(linked)],
+            private_root=private_root,
+            execution_cwd=tmp_path,
+            allowed_python_interpreters=(interpreter,),
+            allowed_worker_snapshots=(snapshot,),
+        )
+
+    worker.write_text("# changed after approval\n", encoding="utf-8")
+    with pytest.raises(TaskCRehearsalError, match="worker.*changed"):
+        validate_private_scoring_command(
+            [str(interpreter), "-I", str(worker)],
+            private_root=private_root,
+            execution_cwd=tmp_path,
+            allowed_python_interpreters=(interpreter,),
+            allowed_worker_snapshots=(snapshot,),
         )
 
 
@@ -1182,6 +1253,43 @@ def test_verified_source_snapshot_detects_a_change_before_import(tmp_path: Path)
 
     with pytest.raises(worker.ScoringContractError, match="changed"):
         worker.verify_causalbench_python_source(verified, frozen)
+
+
+def test_official_import_uses_read_only_snapshot_not_changed_live_checkout(
+    tmp_path: Path,
+) -> None:
+    source, revision = _fake_evaluation_source(tmp_path)
+    worker = _load_evaluation_worker()
+    boundary = worker._load_causalbench_boundary_module()
+    verified = boundary.validate_causalbench_source(source, revision)
+    live_evaluation = source / "causalscbench/evaluation/statistical_evaluation.py"
+    marker = tmp_path / "live-module-executed"
+    snapshot_path: Path | None = None
+
+    with worker.fixed_causalbench_source_snapshot(
+        verified, boundary
+    ) as (snapshot, frozen):
+        snapshot_path = snapshot
+        snapshot_evaluation = (
+            snapshot / "causalscbench/evaluation/statistical_evaluation.py"
+        )
+        assert stat.S_IMODE(snapshot.stat().st_mode) & stat.S_IWUSR == 0
+        assert stat.S_IMODE(snapshot_evaluation.stat().st_mode) & stat.S_IWUSR == 0
+        live_evaluation.write_text(
+            f"from pathlib import Path\nPath({str(marker)!r}).write_text('unsafe')\n",
+            encoding="utf-8",
+        )
+        with boundary._verified_causalbench_imports(snapshot):
+            module = importlib.import_module(
+                "causalscbench.evaluation.statistical_evaluation"
+            )
+            worker.verify_causalbench_python_source(snapshot, frozen)
+            worker.verify_loaded_causalbench_modules(snapshot, frozen)
+        assert Path(module.__file__).resolve().is_relative_to(snapshot)
+        assert not marker.exists()
+
+    assert snapshot_path is not None
+    assert not snapshot_path.exists()
 
 
 @pytest.mark.parametrize("mutation", ["during_import", "during_init"])

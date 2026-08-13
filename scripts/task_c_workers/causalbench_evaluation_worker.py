@@ -15,10 +15,12 @@ import math
 import os
 from pathlib import Path
 import secrets
+import shutil
 import site
 import stat
 import subprocess
 import sys
+import tempfile
 from typing import Any, Iterator, Sequence
 import unicodedata
 import zipfile
@@ -299,6 +301,76 @@ def freeze_causalbench_python_source(
             raise ScoringContractError("fixed CausalBench source file changed")
         frozen[relative] = (hashlib.sha256(committed).hexdigest(), identity)
     return frozen
+
+
+def _make_read_only_tree(root: Path) -> None:
+    directories = [root]
+    directories.extend(
+        path for path in root.rglob("*") if path.is_dir()
+    )
+    for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+        os.chmod(directory, 0o500, follow_symlinks=False)
+
+
+def _remove_private_snapshot(root: Path) -> None:
+    if not root.exists():
+        return
+    for directory, subdirectories, _files in os.walk(root, topdown=True):
+        os.chmod(directory, 0o700, follow_symlinks=False)
+        for name in subdirectories:
+            child = Path(directory) / name
+            if child.is_symlink():
+                raise ScoringContractError(
+                    "private CausalBench snapshot unexpectedly contains a symbolic link"
+                )
+    shutil.rmtree(root)
+
+
+@contextmanager
+def fixed_causalbench_source_snapshot(
+    source: Path, boundary: Any
+) -> Iterator[tuple[Path, dict[str, tuple[str, tuple[int, ...]]]]]:
+    """Loadable private copy made only from verified committed Python bytes."""
+
+    live_frozen = freeze_causalbench_python_source(source, boundary)
+    snapshot = Path(tempfile.mkdtemp(prefix="hypersca-causalbench-evaluation-"))
+    frozen: dict[str, tuple[str, tuple[int, ...]]] = {}
+    try:
+        for relative, (expected_hash, _live_identity) in live_frozen.items():
+            payload = _committed_blob(source, relative, boundary)
+            if hashlib.sha256(payload).hexdigest() != expected_hash:
+                raise ScoringContractError(
+                    "fixed CausalBench committed source changed"
+                )
+            destination = snapshot / relative
+            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                written = 0
+                while written < len(payload):
+                    written += os.write(descriptor, payload[written:])
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.chmod(destination, 0o400, follow_symlinks=False)
+            copied, identity = _source_file_snapshot(destination)
+            if copied != payload:
+                raise ScoringContractError(
+                    "private CausalBench snapshot content changed"
+                )
+            frozen[relative] = (expected_hash, identity)
+        _make_read_only_tree(snapshot)
+        verify_causalbench_python_source(snapshot, frozen)
+        yield snapshot, frozen
+    finally:
+        _remove_private_snapshot(snapshot)
 
 
 def verify_causalbench_python_source(
@@ -935,75 +1007,98 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             except SystemExit as exc:
                 raise ScoringContractError(str(exc)) from exc
-            frozen_source = freeze_causalbench_python_source(source, boundary)
             import numpy as np
 
-            verify_causalbench_python_source(source, frozen_source)
-            with boundary._verified_causalbench_imports(source):
-                evaluation_module = importlib.import_module(
-                    "causalscbench.evaluation.statistical_evaluation"
-                )
-                boundary._assert_causalbench_modules_are_verified(source)
-                verify_causalbench_python_source(source, frozen_source)
-                verify_loaded_causalbench_modules(source, frozen_source)
-                prediction_payload, prediction_inode = _snapshot(
-                    args.prediction_csv,
-                    "prediction CSV",
-                    MAXIMUM_PREDICTION_BYTES,
-                )
-                heldout_payload, heldout_inode = _snapshot(
-                    args.heldout_npz,
-                    "heldout NPZ",
-                    MAXIMUM_HELDOUT_BYTES,
-                )
-                if prediction_inode == heldout_inode:
-                    raise ScoringContractError(
-                        "prediction and heldout inputs must be separate files"
+            with fixed_causalbench_source_snapshot(
+                source, boundary
+            ) as (snapshot_source, frozen_source):
+                with boundary._verified_causalbench_imports(snapshot_source):
+                    evaluation_module = importlib.import_module(
+                        "causalscbench.evaluation.statistical_evaluation"
                     )
-                expression, interventions, genes = load_heldout_npz(
-                    heldout_payload, np
-                )
-                predictions = load_predictions(prediction_payload, genes)
-                eligible_sources = set(interventions.tolist()) - {
-                    CONTROL_LABEL,
-                    EXCLUDED_LABEL,
-                }
-                ordered_edges = [
-                    (source_name, target_name)
-                    for source_name, target_name, _score, _returned in sorted(
-                        (
-                            relation
-                            for relation in predictions
-                            if relation[0] in eligible_sources and relation[3]
-                        ),
-                        key=lambda relation: (
-                            -relation[2],
-                            relation[0],
-                            relation[1],
-                        ),
+                    boundary._assert_causalbench_modules_are_verified(
+                        snapshot_source
                     )
-                ]
-                verify_causalbench_python_source(source, frozen_source)
-                verify_loaded_causalbench_modules(source, frozen_source)
-                evaluator = evaluation_module.Evaluator(
-                    expression,
-                    interventions,
-                    list(genes),
+                    verify_causalbench_python_source(
+                        snapshot_source, frozen_source
+                    )
+                    verify_loaded_causalbench_modules(
+                        snapshot_source, frozen_source
+                    )
+                    prediction_payload, prediction_inode = _snapshot(
+                        args.prediction_csv,
+                        "prediction CSV",
+                        MAXIMUM_PREDICTION_BYTES,
+                    )
+                    heldout_payload, heldout_inode = _snapshot(
+                        args.heldout_npz,
+                        "heldout NPZ",
+                        MAXIMUM_HELDOUT_BYTES,
+                    )
+                    if prediction_inode == heldout_inode:
+                        raise ScoringContractError(
+                            "prediction and heldout inputs must be separate files"
+                        )
+                    expression, interventions, genes = load_heldout_npz(
+                        heldout_payload, np
+                    )
+                    predictions = load_predictions(prediction_payload, genes)
+                    eligible_sources = set(interventions.tolist()) - {
+                        CONTROL_LABEL,
+                        EXCLUDED_LABEL,
+                    }
+                    ordered_edges = [
+                        (source_name, target_name)
+                        for source_name, target_name, _score, _returned in sorted(
+                            (
+                                relation
+                                for relation in predictions
+                                if relation[0] in eligible_sources and relation[3]
+                            ),
+                            key=lambda relation: (
+                                -relation[2],
+                                relation[0],
+                                relation[1],
+                            ),
+                        )
+                    ]
+                    verify_causalbench_python_source(
+                        snapshot_source, frozen_source
+                    )
+                    verify_loaded_causalbench_modules(
+                        snapshot_source, frozen_source
+                    )
+                    evaluator = evaluation_module.Evaluator(
+                        expression,
+                        interventions,
+                        list(genes),
+                    )
+                    verify_causalbench_python_source(
+                        snapshot_source, frozen_source
+                    )
+                    verify_loaded_causalbench_modules(
+                        snapshot_source, frozen_source
+                    )
+                    raw_metrics = evaluator.evaluate_network(
+                        ordered_edges,
+                        max_path_length=1,
+                        check_false_omission_rate=False,
+                        omission_estimation_size=0,
+                        seed=seed,
+                    )
+                    boundary._assert_causalbench_modules_are_verified(
+                        snapshot_source
+                    )
+                    verify_causalbench_python_source(
+                        snapshot_source, frozen_source
+                    )
+                    verify_loaded_causalbench_modules(
+                        snapshot_source, frozen_source
+                    )
+                metrics = make_json_safe(raw_metrics, np)
+                verify_causalbench_python_source(
+                    snapshot_source, frozen_source
                 )
-                verify_causalbench_python_source(source, frozen_source)
-                verify_loaded_causalbench_modules(source, frozen_source)
-                raw_metrics = evaluator.evaluate_network(
-                    ordered_edges,
-                    max_path_length=1,
-                    check_false_omission_rate=False,
-                    omission_estimation_size=0,
-                    seed=seed,
-                )
-                boundary._assert_causalbench_modules_are_verified(source)
-                verify_causalbench_python_source(source, frozen_source)
-                verify_loaded_causalbench_modules(source, frozen_source)
-            metrics = make_json_safe(raw_metrics, np)
-            verify_causalbench_python_source(source, frozen_source)
         payload = {
             "schema_version": "1.0",
             "status": "supplementary_official_metrics",

@@ -38,6 +38,7 @@ from src.evaluation.task_c_profile_input import (
 MAXIMUM_CONFIG_BYTES = 64 * 1024
 MAXIMUM_JSON_DEPTH = 16
 MAXIMUM_SEED = 2**32 - 1
+MAXIMUM_METHOD_WORKER_BYTES = 4 * 1024 * 1024
 CONTROL_LABEL = "non-targeting"
 
 FEATURE_SELECTION = "common_expression_genes_train_control_variance_v1"
@@ -92,6 +93,15 @@ _FULL_RUN_SEEDS = (11, 23, 47, 71, 97)
 
 class TaskCRehearsalError(ValueError):
     """The rehearsal rule or supplied research data are not safe to use."""
+
+
+@dataclass(frozen=True, slots=True)
+class MethodWorkerEntrySnapshot:
+    """Identity of the one reviewed Python file allowed to start a method."""
+
+    path: Path
+    sha256: str
+    identity: tuple[int, ...]
 
 
 def _fixed_positive_integer(value: object, label: str) -> int:
@@ -927,12 +937,147 @@ def _real_execution_directory(path: str | Path) -> Path:
     return directory.resolve(strict=True)
 
 
+def _method_worker_bytes(path: str | Path) -> tuple[Path, bytes, tuple[int, ...]]:
+    try:
+        absolute = Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+    except (TypeError, ValueError, OSError) as exc:
+        raise TaskCRehearsalError(
+            "method worker entry must be a real regular file"
+        ) from exc
+    cursor = Path(absolute.anchor)
+    try:
+        for component in absolute.parts[1:]:
+            cursor /= component
+            metadata = os.lstat(cursor)
+            if stat.S_ISLNK(metadata.st_mode):
+                raise TaskCRehearsalError(
+                    "method worker entry must not use symbolic links"
+                )
+        descriptor = os.open(
+            absolute,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except TaskCRehearsalError:
+        raise
+    except OSError as exc:
+        raise TaskCRehearsalError(
+            "method worker entry must be a real regular file"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size <= 0
+            or before.st_size > MAXIMUM_METHOD_WORKER_BYTES
+        ):
+            raise TaskCRehearsalError(
+                "method worker entry must be a single-link regular file"
+            )
+        collected = bytearray()
+        while len(collected) <= MAXIMUM_METHOD_WORKER_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(
+                    1024 * 1024,
+                    MAXIMUM_METHOD_WORKER_BYTES + 1 - len(collected),
+                ),
+            )
+            if not chunk:
+                break
+            collected.extend(chunk)
+        after = os.fstat(descriptor)
+    except TaskCRehearsalError:
+        raise
+    except OSError as exc:
+        raise TaskCRehearsalError(
+            "method worker entry could not be read safely"
+        ) from exc
+    finally:
+        os.close(descriptor)
+    try:
+        current = os.lstat(absolute)
+    except OSError as exc:
+        raise TaskCRehearsalError("method worker entry changed") from exc
+    if (
+        len(collected) != before.st_size
+        or len(collected) > MAXIMUM_METHOD_WORKER_BYTES
+        or _file_identity(before) != _file_identity(after)
+        or _file_identity(after) != _file_identity(current)
+    ):
+        raise TaskCRehearsalError("method worker entry changed")
+    return absolute.resolve(strict=True), bytes(collected), _file_identity(after)
+
+
+def freeze_method_worker_entry(path: str | Path) -> MethodWorkerEntrySnapshot:
+    """Record the reviewed method entry before the launch-boundary check."""
+
+    resolved, payload, identity = _method_worker_bytes(path)
+    if resolved.suffix.casefold() != ".py":
+        raise TaskCRehearsalError("method entry must be a Python worker entry")
+    return MethodWorkerEntrySnapshot(
+        path=resolved,
+        sha256=hashlib.sha256(payload).hexdigest(),
+        identity=identity,
+    )
+
+
+def _verify_method_worker_entry(
+    path: Path, snapshot: MethodWorkerEntrySnapshot
+) -> None:
+    resolved, payload, identity = _method_worker_bytes(path)
+    if (
+        resolved != snapshot.path
+        or hashlib.sha256(payload).hexdigest() != snapshot.sha256
+        or identity != snapshot.identity
+    ):
+        raise TaskCRehearsalError("registered method worker entry changed")
+
+
+def _normalized_python_interpreters(
+    values: Sequence[str | Path] | None,
+) -> set[Path]:
+    if values is None or isinstance(values, (str, bytes)) or not isinstance(
+        values, Sequence
+    ):
+        raise TaskCRehearsalError(
+            "allowed Python interpreters must be an ordered path list"
+        )
+    allowed: set[Path] = set()
+    for value in values:
+        if not isinstance(value, (str, Path)):
+            raise TaskCRehearsalError(
+                "allowed Python interpreters must be an ordered path list"
+            )
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            raise TaskCRehearsalError(
+                "allowed Python interpreter paths must be absolute"
+            )
+        try:
+            resolved = candidate.resolve(strict=True)
+            metadata = os.stat(resolved, follow_symlinks=False)
+        except OSError as exc:
+            raise TaskCRehearsalError(
+                "allowed Python interpreter must be a real regular file"
+            ) from exc
+        if not stat.S_ISREG(metadata.st_mode):
+            raise TaskCRehearsalError(
+                "allowed Python interpreter must be a real regular file"
+            )
+        allowed.add(resolved)
+    if not allowed:
+        raise TaskCRehearsalError("allowed Python interpreters must not be empty")
+    return allowed
+
+
 def validate_private_scoring_command(
     command: Sequence[str],
     *,
     private_root: str | Path,
     execution_cwd: str | Path | None = None,
-    allowed_worker_paths: Sequence[str | Path] | None = None,
+    allowed_python_interpreters: Sequence[str | Path] | None = None,
+    allowed_worker_snapshots: Sequence[MethodWorkerEntrySnapshot] | None = None,
 ) -> None:
     """Prove that a method process receives no path into sealed scoring data.
 
@@ -977,55 +1122,72 @@ def validate_private_scoring_command(
             "method command must not use a shell or environment wrapper"
         )
     if first_name.startswith("python") or first_name.startswith("pypy"):
-        def dynamic_short_option(argument: str) -> bool:
-            if not argument.startswith("-") or argument.startswith("--"):
-                return False
-            option = argument
-            for separator in ("/", "\\", "="):
-                option = option.split(separator, 1)[0]
-            return any(flag in option[1:] for flag in ("c", "m"))
-
-        if any(
-            dynamic_short_option(argument)
-            for argument in arguments[1:]
+        if len(arguments) > 1 and (
+            arguments[1] in {"-c", "-m"}
+            or arguments[1].startswith("-c")
+            or arguments[1].startswith("-m")
         ):
             raise TaskCRehearsalError(
                 "method command must not use dynamic Python execution"
             )
-
-    allowed: set[Path] | None = None
-    if allowed_worker_paths is not None:
-        if isinstance(allowed_worker_paths, (str, bytes)) or not isinstance(
-            allowed_worker_paths, Sequence
-        ):
+    allowed_interpreters = _normalized_python_interpreters(
+        allowed_python_interpreters
+    )
+    try:
+        interpreter = Path(arguments[0]).expanduser()
+        if not interpreter.is_absolute():
             raise TaskCRehearsalError(
-                "allowed workers must be an ordered path list"
+                "method command must use a registered absolute Python interpreter"
             )
-        allowed = set()
-        for raw_path in allowed_worker_paths:
-            if not isinstance(raw_path, (str, Path)):
-                raise TaskCRehearsalError(
-                    "allowed workers must be an ordered path list"
-                )
-            worker_path = Path(raw_path).expanduser()
-            if not worker_path.is_absolute():
-                worker_path = cwd / worker_path
-            try:
-                metadata = os.lstat(worker_path)
-                resolved_worker = worker_path.resolve(strict=True)
-            except OSError as exc:
-                raise TaskCRehearsalError(
-                    "allowed worker must be a real regular file"
-                ) from exc
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-                raise TaskCRehearsalError(
-                    "allowed worker must be a real regular file"
-                )
-            allowed.add(resolved_worker)
-        if not allowed:
-            raise TaskCRehearsalError("allowed workers must not be empty")
+        interpreter = interpreter.resolve(strict=True)
+    except OSError as exc:
+        raise TaskCRehearsalError(
+            "method command Python interpreter is unavailable"
+        ) from exc
+    if interpreter not in allowed_interpreters:
+        raise TaskCRehearsalError(
+            "method command must use a registered Python interpreter"
+        )
+    if len(arguments) < 3 or arguments[1] != "-I":
+        raise TaskCRehearsalError(
+            "method command must use the fixed 'python -I worker.py' form"
+        )
+    worker_entry = Path(arguments[2]).expanduser()
+    if worker_entry.suffix.casefold() != ".py":
+        raise TaskCRehearsalError(
+            "method command needs a registered Python worker entry"
+        )
+    if not worker_entry.is_absolute():
+        worker_entry = cwd / worker_entry
+    requested_worker_entry = worker_entry
+    worker_entry, _initial_payload, _initial_identity = _method_worker_bytes(
+        requested_worker_entry
+    )
+    if (
+        allowed_worker_snapshots is None
+        or isinstance(allowed_worker_snapshots, (str, bytes))
+        or not isinstance(allowed_worker_snapshots, Sequence)
+        or not allowed_worker_snapshots
+        or any(
+            type(snapshot) is not MethodWorkerEntrySnapshot
+            for snapshot in allowed_worker_snapshots
+        )
+    ):
+        raise TaskCRehearsalError(
+            "allowed workers must use frozen entry snapshots"
+        )
+    snapshots_by_path: dict[Path, MethodWorkerEntrySnapshot] = {}
+    for snapshot in allowed_worker_snapshots:
+        if snapshot.path in snapshots_by_path:
+            raise TaskCRehearsalError(
+                "allowed worker snapshots must contain unique entries"
+            )
+        snapshots_by_path[snapshot.path] = snapshot
+    if worker_entry not in snapshots_by_path:
+        raise TaskCRehearsalError(
+            "method command does not use a registered worker entry"
+        )
 
-    observed_workers: set[Path] = set()
     private_text = os.fspath(private)
     for argument in arguments:
         for candidate_text in _command_path_candidates(argument):
@@ -1051,13 +1213,7 @@ def validate_private_scoring_command(
                 raise TaskCRehearsalError(
                     "method command contains a private scoring path"
                 )
-            if allowed is not None and candidate_text.casefold().endswith(".py"):
-                observed_workers.add(resolved)
-                if resolved not in allowed:
-                    raise TaskCRehearsalError(
-                        "method command does not use a registered worker"
-                    )
-    if allowed is not None and not (observed_workers & allowed):
-        raise TaskCRehearsalError(
-            "method command does not use a registered worker"
-        )
+    _verify_method_worker_entry(
+        requested_worker_entry,
+        snapshots_by_path[worker_entry],
+    )
