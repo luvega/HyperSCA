@@ -138,10 +138,9 @@ def test_prediction_table_requires_exactly_the_three_contract_columns(
         ("A", "B "),
         (unicodedata.normalize("NFD", "É"), "B"),
         ("A", "Z"),
-        ("A", "A"),
     ],
 )
-def test_relation_endpoints_must_be_known_canonical_strings_without_self_loops(
+def test_relation_endpoints_must_be_known_canonical_strings(
     source: object,
     target: object,
 ) -> None:
@@ -149,6 +148,25 @@ def test_relation_endpoints_must_be_known_canonical_strings_without_self_loops(
 
     with pytest.raises(TaskCPredictionError):
         normalize_task_c_predictions(raw, ["A", "B", "É"])
+
+
+def test_self_relations_are_excluded_without_losing_valid_relations() -> None:
+    raw = pd.DataFrame(
+        {
+            "source": ["A", "A"],
+            "target": ["A", "B"],
+            "score": [0.9, 0.4],
+        }
+    )
+
+    completed = normalize_task_c_predictions(raw, ["A", "B"])
+
+    assert list(zip(completed["source"], completed["target"], strict=True)) == [
+        ("A", "B"),
+        ("B", "A"),
+    ]
+    assert completed["score"].tolist() == pytest.approx([0.4, 0.0])
+    assert completed["returned_by_method"].tolist() == [True, False]
 
 
 @pytest.mark.parametrize(

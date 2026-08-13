@@ -96,8 +96,6 @@ def normalize_task_c_predictions(
         raise TaskCPredictionError(
             "prediction table contains a gene outside the fixed gene set"
         )
-    if any(source == target for source, target in zip(sources, targets, strict=True)):
-        raise TaskCPredictionError("self-relations are not part of the scoring range")
     scores = _validated_scores(raw["score"].tolist())
 
     selected = pd.DataFrame(
@@ -106,6 +104,9 @@ def normalize_task_c_predictions(
             "target": pd.array(targets, dtype="string"),
             "score": scores,
         }
+    )
+    selected = selected[selected["source"] != selected["target"]].reset_index(
+        drop=True
     )
     selected = selected.groupby(
         ["source", "target"], as_index=False, sort=False
