@@ -552,12 +552,25 @@ def _verified_causalbench_imports(source: Path) -> Any:
     for name in previous_modules:
         sys.modules.pop(name, None)
 
+    def normalized(entry: str) -> Path:
+        return Path(entry or os.getcwd()).expanduser().resolve(strict=False)
+
     user_site = site.getusersitepackages()
-    user_sites = {user_site} if isinstance(user_site, str) else set(user_site)
-    injected = set(os.environ.get("PYTHONPATH", "").split(os.pathsep))
+    user_sites = (
+        {normalized(user_site)}
+        if isinstance(user_site, str)
+        else {normalized(entry) for entry in user_site}
+    )
+    injected = {
+        normalized(entry)
+        for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+        if entry
+    }
     clean_path: list[str] = []
     for entry in previous_path:
-        candidate = entry or os.getcwd()
+        if not entry or not Path(entry).is_absolute():
+            continue
+        candidate = normalized(entry)
         if candidate in user_sites or candidate in injected:
             continue
         clean_path.append(entry)

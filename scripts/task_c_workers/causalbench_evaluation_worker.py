@@ -6,6 +6,7 @@ import argparse
 from collections.abc import Mapping
 from contextlib import contextmanager
 import csv
+import hashlib
 import importlib
 import importlib.util
 import io
@@ -16,6 +17,7 @@ from pathlib import Path
 import secrets
 import site
 import stat
+import subprocess
 import sys
 from typing import Any, Iterator, Sequence
 import unicodedata
@@ -105,18 +107,28 @@ def _clean_python_environment() -> Iterator[None]:
     previous_path = list(sys.path)
     names = ("PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE", "PYTHONNOUSERSITE")
     previous_environment = {name: os.environ.get(name) for name in names}
+
+    def normalized(entry: str) -> Path:
+        return Path(entry or os.getcwd()).expanduser().resolve(strict=False)
+
     injected = {
-        entry
+        normalized(entry)
         for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep)
         if entry
     }
     user_site = site.getusersitepackages()
-    user_sites = {user_site} if isinstance(user_site, str) else set(user_site)
+    user_sites = (
+        {normalized(user_site)}
+        if isinstance(user_site, str)
+        else {normalized(entry) for entry in user_site}
+    )
     sys.path[:] = [
         entry
         for entry in previous_path
-        if (entry or os.getcwd()) not in injected
-        and (entry or os.getcwd()) not in user_sites
+        if entry
+        and Path(entry).is_absolute()
+        and normalized(entry) not in injected
+        and normalized(entry) not in user_sites
     ]
     for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE"):
         os.environ.pop(name, None)
@@ -190,10 +202,171 @@ def _snapshot(path: Path, label: str, maximum_bytes: int) -> tuple[bytes, tuple[
     return bytes(payload), (int(after.st_dev), int(after.st_ino))
 
 
-def _canonical_text_vector(values: Any, name: str, np: Any) -> tuple[str, ...]:
+def _source_file_snapshot(path: Path) -> tuple[bytes, tuple[int, ...]]:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(absolute, flags)
+    except OSError as exc:
+        raise ScoringContractError("fixed CausalBench source file changed") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size < 0
+            or before.st_size > MAXIMUM_PREDICTION_BYTES
+        ):
+            raise ScoringContractError("fixed CausalBench source file changed")
+        payload = bytearray()
+        while len(payload) <= MAXIMUM_PREDICTION_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(
+                    1024 * 1024,
+                    MAXIMUM_PREDICTION_BYTES + 1 - len(payload),
+                ),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+        after = os.fstat(descriptor)
+    except ScoringContractError:
+        raise
+    except OSError as exc:
+        raise ScoringContractError("fixed CausalBench source file changed") from exc
+    finally:
+        os.close(descriptor)
+    try:
+        current = os.lstat(absolute)
+    except OSError as exc:
+        raise ScoringContractError("fixed CausalBench source file changed") from exc
+    if (
+        len(payload) != before.st_size
+        or len(payload) > MAXIMUM_PREDICTION_BYTES
+        or _identity(before) != _identity(after)
+        or _identity(after) != _identity(current)
+    ):
+        raise ScoringContractError("fixed CausalBench source file changed")
+    return bytes(payload), _identity(after)
+
+
+def _committed_blob(source: Path, relative: str, boundary: Any) -> bytes:
+    environment = boundary._git_environment()
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "--no-replace-objects",
+                "-C",
+                str(source),
+                "show",
+                f"HEAD:{relative}",
+            ],
+            check=True,
+            capture_output=True,
+            env=environment,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ScoringContractError(
+            "fixed CausalBench committed source could not be read"
+        ) from exc
+    return bytes(completed.stdout)
+
+
+def freeze_causalbench_python_source(
+    source: Path, boundary: Any
+) -> dict[str, tuple[str, tuple[int, ...]]]:
+    """Bind every tracked CausalBench Python file to its committed bytes."""
+
+    try:
+        tracked = boundary._git(source, "ls-files", "causalscbench").splitlines()
+    except SystemExit as exc:
+        raise ScoringContractError(str(exc)) from exc
+    relatives = sorted(relative for relative in tracked if relative.endswith(".py"))
+    evaluation_relative = "causalscbench/evaluation/statistical_evaluation.py"
+    if evaluation_relative not in relatives:
+        raise ScoringContractError("fixed CausalBench evaluation module is missing")
+    frozen: dict[str, tuple[str, tuple[int, ...]]] = {}
+    for relative in relatives:
+        lexical = Path(relative)
+        if lexical.is_absolute() or ".." in lexical.parts:
+            raise ScoringContractError("fixed CausalBench source inventory is unsafe")
+        path = source / lexical
+        payload, identity = _source_file_snapshot(path)
+        committed = _committed_blob(source, relative, boundary)
+        if payload != committed:
+            raise ScoringContractError("fixed CausalBench source file changed")
+        frozen[relative] = (hashlib.sha256(committed).hexdigest(), identity)
+    return frozen
+
+
+def verify_causalbench_python_source(
+    source: Path,
+    frozen: Mapping[str, tuple[str, tuple[int, ...]]],
+) -> None:
+    """Reject content, inode or metadata changes after source verification."""
+
+    for relative, expected in frozen.items():
+        payload, identity = _source_file_snapshot(source / relative)
+        if hashlib.sha256(payload).hexdigest() != expected[0] or identity != expected[1]:
+            raise ScoringContractError("fixed CausalBench source file changed")
+
+
+def verify_loaded_causalbench_modules(
+    source: Path,
+    frozen: Mapping[str, tuple[str, tuple[int, ...]]],
+) -> None:
+    """Require imported CausalBench modules to be tracked frozen Python files."""
+
+    found_evaluation = False
+    for name, module in tuple(sys.modules.items()):
+        if name != "causalscbench" and not name.startswith("causalscbench."):
+            continue
+        filename = getattr(module, "__file__", None)
+        if type(filename) is not str:
+            raise ScoringContractError("loaded CausalBench module has no fixed source file")
+        try:
+            module_path = Path(filename).resolve(strict=True)
+            relative = module_path.relative_to(source).as_posix()
+        except (OSError, ValueError) as exc:
+            raise ScoringContractError(
+                "loaded CausalBench module left the fixed source"
+            ) from exc
+        if relative not in frozen:
+            raise ScoringContractError(
+                "loaded CausalBench module is not a tracked fixed Python file"
+            )
+        payload, identity = _source_file_snapshot(module_path)
+        expected_hash, expected_identity = frozen[relative]
+        if (
+            hashlib.sha256(payload).hexdigest() != expected_hash
+            or identity != expected_identity
+        ):
+            raise ScoringContractError("loaded CausalBench module source changed")
+        if name == "causalscbench.evaluation.statistical_evaluation":
+            found_evaluation = True
+    if not found_evaluation:
+        raise ScoringContractError("fixed CausalBench evaluation module was not loaded")
+
+
+def _canonical_text_vector(
+    values: Any,
+    name: str,
+    np: Any,
+    *,
+    expected_length: int,
+    maximum_length: int,
+) -> tuple[str, ...]:
     array = np.asarray(values)
     if array.ndim != 1 or array.dtype.kind not in {"U", "S"}:
         raise ScoringContractError(f"{name} must be a one-dimensional text array")
+    if (
+        array.shape[0] != expected_length
+        or array.shape[0] > maximum_length
+        or array.dtype.itemsize <= 0
+    ):
+        raise ScoringContractError(f"{name} shapes do not match the heldout data")
     if array.dtype.kind == "S":
         try:
             items = tuple(
@@ -211,6 +384,10 @@ def _canonical_text_vector(values: Any, name: str, np: Any) -> tuple[str, ...]:
             raise ScoringContractError(f"{name} must use NFC text")
         if any(ord(character) < 32 or ord(character) == 127 for character in item):
             raise ScoringContractError(f"{name} contains a control character")
+        if item[0] in "=+-@":
+            raise ScoringContractError(
+                f"{name} must not begin with a spreadsheet formula marker"
+            )
         try:
             item_bytes = len(item.encode("utf-8", errors="strict"))
         except UnicodeError as exc:
@@ -291,12 +468,31 @@ def load_heldout_npz(payload: bytes, np: Any) -> tuple[Any, Any, tuple[str, ...]
         raise ScoringContractError("heldout expression must contain numeric values")
     if not np.all(np.isfinite(expression)):
         raise ScoringContractError("heldout expression must contain finite values")
-    interventions = _canonical_text_vector(
-        interventions_raw, "heldout intervention labels", np
-    )
-    genes = _canonical_text_vector(genes_raw, "heldout gene names", np)
-    if len(interventions) != cells or len(genes) != gene_count:
+    if interventions_raw.ndim != 1 or genes_raw.ndim != 1:
         raise ScoringContractError("heldout array shapes do not agree")
+    if interventions_raw.shape[0] != cells or genes_raw.shape[0] != gene_count:
+        raise ScoringContractError("heldout array shapes do not agree")
+    if interventions_raw.dtype.kind not in {"U", "S"} or genes_raw.dtype.kind not in {
+        "U",
+        "S",
+    }:
+        raise ScoringContractError("heldout text arrays must contain strings")
+    if interventions_raw.dtype.itemsize <= 0 or genes_raw.dtype.itemsize <= 0:
+        raise ScoringContractError("heldout text arrays have an invalid width")
+    interventions = _canonical_text_vector(
+        interventions_raw,
+        "heldout intervention labels",
+        np,
+        expected_length=cells,
+        maximum_length=MAXIMUM_CELLS,
+    )
+    genes = _canonical_text_vector(
+        genes_raw,
+        "heldout gene names",
+        np,
+        expected_length=gene_count,
+        maximum_length=MAXIMUM_GENES,
+    )
     if len(set(genes)) != len(genes):
         raise ScoringContractError("heldout gene names must be unique")
     eligible_sources = set(interventions) - {CONTROL_LABEL, EXCLUDED_LABEL}
@@ -329,7 +525,9 @@ def _canonical_endpoint(value: str, genes: set[str]) -> str:
     return value
 
 
-def load_predictions(payload: bytes, genes: Sequence[str]) -> list[tuple[str, str, float]]:
+def load_predictions(
+    payload: bytes, genes: Sequence[str]
+) -> list[tuple[str, str, float, bool]]:
     try:
         decoded = payload.decode("utf-8", errors="strict")
         rows = csv.reader(io.StringIO(decoded, newline=""), strict=True)
@@ -347,7 +545,7 @@ def load_predictions(payload: bytes, genes: Sequence[str]) -> list[tuple[str, st
     has_returned = len(header) == 4
     gene_set = set(genes)
     relations: set[tuple[str, str]] = set()
-    parsed: list[tuple[str, str, float]] = []
+    parsed: list[tuple[str, str, float, bool]] = []
     expected_count = len(genes) * (len(genes) - 1)
     try:
         for row in rows:
@@ -383,8 +581,11 @@ def load_predictions(payload: bytes, genes: Sequence[str]) -> list[tuple[str, st
                     raise ScoringContractError(
                         "unreturned relations must use positive zero scores"
                     )
+                returned = row[3] == "True"
+            else:
+                returned = True
             relations.add(relation)
-            parsed.append((source, target, score))
+            parsed.append((source, target, score, returned))
             if len(parsed) > expected_count:
                 raise ScoringContractError(
                     "prediction CSV contains more than the complete relation set"
@@ -717,6 +918,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         validate_output_destination(args.output_json)
         seed = _fixed_seed(args.seed)
+        if sys.flags.isolated != 1:
+            message = "real sealed scoring requires isolated Python: run with python -I"
+            write_json_new(
+                args.output_json,
+                _failure_payload("failed_runtime_unavailable", seed, message),
+            )
+            print(f"failed_runtime_unavailable: {message}", file=sys.stderr)
+            return 1
         boundary = _load_causalbench_boundary_module()
         with _clean_python_environment():
             try:
@@ -726,51 +935,63 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             except SystemExit as exc:
                 raise ScoringContractError(str(exc)) from exc
+            frozen_source = freeze_causalbench_python_source(source, boundary)
             import numpy as np
 
-            prediction_payload, prediction_inode = _snapshot(
-                args.prediction_csv,
-                "prediction CSV",
-                MAXIMUM_PREDICTION_BYTES,
-            )
-            heldout_payload, heldout_inode = _snapshot(
-                args.heldout_npz,
-                "heldout NPZ",
-                MAXIMUM_HELDOUT_BYTES,
-            )
-            if prediction_inode == heldout_inode:
-                raise ScoringContractError(
-                    "prediction and heldout inputs must be separate files"
-                )
-            expression, interventions, genes = load_heldout_npz(
-                heldout_payload, np
-            )
-            predictions = load_predictions(prediction_payload, genes)
-            eligible_sources = set(interventions.tolist()) - {
-                CONTROL_LABEL,
-                EXCLUDED_LABEL,
-            }
-            ordered_edges = [
-                (source_name, target_name)
-                for source_name, target_name, _score in sorted(
-                    (
-                        relation
-                        for relation in predictions
-                        if relation[0] in eligible_sources
-                    ),
-                    key=lambda relation: (-relation[2], relation[0], relation[1]),
-                )
-            ]
+            verify_causalbench_python_source(source, frozen_source)
             with boundary._verified_causalbench_imports(source):
                 evaluation_module = importlib.import_module(
                     "causalscbench.evaluation.statistical_evaluation"
                 )
                 boundary._assert_causalbench_modules_are_verified(source)
+                verify_causalbench_python_source(source, frozen_source)
+                verify_loaded_causalbench_modules(source, frozen_source)
+                prediction_payload, prediction_inode = _snapshot(
+                    args.prediction_csv,
+                    "prediction CSV",
+                    MAXIMUM_PREDICTION_BYTES,
+                )
+                heldout_payload, heldout_inode = _snapshot(
+                    args.heldout_npz,
+                    "heldout NPZ",
+                    MAXIMUM_HELDOUT_BYTES,
+                )
+                if prediction_inode == heldout_inode:
+                    raise ScoringContractError(
+                        "prediction and heldout inputs must be separate files"
+                    )
+                expression, interventions, genes = load_heldout_npz(
+                    heldout_payload, np
+                )
+                predictions = load_predictions(prediction_payload, genes)
+                eligible_sources = set(interventions.tolist()) - {
+                    CONTROL_LABEL,
+                    EXCLUDED_LABEL,
+                }
+                ordered_edges = [
+                    (source_name, target_name)
+                    for source_name, target_name, _score, _returned in sorted(
+                        (
+                            relation
+                            for relation in predictions
+                            if relation[0] in eligible_sources and relation[3]
+                        ),
+                        key=lambda relation: (
+                            -relation[2],
+                            relation[0],
+                            relation[1],
+                        ),
+                    )
+                ]
+                verify_causalbench_python_source(source, frozen_source)
+                verify_loaded_causalbench_modules(source, frozen_source)
                 evaluator = evaluation_module.Evaluator(
                     expression,
                     interventions,
                     list(genes),
                 )
+                verify_causalbench_python_source(source, frozen_source)
+                verify_loaded_causalbench_modules(source, frozen_source)
                 raw_metrics = evaluator.evaluate_network(
                     ordered_edges,
                     max_path_length=1,
@@ -779,7 +1000,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     seed=seed,
                 )
                 boundary._assert_causalbench_modules_are_verified(source)
+                verify_causalbench_python_source(source, frozen_source)
+                verify_loaded_causalbench_modules(source, frozen_source)
             metrics = make_json_safe(raw_metrics, np)
+            verify_causalbench_python_source(source, frozen_source)
         payload = {
             "schema_version": "1.0",
             "status": "supplementary_official_metrics",

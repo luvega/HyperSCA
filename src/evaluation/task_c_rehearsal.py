@@ -17,10 +17,12 @@ import json
 import math
 import os
 from pathlib import Path
+import shlex
 import stat
 from types import MappingProxyType
 from typing import Any
 import unicodedata
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 
@@ -873,21 +875,64 @@ def _real_private_directory(private_root: str | Path) -> Path:
     return private.resolve(strict=True)
 
 
+def _decoded_command_text(value: str) -> str:
+    decoded = value
+    for _ in range(3):
+        expanded = unquote(decoded)
+        if expanded == decoded:
+            break
+        decoded = expanded
+    parsed = urlparse(decoded)
+    if parsed.scheme.casefold() == "file":
+        if parsed.netloc not in {"", "localhost"}:
+            raise TaskCRehearsalError(
+                "method command contains an unsupported file location"
+            )
+        return unquote(parsed.path)
+    return decoded
+
+
 def _command_path_candidates(argument: str) -> tuple[str, ...]:
     candidates = [argument]
     if "=" in argument:
         candidates.append(argument.split("=", 1)[1])
     if argument.startswith("-") and not argument.startswith("--") and len(argument) > 2:
         candidates.append(argument[2:])
-    if argument.startswith("file://"):
-        candidates.append(argument.removeprefix("file://"))
-    return tuple(dict.fromkeys(candidate for candidate in candidates if candidate))
+    try:
+        candidates.extend(shlex.split(argument, posix=True))
+    except ValueError as exc:
+        raise TaskCRehearsalError(
+            "method command contains unmatched quoting"
+        ) from exc
+    decoded = [_decoded_command_text(candidate.strip("'\"")) for candidate in candidates]
+    return tuple(dict.fromkeys(candidate for candidate in decoded if candidate))
+
+
+def _path_is_within(candidate: Path, parent: Path) -> bool:
+    return candidate == parent or parent in candidate.parents
+
+
+def _real_execution_directory(path: str | Path) -> Path:
+    try:
+        directory = Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+        metadata = os.lstat(directory)
+    except (TypeError, ValueError, OSError) as exc:
+        raise TaskCRehearsalError(
+            "method execution directory must be a real directory"
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise TaskCRehearsalError(
+            "method execution directory must be a real directory"
+        )
+    return directory.resolve(strict=True)
 
 
 def validate_private_scoring_command(
     command: Sequence[str],
     *,
     private_root: str | Path,
+    execution_cwd: str | Path | None = None,
+    allowed_worker_paths: Sequence[str | Path] | None = None,
 ) -> None:
     """Prove that a method process receives no path into sealed scoring data.
 
@@ -911,16 +956,108 @@ def validate_private_scoring_command(
         raise TaskCRehearsalError("method command text must not contain NUL")
 
     private = _real_private_directory(private_root)
+    if execution_cwd is None:
+        raise TaskCRehearsalError(
+            "method execution directory is required for path checking"
+        )
+    cwd = _real_execution_directory(execution_cwd)
+    first_name = Path(arguments[0]).name.casefold()
+    if first_name in {
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "env",
+        "sudo",
+        "nice",
+        "nohup",
+        "command",
+    }:
+        raise TaskCRehearsalError(
+            "method command must not use a shell or environment wrapper"
+        )
+    if first_name.startswith("python") or first_name.startswith("pypy"):
+        def dynamic_short_option(argument: str) -> bool:
+            if not argument.startswith("-") or argument.startswith("--"):
+                return False
+            option = argument
+            for separator in ("/", "\\", "="):
+                option = option.split(separator, 1)[0]
+            return any(flag in option[1:] for flag in ("c", "m"))
+
+        if any(
+            dynamic_short_option(argument)
+            for argument in arguments[1:]
+        ):
+            raise TaskCRehearsalError(
+                "method command must not use dynamic Python execution"
+            )
+
+    allowed: set[Path] | None = None
+    if allowed_worker_paths is not None:
+        if isinstance(allowed_worker_paths, (str, bytes)) or not isinstance(
+            allowed_worker_paths, Sequence
+        ):
+            raise TaskCRehearsalError(
+                "allowed workers must be an ordered path list"
+            )
+        allowed = set()
+        for raw_path in allowed_worker_paths:
+            if not isinstance(raw_path, (str, Path)):
+                raise TaskCRehearsalError(
+                    "allowed workers must be an ordered path list"
+                )
+            worker_path = Path(raw_path).expanduser()
+            if not worker_path.is_absolute():
+                worker_path = cwd / worker_path
+            try:
+                metadata = os.lstat(worker_path)
+                resolved_worker = worker_path.resolve(strict=True)
+            except OSError as exc:
+                raise TaskCRehearsalError(
+                    "allowed worker must be a real regular file"
+                ) from exc
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise TaskCRehearsalError(
+                    "allowed worker must be a real regular file"
+                )
+            allowed.add(resolved_worker)
+        if not allowed:
+            raise TaskCRehearsalError("allowed workers must not be empty")
+
+    observed_workers: set[Path] = set()
+    private_text = os.fspath(private)
     for argument in arguments:
         for candidate_text in _command_path_candidates(argument):
+            if private_text in candidate_text:
+                raise TaskCRehearsalError(
+                    "method command contains a private scoring path"
+                )
             try:
                 candidate = Path(candidate_text).expanduser()
                 if not candidate.is_absolute():
-                    candidate = Path.cwd() / candidate
+                    candidate = cwd / candidate
+                lexical = Path(os.path.normpath(os.fspath(candidate)))
+                if _path_is_within(lexical, private):
+                    raise TaskCRehearsalError(
+                        "method command contains a private scoring path"
+                    )
                 resolved = candidate.resolve(strict=False)
+            except TaskCRehearsalError:
+                raise
             except (OSError, RuntimeError, ValueError):
                 continue
             if resolved == private or private in resolved.parents:
                 raise TaskCRehearsalError(
                     "method command contains a private scoring path"
                 )
+            if allowed is not None and candidate_text.casefold().endswith(".py"):
+                observed_workers.add(resolved)
+                if resolved not in allowed:
+                    raise TaskCRehearsalError(
+                        "method command does not use a registered worker"
+                    )
+    if allowed is not None and not (observed_workers & allowed):
+        raise TaskCRehearsalError(
+            "method command does not use a registered worker"
+        )

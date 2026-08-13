@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import csv
-from contextlib import redirect_stderr
 import importlib.util
-import io
 import json
 from collections.abc import Iterator, Mapping
 from dataclasses import replace
@@ -92,6 +90,10 @@ def _fake_evaluation_source(tmp_path: Path) -> tuple[Path, str]:
         import os
         import numpy as np
 
+        if os.environ.get("FAKE_SOURCE_MUTATION") == "during_import":
+            with open(__file__, "a", encoding="utf-8") as handle:
+                handle.write("# changed during import\\n")
+
         class DuplicateMetrics(Mapping):
             def __len__(self):
                 return 2
@@ -109,6 +111,9 @@ def _fake_evaluation_source(tmp_path: Path) -> tuple[Path, str]:
                     "interventions": list(interventions),
                     "genes": list(genes),
                 }
+                if os.environ.get("FAKE_SOURCE_MUTATION") == "during_init":
+                    with open(__file__, "a", encoding="utf-8") as handle:
+                        handle.write("# changed during evaluator setup\\n")
 
             def evaluate_network(self, edges, **kwargs):
                 self.record["edges"] = [list(edge) for edge in edges]
@@ -185,7 +190,7 @@ def _write_heldout_and_predictions(tmp_path: Path) -> tuple[Path, Path]:
         ("B", "A", 0.9, True),
         ("A", "B", 0.9, True),
         ("C", "A", 0.0, False),
-        ("B", "C", 0.7, True),
+        ("B", "C", 0.0, False),
     ]
     with predictions.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, lineterminator="\n")
@@ -204,39 +209,75 @@ def _run_evaluation_worker(
     heldout, predictions = _write_heldout_and_predictions(tmp_path)
     output_path = output or tmp_path / "official metrics.json"
     record = tmp_path / "evaluation-call.json"
-    worker = _load_evaluation_worker()
-    worker.EXPECTED_CAUSALBENCH_COMMIT = revision
-    previous_record = os.environ.get("FAKE_EVALUATION_RECORD")
-    previous_kind = os.environ.get("FAKE_METRIC_KIND")
-    os.environ["FAKE_EVALUATION_RECORD"] = str(record)
-    os.environ["FAKE_METRIC_KIND"] = metric_kind
-    stderr = io.StringIO()
-    try:
-        with redirect_stderr(stderr):
-            return_code = worker.main(
-                [
-                    "--prediction-csv",
-                    str(predictions),
-                    "--heldout-npz",
-                    str(heldout),
-                    "--output-json",
-                    str(output_path),
-                    "--seed",
-                    "17",
-                    "--causalbench-source",
-                    str(source),
-                ]
-            )
-    finally:
-        if previous_record is None:
-            os.environ.pop("FAKE_EVALUATION_RECORD", None)
-        else:
-            os.environ["FAKE_EVALUATION_RECORD"] = previous_record
-        if previous_kind is None:
-            os.environ.pop("FAKE_METRIC_KIND", None)
-        else:
-            os.environ["FAKE_METRIC_KIND"] = previous_kind
-    return return_code, stderr.getvalue(), output_path, record
+    completed = _invoke_evaluation_worker(
+        tmp_path,
+        source=source,
+        revision=revision,
+        heldout=heldout,
+        predictions=predictions,
+        output=output_path,
+        seed="17",
+        environment={
+            "FAKE_EVALUATION_RECORD": str(record),
+            "FAKE_METRIC_KIND": metric_kind,
+        },
+    )
+    return completed.returncode, completed.stderr, output_path, record
+
+
+def _invoke_evaluation_worker(
+    tmp_path: Path,
+    *,
+    source: Path,
+    revision: str,
+    heldout: Path,
+    predictions: Path,
+    output: Path,
+    seed: str,
+    environment: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    runner = tmp_path / f"isolated-worker-{uuid.uuid4().hex}.py"
+    runner.write_text(
+        textwrap.dedent(
+            f"""
+            import importlib.util
+            import sys
+
+            path = {str(EVALUATION_WORKER)!r}
+            spec = importlib.util.spec_from_file_location("isolated_evaluation_worker", path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            module.EXPECTED_CAUSALBENCH_COMMIT = {revision!r}
+            raise SystemExit(module.main(sys.argv[1:]))
+            """
+        ),
+        encoding="utf-8",
+    )
+    process_environment = os.environ.copy()
+    if environment:
+        process_environment.update(environment)
+    return subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(runner),
+            "--prediction-csv",
+            str(predictions),
+            "--heldout-npz",
+            str(heldout),
+            "--output-json",
+            str(output),
+            "--seed",
+            seed,
+            "--causalbench-source",
+            str(source),
+        ],
+        cwd=ROOT,
+        env=process_environment,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_rehearsal_profiles_are_frozen_and_never_promotion_eligible() -> None:
@@ -825,23 +866,23 @@ def test_cross_context_merge_rejects_unsafe_or_inconsistent_inputs(
 @pytest.mark.parametrize(
     "command_builder",
     [
-        lambda private, _alias: ["python", "worker.py", str(private / "test.npz")],
-        lambda private, _alias: [
+        lambda private, _alias, _cwd: ["python", "worker.py", str(private / "test.npz")],
+        lambda private, _alias, _cwd: [
             "python",
             "worker.py",
             f"--input={private / 'test.npz'}",
         ],
-        lambda private, _alias: [
+        lambda private, _alias, _cwd: [
             "python",
             "worker.py",
             f"-I{private / 'test.npz'}",
         ],
-        lambda private, _alias: [
+        lambda private, _alias, cwd: [
             "python",
             "worker.py",
-            os.path.relpath(private / "test.npz", Path.cwd()),
+            os.path.relpath(private / "test.npz", cwd),
         ],
-        lambda _private, alias: ["python", "worker.py", str(alias / "test.npz")],
+        lambda _private, alias, _cwd: ["python", "worker.py", str(alias / "test.npz")],
     ],
 )
 def test_method_command_cannot_receive_private_paths(
@@ -855,8 +896,9 @@ def test_method_command_cannot_receive_private_paths(
 
     with pytest.raises(TaskCRehearsalError, match="private scoring path"):
         validate_private_scoring_command(
-            command_builder(private_root, alias),
+            command_builder(private_root, alias, tmp_path),
             private_root=private_root,
+            execution_cwd=tmp_path,
         )
 
 
@@ -869,11 +911,13 @@ def test_private_command_check_rejects_ambiguous_inputs_and_bad_private_root(
         validate_private_scoring_command(
             "python worker.py",  # type: ignore[arg-type]
             private_root=private_root,
+            execution_cwd=tmp_path,
         )
     with pytest.raises(TaskCRehearsalError, match="NUL"):
         validate_private_scoring_command(
             ["python", "worker.py\x00--input"],
             private_root=private_root,
+            execution_cwd=tmp_path,
         )
 
     alias = tmp_path / "private-alias"
@@ -882,6 +926,7 @@ def test_private_command_check_rejects_ambiguous_inputs_and_bad_private_root(
         validate_private_scoring_command(
             ["python", "worker.py"],
             private_root=alias,
+            execution_cwd=tmp_path,
         )
 
 
@@ -889,11 +934,77 @@ def test_method_command_without_private_paths_is_accepted(tmp_path: Path) -> Non
     private_root = tmp_path / "private"
     private_root.mkdir()
     public_input = tmp_path / "public input.npz"
+    worker = tmp_path / "worker.py"
+    worker.write_text("# fixed worker\n", encoding="utf-8")
 
     validate_private_scoring_command(
-        ["python", "worker.py", "--input", str(public_input)],
+        ["python", str(worker), "--input", str(public_input)],
         private_root=private_root,
+        execution_cwd=tmp_path,
+        allowed_worker_paths=(worker,),
     )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["bash", "-lc", "python worker.py --input safe.npz"],
+        ["/usr/bin/env", "python", "worker.py"],
+        ["python", "-c", "open('/tmp/input')"],
+        ["python", "-m", "unregistered.worker"],
+    ],
+)
+def test_private_command_check_rejects_shell_and_dynamic_python(
+    tmp_path: Path, command: list[str]
+) -> None:
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    with pytest.raises(TaskCRehearsalError, match="dynamic|wrapper"):
+        validate_private_scoring_command(
+            command,
+            private_root=private_root,
+            execution_cwd=tmp_path,
+        )
+
+
+def test_private_command_check_decodes_file_uri_and_uses_execution_cwd(
+    tmp_path: Path,
+) -> None:
+    private_root = tmp_path / "private scoring data"
+    private_root.mkdir()
+    encoded = "file://" + str(private_root / "sealed.npz").replace(" ", "%20")
+    with pytest.raises(TaskCRehearsalError, match="private scoring path"):
+        validate_private_scoring_command(
+            ["python", "worker.py", f"--input={encoded}"],
+            private_root=private_root,
+            execution_cwd=tmp_path,
+        )
+
+    with pytest.raises(TaskCRehearsalError, match="private scoring path"):
+        validate_private_scoring_command(
+            ["python", "worker.py", "--input", "private scoring data/sealed.npz"],
+            private_root=private_root,
+            execution_cwd=tmp_path,
+        )
+
+
+def test_private_command_check_requires_registered_worker_when_requested(
+    tmp_path: Path,
+) -> None:
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    registered = tmp_path / "registered.py"
+    unregistered = tmp_path / "unregistered.py"
+    registered.write_text("# registered\n", encoding="utf-8")
+    unregistered.write_text("# unregistered\n", encoding="utf-8")
+
+    with pytest.raises(TaskCRehearsalError, match="registered worker"):
+        validate_private_scoring_command(
+            ["python", str(unregistered)],
+            private_root=private_root,
+            execution_cwd=tmp_path,
+            allowed_worker_paths=(registered,),
+        )
 
 
 def test_official_evaluation_worker_exposes_help_without_external_imports(
@@ -926,6 +1037,33 @@ def test_official_evaluation_worker_exposes_help_without_external_imports(
     assert "--causalbench-source" in completed.stdout
 
 
+def test_official_evaluation_worker_requires_isolated_python_for_real_scoring(
+    tmp_path: Path,
+) -> None:
+    worker = _load_evaluation_worker()
+    output = tmp_path / "runtime-status.json"
+
+    return_code = worker.main(
+        [
+            "--prediction-csv",
+            str(tmp_path / "not-read.csv"),
+            "--heldout-npz",
+            str(tmp_path / "not-read.npz"),
+            "--output-json",
+            str(output),
+            "--seed",
+            "17",
+            "--causalbench-source",
+            str(tmp_path / "not-read-source"),
+        ]
+    )
+
+    assert return_code != 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed_runtime_unavailable"
+    assert "python -I" in payload["error"]
+
+
 def test_official_evaluation_worker_uses_fixed_signature_and_stable_order(
     tmp_path: Path,
 ) -> None:
@@ -954,7 +1092,6 @@ def test_official_evaluation_worker_uses_fixed_signature_and_stable_order(
         ["A", "B"],
         ["B", "A"],
         ["A", "C"],
-        ["B", "C"],
     ]
     assert record["kwargs"] == {
         "max_path_length": 1,
@@ -963,6 +1100,118 @@ def test_official_evaluation_worker_uses_fixed_signature_and_stable_order(
         "seed": 17,
     }
     assert not list(output.parent.glob(f".{output.name}.*.tmp"))
+
+
+def test_three_column_prediction_table_treats_every_relation_as_returned(
+    tmp_path: Path,
+) -> None:
+    source, revision = _fake_evaluation_source(tmp_path)
+    heldout, predictions = _write_heldout_and_predictions(tmp_path)
+    rows = list(csv.reader(predictions.read_text(encoding="utf-8").splitlines()))
+    with predictions.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerows([row[:3] for row in rows])
+    output = tmp_path / "metrics.json"
+    record = tmp_path / "call.json"
+
+    completed = _invoke_evaluation_worker(
+        tmp_path,
+        source=source,
+        revision=revision,
+        heldout=heldout,
+        predictions=predictions,
+        output=output,
+        seed="17",
+        environment={"FAKE_EVALUATION_RECORD": str(record)},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(record.read_text(encoding="utf-8"))["edges"] == [
+        ["A", "B"],
+        ["B", "A"],
+        ["A", "C"],
+        ["B", "C"],
+    ]
+
+
+def test_isolated_worker_ignores_pythonpath_sitecustomize_injection(
+    tmp_path: Path,
+) -> None:
+    source, revision = _fake_evaluation_source(tmp_path)
+    heldout, predictions = _write_heldout_and_predictions(tmp_path)
+    injected = tmp_path / "injected"
+    marker = tmp_path / "sitecustomize-ran"
+    _write_python(
+        injected / "sitecustomize.py",
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('unsafe')\n",
+    )
+    _write_python(injected / "numpy.py", "raise RuntimeError('injected numpy')")
+    output = tmp_path / "metrics.json"
+    record = tmp_path / "call.json"
+
+    completed = _invoke_evaluation_worker(
+        tmp_path,
+        source=source,
+        revision=revision,
+        heldout=heldout,
+        predictions=predictions,
+        output=output,
+        seed="17",
+        environment={
+            "PYTHONPATH": str(injected),
+            "FAKE_EVALUATION_RECORD": str(record),
+        },
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert output.exists()
+    assert not marker.exists()
+
+
+def test_verified_source_snapshot_detects_a_change_before_import(tmp_path: Path) -> None:
+    source, revision = _fake_evaluation_source(tmp_path)
+    worker = _load_evaluation_worker()
+    boundary = worker._load_causalbench_boundary_module()
+    verified = boundary.validate_causalbench_source(source, revision)
+    frozen = worker.freeze_causalbench_python_source(verified, boundary)
+    evaluation_path = source / "causalscbench/evaluation/statistical_evaluation.py"
+    evaluation_path.write_text(
+        evaluation_path.read_text(encoding="utf-8") + "# changed before import\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(worker.ScoringContractError, match="changed"):
+        worker.verify_causalbench_python_source(verified, frozen)
+
+
+@pytest.mark.parametrize("mutation", ["during_import", "during_init"])
+def test_official_worker_rejects_source_changes_during_import_or_setup(
+    tmp_path: Path, mutation: str
+) -> None:
+    source, revision = _fake_evaluation_source(tmp_path)
+    heldout, predictions = _write_heldout_and_predictions(tmp_path)
+    output = tmp_path / "failed.json"
+    record = tmp_path / "call.json"
+
+    completed = _invoke_evaluation_worker(
+        tmp_path,
+        source=source,
+        revision=revision,
+        heldout=heldout,
+        predictions=predictions,
+        output=output,
+        seed="17",
+        environment={
+            "FAKE_SOURCE_MUTATION": mutation,
+            "FAKE_EVALUATION_RECORD": str(record),
+        },
+    )
+
+    assert completed.returncode != 0
+    assert json.loads(output.read_text(encoding="utf-8"))["status"] == (
+        "failed_private_scoring"
+    )
+    assert not record.exists()
 
 
 @pytest.mark.parametrize("metric_kind", ["nonfinite", "duplicate_mapping", "deep"])
@@ -1017,26 +1266,19 @@ def test_official_evaluation_worker_rejects_incomplete_or_false_nonzero_predicti
 ) -> None:
     source, revision = _fake_evaluation_source(tmp_path)
     heldout, predictions = _write_heldout_and_predictions(tmp_path)
-    worker = _load_evaluation_worker()
-    worker.EXPECTED_CAUSALBENCH_COMMIT = revision
     lines = predictions.read_text(encoding="utf-8").splitlines()
     predictions.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
     output = tmp_path / "failed.json"
-    return_code = worker.main(
-        [
-            "--prediction-csv",
-            str(predictions),
-            "--heldout-npz",
-            str(heldout),
-            "--output-json",
-            str(output),
-            "--seed",
-            "17",
-            "--causalbench-source",
-            str(source),
-        ]
+    completed = _invoke_evaluation_worker(
+        tmp_path,
+        source=source,
+        revision=revision,
+        heldout=heldout,
+        predictions=predictions,
+        output=output,
+        seed="17",
     )
-    assert return_code != 0
+    assert completed.returncode != 0
     assert json.loads(output.read_text(encoding="utf-8"))["status"] == (
         "failed_private_scoring"
     )
@@ -1051,23 +1293,16 @@ def test_official_evaluation_worker_rejects_incomplete_or_false_nonzero_predicti
         ),
         encoding="utf-8",
     )
-    worker = _load_evaluation_worker()
-    worker.EXPECTED_CAUSALBENCH_COMMIT = revision
     output = third_root / "failed.json"
-    assert worker.main(
-        [
-            "--prediction-csv",
-            str(predictions),
-            "--heldout-npz",
-            str(heldout),
-            "--output-json",
-            str(output),
-            "--seed",
-            "17",
-            "--causalbench-source",
-            str(source),
-        ]
-    ) != 0
+    assert _invoke_evaluation_worker(
+        third_root,
+        source=source,
+        revision=revision,
+        heldout=heldout,
+        predictions=predictions,
+        output=output,
+        seed="17",
+    ).returncode != 0
     assert json.loads(output.read_text(encoding="utf-8"))["status"] == (
         "failed_private_scoring"
     )
@@ -1080,23 +1315,16 @@ def test_official_evaluation_worker_rejects_incomplete_or_false_nonzero_predicti
         "C,B,0.0,False", "C,B,0.1,False"
     )
     predictions.write_text(content, encoding="utf-8")
-    worker = _load_evaluation_worker()
-    worker.EXPECTED_CAUSALBENCH_COMMIT = revision
     output = second_root / "failed.json"
-    assert worker.main(
-        [
-            "--prediction-csv",
-            str(predictions),
-            "--heldout-npz",
-            str(heldout),
-            "--output-json",
-            str(output),
-            "--seed",
-            "17",
-            "--causalbench-source",
-            str(source),
-        ]
-    ) != 0
+    assert _invoke_evaluation_worker(
+        second_root,
+        source=source,
+        revision=revision,
+        heldout=heldout,
+        predictions=predictions,
+        output=output,
+        seed="17",
+    ).returncode != 0
     assert json.loads(output.read_text(encoding="utf-8"))["status"] == (
         "failed_private_scoring"
     )
@@ -1109,44 +1337,64 @@ def test_official_evaluation_worker_rejects_input_aliases_and_bad_seed(
     heldout, predictions = _write_heldout_and_predictions(tmp_path)
     linked = tmp_path / "linked-heldout.npz"
     linked.symlink_to(heldout)
-    worker = _load_evaluation_worker()
-    worker.EXPECTED_CAUSALBENCH_COMMIT = revision
-
     for seed in ("-1", "true", str(2**32)):
         output = tmp_path / f"failed-seed-{seed}.json"
-        assert worker.main(
-            [
-                "--prediction-csv",
-                str(predictions),
-                "--heldout-npz",
-                str(heldout),
-                "--output-json",
-                str(output),
-                "--seed",
-                seed,
-                "--causalbench-source",
-                str(source),
-            ]
-        ) != 0
+        assert _invoke_evaluation_worker(
+            tmp_path,
+            source=source,
+            revision=revision,
+            heldout=heldout,
+            predictions=predictions,
+            output=output,
+            seed=seed,
+        ).returncode != 0
         assert json.loads(output.read_text(encoding="utf-8"))["status"] == (
             "failed_private_scoring"
         )
 
     output = tmp_path / "failed-link.json"
-    assert worker.main(
-        [
-            "--prediction-csv",
-            str(predictions),
-            "--heldout-npz",
-            str(linked),
-            "--output-json",
-            str(output),
-            "--seed",
-            "17",
-            "--causalbench-source",
-            str(source),
-        ]
-    ) != 0
+    assert _invoke_evaluation_worker(
+        tmp_path,
+        source=source,
+        revision=revision,
+        heldout=linked,
+        predictions=predictions,
+        output=output,
+        seed="17",
+    ).returncode != 0
     assert json.loads(output.read_text(encoding="utf-8"))["status"] == (
         "failed_private_scoring"
     )
+
+    hardlink = tmp_path / "hardlinked-heldout.npz"
+    os.link(heldout, hardlink)
+    output = tmp_path / "failed-hardlink.json"
+    assert _invoke_evaluation_worker(
+        tmp_path,
+        source=source,
+        revision=revision,
+        heldout=heldout,
+        predictions=predictions,
+        output=output,
+        seed="17",
+    ).returncode != 0
+    assert json.loads(output.read_text(encoding="utf-8"))["status"] == (
+        "failed_private_scoring"
+    )
+
+
+def test_heldout_text_shapes_are_rejected_before_large_vector_conversion(
+    tmp_path: Path,
+) -> None:
+    heldout = tmp_path / "bad-text-shape.npz"
+    np.savez(
+        heldout,
+        expression_matrix=np.zeros((2, 2), dtype=np.float32),
+        interventions=np.asarray([b"A"] * 1_000_000, dtype="S1"),
+        var_names=np.asarray(["A", "B"]),
+    )
+    worker = _load_evaluation_worker()
+    payload = heldout.read_bytes()
+
+    with pytest.raises(worker.ScoringContractError, match="shapes"):
+        worker.load_heldout_npz(payload, np)
