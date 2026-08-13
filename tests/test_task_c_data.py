@@ -10,6 +10,7 @@ from src.evaluation.task_c_data import (
     CAUSALBENCH_COMMIT,
     TaskCDataError,
     TaskCDataset,
+    TaskCSplit,
     build_shared_task_c_split,
     validate_task_c_split,
     build_task_c_provenance,
@@ -98,6 +99,39 @@ def test_shared_split_nested_control_mappings_are_immutable():
         split.control_indices["k562"]["train"] = ()
     with pytest.raises(TypeError):
         split.control_indices["k562"] = {}
+
+
+def test_task_c_split_defensively_copies_replace_control_mapping():
+    k562, rpe1 = dataset_for_split("k562"), dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+    original = {context: dict(values) for context, values in split.control_indices.items()}
+    replaced = replace(split, control_indices=original)
+    validate_task_c_split(replaced, k562, rpe1)
+    original["k562"]["train"] = ()
+    assert replaced.control_indices["k562"]["train"] == split.control_indices["k562"]["train"]
+    with pytest.raises(TypeError):
+        replaced.control_indices["k562"]["train"] = ()
+
+
+def test_task_c_split_constructor_defensively_copies_control_mapping():
+    k562, rpe1 = dataset_for_split("k562"), dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+    original = {context: dict(values) for context, values in split.control_indices.items()}
+    constructed = TaskCSplit(
+        schema_version=split.schema_version,
+        split_id=split.split_id,
+        seed=split.seed,
+        train_sources=split.train_sources,
+        tune_sources=split.tune_sources,
+        holdout_sources=split.holdout_sources,
+        control_indices=original,
+        min_cells_per_intervention=split.min_cells_per_intervention,
+    )
+    validate_task_c_split(constructed, k562, rpe1)
+    original["rpe1"]["holdout"] = ()
+    assert constructed.control_indices["rpe1"]["holdout"] == split.control_indices["rpe1"]["holdout"]
+    with pytest.raises(TypeError):
+        constructed.control_indices["rpe1"] = {}
 
 
 def test_shared_split_rejects_source_reassignment_preserving_union():

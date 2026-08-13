@@ -47,6 +47,15 @@ class TaskCSplit:
     control_indices: Mapping[str, Mapping[str, tuple[int, ...]]]
     min_cells_per_intervention: int
 
+    def __post_init__(self) -> None:
+        frozen_controls = {
+            context: MappingProxyType({
+                partition: tuple(indices) for partition, indices in partitions.items()
+            })
+            for context, partitions in self.control_indices.items()
+        }
+        object.__setattr__(self, "control_indices", MappingProxyType(frozen_controls))
+
 
 _TASK_C_SPLIT_SEEDS = frozenset({11, 23, 47, 71, 97})
 
