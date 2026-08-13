@@ -765,8 +765,8 @@ def _actual_parent_records(
     context_id: str | None,
     direction: str | None,
 ) -> tuple[dict[str, str], ...]:
-    if stage not in {"tune", "refit"}:
-        raise TaskCProfileInputError("profile stage must be tune or refit")
+    if stage not in {"train", "tune", "refit"}:
+        raise TaskCProfileInputError("profile stage must be train, tune, or refit")
     if condition == "within_environment":
         if context_id not in {"k562", "rpe1"} or direction is not None:
             raise TaskCProfileInputError("within profile needs one k562 or rpe1 context")
@@ -966,11 +966,14 @@ def _build_profile(
     expression_out = np.concatenate(expressions, axis=0)
     interventions_out = np.concatenate(labels_out)
     final_counts = Counter(interventions_out.tolist())
-    required_response_sources = (
-        set(genes)
-        if stage == "refit"
-        else set(genes) & set(public_manifest["tune_sources"])
+    stage_sources = (
+        set(public_manifest["train_sources"])
+        if stage == "train"
+        else set(public_manifest["tune_sources"])
+        if stage == "tune"
+        else set(genes)
     )
+    required_response_sources = set(genes) & stage_sources
     if (
         not required_response_sources
         or final_counts.get(CONTROL_LABEL, 0) < minimum_cells
@@ -1158,7 +1161,7 @@ def validate_task_c_profile_input(
     if (
         not isinstance(profile, str)
         or not isinstance(condition, str)
-        or stage not in {"tune", "refit"}
+        or stage not in {"train", "tune", "refit"}
     ):
         raise TaskCProfileInputError("profile manifest identity is malformed")
     if context_id is not None and not isinstance(context_id, str):

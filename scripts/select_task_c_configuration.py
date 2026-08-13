@@ -56,9 +56,10 @@ _FORMAL_TRIAL_FIELDS = _SMOKE_TRIAL_FIELDS | frozenset(
         "context_id",
         "direction",
         "seed",
-        "tune_input_sha256",
+        "training_input_sha256",
         "public_manifest_sha256",
         "profile_manifest_sha256",
+        "gene_order_sha256",
     }
 )
 _MAXIMUM_TRIAL_JSON_BYTES = 1024 * 1024
@@ -101,6 +102,7 @@ _ENVIRONMENT_FIELDS = frozenset(
         "run_identity",
         "run_identity_sha256",
         "trial_parameters",
+        "selection_record",
     }
 )
 
@@ -336,19 +338,24 @@ def _trial_record(
         record_context = parameters.get("context_id")
         direction = parameters.get("direction")
         record_seed = parameters.get("seed")
+        training_input_sha256 = parameters.get("training_input_sha256")
+        gene_order_sha256 = parameters.get("gene_order_sha256")
         if (
-            stage != "tune"
+            stage != "train"
             or isinstance(record_seed, bool)
             or not isinstance(record_seed, int)
             or record_seed < 0
+            or not isinstance(training_input_sha256, str)
+            or not training_input_sha256.startswith("sha256:")
+            or training_input_sha256 == evidence_hashes["tune_input_sha256"]
+            or gene_order_sha256 != evidence_hashes["gene_order_sha256"]
             or record_context != expected_scope["context_id"]
             or direction != expected_scope["direction"]
             or condition != expected_scope["condition"]
             or profile != expected_scope["profile"]
-            or stage != expected_scope["stage"]
         ):
             raise TaskCTuningError(
-                "trial context, direction, profile, condition, or tune stage differs from tuning evidence"
+                "trial must use a separate train input with the same genes, context, direction, condition, and profile"
             )
         status_snapshot = _snapshot(
             root / "method_status.json",
@@ -395,11 +402,16 @@ def _trial_record(
             raise TaskCTuningError("formal trial is not the recorded completed method run")
         environment_trial = environment.get("trial_parameters")
         identity_trial = run_identity.get("trial_parameters")
+        environment_input = environment.get("input")
+        environment_profile = environment.get("derived_input_manifest")
+        environment_public = environment.get("public_manifest")
         if (
             not isinstance(environment_trial, dict)
             or environment_trial.get("sha256") != parameter_snapshot.sha256
             or environment_trial.get("content") != parameters
             or identity_trial != environment_trial
+            or environment.get("selection_record") is not None
+            or run_identity.get("selection_record") is not None
             or status.get("trial_parameters_sha256") != parameter_snapshot.sha256
             or not isinstance(status.get("artifacts"), dict)
             or status["artifacts"].get("trial_parameters.json")
@@ -411,9 +423,34 @@ def _trial_record(
             raise TaskCTuningError(
                 "formal trial parameters were not sealed before the method run"
             )
-        for field, expected in evidence_hashes.items():
-            if parameters.get(field) != expected:
-                raise TaskCTuningError(f"trial {field} differs from the tuning evidence")
+        if (
+            not isinstance(environment_input, dict)
+            or environment_input.get("sha256") != training_input_sha256
+            or run_identity.get("input_sha256") != training_input_sha256
+            or parameters.get("public_manifest_sha256")
+            != evidence_hashes["public_manifest_sha256"]
+            or not isinstance(environment_public, dict)
+            or environment_public.get("sha256")
+            != parameters.get("public_manifest_sha256")
+            or run_identity.get("public_manifest_sha256")
+            != parameters.get("public_manifest_sha256")
+            or (
+                environment_profile.get("sha256")
+                if isinstance(environment_profile, dict)
+                else None
+            )
+            != parameters.get("profile_manifest_sha256")
+            or run_identity.get("derived_input_manifest_sha256")
+            != parameters.get("profile_manifest_sha256")
+            or (
+                parameters.get("profile_manifest_sha256")
+                == evidence_hashes["profile_manifest_sha256"]
+                and parameters.get("profile_manifest_sha256") is not None
+            )
+        ):
+            raise TaskCTuningError(
+                "trial training evidence is not separate from the tuning evidence"
+            )
         snapshots.extend((status_snapshot, environment_snapshot))
         artifacts = status.get("artifacts")
         if not isinstance(artifacts, dict) or "predictions.csv" not in artifacts:
@@ -431,7 +468,18 @@ def _trial_record(
         "method_id": method,
         "condition": condition,
         "profile": profile,
+        "context_id": parameters.get("context_id") if not synthetic_smoke else None,
+        "direction": parameters.get("direction") if not synthetic_smoke else None,
         "seed": parameters.get("seed") if not synthetic_smoke else None,
+        "training_input_sha256": (
+            parameters.get("training_input_sha256") if not synthetic_smoke else None
+        ),
+        "training_profile_manifest_sha256": (
+            parameters.get("profile_manifest_sha256") if not synthetic_smoke else None
+        ),
+        "gene_order_sha256": (
+            parameters.get("gene_order_sha256") if not synthetic_smoke else None
+        ),
         "trial_index": trial_index,
         "parameters_sha256": parameter_snapshot.sha256,
         "predictions_sha256": prediction_snapshot.sha256,
@@ -468,6 +516,7 @@ def _load_tune_input(args: argparse.Namespace):
                 "tune_input_sha256": input_snapshot.sha256,
                 "public_manifest_sha256": None,
                 "profile_manifest_sha256": None,
+                "gene_order_sha256": None,
             },
             (input_snapshot,),
             "synthetic_smoke",
@@ -552,6 +601,11 @@ def _load_tune_input(args: argparse.Namespace):
             "tune_input_sha256": input_snapshot.sha256,
             "public_manifest_sha256": public_snapshot.sha256,
             "profile_manifest_sha256": profile_hash,
+            "gene_order_sha256": _sha256(
+                json.dumps(
+                    list(genes), ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+            ),
         },
         snapshots,
         "external_benchmark",
@@ -661,13 +715,21 @@ def main(argv: list[str] | None = None) -> int:
             trials.append((index, parameters, frame))
             identities.append(identity)
             trial_snapshots.extend(snapshots)
-        shared_identity_fields = ("method_id", "condition", "profile", "seed")
+        shared_identity_fields = (
+            "method_id",
+            "condition",
+            "profile",
+            "context_id",
+            "direction",
+            "seed",
+            "gene_order_sha256",
+        )
         if any(
             any(identity[field] != identities[0][field] for field in shared_identity_fields)
             for identity in identities[1:]
         ):
             raise TaskCTuningError(
-                "all trials must use the same method, condition, profile, and seed"
+                "all trials must use the same method, genes, context, condition, profile, direction, and seed"
             )
         selection = select_task_c_configuration(
             trials,
@@ -689,6 +751,17 @@ def main(argv: list[str] | None = None) -> int:
         assert isinstance(result, dict)
         result["method_id"] = identities[0]["method_id"]
         result.update(tune_scope)
+        result["training_and_tuning_inputs_separate"] = True
+        training_inputs = sorted(
+            {str(identity["training_input_sha256"]) for identity in identities}
+        )
+        training_profiles = sorted(
+            {
+                str(identity["training_profile_manifest_sha256"])
+                for identity in identities
+                if identity["training_profile_manifest_sha256"] is not None
+            }
+        )
         result["evidence"] = {
             "data_status": data_status,
             **evidence_hashes,
@@ -696,9 +769,11 @@ def main(argv: list[str] | None = None) -> int:
             "code_sha256": code_identity,
             "tuning_positive_relation_count": len(tuning_edges),
             "gene_count": len(genes),
+            "training_input_sha256s": training_inputs,
+            "training_profile_manifest_sha256s": training_profiles,
             "trials": sorted(identities, key=lambda item: int(item["trial_index"])),
         }
-        result["selection_identity_sha256"] = _sha256(_json_bytes(result))
+        result["selection_record_sha256"] = _sha256(_json_bytes(result))
         all_snapshots = (
             config_snapshot,
             *tune_snapshots,

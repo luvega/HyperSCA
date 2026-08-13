@@ -157,7 +157,7 @@ def test_profiles_freeze_gene_and_cell_limits_for_within_and_cross(
     }
 
 
-def test_tune_profiles_reuse_refit_gene_selection_and_only_read_tune_cells(
+def test_train_tune_and_refit_profiles_share_genes_but_use_separate_parents(
     large_public_bundle: dict[str, object],
     tmp_path: Path,
 ) -> None:
@@ -170,6 +170,14 @@ def test_tune_profiles_reuse_refit_gene_selection_and_only_read_tune_cells(
         stage="refit",
         output_dir=tmp_path / "refit",
     )
+    train = materialize_task_c_profile_input(
+        public_manifest_path=public_manifest,
+        profile="connection",
+        condition="within_environment",
+        context_id="k562",
+        stage="train",
+        output_dir=tmp_path / "train",
+    )
     tune = materialize_task_c_profile_input(
         public_manifest_path=public_manifest,
         profile="connection",
@@ -179,15 +187,35 @@ def test_tune_profiles_reuse_refit_gene_selection_and_only_read_tune_cells(
         output_dir=tmp_path / "tune",
     )
     refit_manifest = json.loads(Path(refit["manifest"]).read_text(encoding="utf-8"))
+    train_manifest = json.loads(Path(train["manifest"]).read_text(encoding="utf-8"))
     tune_manifest = json.loads(Path(tune["manifest"]).read_text(encoding="utf-8"))
 
+    assert train_manifest["stage"] == "train"
     assert tune_manifest["stage"] == "tune"
+    assert train_manifest["gene_selection"] == refit_manifest["gene_selection"]
     assert tune_manifest["gene_selection"] == refit_manifest["gene_selection"]
     assert tune_manifest["gene_selection"]["selection_reference_stage"] == "refit"
     assert tune_manifest["contexts"][0]["public_relative_path"] == (
         "within/k562/tune.npz"
     )
     assert tune_manifest["contexts"][0]["role"] == "within_tune"
+    assert train_manifest["contexts"][0]["public_relative_path"] == (
+        "within/k562/train.npz"
+    )
+    assert train_manifest["contexts"][0]["role"] == "within_train"
+    stage_parents = {
+        manifest["contexts"][0]["public_relative_path"]
+        for manifest in (train_manifest, tune_manifest, refit_manifest)
+    }
+    stage_parent_hashes = {
+        manifest["contexts"][0]["parent_sha256"]
+        for manifest in (train_manifest, tune_manifest, refit_manifest)
+    }
+    stage_input_hashes = {
+        manifest["output"]["sha256"]
+        for manifest in (train_manifest, tune_manifest, refit_manifest)
+    }
+    assert len(stage_parents) == len(stage_parent_hashes) == len(stage_input_hashes) == 3
     assert len(tune_manifest["gene_selection"]["ordered_genes"]) <= 64
     with np.load(tune["input_npz"], allow_pickle=False) as archive:
         assert set(archive.files) == {
@@ -230,6 +258,24 @@ def test_cross_tune_profile_records_direction_and_tune_parents(
     ]
     with np.load(created["input_npz"], allow_pickle=False) as archive:
         assert set(archive["environment_labels"].tolist()) == {"k562", "rpe1"}
+
+    train = materialize_task_c_profile_input(
+        public_manifest_path=Path(large_public_bundle["public_manifest"]),
+        profile="connection",
+        condition="cross_environment",
+        direction="k562_to_rpe1",
+        stage="train",
+        output_dir=tmp_path / "cross-train",
+    )
+    train_manifest = json.loads(Path(train["manifest"]).read_text(encoding="utf-8"))
+    assert train_manifest["gene_selection"] == manifest["gene_selection"]
+    assert [record["public_relative_path"] for record in train_manifest["contexts"]] == [
+        "cross/k562_to_rpe1/source_train.npz",
+        "cross/k562_to_rpe1/target_adapt_train.npz",
+    ]
+    assert {
+        record["parent_sha256"] for record in train_manifest["contexts"]
+    }.isdisjoint({record["parent_sha256"] for record in manifest["contexts"]})
 
 
 def _sparse_intervention_bundle(tmp_path: Path) -> dict[str, object]:

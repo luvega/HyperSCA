@@ -25,7 +25,7 @@ from src.evaluation.task_c_data import (
     materialize_task_c_split,
 )
 from src.evaluation.task_c_profile_input import materialize_task_c_profile_input
-from src.evaluation.task_c_method_run import run_task_c_method
+from src.evaluation.task_c_method_run import TaskCMethodRunError, run_task_c_method
 from tests.test_task_c_data import dataset_for_split
 
 
@@ -349,7 +349,7 @@ def test_cli_synthetic_smoke_is_explicit_atomic_and_deterministic(tmp_path: Path
     assert payload["external_biological_references_used"] is False
     assert payload["final_holdout_used"] is False
     assert payload["evidence"]["code_sha256"].startswith("sha256:")
-    assert payload["selection_identity_sha256"].startswith("sha256:")
+    assert payload["selection_record_sha256"].startswith("sha256:")
     assert payload["evidence"]["trials"][0]["predictions_sha256"].startswith(
         "sha256:"
     )
@@ -464,96 +464,6 @@ def _canonical_sha256(payload: dict[str, object]) -> str:
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
-def _write_formal_trial(
-    path: Path,
-    *,
-    index: int,
-    tune_sha256: str,
-    public_sha256: str,
-) -> None:
-    path.mkdir()
-    frame = _complete_predictions(
-        ("A", "B", "C", "D", "E", "F", "Z"), {("A", "B"): 0.9}
-    )
-    frame.to_csv(path / "predictions.csv", index=False)
-    run_identity = {"test_run": "formal"}
-    run_identity_sha256 = f"sha256:{hashlib.sha256((json.dumps(run_identity, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + chr(10)).encode('utf-8')).hexdigest()}"
-    environment = {
-        "schema_version": "1.0",
-        "method_id": "demo",
-        "role": "baseline",
-        "source_kind": "local",
-        "training_information": "partial_interventional",
-        "output_semantics": "directed_score",
-        "data_status": "external_benchmark",
-        "context_id": "k562",
-        "seed": 11,
-        "min_cells": 5,
-        "registry_sha256": "sha256:test-registry",
-        "input": {"sha256": "sha256:test-input", "size_bytes": 1},
-        "derived_input_manifest": None,
-        "public_manifest": {"sha256": public_sha256, "size_bytes": 1},
-        "registered_method": {"method_id": "demo"},
-        "code": {"demo.py": "sha256:test-code"},
-        "assets": {},
-        "command": None,
-        "python": {
-            "implementation": "cpython",
-            "version": "3.10.0",
-            "numpy": np.__version__,
-            "pandas": pd.__version__,
-        },
-        "run_identity": run_identity,
-        "run_identity_sha256": run_identity_sha256,
-    }
-    (path / "environment_manifest.json").write_text(
-        json.dumps(environment, allow_nan=False) + "\n", encoding="utf-8"
-    )
-    prediction_bytes = (path / "predictions.csv").read_bytes()
-    environment_bytes = (path / "environment_manifest.json").read_bytes()
-    status = {
-        "schema_version": "1.0",
-        "method_id": "demo",
-        "status": "completed_standardized_output",
-        "run_identity_sha256": run_identity_sha256,
-        "inner_status": None,
-        "status_origin": "local",
-        "artifacts": {
-            "environment_manifest.json": {
-                "sha256": f"sha256:{hashlib.sha256(environment_bytes).hexdigest()}",
-                "size_bytes": len(environment_bytes),
-            },
-            "predictions.csv": {
-                "sha256": f"sha256:{hashlib.sha256(prediction_bytes).hexdigest()}",
-                "size_bytes": len(prediction_bytes),
-            },
-        },
-    }
-    status["status_content_sha256"] = _canonical_sha256(status)
-    (path / "method_status.json").write_text(
-        json.dumps(status, allow_nan=False) + "\n", encoding="utf-8"
-    )
-    (path / "trial_parameters.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "1.0",
-                "trial_index": index,
-                "method_id": "demo",
-                "condition": "within_environment",
-                "profile": "connection",
-                "parameters": {"strength": index + 1},
-                "run_identity_sha256": run_identity_sha256,
-                "tune_input_sha256": tune_sha256,
-                "public_manifest_sha256": public_sha256,
-                "profile_manifest_sha256": None,
-            },
-            allow_nan=False,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-
 def _dataset_with_public_tune_controls(context_id: str) -> TaskCDataset:
     original = dataset_for_split(context_id)
     extra_controls = np.zeros((15, len(original.gene_names)), dtype=np.float32)
@@ -572,7 +482,7 @@ def _dataset_with_public_tune_controls(context_id: str) -> TaskCDataset:
 def _run_bound_direct_mean_trial(
     tmp_path: Path,
     *,
-    tune: Path,
+    training: Path,
     public: Path,
     trial_index: int,
 ) -> Path:
@@ -587,7 +497,7 @@ def _run_bound_direct_mean_trial(
     output = tmp_path / f"direct-trial-{trial_index}"
     run_task_c_method(
         method_id="mean_difference",
-        input_npz=tune,
+        input_npz=training,
         output_dir=output,
         seed=11,
         registry_path=ROOT / "configs/task_c_methods_v1.json",
@@ -608,9 +518,10 @@ def test_cli_formal_mode_binds_public_tune_and_completed_run(tmp_path: Path) -> 
     split = build_shared_task_c_split(k562, rpe1, seed=11, min_cells=5)
     bundle = materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
     tune = Path(bundle["within"]["k562"]["tune"])
+    train = Path(bundle["within"]["k562"]["train"])
     public = Path(bundle["public_manifest"])
     trial = _run_bound_direct_mean_trial(
-        tmp_path, tune=tune, public=public, trial_index=0
+        tmp_path, training=train, public=public, trial_index=0
     )
 
     completed = _run_cli(
@@ -670,9 +581,10 @@ def test_cli_formal_mode_rejects_non_task_c_environment_schema(tmp_path: Path) -
     split = build_shared_task_c_split(k562, rpe1, seed=11, min_cells=5)
     bundle = materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
     tune = Path(bundle["within"]["k562"]["tune"])
+    train = Path(bundle["within"]["k562"]["train"])
     public = Path(bundle["public_manifest"])
     trial = _run_bound_direct_mean_trial(
-        tmp_path, tune=tune, public=public, trial_index=0
+        tmp_path, training=train, public=public, trial_index=0
     )
     environment_path = trial / "environment_manifest.json"
     environment = json.loads(environment_path.read_text(encoding="utf-8"))
@@ -736,14 +648,22 @@ def _run_bound_mean_trial(
     return output
 
 
-def test_cli_selects_two_real_task_c_tune_profile_runs_without_sidecars(
+def test_cli_selects_train_fitted_trials_using_separate_tune_responses(
     tmp_path: Path,
 ) -> None:
     k562 = _dataset_with_public_tune_controls("k562")
     rpe1 = _dataset_with_public_tune_controls("rpe1")
     split = build_shared_task_c_split(k562, rpe1, seed=11, min_cells=5)
     bundle = materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
-    profile = materialize_task_c_profile_input(
+    train_profile = materialize_task_c_profile_input(
+        public_manifest_path=Path(bundle["public_manifest"]),
+        profile="connection",
+        condition="within_environment",
+        context_id="k562",
+        stage="train",
+        output_dir=tmp_path / "profile-train",
+    )
+    tune_profile = materialize_task_c_profile_input(
         public_manifest_path=Path(bundle["public_manifest"]),
         profile="connection",
         condition="within_environment",
@@ -754,21 +674,21 @@ def test_cli_selects_two_real_task_c_tune_profile_runs_without_sidecars(
     first = _run_bound_mean_trial(
         tmp_path,
         bundle=bundle,
-        profile=profile,
+        profile=train_profile,
         context_id="k562",
         trial_index=0,
     )
     second = _run_bound_mean_trial(
         tmp_path,
         bundle=bundle,
-        profile=profile,
+        profile=train_profile,
         context_id="k562",
         trial_index=1,
     )
 
     completed = _run_cli(
-        "--tune-npz", profile["input_npz"],
-        "--profile-manifest", profile["manifest"],
+        "--tune-npz", tune_profile["input_npz"],
+        "--profile-manifest", tune_profile["manifest"],
         "--public-manifest", str(bundle["public_manifest"]),
         "--trial-dir", str(second),
         "--trial-dir", str(first),
@@ -784,8 +704,73 @@ def test_cli_selects_two_real_task_c_tune_profile_runs_without_sidecars(
     assert result["context_id"] == "k562"
     assert result["direction"] is None
     assert result["stage"] == "tune"
+    assert result["training_and_tuning_inputs_separate"] is True
+    assert result["evidence"]["tune_input_sha256"] != (
+        result["evidence"]["training_input_sha256s"][0]
+    )
+    assert result["evidence"]["training_input_sha256s"] == [
+        json.loads(
+            (first / "trial_parameters.json").read_text(encoding="utf-8")
+        )["training_input_sha256"]
+    ]
     assert {trial["seed"] for trial in result["evidence"]["trials"]} == {11}
     assert not any(path.name == "trial_parameters.json" for path in tmp_path.glob("*.json"))
+
+    refit_profile = materialize_task_c_profile_input(
+        public_manifest_path=Path(bundle["public_manifest"]),
+        profile="connection",
+        condition="within_environment",
+        context_id="k562",
+        stage="refit",
+        output_dir=tmp_path / "profile-refit",
+    )
+    refit_output = tmp_path / "selected-refit"
+    run_task_c_method(
+        method_id="mean_difference",
+        input_npz=Path(refit_profile["input_npz"]),
+        derived_input_manifest_path=Path(refit_profile["manifest"]),
+        output_dir=refit_output,
+        seed=11,
+        registry_path=ROOT / "configs/task_c_methods_v1.json",
+        asset_root=tmp_path / "assets",
+        data_status="external_benchmark",
+        context_id="k562",
+        min_cells=5,
+        public_manifest_path=Path(bundle["public_manifest"]),
+        selection_record_path=tmp_path / "selected.json",
+        project_root=ROOT,
+    )
+    refit_environment = json.loads(
+        (refit_output / "environment_manifest.json").read_text(encoding="utf-8")
+    )
+    assert refit_environment["selection_record"]["content"] == result
+    assert refit_environment["run_identity"]["selection_record"] == (
+        refit_environment["selection_record"]
+    )
+    assert json.loads(
+        (refit_output / "trial_parameters.json").read_text(encoding="utf-8")
+    )["parameters"] == result["selected_parameters"]
+
+    tampered_record = tmp_path / "tampered-selected.json"
+    tampered = dict(result)
+    tampered["selected_parameters"] = {"not": "selected"}
+    tampered_record.write_text(json.dumps(tampered) + "\n", encoding="utf-8")
+    with pytest.raises(TaskCMethodRunError, match="selection record"):
+        run_task_c_method(
+            method_id="mean_difference",
+            input_npz=Path(refit_profile["input_npz"]),
+            derived_input_manifest_path=Path(refit_profile["manifest"]),
+            output_dir=tmp_path / "tampered-refit",
+            seed=11,
+            registry_path=ROOT / "configs/task_c_methods_v1.json",
+            asset_root=tmp_path / "assets",
+            data_status="external_benchmark",
+            context_id="k562",
+            min_cells=5,
+            public_manifest_path=Path(bundle["public_manifest"]),
+            selection_record_path=tampered_record,
+            project_root=ROOT,
+        )
 
 
 def test_cli_rejects_k562_trial_for_rpe1_tune_profile(tmp_path: Path) -> None:
@@ -798,8 +783,8 @@ def test_cli_rejects_k562_trial_for_rpe1_tune_profile(tmp_path: Path) -> None:
         profile="connection",
         condition="within_environment",
         context_id="k562",
-        stage="tune",
-        output_dir=tmp_path / "k562-tune",
+        stage="train",
+        output_dir=tmp_path / "k562-train",
     )
     rpe1_profile = materialize_task_c_profile_input(
         public_manifest_path=Path(bundle["public_manifest"]),
@@ -828,3 +813,116 @@ def test_cli_rejects_k562_trial_for_rpe1_tune_profile(tmp_path: Path) -> None:
 
     assert completed.returncode != 0
     assert "context" in completed.stderr or "tuning evidence" in completed.stderr
+
+
+def test_cli_scores_a_sealed_hypersca_train_run_on_separate_tune_cells(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.causal import hypersca_c_run as hypersca_run
+
+    k562 = _dataset_with_public_tune_controls("k562")
+    rpe1 = _dataset_with_public_tune_controls("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11, min_cells=5)
+    bundle = materialize_task_c_split(k562, rpe1, split, tmp_path / "bundle")
+    profiles = {
+        stage: materialize_task_c_profile_input(
+            public_manifest_path=Path(bundle["public_manifest"]),
+            profile="connection",
+            condition="within_environment",
+            context_id="k562",
+            stage=stage,
+            output_dir=tmp_path / f"profile-{stage}",
+        )
+        for stage in ("train", "tune")
+    }
+    profile_manifest = json.loads(
+        Path(profiles["train"]["manifest"]).read_text(encoding="utf-8")
+    )
+    genes = profile_manifest["gene_selection"]["ordered_genes"]
+    gene_list = tmp_path / "genes.json"
+    gene_list.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "selection_id": "tuning-train-profile",
+                "selection_basis": "使用统一比较范围中的固定基因顺序",
+                "genes": genes,
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = tmp_path / "hypersca-config.json"
+    config.write_text("{}\n", encoding="utf-8")
+    candidate = tmp_path / "hypersca-candidate.json"
+    candidate.write_text(
+        '{"schema_version":"1.0","trial_index":0,"parameters":{}}\n',
+        encoding="utf-8",
+    )
+
+    def fake_run(
+        command: Sequence[str], *, output_dir: Path, timeout_seconds: object
+    ) -> dict[str, object]:
+        del timeout_seconds
+        runtime = Path(output_dir)
+        runtime.mkdir()
+        raw_output = Path(command[command.index("--output-dir") + 1])
+        raw_output.mkdir()
+        (raw_output / "raw_predictions.csv").write_text(
+            f"source,target,score\n{genes[0]},{genes[1]},1\n",
+            encoding="utf-8",
+        )
+        inner = {"schema_version": "1.0", "status": "completed_raw_inference"}
+        (runtime / "method_status.json").write_text(
+            json.dumps(inner) + "\n", encoding="utf-8"
+        )
+        (runtime / "resource_usage.json").write_text(
+            '{"schema_version":"1.0"}\n', encoding="utf-8"
+        )
+        return inner
+
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run.run_isolated_method", fake_run
+    )
+    monkeypatch.setattr(
+        hypersca_run, "validate_hypersca_c_output_bundle", lambda *args, **kwargs: None
+    )
+    trial = tmp_path / "hypersca-train-trial"
+    run_task_c_method(
+        method_id="hypersca_c",
+        input_npz=Path(profiles["train"]["input_npz"]),
+        derived_input_manifest_path=Path(profiles["train"]["manifest"]),
+        output_dir=trial,
+        seed=11,
+        registry_path=ROOT / "configs/task_c_methods_v1.json",
+        asset_root=tmp_path / "assets",
+        data_status="external_benchmark",
+        context_id="k562",
+        min_cells=5,
+        public_manifest_path=Path(bundle["public_manifest"]),
+        hypersca_config_path=config,
+        gene_list_path=gene_list,
+        trial_parameters_path=candidate,
+        project_root=ROOT,
+    )
+
+    completed = _run_cli(
+        "--tune-npz", profiles["tune"]["input_npz"],
+        "--profile-manifest", profiles["tune"]["manifest"],
+        "--public-manifest", str(bundle["public_manifest"]),
+        "--trial-dir", str(trial),
+        "--output-json", str(tmp_path / "hypersca-selected.json"),
+        "--config", str(CONFIG),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    selected = json.loads(
+        (tmp_path / "hypersca-selected.json").read_text(encoding="utf-8")
+    )
+    assert selected["method_id"] == "hypersca_c"
+    assert selected["training_and_tuning_inputs_separate"] is True
+    assert selected["evidence"]["tune_input_sha256"] not in selected["evidence"][
+        "training_input_sha256s"
+    ]

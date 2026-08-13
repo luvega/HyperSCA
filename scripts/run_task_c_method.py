@@ -72,6 +72,13 @@ def build_parser() -> argparse.ArgumentParser:
             "运行前固定的候选编号和参数；省略时记录为无需调节的固定设置。"
         ),
     )
+    parser.add_argument(
+        "--selection-record",
+        type=Path,
+        help=(
+            "完成公开调节后生成的选择记录；只用于把选定设置绑定到重新拟合运行。"
+        ),
+    )
     return parser
 
 
@@ -105,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
             device=args.device,
             timeout_seconds=timeout_seconds,
             trial_parameters_path=args.trial_parameters,
+            selection_record_path=args.selection_record,
             project_root=ROOT,
         )
     except (TaskCMethodRunError, OSError, UnicodeError) as exc:

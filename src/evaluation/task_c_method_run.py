@@ -59,6 +59,42 @@ MAXIMUM_TUNING_TRIALS = 20
 _CONTROL_LABEL = "non-targeting"
 _EXCLUDED_LABEL = "excluded"
 _DATA_STATUSES = frozenset({"external_benchmark", "synthetic_smoke"})
+_SELECTION_RECORD_FIELDS = frozenset(
+    {
+        "schema_version",
+        "selected_trial_index",
+        "selected_parameters",
+        "average_precision",
+        "completed_trial_count",
+        "external_biological_references_used",
+        "final_holdout_used",
+        "method_id",
+        "condition",
+        "profile",
+        "stage",
+        "context_id",
+        "direction",
+        "training_and_tuning_inputs_separate",
+        "evidence",
+        "selection_record_sha256",
+    }
+)
+_SELECTION_EVIDENCE_FIELDS = frozenset(
+    {
+        "data_status",
+        "tune_input_sha256",
+        "public_manifest_sha256",
+        "profile_manifest_sha256",
+        "gene_order_sha256",
+        "config_sha256",
+        "code_sha256",
+        "tuning_positive_relation_count",
+        "gene_count",
+        "training_input_sha256s",
+        "training_profile_manifest_sha256s",
+        "trials",
+    }
+)
 _COMPLETED_STATUS = "completed_standardized_output"
 _STATUS_SELF_FIELD = "status_content_sha256"
 _FAILED_STATUSES = frozenset(
@@ -453,9 +489,10 @@ def _sealed_trial_parameters(
     trial_index: int | None,
     parameters: Mapping[str, Any],
     scope: Mapping[str, str | None],
-    tune_input_sha256: str | None,
+    training_input_sha256: str | None,
     profile_manifest_sha256: str | None,
     public_manifest_sha256: str | None,
+    gene_order_sha256: str | None,
 ) -> dict[str, object]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -467,11 +504,101 @@ def _sealed_trial_parameters(
         "context_id": scope["context_id"],
         "direction": scope["direction"],
         "seed": seed,
-        "tune_input_sha256": tune_input_sha256,
+        "training_input_sha256": training_input_sha256,
         "profile_manifest_sha256": profile_manifest_sha256,
         "public_manifest_sha256": public_manifest_sha256,
+        "gene_order_sha256": gene_order_sha256,
         "parameters": dict(parameters),
     }
+
+
+def _gene_order_sha256(genes: Sequence[str] | None) -> str | None:
+    if genes is None:
+        return None
+    payload = json.dumps(
+        list(genes), ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def _validated_selection_record(
+    snapshot: _Snapshot,
+    *,
+    method_id: str,
+    scope: Mapping[str, str | None],
+    seed: int,
+    gene_order_sha256: str | None,
+    public_manifest_sha256: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    record = _parse_json(snapshot, "selection record")
+    if set(record) != _SELECTION_RECORD_FIELDS:
+        raise TaskCMethodRunError("selection record fields changed")
+    recorded_sha256 = record.get("selection_record_sha256")
+    unsigned = dict(record)
+    unsigned.pop("selection_record_sha256", None)
+    expected_sha256 = f"sha256:{hashlib.sha256(_json_bytes(unsigned)).hexdigest()}"
+    evidence = record.get("evidence")
+    parameters = record.get("selected_parameters")
+    trial_index = record.get("selected_trial_index")
+    completed_count = record.get("completed_trial_count")
+    average_precision = record.get("average_precision")
+    if (
+        record.get("schema_version") != SCHEMA_VERSION
+        or recorded_sha256 != expected_sha256
+        or record.get("method_id") != method_id
+        or record.get("condition") != scope["condition"]
+        or record.get("profile") != scope["profile"]
+        or record.get("stage") != "tune"
+        or record.get("context_id") != scope["context_id"]
+        or record.get("direction") != scope["direction"]
+        or record.get("training_and_tuning_inputs_separate") is not True
+        or record.get("external_biological_references_used") is not False
+        or record.get("final_holdout_used") is not False
+        or isinstance(trial_index, bool)
+        or not isinstance(trial_index, int)
+        or not 0 <= trial_index < MAXIMUM_TUNING_TRIALS
+        or isinstance(completed_count, bool)
+        or not isinstance(completed_count, int)
+        or not 1 <= completed_count <= MAXIMUM_TUNING_TRIALS
+        or isinstance(average_precision, bool)
+        or not isinstance(average_precision, (int, float))
+        or not math.isfinite(float(average_precision))
+        or not isinstance(parameters, dict)
+        or not isinstance(evidence, dict)
+        or set(evidence) != _SELECTION_EVIDENCE_FIELDS
+    ):
+        raise TaskCMethodRunError(
+            "selection record identity, policy, or selected parameters are invalid"
+        )
+    trials = evidence.get("trials")
+    training_inputs = evidence.get("training_input_sha256s")
+    tune_input = evidence.get("tune_input_sha256")
+    if (
+        evidence.get("data_status") != "external_benchmark"
+        or evidence.get("gene_order_sha256") != gene_order_sha256
+        or evidence.get("public_manifest_sha256") != public_manifest_sha256
+        or not isinstance(tune_input, str)
+        or not tune_input.startswith("sha256:")
+        or not isinstance(training_inputs, list)
+        or not training_inputs
+        or any(
+            not isinstance(value, str) or not value.startswith("sha256:")
+            for value in training_inputs
+        )
+        or tune_input in training_inputs
+        or not isinstance(trials, list)
+        or len(trials) != completed_count
+        or any(
+            not isinstance(trial, dict)
+            or trial.get("seed") != seed
+            or trial.get("gene_order_sha256") != gene_order_sha256
+            for trial in trials
+        )
+    ):
+        raise TaskCMethodRunError(
+            "selection record does not match the refit data, genes, or seed"
+        )
+    return record, dict(parameters)
 
 
 def _canonical_text(values: np.ndarray, label: str) -> tuple[str, ...]:
@@ -750,8 +877,8 @@ def materialize_task_c_derived_input(
 ) -> dict[str, str]:
     """Build a cross-environment profile subset from registered public parents."""
 
-    if stage not in {"tune", "refit"}:
-        raise TaskCMethodRunError("derived profile stage must be tune or refit")
+    if stage not in {"train", "tune", "refit"}:
+        raise TaskCMethodRunError("derived profile stage must be train, tune, or refit")
     try:
         from src.evaluation.task_c_profile_input import (
             materialize_task_c_profile_input,
@@ -1214,6 +1341,7 @@ def _run_identity(
     hypersca_inputs: Mapping[str, str],
     trial_parameters: Mapping[str, object],
     trial_parameters_sha256: str,
+    selection_record: Mapping[str, object] | None,
 ) -> tuple[dict[str, object], str]:
     identity: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -1240,6 +1368,9 @@ def _run_identity(
             "sha256": trial_parameters_sha256,
             "content": dict(trial_parameters),
         },
+        "selection_record": (
+            dict(selection_record) if selection_record is not None else None
+        ),
     }
     digest = f"sha256:{hashlib.sha256(_json_bytes(identity)).hexdigest()}"
     return identity, digest
@@ -1263,6 +1394,7 @@ def _environment_manifest(
     hypersca_inputs: Mapping[str, str],
     trial_parameters: Mapping[str, object],
     trial_parameters_sha256: str,
+    selection_record: Mapping[str, object] | None,
 ) -> dict[str, object]:
     identity, identity_sha256 = _run_identity(
         spec=spec,
@@ -1281,6 +1413,7 @@ def _environment_manifest(
         hypersca_inputs=hypersca_inputs,
         trial_parameters=trial_parameters,
         trial_parameters_sha256=trial_parameters_sha256,
+        selection_record=selection_record,
     )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1331,6 +1464,9 @@ def _environment_manifest(
             "sha256": trial_parameters_sha256,
             "content": dict(trial_parameters),
         },
+        "selection_record": (
+            dict(selection_record) if selection_record is not None else None
+        ),
     }
 
 
@@ -1712,6 +1848,7 @@ def run_task_c_method(
     device: str = "cpu",
     timeout_seconds: int | float = 86_400,
     trial_parameters_path: Path | None = None,
+    selection_record_path: Path | None = None,
     project_root: Path | None = None,
 ) -> dict[str, object]:
     """Run one registered method and publish a verified, reusable evidence bundle."""
@@ -1737,6 +1874,21 @@ def run_task_c_method(
         if trial_parameters_path is not None
         else None
     )
+    selection_record_snapshot = (
+        _capture_file(
+            selection_record_path,
+            "selection record",
+            maximum_bytes=MAXIMUM_RECORD_BYTES,
+            reject_private=True,
+            require_single_link=True,
+        )
+        if selection_record_path is not None
+        else None
+    )
+    if trial_candidate_snapshot is not None and selection_record_snapshot is not None:
+        raise TaskCMethodRunError(
+            "choose either trial parameters or one selection record, not both"
+        )
     trial_index, candidate_parameters = _trial_candidate(trial_candidate_snapshot)
 
     registry_snapshot = _capture_file(
@@ -1791,6 +1943,8 @@ def run_task_c_method(
     extra_snapshots: dict[str, _Snapshot] = {}
     if trial_candidate_snapshot is not None:
         extra_snapshots["trial_parameter_candidate"] = trial_candidate_snapshot
+    if selection_record_snapshot is not None:
+        extra_snapshots["selection_record"] = selection_record_snapshot
     expression: np.ndarray | None = None
     interventions: np.ndarray | None = None
     genes: tuple[str, ...] | None = None
@@ -2038,7 +2192,34 @@ def run_task_c_method(
                     "minimum cells must match the fixed public split manifest"
                 )
 
+    gene_order_sha256 = _gene_order_sha256(genes)
+    selection_record_identity: dict[str, object] | None = None
+    if selection_record_snapshot is not None:
+        if data_status != "external_benchmark" or trial_scope["stage"] != "refit":
+            raise TaskCMethodRunError(
+                "a selection record may only authorize the public refit stage"
+            )
+        selection_record, candidate_parameters = _validated_selection_record(
+            selection_record_snapshot,
+            method_id=spec.method_id,
+            scope=trial_scope,
+            seed=seed,
+            gene_order_sha256=gene_order_sha256,
+            public_manifest_sha256=(
+                public_manifest_snapshot.sha256 if public_manifest_snapshot else None
+            ),
+        )
+        selection_record_identity = {
+            "sha256": selection_record_snapshot.sha256,
+            "record_sha256": selection_record["selection_record_sha256"],
+            "content": selection_record,
+        }
+
     if trial_candidate_snapshot is not None:
+        if data_status == "external_benchmark" and trial_scope["stage"] != "train":
+            raise TaskCMethodRunError(
+                "formal trial candidates must use the public train stage"
+            )
         if spec.method_id != "hypersca_c" and candidate_parameters:
             raise TaskCMethodRunError(
                 "this fixed comparison method does not accept tunable parameters"
@@ -2051,13 +2232,26 @@ def run_task_c_method(
                 raise TaskCMethodRunError(
                     "HyperSCA-C trial parameters must exactly equal the run config"
                 )
+    if selection_record_snapshot is not None:
+        if spec.method_id != "hypersca_c" and candidate_parameters:
+            raise TaskCMethodRunError(
+                "the selected fixed comparison method has no tunable parameters"
+            )
+        if spec.method_id == "hypersca_c":
+            assert "config" in extra_snapshots
+            if candidate_parameters != _parse_json(
+                extra_snapshots["config"], "HyperSCA-C config"
+            ):
+                raise TaskCMethodRunError(
+                    "selected HyperSCA-C parameters must exactly equal the refit config"
+                )
     sealed_trial_parameters = _sealed_trial_parameters(
         method_id=spec.method_id,
         seed=seed,
         trial_index=trial_index,
         parameters=candidate_parameters,
         scope=trial_scope,
-        tune_input_sha256=input_snapshot.sha256 if input_snapshot else None,
+        training_input_sha256=input_snapshot.sha256 if input_snapshot else None,
         profile_manifest_sha256=(
             derived_input_manifest_snapshot.sha256
             if derived_input_manifest_snapshot
@@ -2066,6 +2260,7 @@ def run_task_c_method(
         public_manifest_sha256=(
             public_manifest_snapshot.sha256 if public_manifest_snapshot else None
         ),
+        gene_order_sha256=gene_order_sha256,
     )
     sealed_trial_parameters_bytes = _json_bytes(sealed_trial_parameters)
     sealed_trial_parameters_sha256 = (
@@ -2105,6 +2300,7 @@ def run_task_c_method(
             hypersca_inputs=hypersca_input_hashes,
             trial_parameters=sealed_trial_parameters,
             trial_parameters_sha256=sealed_trial_parameters_sha256,
+            selection_record=selection_record_identity,
         )
         expected_raw: pd.DataFrame | None = None
         if spec.method_id == "mean_difference":
@@ -2215,6 +2411,7 @@ def run_task_c_method(
             hypersca_inputs=hypersca_input_hashes,
             trial_parameters=sealed_trial_parameters,
             trial_parameters_sha256=sealed_trial_parameters_sha256,
+            selection_record=selection_record_identity,
         )
         _write_new(staging / "trial_parameters.json", sealed_trial_parameters_bytes)
         _write_json(staging / "environment_manifest.json", environment)

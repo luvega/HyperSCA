@@ -2009,7 +2009,8 @@ def test_trial_parameters_are_bound_before_run_and_changed_candidate_cannot_reus
     assert record["trial_index"] == 3
     assert record["method_id"] == "mean_difference"
     assert record["seed"] == 11
-    assert record["tune_input_sha256"].startswith("sha256:")
+    assert record["training_input_sha256"].startswith("sha256:")
+    assert "tune_input_sha256" not in record
 
     candidate.write_text(
         '{"schema_version":"1.0","trial_index":4,"parameters":{}}\n',
@@ -2017,6 +2018,31 @@ def test_trial_parameters_are_bound_before_run_and_changed_candidate_cannot_reus
     )
     with pytest.raises(TaskCMethodRunError, match="environment|identity|parameter"):
         run_task_c_method(**arguments)
+
+
+def test_formal_trial_candidate_must_train_before_tuning(tmp_path: Path) -> None:
+    bundle = _materialized_public_bundle(tmp_path)
+    candidate = tmp_path / "candidate.json"
+    candidate.write_text(
+        '{"schema_version":"1.0","trial_index":0,"parameters":{}}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TaskCMethodRunError, match="train stage"):
+        run_task_c_method(
+            method_id="mean_difference",
+            input_npz=Path(bundle["within"]["k562"]["tune"]),
+            output_dir=tmp_path / "run",
+            seed=11,
+            registry_path=REGISTRY,
+            asset_root=tmp_path / "assets",
+            data_status="external_benchmark",
+            context_id="k562",
+            min_cells=5,
+            public_manifest_path=Path(bundle["public_manifest"]),
+            trial_parameters_path=candidate,
+            project_root=ROOT,
+        )
 
 
 def test_bound_trial_parameter_artifact_cannot_be_replaced_and_resealed(
