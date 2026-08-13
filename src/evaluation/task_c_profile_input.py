@@ -42,6 +42,9 @@ MAXIMUM_TOTAL_EXPANDED_PARENT_BYTES = 2 * 1024 * 1024 * 1024
 MAXIMUM_EXPANDED_PARENT_BYTES = 1024 * 1024 * 1024
 MAXIMUM_PROFILE_INPUT_BYTES = 512 * 1024 * 1024
 MAXIMUM_NPY_HEADER_BYTES = 64 * 1024
+MAXIMUM_PARENT_CELLS = 1_000_000
+MAXIMUM_PARENT_GENES = 1_000
+MAXIMUM_PARENT_EXPRESSION_ELEMENTS = MAXIMUM_PARENT_CELLS * MAXIMUM_PARENT_GENES
 
 _PUBLIC_MANIFEST_FIELDS = frozenset(
     {
@@ -427,6 +430,7 @@ def _preflight_parent_archive(payload: bytes) -> None:
             if sum(int(member.file_size) for member in members) > MAXIMUM_EXPANDED_PARENT_BYTES:
                 raise TaskCProfileInputError("public parent expanded members are too large")
             total_array_bytes = 0
+            headers: dict[str, tuple[tuple[int, ...], np.dtype[Any], int]] = {}
             for member in members:
                 with archive.open(member, mode="r") as handle:
                     version = np.lib.format.read_magic(handle)
@@ -449,7 +453,7 @@ def _preflight_parent_archive(payload: bytes) -> None:
                         raise TaskCProfileInputError(
                             "public parent NPY object arrays are not allowed"
                         )
-                    array_bytes = int(dtype.itemsize)
+                    element_count = 1
                     for dimension in shape:
                         if (
                             isinstance(dimension, bool)
@@ -457,14 +461,22 @@ def _preflight_parent_archive(payload: bytes) -> None:
                             or dimension < 0
                             or (
                                 dimension
-                                and array_bytes
-                                > MAXIMUM_EXPANDED_PARENT_BYTES // dimension
+                                and element_count
+                                > MAXIMUM_PARENT_EXPRESSION_ELEMENTS // dimension
                             )
                         ):
                             raise TaskCProfileInputError(
-                                "public parent NPY array bytes exceed the limit"
+                                "public parent NPY element count exceeds the limit"
                             )
-                        array_bytes *= dimension
+                        element_count *= dimension
+                    if dtype.itemsize < 1 or (
+                        element_count
+                        > MAXIMUM_EXPANDED_PARENT_BYTES // int(dtype.itemsize)
+                    ):
+                        raise TaskCProfileInputError(
+                            "public parent NPY dtype or array bytes exceed the limit"
+                        )
+                    array_bytes = element_count * int(dtype.itemsize)
                     if handle.tell() > MAXIMUM_NPY_HEADER_BYTES + 16:
                         raise TaskCProfileInputError(
                             "public parent NPY header exceeds the limit"
@@ -478,6 +490,48 @@ def _preflight_parent_archive(payload: bytes) -> None:
                         raise TaskCProfileInputError(
                             "public parent expanded array bytes exceed the limit"
                         )
+                    headers[member.filename] = (
+                        tuple(int(dimension) for dimension in shape),
+                        dtype,
+                        element_count,
+                    )
+            expression_shape, expression_dtype, expression_elements = headers[
+                "expression_matrix.npy"
+            ]
+            labels_shape, labels_dtype, labels_elements = headers[
+                "interventions.npy"
+            ]
+            genes_shape, genes_dtype, genes_elements = headers["var_names.npy"]
+            if (
+                len(expression_shape) != 2
+                or expression_dtype.kind not in {"i", "u", "f"}
+                or not 1 <= expression_shape[0] <= MAXIMUM_PARENT_CELLS
+                or not 2 <= expression_shape[1] <= MAXIMUM_PARENT_GENES
+                or expression_elements > MAXIMUM_PARENT_EXPRESSION_ELEMENTS
+            ):
+                raise TaskCProfileInputError(
+                    "public parent expression header has an unsafe shape or dtype"
+                )
+            if (
+                len(labels_shape) != 1
+                or labels_dtype.kind not in {"U", "S"}
+                or labels_dtype.itemsize < 1
+                or labels_shape[0] != expression_shape[0]
+                or labels_elements > MAXIMUM_PARENT_CELLS
+            ):
+                raise TaskCProfileInputError(
+                    "public parent intervention text header disagrees with expression rows"
+                )
+            if (
+                len(genes_shape) != 1
+                or genes_dtype.kind not in {"U", "S"}
+                or genes_dtype.itemsize < 1
+                or genes_shape[0] != expression_shape[1]
+                or genes_elements > MAXIMUM_PARENT_GENES
+            ):
+                raise TaskCProfileInputError(
+                    "public parent gene text header disagrees with expression columns"
+                )
     except TaskCProfileInputError:
         raise
     except (OSError, ValueError, EOFError, zipfile.BadZipFile) as exc:

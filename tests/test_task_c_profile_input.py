@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 from pathlib import Path
 from collections.abc import Sequence
 import zipfile
@@ -316,12 +317,15 @@ def test_profile_rejects_selected_parents_whose_arrays_expand_past_budget(
         )
 
 
-def _small_parent_archive(path: Path) -> None:
+def _small_parent_archive(path: Path, *, text_kind: str = "U") -> None:
     np.savez(
         path,
         expression_matrix=np.arange(12, dtype=np.float64).reshape(6, 2),
-        interventions=np.asarray(["non-targeting"] * 3 + ["A"] * 3),
-        var_names=np.asarray(["A", "B"]),
+        interventions=np.asarray(
+            ["non-targeting"] * 3 + ["A"] * 3,
+            dtype=f"{text_kind}16",
+        ),
+        var_names=np.asarray(["A", "B"], dtype=f"{text_kind}16"),
     )
 
 
@@ -383,14 +387,16 @@ def test_parent_zip_preflight_rejects_duplicate_members_before_numpy_load(
     assert called == 0
 
 
+@pytest.mark.parametrize("text_kind", ["S", "U"])
 def test_parent_zip_preflight_accepts_a_valid_fixed_archive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    text_kind: str,
 ) -> None:
     import src.evaluation.task_c_profile_input as profile_module
 
     path = tmp_path / "parent.npz"
-    _small_parent_archive(path)
+    _small_parent_archive(path, text_kind=text_kind)
     snapshot = profile_module._capture(
         path, "parent", maximum_bytes=profile_module.MAXIMUM_FILE_BYTES
     )
@@ -408,6 +414,52 @@ def test_parent_zip_preflight_accepts_a_valid_fixed_archive(
     assert expression.shape == (6, 2)
     assert labels.shape == (6,)
     assert genes == ("A", "B")
+
+
+def test_parent_zip_preflight_rejects_huge_zero_width_text_before_numpy_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.evaluation.task_c_profile_input as profile_module
+
+    def npy_bytes(values: np.ndarray) -> bytes:
+        buffer = io.BytesIO()
+        np.lib.format.write_array(buffer, values, allow_pickle=False)
+        return buffer.getvalue()
+
+    huge_text_header = io.BytesIO()
+    np.lib.format.write_array_header_1_0(
+        huge_text_header,
+        {
+            "descr": np.dtype("S0").str,
+            "fortran_order": False,
+            "shape": (1_000_000_000,),
+        },
+    )
+    path = tmp_path / "zero-width.npz"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "expression_matrix.npy",
+            npy_bytes(np.arange(12, dtype=np.float64).reshape(6, 2)),
+        )
+        archive.writestr("interventions.npy", huge_text_header.getvalue())
+        archive.writestr(
+            "var_names.npy", npy_bytes(np.asarray(["A", "B"], dtype="S16"))
+        )
+    snapshot = profile_module._capture(
+        path, "parent", maximum_bytes=profile_module.MAXIMUM_FILE_BYTES
+    )
+    called = 0
+
+    def forbidden_load(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called += 1
+        raise AssertionError("np.load must not see a huge zero-width array")
+
+    monkeypatch.setattr(profile_module.np, "load", forbidden_load)
+    with pytest.raises(TaskCProfileInputError, match="text|length|element|shape|dtype"):
+        profile_module._load_parent(snapshot)
+    assert called == 0
 
 
 def test_validator_rejects_manifest_replacement_after_initial_capture(
