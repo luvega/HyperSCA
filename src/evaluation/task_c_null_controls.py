@@ -26,7 +26,6 @@ from src.evaluation.task_c_profile_input import (
 
 
 CONTROL_LABEL = "non-targeting"
-MINIMUM_CELLS_PER_GROUP = 5
 NULL_REPEAT_COUNT = 20
 MAXIMUM_EMPIRICAL_P_VALUE = 0.05
 MINIMUM_EMPIRICAL_ADVANTAGE = 0.0
@@ -141,10 +140,6 @@ def _validated_labels(labels: object, control_label: object) -> tuple[str, ...]:
     if len(counts) < 2:
         raise TaskCNullControlError(
             "at least one intervention group is needed alongside controls"
-        )
-    if any(count < MINIMUM_CELLS_PER_GROUP for count in counts.values()):
-        raise TaskCNullControlError(
-            "every control and intervention group needs at least five cells"
         )
     return copied
 

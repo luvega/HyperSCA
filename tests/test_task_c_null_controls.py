@@ -71,6 +71,17 @@ def test_permutation_keeps_group_sizes_and_returns_a_real_null() -> None:
     _assert_random_state_equal(random_before, _random_state())
 
 
+def test_plan_fixture_permutation_accepts_small_rehearsal_groups() -> None:
+    labels = np.asarray(["non-targeting"] * 4 + ["A"] * 3 + ["B"] * 2)
+
+    permuted = permute_intervention_labels(labels, seed=11)
+
+    assert {label: int(np.count_nonzero(permuted == label)) for label in set(labels)} == {
+        label: int(np.count_nonzero(labels == label)) for label in set(labels)
+    }
+    assert not np.array_equal(labels, permuted)
+
+
 def test_control_resampling_uses_only_control_rows_and_keeps_fake_group_sizes() -> None:
     expression = np.arange(60, dtype=float).reshape(20, 3)
     labels = _valid_labels()
@@ -98,6 +109,20 @@ def test_control_resampling_uses_only_control_rows_and_keeps_fake_group_sizes() 
     _assert_random_state_equal(random_before, _random_state())
 
 
+def test_plan_fixture_control_resampling_accepts_small_fake_groups() -> None:
+    expression = np.arange(60, dtype=float).reshape(20, 3)
+    labels = np.asarray(["non-targeting"] * 12 + ["A"] * 5 + ["B"] * 3)
+
+    null_expression, null_labels = build_control_resampling_null(
+        expression, labels, seed=11
+    )
+
+    assert null_expression.shape == expression.shape
+    assert int(np.count_nonzero(null_labels == "A")) == 5
+    assert int(np.count_nonzero(null_labels == "B")) == 3
+    assert set(null_labels) == {"non-targeting", "A", "B"}
+
+
 def test_control_resampling_is_reproducible_and_seed_sensitive() -> None:
     expression = np.arange(60, dtype=float).reshape(20, 3)
     labels = _valid_labels()
@@ -113,7 +138,6 @@ def test_control_resampling_is_reproducible_and_seed_sensitive() -> None:
 @pytest.mark.parametrize(
     ("labels", "message"),
     [
-        (["non-targeting"] * 5 + ["A"] * 4, "at least five"),
         (["non-targeting"] * 10, "intervention group"),
         (["control"] * 5 + ["A"] * 5, "control label"),
         (["non-targeting"] * 5 + [""] * 5, "safe"),
