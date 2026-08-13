@@ -15,7 +15,10 @@ import time
 import pytest
 
 from src.evaluation import task_c_runtime as runtime_module
-from src.evaluation.task_c_method_registry import load_task_c_method_registry
+from src.evaluation.task_c_method_registry import (
+    TaskCMethodRegistryError,
+    load_task_c_method_registry,
+)
 from src.evaluation.task_c_runtime import (
     TaskCRuntimeError,
     _run_bounded_command,
@@ -129,6 +132,12 @@ def test_resource_parser_does_not_silently_misread_malformed_rss(
 
     assert _parse_maximum_resident_kib(report) is None
 
+    report.write_text(
+        f"Maximum resident set size (kbytes): {2**63}\n",
+        encoding="utf-8",
+    )
+    assert _parse_maximum_resident_kib(report) is None
+
 
 def test_nonzero_exit_records_bounded_stderr_without_private_command_paths(
     tmp_path: Path,
@@ -230,6 +239,47 @@ def test_command_values_with_spaces_are_removed_from_saved_output(
     assert "<command-argument>" in result["stderr_tail"]
 
 
+def test_option_equals_value_is_redacted_without_hiding_option_name(
+    tmp_path: Path,
+) -> None:
+    private_value = str(tmp_path / "patient-007" / "input.npz")
+    argument = f"--input-npz={private_value}"
+    result = run_isolated_method(
+        [
+            sys.executable,
+            "-c",
+            "import sys; print(sys.argv[1], file=sys.stderr); sys.exit(3)",
+            argument,
+        ],
+        output_dir=tmp_path / "run",
+        timeout_seconds=10,
+    )
+
+    assert "--input-npz=<command-argument>" in result["stderr_tail"]
+    assert "patient-007" not in result["stderr_tail"]
+    assert private_value not in result["stderr_tail"]
+
+
+def test_option_equals_value_is_redacted_when_only_its_value_is_logged(
+    tmp_path: Path,
+) -> None:
+    private_value = str(tmp_path / "patient cohort B" / "input matrix.npz")
+    result = run_isolated_method(
+        [
+            sys.executable,
+            "-c",
+            "import sys; print(sys.argv[1].split('=', 1)[1], file=sys.stderr); sys.exit(3)",
+            f"--input-npz={private_value}",
+        ],
+        output_dir=tmp_path / "run",
+        timeout_seconds=10,
+    )
+
+    assert private_value not in result["stderr_tail"]
+    assert "patient cohort B" not in result["stderr_tail"]
+    assert "<command-argument>" in result["stderr_tail"]
+
+
 def test_explicit_exit_137_is_not_reported_as_a_terminating_signal(
     tmp_path: Path,
 ) -> None:
@@ -279,6 +329,51 @@ def test_missing_resource_meter_produces_paired_runtime_unavailable_records(
     assert result["status"] == "failed_runtime_unavailable"
     resource = json.loads((output / "resource_usage.json").read_text(encoding="utf-8"))
     assert resource["resource_meter"] == "unavailable"
+    assert {path.name for path in output.iterdir()} == {
+        "method_status.json",
+        "resource_usage.json",
+    }
+
+
+def test_unreasonably_long_rss_number_becomes_paired_runtime_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class HugeRssProcess:
+        pid = 99999997
+        returncode = 0
+        stdout = io.BytesIO()
+        stderr = io.BytesIO()
+
+        def __init__(self, command: list[str]) -> None:
+            report = Path(command[command.index("-o") + 1])
+            report.write_text(
+                "Maximum resident set size (kbytes): " + "9" * 10000 + "\n",
+                encoding="utf-8",
+            )
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    monkeypatch.setattr(
+        runtime_module.subprocess,
+        "Popen",
+        lambda command, **kwargs: HugeRssProcess(command),
+    )
+    monkeypatch.setattr(
+        runtime_module, "_terminate_process_group", lambda process: None
+    )
+    output = tmp_path / "run"
+
+    result = run_isolated_method(
+        [sys.executable, "-c", "pass"],
+        output_dir=output,
+        timeout_seconds=10,
+    )
+
+    assert result["status"] == "failed_runtime_unavailable"
+    resource = json.loads((output / "resource_usage.json").read_text(encoding="utf-8"))
+    assert resource["resource_meter"] == "unavailable"
+    assert resource["maximum_resident_kib"] is None
     assert {path.name for path in output.iterdir()} == {
         "method_status.json",
         "resource_usage.json",
@@ -861,6 +956,130 @@ def test_bootstrap_yaml_rejects_duplicate_sections_and_extra_vcs_source(
             project_root=project,
             run_command=_FakeBootstrapRunner(),
         )
+
+
+@pytest.mark.parametrize(
+    "environment_text",
+    [
+        "\n".join(
+            [
+                "name: hypersca-task-c-causalbench",
+                "channels:",
+                "  - conda-forge",
+                "dependencies:",
+                "  - python=3.10",
+                "  - pip: {git+https://github.com/causalbench/causalbench.git@1a2143cffdc85f835b41ce8d52034be1bf903e71: null}",
+            ]
+        ),
+        "\n".join(
+            [
+                "name: hypersca-task-c-causalbench",
+                "channels:",
+                "  - conda-forge",
+                "dependencies:",
+                "  - python=3.10",
+                "  - pip:",
+                "      - git+https://github.com/causalbench/causalbench.git@1a2143cffdc85f835b41ce8d52034be1bf903e71",
+                "  - pip:",
+                "      - numpy==1.26.4",
+            ]
+        ),
+        "\n".join(
+            [
+                "name: hypersca-task-c-causalbench",
+                "name : hypersca-task-c-causalbench",
+                "channels:",
+                "  - conda-forge",
+                "dependencies:",
+                "  - python=3.10",
+                "  - pip:",
+                "      - git+https://github.com/causalbench/causalbench.git@1a2143cffdc85f835b41ce8d52034be1bf903e71",
+            ]
+        ),
+        "\n".join(
+            [
+                "name: hypersca-task-c-causalbench",
+                "channels:",
+                "  - conda-forge",
+                "dependencies:",
+                "  - python=3.10",
+                "  - pip:",
+                "      - git+https://github.com/causalbench/causalbench.git@1a2143cffdc85f835b41ce8d52034be1bf903e71",
+                "      - extra @ git+https://example.invalid/other.git@" + "0" * 40,
+            ]
+        ),
+        "\n".join(
+            [
+                "name: hypersca-task-c-causalbench",
+                "channels:",
+                "  - conda-forge",
+                "dependencies:",
+                "  - python=3.10",
+                "  - pip:",
+                "      - !!python/object/apply:os.system [echo unsafe]",
+                "      - git+https://github.com/causalbench/causalbench.git@1a2143cffdc85f835b41ce8d52034be1bf903e71",
+            ]
+        ),
+    ],
+)
+def test_bootstrap_safe_yaml_rejects_mapping_pip_duplicate_keys_and_tags(
+    tmp_path: Path,
+    environment_text: str,
+) -> None:
+    project, registry = _copy_bootstrap_inputs(tmp_path)
+    (project / "envs/task_c/causalbench.yml").write_text(
+        environment_text + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TaskCRuntimeError, match="YAML|pip|environment"):
+        bootstrap_task_c_methods(
+            cache_root=tmp_path / "cache",
+            registry_path=registry,
+            project_root=project,
+            run_command=_FakeBootstrapRunner(),
+        )
+
+
+def test_bad_registry_never_leaves_staging_and_is_repeatably_rejected(
+    tmp_path: Path,
+) -> None:
+    bad_registry = tmp_path / "bad-registry.json"
+    bad_registry.write_text('{"schema_version":"wrong"}', encoding="utf-8")
+    cache = tmp_path / "cache"
+
+    for _ in range(2):
+        with pytest.raises(
+            (TaskCMethodRegistryError, TaskCRuntimeError),
+            match="registry|schema_version|fixed method",
+        ):
+            bootstrap_task_c_methods(
+                cache_root=cache,
+                registry_path=bad_registry,
+                project_root=ROOT,
+                run_command=_FakeBootstrapRunner(),
+            )
+        assert not list(cache.glob(".bootstrap-staging-*")) if cache.exists() else True
+
+
+def test_leftover_bootstrap_staging_fails_closed_without_creating_another(
+    tmp_path: Path,
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    leftover = cache / ".bootstrap-staging-fixed"
+    leftover.mkdir()
+    (leftover / "unexpected").write_text("partial", encoding="utf-8")
+
+    with pytest.raises(TaskCRuntimeError, match="staging|unrecognized"):
+        bootstrap_task_c_methods(
+            cache_root=cache,
+            registry_path=REGISTRY,
+            project_root=ROOT,
+            run_command=_FakeBootstrapRunner(),
+        )
+
+    assert {path.name for path in cache.iterdir()} == {leftover.name}
 
 
 class _MutatingInputRunner(_FakeBootstrapRunner):

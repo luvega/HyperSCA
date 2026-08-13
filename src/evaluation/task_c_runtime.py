@@ -13,10 +13,13 @@ import shutil
 import signal
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Any
 import uuid
+
+import yaml  # type: ignore[import-untyped]
 
 from src.evaluation.task_c_method_registry import (
     TaskCMethodRegistry,
@@ -78,7 +81,16 @@ class _TailBuffer:
     def text(self, command: Sequence[str] = ()) -> str:
         decoded = self.raw_text()
         for argument in sorted(set(command[1:]), key=len, reverse=True):
-            if len(argument) >= 4 and not argument.startswith("-"):
+            if argument.startswith("--") and "=" in argument:
+                option, value = argument.split("=", 1)
+                if value:
+                    decoded = decoded.replace(
+                        argument,
+                        f"{option}=<command-argument>",
+                    )
+                    if len(value) >= 4:
+                        decoded = decoded.replace(value, "<command-argument>")
+            elif len(argument) >= 4 and not argument.startswith("-"):
                 decoded = decoded.replace(argument, "<command-argument>")
         return _PRIVATE_PATH.sub("<absolute-path>", decoded)
 
@@ -88,6 +100,36 @@ class _TailBuffer:
 
 class _DuplicateJsonKey(ValueError):
     pass
+
+
+class _UniqueSafeYamlLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_unique_yaml_mapping(
+    loader: _UniqueSafeYamlLoader,
+    node: yaml.nodes.MappingNode,
+    deep: bool = False,
+) -> dict[object, object]:
+    result: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in result
+        except TypeError as exc:
+            raise TaskCRuntimeError(
+                "environment YAML contains an invalid mapping key"
+            ) from exc
+        if duplicate:
+            raise TaskCRuntimeError(f"environment YAML contains duplicate key: {key}")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+_UniqueSafeYamlLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_yaml_mapping,
+)
 
 
 class _FileSnapshot:
@@ -300,6 +342,18 @@ def _write_snapshot(path: Path, payload: bytes) -> None:
     finally:
         os.close(descriptor)
     _fsync_directory(path.parent)
+
+
+def _validate_registry_snapshot(snapshot: _FileSnapshot) -> TaskCMethodRegistry:
+    # TemporaryFile is anonymous on supported POSIX systems, so validation uses
+    # the immutable bytes already read without leaving a named preflight file.
+    with tempfile.TemporaryFile(mode="w+b") as registry_file:
+        registry_file.write(snapshot.payload)
+        registry_file.flush()
+        registry_file.seek(0)
+        return load_task_c_method_registry(
+            Path(f"/proc/self/fd/{registry_file.fileno()}")
+        )
 
 
 def _reject_symlink_components(path: Path, label: str) -> None:
@@ -598,13 +652,13 @@ def _parse_maximum_resident_kib(path: Path) -> int | None:
         if "Maximum resident set size" not in line:
             continue
         value_text = line.rsplit(":", 1)[-1].strip()
-        if re.fullmatch(r"[0-9]+", value_text) is None:
+        if re.fullmatch(r"[0-9]{1,20}", value_text) is None:
             return None
         try:
             value = int(value_text)
-        except ValueError:
+        except (ValueError, OverflowError):
             return None
-        return value if value >= 0 else None
+        return value if value <= 2**63 - 1 else None
     return None
 
 
@@ -635,9 +689,15 @@ def _parse_maximum_resident_kib_at(
         if "Maximum resident set size" not in line:
             continue
         value_text = line.rsplit(":", 1)[-1].strip()
-        if re.fullmatch(r"[0-9]+", value_text) is None:
+        if re.fullmatch(r"[0-9]{1,20}", value_text) is None:
             return None, False
-        return int(value_text), True
+        try:
+            value = int(value_text)
+        except (ValueError, OverflowError):
+            return None, False
+        if value > 2**63 - 1:
+            return None, False
+        return value, True
     return None, False
 
 
@@ -869,49 +929,74 @@ def _validate_environment_snapshot(
         raise TaskCRuntimeError(
             f"environment file {snapshot.path.name} is not valid UTF-8"
         ) from exc
-    if "\t" in text or "\x00" in text or "\n---" in text:
+    try:
+        documents = list(yaml.load_all(text, Loader=_UniqueSafeYamlLoader))
+    except (yaml.YAMLError, TaskCRuntimeError, TypeError, ValueError) as exc:
+        if isinstance(exc, TaskCRuntimeError):
+            raise
         raise TaskCRuntimeError(
-            f"environment file {snapshot.path.name} uses unsupported YAML structure"
+            f"environment file {snapshot.path.name} is not safe, valid YAML"
+        ) from exc
+    if len(documents) != 1 or not isinstance(documents[0], dict):
+        raise TaskCRuntimeError(
+            f"environment file {snapshot.path.name} must contain one YAML mapping"
         )
-    names = [
-        line[len("name:") :].strip()
-        for line in text.splitlines()
-        if line.startswith("name:")
-    ]
-    if names != [expected_name]:
+    document = documents[0]
+    if "name" in document and document["name"] != expected_name:
         raise TaskCRuntimeError(
             f"environment name in {snapshot.path.name} does not match the method registry"
         )
-    for section in ("channels:", "dependencies:"):
-        if sum(line == section for line in text.splitlines()) != 1:
-            raise TaskCRuntimeError(
-                f"environment file {snapshot.path.name} has duplicate or missing YAML sections"
-            )
-    pip_headers = [
-        index
-        for index, line in enumerate(text.splitlines())
-        if re.fullmatch(r"  - pip:\s*", line)
-    ]
-    if len(pip_headers) != 1:
+    if set(document) != {"name", "channels", "dependencies"}:
+        raise TaskCRuntimeError(
+            f"environment file {snapshot.path.name} fields must be exactly name, channels, dependencies"
+        )
+    channels = document["channels"]
+    if (
+        not isinstance(channels, list)
+        or not channels
+        or any(type(channel) is not str or not channel for channel in channels)
+        or len(set(channels)) != len(channels)
+    ):
+        raise TaskCRuntimeError(
+            f"environment {expected_name} channels must be unique names"
+        )
+    dependencies = document["dependencies"]
+    if not isinstance(dependencies, list) or not dependencies:
+        raise TaskCRuntimeError(
+            f"environment {expected_name} dependencies must be a non-empty list"
+        )
+    pip_sections: list[list[object]] = []
+    for dependency in dependencies:
+        if type(dependency) is str and dependency:
+            continue
+        if (
+            isinstance(dependency, dict)
+            and set(dependency) == {"pip"}
+            and isinstance(dependency["pip"], list)
+        ):
+            pip_sections.append(dependency["pip"])
+            continue
+        raise TaskCRuntimeError(
+            f"environment {expected_name} contains an unsupported dependency structure"
+        )
+    if len(pip_sections) != 1:
         raise TaskCRuntimeError(
             f"environment {expected_name} must contain one pip dependency section"
         )
-    lines = text.splitlines()
-    pip_dependencies: list[str] = []
-    for line in lines[pip_headers[0] + 1 :]:
-        if line and not line.startswith(" "):
-            break
-        if line.startswith("  - "):
-            break
-        match = re.fullmatch(r"      - (\S+)\s*", line)
-        if match:
-            pip_dependencies.append(match.group(1))
-        elif line.strip() and not line.lstrip().startswith("#"):
-            raise TaskCRuntimeError(
-                f"environment {expected_name} has an ambiguous pip dependency"
-            )
+    pip_dependencies = pip_sections[0]
+    if any(
+        type(dependency) is not str or not dependency for dependency in pip_dependencies
+    ):
+        raise TaskCRuntimeError(
+            f"environment {expected_name} pip dependencies must be package strings"
+        )
+    pip_strings = [str(dependency) for dependency in pip_dependencies]
+    if len(set(pip_strings)) != len(pip_strings):
+        raise TaskCRuntimeError(
+            f"environment {expected_name} contains duplicate pip dependencies"
+        )
     vcs_dependencies = [
-        dependency for dependency in pip_dependencies if dependency.startswith("git+")
+        dependency for dependency in pip_strings if "git+" in dependency.casefold()
     ]
     if vcs_dependencies != [causalbench_pin]:
         raise TaskCRuntimeError(
@@ -1304,23 +1389,25 @@ def bootstrap_task_c_methods(
         Path(registry_path),
         "method registry",
     )
+    # Validate the immutable bytes before creating any cache or staging path.
+    registry = _validate_registry_snapshot(registry_snapshot)
     root = _prepare_cache_root(cache_root)
     staging = root / f".bootstrap-staging-{uuid.uuid4().hex}"
-    staging.mkdir(mode=0o700)
-    _fsync_directory(root)
-    registry_copy = staging / "task_c_methods_v1.json"
-    _write_snapshot(registry_copy, registry_snapshot.payload)
-    registry = load_task_c_method_registry(registry_copy)
-    sources = _source_records(registry)
-    project = Path(project_root)
-    in_progress = {
-        "schema_version": SCHEMA_VERSION,
-        "status": "asset_preparation_in_progress",
-    }
-    _atomic_replace_json(root / "bootstrap_status.json", in_progress)
-    _unlink_cache_record(root / "bootstrap_manifest.json")
-
+    staging_created = False
     try:
+        staging.mkdir(mode=0o700)
+        staging_created = True
+        _fsync_directory(root)
+        registry_copy = staging / "task_c_methods_v1.json"
+        _write_snapshot(registry_copy, registry_snapshot.payload)
+        sources = _source_records(registry)
+        project = Path(project_root)
+        in_progress = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "asset_preparation_in_progress",
+        }
+        _atomic_replace_json(root / "bootstrap_status.json", in_progress)
+        _unlink_cache_record(root / "bootstrap_manifest.json")
         environments = _environment_records(registry, project)
         environment_copies: dict[str, Path] = {}
         input_directory = staging / "environment_inputs"
@@ -1497,19 +1584,20 @@ def bootstrap_task_c_methods(
         }
         _atomic_replace_json(root / "bootstrap_status.json", completed_status)
     except BaseException:
-        _unlink_cache_record(root / "bootstrap_manifest.json")
-        failed_status = {
-            "schema_version": SCHEMA_VERSION,
-            "status": "failed_asset_preparation",
-            "reason": (
-                "Official assets or isolated environments did not satisfy the "
-                "fixed preparation rules."
-            ),
-        }
-        _atomic_replace_json(root / "bootstrap_status.json", failed_status)
+        if staging_created:
+            _unlink_cache_record(root / "bootstrap_manifest.json")
+            failed_status = {
+                "schema_version": SCHEMA_VERSION,
+                "status": "failed_asset_preparation",
+                "reason": (
+                    "Official assets or isolated environments did not satisfy the "
+                    "fixed preparation rules."
+                ),
+            }
+            _atomic_replace_json(root / "bootstrap_status.json", failed_status)
         raise
     finally:
-        if staging.exists() and not staging.is_symlink():
+        if staging_created and staging.exists() and not staging.is_symlink():
             shutil.rmtree(staging)
             _fsync_directory(root)
 
