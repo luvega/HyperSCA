@@ -106,6 +106,35 @@ def test_gene_limit_is_checked_before_quadratic_completion() -> None:
         normalize_task_c_predictions(raw, gene_names)
 
 
+def test_raw_row_limit_fails_before_any_prediction_column_is_accessed() -> None:
+    class ColumnAccessProbe(pd.DataFrame):
+        def __getitem__(self, key: object) -> object:
+            raise AssertionError(f"column was accessed before row limit check: {key}")
+
+    raw = ColumnAccessProbe(
+        index=range(1_001),
+        columns=["source", "target", "score"],
+    )
+
+    with pytest.raises(TaskCPredictionError, match="at most 1000 rows"):
+        normalize_task_c_predictions(raw, ["A", "B"])
+
+
+def test_top_1000_output_is_allowed_for_a_small_gene_set() -> None:
+    raw = pd.DataFrame(
+        {
+            "source": ["A"] * 1_000,
+            "target": ["B"] * 1_000,
+            "score": [0.1] * 1_000,
+        }
+    )
+
+    completed = normalize_task_c_predictions(raw, ["A", "B"])
+
+    assert completed["score"].tolist() == pytest.approx([0.1, 0.0])
+    assert completed["returned_by_method"].tolist() == [True, False]
+
+
 @pytest.mark.parametrize(
     "raw",
     [
@@ -178,6 +207,18 @@ def test_scores_must_be_real_finite_non_negative_numbers(score: object) -> None:
 
     with pytest.raises(TaskCPredictionError, match="scores"):
         normalize_task_c_predictions(raw, ["A", "B"])
+
+
+def test_negative_zero_is_returned_but_all_output_zeros_are_positive() -> None:
+    raw = pd.DataFrame(
+        {"source": ["A"], "target": ["B"], "score": [-0.0]}
+    )
+
+    completed = normalize_task_c_predictions(raw, ["A", "B"])
+
+    assert completed["score"].tolist() == [0.0, 0.0]
+    assert not np.signbit(completed["score"].to_numpy()).any()
+    assert completed["returned_by_method"].tolist() == [True, False]
 
 
 def test_one_gene_has_a_well_typed_empty_relation_scope() -> None:

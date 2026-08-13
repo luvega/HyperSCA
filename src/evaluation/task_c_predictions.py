@@ -12,6 +12,12 @@ import pandas as pd
 MAXIMUM_TASK_C_GENES = 1_000
 """本层允许展开的基因上限；正式演练可在外层使用更小上限。"""
 
+MINIMUM_RAW_ROW_ALLOWANCE = 1_000
+"""即使关系范围较小，也容许外部方法返回前 1,000 条候选关系。"""
+
+MAXIMUM_COPIES_PER_RELATION = 4
+"""较大关系范围内，每条可能关系最多预留四份重复结果的总量。"""
+
 
 class TaskCPredictionError(ValueError):
     """一个方法的关系结果不能安全进入统一评价。"""
@@ -65,7 +71,7 @@ def _validated_scores(values: list[object]) -> np.ndarray:
             raise TaskCPredictionError(
                 "scores must be real, finite, non-negative numbers"
             )
-        scores.append(score)
+        scores.append(0.0 if score == 0.0 else score)
     return np.asarray(scores, dtype=np.float64)
 
 
@@ -81,6 +87,16 @@ def normalize_task_c_predictions(
     if len(raw.columns) != 3 or set(raw.columns) != required_columns:
         raise TaskCPredictionError(
             "prediction table must contain exactly source, target, and score"
+        )
+    complete_relation_count = len(genes) * (len(genes) - 1)
+    maximum_raw_rows = max(
+        MINIMUM_RAW_ROW_ALLOWANCE,
+        MAXIMUM_COPIES_PER_RELATION * complete_relation_count,
+    )
+    if len(raw) > maximum_raw_rows:
+        raise TaskCPredictionError(
+            "prediction table is unexpectedly large: "
+            f"this fixed gene set accepts at most {maximum_raw_rows} rows"
         )
 
     sources = raw["source"].tolist()
@@ -133,6 +149,7 @@ def normalize_task_c_predictions(
         validate="one_to_one",
     )
     completed["score"] = completed["score"].fillna(0.0).astype(np.float64)
+    completed.loc[completed["score"] == 0.0, "score"] = 0.0
     completed["returned_by_method"] = completed["_returned"].eq(True)
     completed = completed.sort_values(
         ["score", "_fixed_order"],
