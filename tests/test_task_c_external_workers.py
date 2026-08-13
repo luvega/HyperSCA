@@ -19,6 +19,21 @@ CAUSALBENCH_WORKER = ROOT / "scripts/task_c_workers/causalbench_worker.py"
 PSGRN_WORKER = ROOT / "scripts/task_c_workers/psgrn_worker.py"
 EXPECTED_CAUSALBENCH_COMMIT = "1a2143cffdc85f835b41ce8d52034be1bf903e71"
 EXPECTED_PSGRN_COMMIT = "74aa640f7c472b23a69811f6795bb17678efd344"
+PROVEN_ORDER_MODELS = {"grnboost"}
+UNPROVEN_ORDER_MODELS = {
+    "random1000",
+    "pc",
+    "ges",
+    "gies",
+    "gsp",
+    "igsp",
+    "notears-lin-sparse",
+    "DCDI-G",
+    "DCDI-DSF",
+    "DCDFG-LIN",
+    "DCDFG-MLP",
+    "sortnregress",
+}
 
 
 def _write_input(
@@ -75,6 +90,7 @@ def _fake_causalbench(tmp_path: Path) -> Path:
         models / "fake_base.py",
         """
         import json
+        import numpy as np
         import os
 
         class Base:
@@ -106,6 +122,8 @@ def _fake_causalbench(tmp_path: Path) -> Path:
                     return (edge for edge in edges)
                 if kind == "unknown_gene":
                     return [("A", "NOT_IN_FIXED_GENES")]
+                if kind == "numpy_string":
+                    return [(np.str_("A"), np.str_("B"))]
                 return edges
         """,
     )
@@ -134,7 +152,7 @@ def _fake_causalbench(tmp_path: Path) -> Path:
 def _run_causalbench(
     tmp_path: Path,
     *,
-    model_name: str = "pc",
+    model_name: str = "grnboost",
     training_information: str = "observational",
     input_path: Path | None = None,
     output_path: Path | None = None,
@@ -312,7 +330,7 @@ def test_causalbench_uses_the_pinned_official_constructor_contract(
     expected_args: list[object],
     expected_kwargs: dict[str, object],
 ) -> None:
-    _, destination, record_path = _run_causalbench(
+    completed, destination, record_path = _run_causalbench(
         tmp_path,
         model_name=model_name,
         training_information=(
@@ -320,13 +338,51 @@ def test_causalbench_uses_the_pinned_official_constructor_contract(
             if model_name in {"gies", "igsp", "DCDI-G", "DCDI-DSF", "DCDFG-LIN", "DCDFG-MLP"}
             else "observational"
         ),
+        check=False,
     )
 
     record = json.loads(record_path.read_text(encoding="utf-8"))
     assert record["class_name"] == expected_class
     assert record["init_args"] == expected_args
     assert record["init_kwargs"] == expected_kwargs
-    assert destination.exists()
+    if model_name in PROVEN_ORDER_MODELS:
+        assert completed.returncode == 0
+        assert destination.exists()
+    else:
+        assert model_name in UNPROVEN_ORDER_MODELS
+        assert completed.returncode != 0
+        assert "failed_invalid_output" in completed.stderr
+        assert not destination.exists()
+
+
+def test_only_grnboost_has_a_provable_ranked_return_in_the_pinned_adapter() -> None:
+    worker = _load_worker(CAUSALBENCH_WORKER, "test_causalbench_order_boundary")
+
+    assert set(worker.PROVEN_OFFICIAL_RETURN_ORDER) == PROVEN_ORDER_MODELS
+    assert set(worker.MODEL_NAMES) == PROVEN_ORDER_MODELS | UNPROVEN_ORDER_MODELS
+
+
+@pytest.mark.parametrize("model_name", sorted(UNPROVEN_ORDER_MODELS))
+def test_causalbench_rejects_unproven_order_even_when_the_object_is_a_list(
+    tmp_path: Path, model_name: str
+) -> None:
+    completed, destination, _ = _run_causalbench(
+        tmp_path,
+        model_name=model_name,
+        training_information=(
+            "partial_interventional"
+            if model_name
+            in {"gies", "igsp", "DCDI-G", "DCDI-DSF", "DCDFG-LIN", "DCDFG-MLP"}
+            else "observational"
+        ),
+        return_kind="list",
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "failed_invalid_output" in completed.stderr
+    assert "not proven" in completed.stderr
+    assert not destination.exists()
 
 
 def test_observational_worker_uses_only_controls_and_preserves_official_order(
@@ -353,16 +409,20 @@ def test_observational_worker_uses_only_controls_and_preserves_official_order(
 
 
 def test_partial_interventional_worker_keeps_every_allowed_cell(tmp_path: Path) -> None:
-    _, _, record_path = _run_causalbench(
+    completed, destination, record_path = _run_causalbench(
         tmp_path,
         model_name="gies",
         training_information="partial_interventional",
+        check=False,
     )
 
     record = json.loads(record_path.read_text(encoding="utf-8"))
     assert record["shape"] == [3, 2]
     assert record["interventions"] == ["non-targeting", "A", "non-targeting"]
     assert record["regime_name"] == "PartialIntervational"
+    assert completed.returncode != 0
+    assert "failed_invalid_output" in completed.stderr
+    assert not destination.exists()
 
 
 @pytest.mark.parametrize("return_kind", ["set", "mapping", "generator"])
@@ -391,6 +451,20 @@ def test_unknown_causalbench_endpoint_is_rejected_before_writing(tmp_path: Path)
     assert completed.returncode != 0
     assert "fixed gene set" in completed.stderr
     assert not destination.exists()
+
+
+def test_numpy_string_endpoints_are_converted_and_validated(tmp_path: Path) -> None:
+    completed, destination, _ = _run_causalbench(
+        tmp_path,
+        model_name="grnboost",
+        return_kind="numpy_string",
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    with destination.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows == [{"source": "A", "target": "B", "score": "1.0"}]
 
 
 @pytest.mark.parametrize(

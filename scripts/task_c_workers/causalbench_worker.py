@@ -30,6 +30,13 @@ MODEL_NAMES = (
     "DCDFG-MLP",
     "sortnregress",
 )
+PROVEN_OFFICIAL_RETURN_ORDER = frozenset({"grnboost"})
+"""Methods whose fixed adapter preserves a documented ranked result.
+
+GRNBoost receives Arboreto's importance-sorted table.  The other registered
+models expose graph storage order or convert a set to a list, so their list
+objects do not carry a scientifically meaningful ranking.
+"""
 TRAINING_INFORMATION = ("observational", "partial_interventional")
 MAXIMUM_INPUT_BYTES = 512 * 1024 * 1024
 MAXIMUM_ARCHIVE_BYTES = 512 * 1024 * 1024
@@ -228,10 +235,12 @@ def ranked_edges(raw: object, genes: Sequence[str], *, limit: int | None = None)
                 "failed_invalid_output: every returned relation must have two endpoints"
             )
         source, target = relation
-        if type(source) is not str or type(target) is not str:
+        if not isinstance(source, str) or not isinstance(target, str):
             raise WorkerContractError(
                 "failed_invalid_output: relation endpoints must be gene names"
             )
+        source = str(source)
+        target = str(target)
         if (
             not source
             or not target
@@ -380,6 +389,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             regime,
             args.seed,
         )
+        if args.model_name not in PROVEN_OFFICIAL_RETURN_ORDER:
+            raise WorkerContractError(
+                "failed_invalid_output: official return order is not proven "
+                f"for {args.model_name} at the registered source version"
+            )
         rows = ranked_edges(returned, genes)
         write_ranked_csv(args.output_csv, rows)
     except WorkerContractError as exc:
