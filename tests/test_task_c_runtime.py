@@ -327,6 +327,55 @@ def test_short_equals_option_value_is_redacted_when_logged_without_option(
     assert "<command-argument>" in result["stderr_tail"]
 
 
+def test_short_nonsensitive_arguments_do_not_change_method_logs(
+    tmp_path: Path,
+) -> None:
+    expected = "A method 3 stayed visible"
+    result = run_isolated_method(
+        [
+            sys.executable,
+            "-c",
+            f"import sys; print({expected!r}, file=sys.stderr); sys.exit(3)",
+            "3",
+            "A",
+        ],
+        output_dir=tmp_path / "run",
+        timeout_seconds=10,
+    )
+
+    assert result["stderr_tail"] == expected + "\n"
+    assert "\x00" not in result["stderr_tail"]
+
+
+def test_overlapping_sensitive_paths_are_redacted_once_without_nul_markers(
+    tmp_path: Path,
+) -> None:
+    private_root = str(tmp_path / "Patient cohort A")
+    private_input = str(Path(private_root) / "nested input matrix.npz")
+    output = tmp_path / "run"
+    result = run_isolated_method(
+        [
+            sys.executable,
+            "-c",
+            "import sys; print(sys.argv[1], sys.argv[2], sep='\\n', file=sys.stderr); sys.exit(3)",
+            private_input,
+            private_root,
+            "A",
+        ],
+        output_dir=output,
+        timeout_seconds=10,
+    )
+
+    assert private_input not in result["stderr_tail"]
+    assert private_root not in result["stderr_tail"]
+    assert "Patient" not in result["stderr_tail"]
+    assert result["stderr_tail"].count("<command-argument>") == 2
+    assert "\x00" not in result["stderr_tail"]
+    serialized = (output / "method_status.json").read_text(encoding="utf-8")
+    assert "\\u0000" not in serialized
+    assert json.loads(serialized) == result
+
+
 def test_explicit_exit_137_is_not_reported_as_a_terminating_signal(
     tmp_path: Path,
 ) -> None:

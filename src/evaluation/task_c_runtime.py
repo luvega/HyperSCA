@@ -51,7 +51,43 @@ _PLAIN_OPTION = re.compile(r"(?:--[A-Za-z][A-Za-z0-9_-]*|-[A-Za-z])")
 _OPTION_WITH_VALUE = re.compile(r"(-{1,2}[A-Za-z][A-Za-z0-9_-]*)=(.+)", re.DOTALL)
 _SHORT_OPTION_WITH_VALUE = re.compile(r"(-[A-Za-z])(.+)", re.DOTALL)
 _NEGATIVE_NUMBER = re.compile(r"-(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
-_COMMAND_ARGUMENT_MARKER = "\x00TASK_C_COMMAND_ARGUMENT\x00"
+_COMMAND_ARGUMENT_REDACTION = "<command-argument>"
+
+
+def _has_private_command_shape(value: str) -> bool:
+    return (
+        "/" in value or "\\" in value or any(character.isspace() for character in value)
+    )
+
+
+def _redact_command_values(text: str, command: Sequence[str]) -> str:
+    replacements: dict[str, str] = {}
+    for argument in command:
+        if _PLAIN_OPTION.fullmatch(argument) or _NEGATIVE_NUMBER.fullmatch(argument):
+            continue
+        equals_option = _OPTION_WITH_VALUE.fullmatch(argument)
+        attached_option = _SHORT_OPTION_WITH_VALUE.fullmatch(argument)
+        if equals_option is not None:
+            option, value = equals_option.groups()
+            replacements.setdefault(
+                argument,
+                f"{option}={_COMMAND_ARGUMENT_REDACTION}",
+            )
+            replacements.setdefault(value, _COMMAND_ARGUMENT_REDACTION)
+        elif attached_option is not None:
+            option, value = attached_option.groups()
+            replacements.setdefault(
+                argument,
+                f"{option}{_COMMAND_ARGUMENT_REDACTION}",
+            )
+            replacements.setdefault(value, _COMMAND_ARGUMENT_REDACTION)
+        elif _has_private_command_shape(argument):
+            replacements.setdefault(argument, _COMMAND_ARGUMENT_REDACTION)
+    if not replacements:
+        return text
+    alternatives = sorted(replacements, key=len, reverse=True)
+    pattern = re.compile("|".join(re.escape(value) for value in alternatives))
+    return pattern.sub(lambda match: replacements[match.group(0)], text)
 
 
 class TaskCRuntimeError(ValueError):
@@ -84,33 +120,10 @@ class _TailBuffer:
         return self.total_bytes > self.maximum_bytes
 
     def text(self, command: Sequence[str] = ()) -> str:
-        decoded = self.raw_text()
-        for argument in sorted(set(command), key=len, reverse=True):
-            if _PLAIN_OPTION.fullmatch(argument) or _NEGATIVE_NUMBER.fullmatch(
-                argument
-            ):
-                continue
-            equals_option = _OPTION_WITH_VALUE.fullmatch(argument)
-            attached_option = _SHORT_OPTION_WITH_VALUE.fullmatch(argument)
-            if equals_option is not None:
-                option, value = equals_option.groups()
-                decoded = decoded.replace(
-                    argument,
-                    f"{option}={_COMMAND_ARGUMENT_MARKER}",
-                )
-                decoded = decoded.replace(value, _COMMAND_ARGUMENT_MARKER)
-            elif attached_option is not None:
-                option, value = attached_option.groups()
-                decoded = decoded.replace(
-                    argument,
-                    f"{option}{_COMMAND_ARGUMENT_MARKER}",
-                )
-                decoded = decoded.replace(value, _COMMAND_ARGUMENT_MARKER)
-            else:
-                decoded = decoded.replace(argument, _COMMAND_ARGUMENT_MARKER)
-        return _PRIVATE_PATH.sub("<absolute-path>", decoded).replace(
-            _COMMAND_ARGUMENT_MARKER,
-            "<command-argument>",
+        decoded = _redact_command_values(self.raw_text(), command)
+        return _PRIVATE_PATH.sub(
+            "<absolute-path>",
+            decoded,
         )
 
     def raw_text(self) -> str:
