@@ -695,6 +695,32 @@ def _all_finite_tensor(value: torch.Tensor) -> bool:
         raise HyperSCACError("could not validate optimization values") from exc
 
 
+def _hypersca_c_objective(
+    shared_raw: torch.Tensor,
+    delta_raw: Mapping[str, torch.Tensor],
+    contexts: Sequence[HyperSCACContext],
+    prepared: Mapping[str, tuple[torch.Tensor, torch.Tensor]],
+    config: HyperSCACConfig,
+    prior_weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """用一份公式同时计算训练目标和更新后留档目标。"""
+
+    shared = zero_diagonal(shared_raw)
+    total = config.shared_l1 * (shared.abs() * prior_weights).mean()
+    current_deltas: dict[str, torch.Tensor] = {}
+    for context in contexts:
+        delta = zero_diagonal(delta_raw[context.context_id])
+        current_deltas[context.context_id] = delta
+        adjacency = shared + delta
+        values, mask = prepared[context.context_id]
+        # Convention: adjacency[source, target], so prediction = X @ adjacency.
+        prediction = values @ adjacency
+        total = total + masked_sem_loss(prediction, values, mask)
+        total = total + config.context_l1 * delta.abs().mean()
+        total = total + config.acyclicity_weight * acyclicity_penalty(adjacency)
+    return total, shared, current_deltas
+
+
 def fit_hypersca_c_once(
     contexts: Sequence[HyperSCACContext],
     config: HyperSCACConfig,
@@ -793,47 +819,18 @@ def _fit_hypersca_c_once(
     best_state: tuple[np.ndarray, dict[str, np.ndarray]] | None = None
     for _ in range(config.maximum_epochs):
         optimizer.zero_grad(set_to_none=True)
-        shared = zero_diagonal(shared_raw)
-        total = config.shared_l1 * (shared.abs() * prior_weights).mean()
-        current_deltas: dict[str, torch.Tensor] = {}
-        for context in normalized_contexts:
-            delta = zero_diagonal(delta_raw[context.context_id])
-            current_deltas[context.context_id] = delta
-            adjacency = shared + delta
-            values, mask = prepared[context.context_id]
-            # Convention: adjacency[source, target], so prediction = X @ adjacency.
-            prediction = values @ adjacency
-            total = total + masked_sem_loss(prediction, values, mask)
-            total = total + config.context_l1 * delta.abs().mean()
-            total = total + config.acyclicity_weight * acyclicity_penalty(adjacency)
-
-        if not _all_finite_tensor(total):
+        training_total, _, _ = _hypersca_c_objective(
+            shared_raw,
+            delta_raw,
+            normalized_contexts,
+            prepared,
+            config,
+            prior_weights,
+        )
+        if not _all_finite_tensor(training_total):
             raise HyperSCACError("optimization loss must be finite at every step")
-        numeric_loss = float(total.detach().cpu().item())
-        history.append(numeric_loss)
-
-        # Save the tensors used for this exact recorded loss before optimizer.step().
-        if numeric_loss < best_loss:
-            best_loss = numeric_loss
-            best_state = (
-                shared.detach().cpu().numpy().copy(),
-                {
-                    name: delta.detach().cpu().numpy().copy()
-                    for name, delta in current_deltas.items()
-                },
-            )
-
-        if numeric_loss < early_stopping_best - 1e-7:
-            early_stopping_best = numeric_loss
-            stale_epochs = 0
-        else:
-            stale_epochs += 1
-            if stale_epochs >= config.early_stopping_patience:
-                converged = True
-                break
-
         try:
-            total.backward()
+            training_total.backward()
         except (RuntimeError, TypeError, ValueError) as exc:
             raise HyperSCACError("optimization gradient could not be calculated") from exc
         for parameter in parameters:
@@ -845,6 +842,40 @@ def _fit_hypersca_c_once(
             raise HyperSCACError("optimizer could not update the model") from exc
         if any(not _all_finite_tensor(parameter) for parameter in parameters):
             raise HyperSCACError("model values must remain finite after every step")
+
+        with torch.no_grad():
+            updated_total, updated_shared, updated_deltas = _hypersca_c_objective(
+                shared_raw,
+                delta_raw,
+                normalized_contexts,
+                prepared,
+                config,
+                prior_weights,
+            )
+        if not _all_finite_tensor(updated_total):
+            raise HyperSCACError("updated optimization loss must be finite")
+        numeric_loss = float(updated_total.detach().cpu().item())
+        history.append(numeric_loss)
+
+        # History and the saved state now describe the same post-update parameters.
+        if numeric_loss < best_loss:
+            best_loss = numeric_loss
+            best_state = (
+                updated_shared.detach().cpu().numpy().copy(),
+                {
+                    name: delta.detach().cpu().numpy().copy()
+                    for name, delta in updated_deltas.items()
+                },
+            )
+
+        if numeric_loss < early_stopping_best - 1e-7:
+            early_stopping_best = numeric_loss
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+            if stale_epochs >= config.early_stopping_patience:
+                converged = True
+                break
 
     if best_state is None or not history:
         raise HyperSCACError("optimization did not produce a usable state")

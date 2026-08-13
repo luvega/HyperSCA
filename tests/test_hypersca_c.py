@@ -766,6 +766,23 @@ def test_fit_rejects_unavailable_cuda_device() -> None:
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_fit_runs_on_cuda_and_returns_finite_cpu_arrays() -> None:
+    result = fit_hypersca_c_once(
+        [small_context()],
+        small_config(maximum_epochs=2, early_stopping_patience=2),
+        seed=11,
+        device="cuda",
+    )
+    assert isinstance(result.shared, np.ndarray)
+    assert np.isfinite(result.shared).all()
+    assert np.isfinite(result.loss_history).all()
+    assert all(
+        isinstance(matrix, np.ndarray) and np.isfinite(matrix).all()
+        for matrix in result.context_adjacencies.values()
+    )
+
+
 def test_fit_requires_unique_contexts_with_identical_ordered_genes() -> None:
     with pytest.raises(HyperSCACError, match="unique"):
         fit_hypersca_c_once(
@@ -842,6 +859,20 @@ def test_best_state_matches_the_best_recorded_loss() -> None:
     result = fit_hypersca_c_once(contexts, config, seed=11, device="cpu")
     returned_loss = _objective_for_fit(result, contexts, config)
     assert returned_loss == pytest.approx(float(result.loss_history.min()), abs=2e-6)
+
+
+def test_one_epoch_returns_the_first_updated_state_and_matching_loss() -> None:
+    contexts = [small_context()]
+    config = small_config(
+        maximum_epochs=1,
+        early_stopping_patience=1,
+        enable_context_adjustments=False,
+    )
+    result = fit_hypersca_c_once(contexts, config, seed=11, device="cpu")
+    assert np.any(result.shared != 0.0)
+    returned_loss = _objective_for_fit(result, contexts, config)
+    assert result.epochs_run == 1
+    assert result.loss_history.tolist() == pytest.approx([returned_loss], abs=2e-6)
 
 
 def test_best_state_keeps_even_a_small_recorded_improvement(
