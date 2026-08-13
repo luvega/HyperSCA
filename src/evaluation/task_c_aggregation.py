@@ -77,6 +77,7 @@ _FAILED_FILES = frozenset(
         "environment_manifest.json",
     }
 )
+_MINIMAL_STATUS_FIELDS = frozenset({"method_id", "status"})
 _STATUS_FIELDS = frozenset(
     {
         "schema_version",
@@ -86,6 +87,14 @@ _STATUS_FIELDS = frozenset(
         "run_identity_sha256",
         "status",
         "validated_by_rehearsal_controller",
+    }
+)
+_KNOWN_PASSED_FILES = _PASSED_FILES
+_KNOWN_FAILED_FILES = _FAILED_FILES | frozenset(
+    {
+        "run_manifest.json",
+        "input_summary.json",
+        "promotion_decision.json",
     }
 )
 _REHEARSAL_CONDITIONS = frozenset(
@@ -196,7 +205,6 @@ def _normalize_relations(
     values: Iterable[tuple[str, str]],
     *,
     label: str,
-    genes: set[str],
 ) -> set[tuple[str, str]]:
     if isinstance(values, (str, bytes)):
         raise TaskCAggregationError(f"{label} must contain source-target pairs")
@@ -217,10 +225,6 @@ def _normalize_relations(
         edge = (source, target)
         if edge in normalized:
             raise TaskCAggregationError(f"{label} must contain unique relations")
-        if source not in genes or target not in genes:
-            raise TaskCAggregationError(
-                f"{label} contains a gene outside the scored universe"
-            )
         normalized.add(edge)
     return normalized
 
@@ -251,27 +255,23 @@ def _normalize_eligible_sources(
     return allowed
 
 
-def _precision_at_k_with_ties(
+def _stable_precision_at_k(
     scores: pd.DataFrame,
     positives: set[tuple[str, str]],
     requested_k: int,
 ) -> tuple[float, int]:
     effective_k = min(requested_k, len(scores))
-    values = scores["score"].to_numpy(dtype=float)
-    cutoff = float(np.partition(values, len(values) - effective_k)[len(values) - effective_k])
-    above = scores[scores["score"] > cutoff]
-    tied = scores[scores["score"] == cutoff]
-    above_positive = sum(
-        edge in positives
-        for edge in above[["source", "target"]].itertuples(index=False, name=None)
+    ordered = scores.sort_values(
+        ["score", "source", "target"],
+        ascending=[False, True, True],
+        kind="mergesort",
     )
-    tied_positive = sum(
+    selected = ordered.head(effective_k)
+    selected_positive = sum(
         edge in positives
-        for edge in tied[["source", "target"]].itertuples(index=False, name=None)
+        for edge in selected[["source", "target"]].itertuples(index=False, name=None)
     )
-    remaining = effective_k - len(above)
-    expected_positive = above_positive + remaining * tied_positive / len(tied)
-    return float(expected_positive / effective_k), int(effective_k)
+    return float(selected_positive / effective_k), int(effective_k)
 
 
 def evaluate_declared_references(
@@ -285,12 +285,10 @@ def evaluate_declared_references(
 ) -> Mapping[str, object]:
     """分别报告汇总生物参考关系和环境匹配的有向补充关系。"""
 
-    genes, _ = _validate_scores(scores)
-    pooled = _normalize_relations(
-        pooled_reference, label="pooled reference", genes=genes
-    )
+    genes, scored_relations = _validate_scores(scores)
+    pooled = _normalize_relations(pooled_reference, label="pooled reference")
     directed = _normalize_relations(
-        directed_chip_reference, label="directed reference", genes=genes
+        directed_chip_reference, label="directed reference"
     )
     allowed_sources = _normalize_eligible_sources(eligible_sources, genes)
     if type(directed_reference_context_match) is not bool:
@@ -315,7 +313,9 @@ def evaluate_declared_references(
             "holdout scoring has no eligible source relations"
         )
     pooled_in_scope = {
-        edge for edge in pooled if edge[0] in allowed_sources
+        edge
+        for edge in pooled
+        if edge[0] in allowed_sources and edge in scored_relations
     }
     if not pooled_in_scope:
         raise TaskCAggregationError(
@@ -329,7 +329,7 @@ def evaluate_declared_references(
         raise TaskCAggregationError(str(exc)) from exc
 
     for index, requested_k in enumerate(checked_k):
-        precision, effective_k = _precision_at_k_with_ties(
+        precision, effective_k = _stable_precision_at_k(
             scored, pooled_in_scope, requested_k
         )
         metrics[f"precision_at_{requested_k}"] = precision
@@ -337,7 +337,7 @@ def evaluate_declared_references(
             metrics["precision_at_k"] = precision
             metrics["precision_k"] = effective_k
     metrics["precision_tie_policy"] = (
-        "expected precision under uniform selection within the cutoff tie"
+        "score descending, then source and target alphabetical order"
     )
 
     score_map = {
@@ -347,16 +347,18 @@ def evaluate_declared_references(
         )
     }
     directed_in_scope = sorted(
-        edge for edge in directed if edge[0] in allowed_sources
+        edge
+        for edge in directed
+        if edge[0] in allowed_sources
+        and edge in scored_relations
+        and (edge[1], edge[0]) in scored_relations
     )
     comparisons: list[float] = []
     if directed_reference_context_match:
         for source, target in directed_in_scope:
             forward = score_map[(source, target)]
             reverse = score_map[(target, source)]
-            comparisons.append(
-                1.0 if forward > reverse else 0.0 if forward < reverse else 0.5
-            )
+            comparisons.append(float(forward > reverse))
     direction_accuracy = (
         float(np.mean(comparisons)) if comparisons else None
     )
@@ -371,7 +373,7 @@ def evaluate_declared_references(
             "directed_chip_edge_count": int(len(directed_in_scope)),
             "directed_reference_context_match": directed_reference_context_match,
             "edge_direction_accuracy": direction_accuracy,
-            "direction_tie_credit": 0.5,
+            "direction_tie_credit": 0.0,
             "eligible_source_count": int(len(allowed_sources)),
             "scored_edge_count": int(len(scored)),
             "complete_scored_edge_count": int(len(scores)),
@@ -603,19 +605,25 @@ def _parse_json_object(payload: bytes, label: str) -> dict[str, Any]:
     return value
 
 
-def _validate_method_status(status_payload: dict[str, Any]) -> None:
+def _validate_method_status(status_payload: dict[str, Any]) -> bool:
     fields = frozenset(status_payload)
-    allowed = {_STATUS_FIELDS, _STATUS_FIELDS | {"reason"}}
-    if fields not in allowed:
+    extended_fields = {_STATUS_FIELDS, _STATUS_FIELDS | {"reason"}}
+    if fields != _MINIMAL_STATUS_FIELDS and fields not in extended_fields:
         raise TaskCAggregationError("method status fields changed")
-    if status_payload.get("schema_version") != "1.0":
-        raise TaskCAggregationError("method status schema changed")
     method_id = _valid_name(status_payload.get("method_id"), "method identity")
     if (
         len(method_id) > 80
         or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in method_id)
     ):
         raise TaskCAggregationError("method identity contains unsafe text")
+    status = status_payload.get("status")
+    if status not in {_PASSED_STATUS, *_FAILED_OR_UNAVAILABLE_STATUSES}:
+        raise TaskCAggregationError("method status is not a final rehearsal status")
+    if fields == _MINIMAL_STATUS_FIELDS:
+        return False
+
+    if status_payload.get("schema_version") != "1.0":
+        raise TaskCAggregationError("method status schema changed")
     condition = status_payload.get("condition")
     if condition not in _REHEARSAL_CONDITIONS:
         raise TaskCAggregationError("method status condition is not recognized")
@@ -630,9 +638,6 @@ def _validate_method_status(status_payload: dict[str, Any]) -> None:
         or any(character not in "0123456789abcdef" for character in identity[7:])
     ):
         raise TaskCAggregationError("method status run identity is invalid")
-    status = status_payload.get("status")
-    if status not in {_PASSED_STATUS, *_FAILED_OR_UNAVAILABLE_STATUSES}:
-        raise TaskCAggregationError("method status is not a final rehearsal status")
     if status_payload.get("validated_by_rehearsal_controller") is not True:
         raise TaskCAggregationError(
             "method status lacks the rehearsal controller validation declaration"
@@ -642,6 +647,7 @@ def _validate_method_status(status_payload: dict[str, Any]) -> None:
         raise TaskCAggregationError("passed method status must not contain a failure reason")
     if "reason" in status_payload:
         _valid_name(reason, "failure reason")
+    return True
 
 
 def _validate_metrics(metrics: dict[str, Any]) -> None:
@@ -726,21 +732,26 @@ def aggregate_task_c_runs(
             raise TaskCAggregationError("run evidence reuses a file inode")
         seen_file_inodes.add(status_inode)
         method_status = _parse_json_object(status_bytes, "method status")
-        _validate_method_status(method_status)
+        extended_status = _validate_method_status(method_status)
 
         status_name = str(method_status["status"])
-        expected_files = _PASSED_FILES if status_name == _PASSED_STATUS else _FAILED_FILES
+        if status_name == _PASSED_STATUS:
+            required_files = frozenset({"method_status.json", "metrics.json"})
+            allowed_files = _KNOWN_PASSED_FILES
+        else:
+            required_files = frozenset({"method_status.json"})
+            allowed_files = _KNOWN_FAILED_FILES
         try:
             names = {entry.name for entry in os.scandir(run_dir)}
         except OSError as exc:
             raise TaskCAggregationError("run directory cannot be inspected") from exc
-        if names != expected_files:
+        if not required_files <= names or not names <= allowed_files:
             raise TaskCAggregationError(
                 f"run file set changed for status {status_name}"
             )
 
         captured_json: dict[str, dict[str, Any]] = {"method_status.json": method_status}
-        for name in sorted(expected_files - {"method_status.json"}):
+        for name in sorted(names - {"method_status.json"}):
             maximum = MAXIMUM_METRICS_BYTES if name == "metrics.json" else MAXIMUM_EVIDENCE_BYTES
             payload, file_inode = _capture_regular_file(
                 run_dir / name, maximum_bytes=maximum
@@ -754,23 +765,24 @@ def aggregate_task_c_runs(
         _, _, directory_after = _run_directory_identity(run_dir)
         if directory_after != directory_before:
             raise TaskCAggregationError("run directory changed during aggregation")
-        if {entry.name for entry in os.scandir(run_dir)} != expected_files:
+        if {entry.name for entry in os.scandir(run_dir)} != names:
             raise TaskCAggregationError("run directory changed during aggregation")
 
-        run_identity = str(method_status["run_identity_sha256"])
-        if run_identity in seen_run_identities:
-            raise TaskCAggregationError("duplicate run identity was supplied")
-        seen_run_identities.add(run_identity)
-        cluster = (
-            str(method_status["method_id"]),
-            str(method_status["condition"]),
-            int(method_status["seed"]),
-        )
-        if cluster in seen_method_clusters:
-            raise TaskCAggregationError(
-                "duplicate method-condition-seed attempt was supplied"
+        if extended_status:
+            run_identity = str(method_status["run_identity_sha256"])
+            if run_identity in seen_run_identities:
+                raise TaskCAggregationError("duplicate run identity was supplied")
+            seen_run_identities.add(run_identity)
+            cluster = (
+                str(method_status["method_id"]),
+                str(method_status["condition"]),
+                int(method_status["seed"]),
             )
-        seen_method_clusters.add(cluster)
+            if cluster in seen_method_clusters:
+                raise TaskCAggregationError(
+                    "duplicate method-condition-seed attempt was supplied"
+                )
+            seen_method_clusters.add(cluster)
 
         record = dict(method_status)
         if status_name == _PASSED_STATUS:
@@ -789,7 +801,8 @@ def aggregate_task_c_runs(
         "status_counts": dict(sorted(counts.items())),
         "runs": run_records,
         "validation_scope": (
-            "structural checks plus a controller validation declaration"
+            "structural checks; extended records also require a controller "
+            "validation declaration"
         ),
         "independent_bundle_verification": False,
     }

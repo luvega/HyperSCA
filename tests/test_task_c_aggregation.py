@@ -105,7 +105,7 @@ def test_primary_reference_and_directed_reference_are_reported_separately() -> N
         metrics["average_precision"] = 0.0  # type: ignore[index]
 
 
-def test_precision_at_k_gives_fair_expected_credit_to_cutoff_ties() -> None:
+def test_precision_at_k_uses_frozen_stable_relation_order_for_cutoff_ties() -> None:
     scores = _complete_scores()
     scores["score"] = [1.0, 1.0, 1.0, 0.4, 0.3, 0.2]
     metrics = evaluate_declared_references(
@@ -117,11 +117,11 @@ def test_precision_at_k_gives_fair_expected_credit_to_cutoff_ties() -> None:
         precision_values=(1,),
     )
 
-    assert metrics["precision_at_1"] == pytest.approx(0.5)
-    assert metrics["precision_at_k"] == pytest.approx(0.5)
-    assert metrics["edge_direction_accuracy"] == pytest.approx(0.5)
-    assert metrics["direction_tie_credit"] == pytest.approx(0.5)
-    assert task_c_aggregation_to_jsonable(metrics)["precision_at_1"] == 0.5
+    assert metrics["precision_at_1"] == pytest.approx(1.0)
+    assert metrics["precision_at_k"] == pytest.approx(1.0)
+    assert metrics["edge_direction_accuracy"] == pytest.approx(0.0)
+    assert metrics["direction_tie_credit"] == pytest.approx(0.0)
+    assert task_c_aggregation_to_jsonable(metrics)["precision_at_1"] == 1.0
 
 
 def test_direction_metric_is_withheld_when_cell_environment_does_not_match() -> None:
@@ -214,15 +214,21 @@ def test_score_table_must_be_one_complete_finite_directed_universe(
         )
 
 
-def test_references_and_eligible_sources_must_stay_inside_scored_gene_set() -> None:
-    with pytest.raises(TaskCAggregationError, match="outside the scored universe"):
-        evaluate_declared_references(
-            _complete_scores(),
-            pooled_reference={("A", "D")},
-            directed_chip_reference=set(),
-            eligible_sources={"A"},
-            directed_reference_context_match=False,
-        )
+def test_reference_relations_outside_scored_gene_set_are_ignored() -> None:
+    metrics = evaluate_declared_references(
+        _complete_scores(),
+        pooled_reference={("A", "B"), ("A", "D")},
+        directed_chip_reference={("A", "B"), ("A", "D")},
+        eligible_sources={"A"},
+        directed_reference_context_match=True,
+        precision_values=(2,),
+    )
+
+    assert metrics["n_reference_edges_in_universe"] == 1
+    assert metrics["directed_chip_edge_count"] == 1
+
+
+def test_eligible_sources_must_stay_inside_scored_gene_set() -> None:
     with pytest.raises(TaskCAggregationError, match="subset"):
         evaluate_declared_references(
             _complete_scores(),
@@ -234,7 +240,7 @@ def test_references_and_eligible_sources_must_stay_inside_scored_gene_set() -> N
     with pytest.raises(TaskCAggregationError, match="no relation"):
         evaluate_declared_references(
             _complete_scores(),
-            pooled_reference={("B", "C")},
+            pooled_reference={("B", "C"), ("A", "D")},
             directed_chip_reference=set(),
             eligible_sources={"A"},
             directed_reference_context_match=False,
@@ -338,13 +344,35 @@ def test_failed_runs_remain_in_read_only_method_summary(tmp_path: Path) -> None:
     assert summary["failed_or_unavailable_count"] == 1
     assert summary["status_counts"]["failed_timeout"] == 1
     assert summary["validation_scope"] == (
-        "structural checks plus a controller validation declaration"
+        "structural checks; extended records also require a controller validation declaration"
     )
     assert isinstance(summary["runs"], tuple)
     assert [run["method_id"] for run in summary["runs"]] == ["pc", "gies"]
     with pytest.raises(TypeError):
         summary["status_counts"]["failed_timeout"] = 2  # type: ignore[index]
     json.dumps(task_c_aggregation_to_jsonable(summary), allow_nan=False)
+
+
+def test_original_plan_minimal_run_records_are_accepted(tmp_path: Path) -> None:
+    passed = tmp_path / "passed"
+    failed = tmp_path / "failed"
+    passed.mkdir()
+    failed.mkdir()
+    _write_json(
+        passed / "method_status.json",
+        {"method_id": "pc", "status": "passed_real_rehearsal"},
+    )
+    _write_json(passed / "metrics.json", {"average_precision": 0.2})
+    _write_json(
+        failed / "method_status.json",
+        {"method_id": "gies", "status": "failed_timeout"},
+    )
+
+    summary = aggregate_task_c_runs([passed, failed])
+
+    assert summary["attempted_run_count"] == 2
+    assert summary["completed_run_count"] == 1
+    assert summary["status_counts"]["failed_timeout"] == 1
 
 
 def test_aggregation_rejects_duplicate_run_identity_or_seed_condition_method(
@@ -367,7 +395,7 @@ def test_aggregation_rejects_duplicate_run_identity_or_seed_condition_method(
         aggregate_task_c_runs([first, first])
 
 
-def test_aggregation_enforces_exact_files_for_passed_and_failed_runs(
+def test_aggregation_requires_minimum_files_and_rejects_failure_metrics(
     tmp_path: Path,
 ) -> None:
     passed = _make_run(
@@ -387,6 +415,25 @@ def test_aggregation_enforces_exact_files_for_passed_and_failed_runs(
     _write_json(failed / "metrics.json", {"average_precision": 0.9})
     with pytest.raises(TaskCAggregationError, match="file set"):
         aggregate_task_c_runs([failed])
+
+
+def test_aggregation_allows_known_controller_files_but_rejects_unknown_extras(
+    tmp_path: Path,
+) -> None:
+    passed = tmp_path / "passed"
+    passed.mkdir()
+    _write_json(
+        passed / "method_status.json",
+        {"method_id": "pc", "status": "passed_real_rehearsal"},
+    )
+    _write_json(passed / "metrics.json", {"average_precision": 0.2})
+    _write_json(passed / "run_manifest.json", {"schema_version": "1.0"})
+    _write_json(passed / "resource_usage.json", {"schema_version": "1.0"})
+    assert aggregate_task_c_runs([passed])["completed_run_count"] == 1
+
+    (passed / "unregistered-diagnostic.txt").write_text("surprise", encoding="utf-8")
+    with pytest.raises(TaskCAggregationError, match="file set"):
+        aggregate_task_c_runs([passed])
 
 
 def test_aggregation_rejects_untrusted_or_malformed_status_and_metrics(
