@@ -6,6 +6,8 @@
 *.bam
 *.fastq.gz
 /data/
+# 任务 C 官方缓存与封存划分
+/data/task_c/
 
 # IDE / 编辑器
 .cursor/
@@ -13,6 +15,7 @@
 
 # 运行产物
 results/
+/results/benchmarks/task_c/
 
 # 参考仓库（只读，不入版本控制）
 references/
