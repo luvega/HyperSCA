@@ -8,6 +8,7 @@ import io
 import json
 import math
 import os
+import stat
 import shutil
 import tempfile
 import time
@@ -42,6 +43,7 @@ from src.evaluation.task_c_data import (
 
 _ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_REGISTRY = _ROOT / "configs/hypersca_c_ablations_v1.json"
+_DEFAULT_PRIOR_TRUST_REGISTRY = _ROOT / "configs/hypersca_c_prior_trust_v1.json"
 ABLATION_IDS = (
     "primary",
     "shared_only",
@@ -95,6 +97,27 @@ _PRIOR_MANIFEST_FIELDS = {
     "independence_attestation",
 }
 _RELATION_FINGERPRINT_SCHEMA = "directed_edge_set_v1"
+_INTERSECTION_AUDIT_SCHEMA = "exact_directed_edge_set_intersection_v1"
+_PRIOR_TRUST_FIELDS = {
+    "schema_version",
+    "relation_fingerprint_schema",
+    "intersection_audit_schema",
+    "approved_priors",
+}
+_APPROVED_PRIOR_FIELDS = {
+    "prior_id",
+    "source_uri",
+    "prior_source_manifest_sha256",
+    "prior_edges_sha256",
+    "relation_fingerprint",
+    "scoring_reference_fingerprints",
+    "intersection_audit",
+}
+_INTERSECTION_AUDIT_FIELDS = {
+    "status",
+    "pooled_essentiality_overlap_count",
+    "chip_directional_reference_overlap_count",
+}
 _ITEM_ARTIFACTS = {
     "raw_predictions.csv",
     "fit_summary.json",
@@ -219,14 +242,70 @@ def _load_registry_with_snapshot(
         raise HyperSCACError("消融登记表字段不符合固定格式")
     if payload["schema_version"] != "1.0":
         raise HyperSCACError("消融登记表 schema_version 必须是 1.0")
-    ablations = payload["ablations"]
-    if not isinstance(ablations, dict) or tuple(ablations) != ABLATION_IDS:
-        raise HyperSCACError("消融登记表必须保留八项固定登记顺序")
-    if _canonical_compact(ablations) != _canonical_compact(_EXPECTED_ABLATIONS):
-        raise HyperSCACError("消融登记表的固定模式或设置发生了变化")
-    frozen = _deep_freeze(ablations)
+    return _validated_registry(payload["ablations"]), absolute, snapshot
+
+
+def _mapping_items(
+    value: object, description: str
+) -> tuple[tuple[object, object], ...]:
+    if not isinstance(value, Mapping):
+        raise HyperSCACError(f"{description}必须是字段映射")
+    try:
+        raw_items = tuple(value.items())
+    except Exception as exc:
+        raise HyperSCACError(f"{description}无法完整读取") from exc
+    items: list[tuple[object, object]] = []
+    for item in raw_items:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise HyperSCACError(f"{description}字段格式无效")
+        items.append(item)
+    seen_keys: set[str] = set()
+    for key, _ in items:
+        if not isinstance(key, str):
+            raise HyperSCACError(f"{description}字段名必须是文字")
+        if key in seen_keys:
+            raise HyperSCACError(f"{description}不能含有重复字段")
+        seen_keys.add(key)
+    return tuple(items)
+
+
+def _validated_registry(
+    value: object,
+) -> Mapping[str, Mapping[str, object]]:
+    """集中核验文件或库参数中的固定八项登记并深度冻结。"""
+
+    items = _mapping_items(value, "消融登记内容")
+    if tuple(item[0] for item in items) != ABLATION_IDS:
+        raise HyperSCACError("消融登记内容必须保留八项固定登记顺序")
+    normalized: dict[str, dict[str, object]] = {}
+    for raw_id, raw_spec in items:
+        if not isinstance(raw_id, str):
+            raise HyperSCACError("消融登记编号必须是文字")
+        spec_items = _mapping_items(raw_spec, f"消融 {raw_id}")
+        if {item[0] for item in spec_items} != {
+            "mode",
+            "configuration_changes",
+        }:
+            raise HyperSCACError(f"消融 {raw_id} 字段不符合固定格式")
+        spec = dict(spec_items)
+        change_items = _mapping_items(
+            spec["configuration_changes"], f"消融 {raw_id} 设置变化"
+        )
+        normalized[raw_id] = {
+            "mode": spec["mode"],
+            "configuration_changes": dict(change_items),
+        }
+    try:
+        same_as_fixed = _canonical_compact(normalized) == _canonical_compact(
+            _EXPECTED_ABLATIONS
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HyperSCACError("消融登记内容含有不能核验的字段值") from exc
+    if not same_as_fixed:
+        raise HyperSCACError("消融登记内容的固定模式或设置发生了变化")
+    frozen = _deep_freeze(normalized)
     assert isinstance(frozen, Mapping)
-    return frozen, absolute, snapshot  # type: ignore[return-value]
+    return frozen  # type: ignore[return-value]
 
 
 def load_hypersca_c_ablations(
@@ -256,7 +335,11 @@ def apply_hypersca_c_ablation(
         isinstance(context, HyperSCACContext) for context in original_contexts
     ):
         raise HyperSCACError("contexts 必须含有至少一个已核验细胞环境")
-    chosen_registry = registry or load_hypersca_c_ablations(_DEFAULT_REGISTRY)
+    chosen_registry = (
+        load_hypersca_c_ablations(_DEFAULT_REGISTRY)
+        if registry is None
+        else _validated_registry(registry)
+    )
     if ablation_id not in chosen_registry:
         raise HyperSCACError(f"未登记的 HyperSCA-C 消融：{ablation_id}")
     spec = chosen_registry[ablation_id]
@@ -394,7 +477,11 @@ def fit_hypersca_c_ablation(
 ) -> HyperSCAStabilityResult:
     """运行一个已登记消融；主分析沿用完全相同的稳定性拟合入口。"""
 
-    chosen_registry = registry or load_hypersca_c_ablations(_DEFAULT_REGISTRY)
+    chosen_registry = (
+        load_hypersca_c_ablations(_DEFAULT_REGISTRY)
+        if registry is None
+        else _validated_registry(registry)
+    )
     transformed, transformed_config = apply_hypersca_c_ablation(
         contexts,
         config,
@@ -463,6 +550,83 @@ def _directed_relation_fingerprint(rows: Sequence[tuple[str, str]]) -> str:
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
+def _public_prior_file(path: Path, description: str) -> Path:
+    absolute = _run._lexical_absolute(path)
+    if _run._contains_private_component(absolute):
+        raise HyperSCACError(f"{description}路径不能包含 private 目录")
+    return _run._regular_file(absolute, description, reject_symlink=True)
+
+
+def _load_prior_trust_registry() -> (
+    tuple[Path, tuple[dict[str, object], ...], _run._FileSnapshot]
+):
+    path = _public_prior_file(Path(_DEFAULT_PRIOR_TRUST_REGISTRY), "外部先验可信登记表")
+    payload, snapshot = _run._read_strict_json_snapshot(path, "外部先验可信登记表")
+    if set(payload) != _PRIOR_TRUST_FIELDS:
+        raise HyperSCACError("外部先验可信登记表字段不符合固定格式")
+    if (
+        payload["schema_version"] != "1.0"
+        or payload["relation_fingerprint_schema"] != _RELATION_FINGERPRINT_SCHEMA
+        or payload["intersection_audit_schema"] != _INTERSECTION_AUDIT_SCHEMA
+    ):
+        raise HyperSCACError("外部先验可信登记表的指纹或审计规则无效")
+    entries = payload["approved_priors"]
+    if not isinstance(entries, list):
+        raise HyperSCACError("外部先验可信登记表 approved_priors 必须是列表")
+    normalized: list[dict[str, object]] = []
+    seen_ids: set[str] = set()
+    for raw_entry in entries:
+        if not isinstance(raw_entry, dict) or set(raw_entry) != _APPROVED_PRIOR_FIELDS:
+            raise HyperSCACError("可信先验项目字段不符合固定格式")
+        entry = dict(raw_entry)
+        prior_id = _run._required_no_whitespace(entry["prior_id"], "可信 prior_id")
+        if prior_id in seen_ids:
+            raise HyperSCACError("外部先验可信登记表不能重复 prior_id")
+        seen_ids.add(prior_id)
+        entry["source_uri"] = _run._required_plain_text(
+            entry["source_uri"], "可信 source_uri"
+        )
+        for field in (
+            "prior_source_manifest_sha256",
+            "prior_edges_sha256",
+            "relation_fingerprint",
+        ):
+            entry[field] = _run._sha256_text(entry[field], f"可信先验 {field}")
+        references = entry["scoring_reference_fingerprints"]
+        expected_references = {
+            "pooled_essentiality",
+            "chip_directional_reference",
+        }
+        if not isinstance(references, dict) or set(references) != expected_references:
+            raise HyperSCACError("可信先验必须登记两类评分参考关系指纹")
+        entry["scoring_reference_fingerprints"] = {
+            name: _run._sha256_text(value, f"可信评分参考指纹 {name}")
+            for name, value in references.items()
+        }
+        audit = entry["intersection_audit"]
+        if not isinstance(audit, dict) or set(audit) != _INTERSECTION_AUDIT_FIELDS:
+            raise HyperSCACError("可信先验缺少精确有向关系集合交集审计")
+        for field in (
+            "pooled_essentiality_overlap_count",
+            "chip_directional_reference_overlap_count",
+        ):
+            if isinstance(audit[field], bool) or not isinstance(audit[field], int):
+                raise HyperSCACError("可信先验交集审计计数必须是非负整数")
+            if int(audit[field]) < 0:
+                raise HyperSCACError("可信先验交集审计计数必须是非负整数")
+        if audit["status"] != "no_overlap" or any(
+            int(audit[field]) != 0
+            for field in (
+                "pooled_essentiality_overlap_count",
+                "chip_directional_reference_overlap_count",
+            )
+        ):
+            raise HyperSCACError("可信先验的精确关系交集审计未证明无重叠")
+        entry["intersection_audit"] = dict(audit)
+        normalized.append(entry)
+    return path, tuple(normalized), snapshot
+
+
 def load_registered_prior(
     prior_edges_path: str | Path,
     prior_source_manifest_path: str | Path,
@@ -473,12 +637,11 @@ def load_registered_prior(
     genes = tuple(gene_names)
     if len(genes) < 2 or len(set(genes)) != len(genes):
         raise HyperSCACError("先验核验需要至少两个不重复的有序基因")
-    edges_path = _run._regular_file(
-        Path(prior_edges_path), "外部先验关系", reject_symlink=True
+    edges_path = _public_prior_file(Path(prior_edges_path), "外部先验关系")
+    manifest_path = _public_prior_file(
+        Path(prior_source_manifest_path), "外部先验来源清单"
     )
-    manifest_path = _run._regular_file(
-        Path(prior_source_manifest_path), "外部先验来源清单", reject_symlink=True
-    )
+    trust_path, trusted_entries, trust_snapshot = _load_prior_trust_registry()
     manifest, manifest_snapshot = _run._read_strict_json_snapshot(
         manifest_path, "外部先验来源清单"
     )
@@ -534,6 +697,30 @@ def load_registered_prior(
     ):
         raise HyperSCACError("外部先验重用或重叠了任务 C 评分参考关系")
 
+    trusted_matches = [
+        entry
+        for entry in trusted_entries
+        if entry["prior_id"] == prior_id
+        and entry["source_uri"] == source_uri
+        and entry["prior_source_manifest_sha256"] == manifest_snapshot.sha256
+        and entry["prior_edges_sha256"] == edges_snapshot.sha256
+        and entry["relation_fingerprint"] == relation_fingerprint
+        and entry["scoring_reference_fingerprints"] == reference_hashes
+    ]
+    if len(trusted_matches) != 1:
+        raise HyperSCACError("外部先验未在独立的项目级可信登记表中预先登记")
+    trusted_entry = trusted_matches[0]
+    audit = trusted_entry["intersection_audit"]
+    assert isinstance(audit, dict)
+    if audit["status"] != "no_overlap" or any(
+        int(audit[field]) != 0
+        for field in (
+            "pooled_essentiality_overlap_count",
+            "chip_directional_reference_overlap_count",
+        )
+    ):
+        raise HyperSCACError("可信先验的精确关系交集审计未证明无重叠")
+
     gene_index = {gene: index for index, gene in enumerate(genes)}
     mask = np.zeros((len(genes), len(genes)), dtype=np.int8)
     for source, target in rows:
@@ -554,13 +741,17 @@ def load_registered_prior(
             "prior_source_manifest_path": str(manifest_path),
             "prior_edges_sha256": edges_snapshot.sha256,
             "prior_source_manifest_sha256": manifest_snapshot.sha256,
+            "prior_trust_registry_path": str(trust_path),
+            "prior_trust_registry_sha256": trust_snapshot.sha256,
             "relation_fingerprint_schema": _RELATION_FINGERPRINT_SCHEMA,
             "relation_fingerprint": relation_fingerprint,
             "scoring_reference_fingerprints": MappingProxyType(reference_hashes),
+            "intersection_audit_schema": _INTERSECTION_AUDIT_SCHEMA,
+            "intersection_audit": MappingProxyType(dict(audit)),
             "edge_count": len(rows),
         }
     )
-    return immutable_mask, record, (edges_snapshot, manifest_snapshot)
+    return immutable_mask, record, (edges_snapshot, manifest_snapshot, trust_snapshot)
 
 
 @dataclass(frozen=True)
@@ -703,6 +894,7 @@ def _batch_identity(
     registry_snapshot: _run._FileSnapshot,
     prior_record: Mapping[str, object] | None,
     prior_arguments: Mapping[str, object],
+    prior_trust_registry: Mapping[str, object],
 ) -> dict[str, object]:
     identity: dict[str, object] = {
         "schema_version": "1.0",
@@ -728,23 +920,120 @@ def _batch_identity(
         "code_dirty": prepared.code["dirty"],
         "code_state_sha256": prepared.code["code_state_sha256"],
         "prior_arguments": _plain(prior_arguments),
+        "prior_trust_registry": _plain(prior_trust_registry),
         "registered_prior": _plain(prior_record) if prior_record is not None else None,
     }
     return identity
 
 
+@dataclass(frozen=True)
+class _OptionalPriorState:
+    record: Mapping[str, object]
+    snapshot: _run._FileSnapshot | None
+
+
+def _first_symlink_component(path: Path) -> tuple[Path, os.stat_result] | None:
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            current_stat = os.lstat(current)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise HyperSCACError(f"无法检查外部先验参数路径：{path}") from exc
+        if stat.S_ISLNK(current_stat.st_mode):
+            return current, current_stat
+    return None
+
+
 def _capture_optional_prior_argument(
     path: Path | None,
     description: str,
-) -> tuple[dict[str, object], _run._FileSnapshot | None]:
+) -> _OptionalPriorState:
     if path is None:
-        return {
-            "provided": False,
-            "path": None,
-            "sha256": None,
-            "capture_status": "not_provided",
-        }, None
+        return _OptionalPriorState(
+            record=MappingProxyType(
+                {
+                    "provided": False,
+                    "path": None,
+                    "sha256": None,
+                    "capture_status": "not_provided",
+                    "path_state": None,
+                }
+            ),
+            snapshot=None,
+        )
     lexical = _run._lexical_absolute(path)
+    if _run._contains_private_component(lexical):
+        raise HyperSCACError(f"{description}路径不能包含 private 目录")
+    symlink = _first_symlink_component(lexical)
+    if symlink is not None:
+        link_path, link_stat = symlink
+        try:
+            target = os.readlink(link_path)
+        except OSError as exc:
+            raise HyperSCACError(f"无法读取{description}的符号链接状态") from exc
+        return _OptionalPriorState(
+            record=MappingProxyType(
+                {
+                    "provided": True,
+                    "path": str(lexical),
+                    "sha256": None,
+                    "capture_status": "unsafe_symlink",
+                    "path_state": {
+                        "link_path": str(link_path),
+                        "link_target": target,
+                        "device": int(link_stat.st_dev),
+                        "inode": int(link_stat.st_ino),
+                        "mode": int(link_stat.st_mode),
+                        "size": int(link_stat.st_size),
+                        "modified_ns": int(link_stat.st_mtime_ns),
+                        "changed_ns": int(link_stat.st_ctime_ns),
+                        "link_count": int(link_stat.st_nlink),
+                    },
+                }
+            ),
+            snapshot=None,
+        )
+    try:
+        final_stat = os.lstat(lexical)
+    except FileNotFoundError:
+        return _OptionalPriorState(
+            record=MappingProxyType(
+                {
+                    "provided": True,
+                    "path": str(lexical),
+                    "sha256": None,
+                    "capture_status": "missing",
+                    "path_state": None,
+                }
+            ),
+            snapshot=None,
+        )
+    except OSError as exc:
+        raise HyperSCACError(f"无法检查{description}的路径状态") from exc
+    if not stat.S_ISREG(final_stat.st_mode):
+        return _OptionalPriorState(
+            record=MappingProxyType(
+                {
+                    "provided": True,
+                    "path": str(lexical),
+                    "sha256": None,
+                    "capture_status": "unsafe_nonregular",
+                    "path_state": {
+                        "device": int(final_stat.st_dev),
+                        "inode": int(final_stat.st_ino),
+                        "mode": int(final_stat.st_mode),
+                        "size": int(final_stat.st_size),
+                        "modified_ns": int(final_stat.st_mtime_ns),
+                        "changed_ns": int(final_stat.st_ctime_ns),
+                        "link_count": int(final_stat.st_nlink),
+                    },
+                }
+            ),
+            snapshot=None,
+        )
     try:
         snapshot, _ = _run._capture_file_snapshot(
             lexical,
@@ -752,18 +1041,54 @@ def _capture_optional_prior_argument(
             collect_bytes=False,
         )
     except HyperSCACError:
-        return {
-            "provided": True,
-            "path": str(lexical),
-            "sha256": None,
-            "capture_status": "unavailable_or_unsafe",
-        }, None
-    return {
-        "provided": True,
-        "path": str(snapshot.path),
-        "sha256": snapshot.sha256,
-        "capture_status": "captured",
-    }, snapshot
+        return _OptionalPriorState(
+            record=MappingProxyType(
+                {
+                    "provided": True,
+                    "path": str(lexical),
+                    "sha256": None,
+                    "capture_status": "unsafe_unreadable",
+                    "path_state": {
+                        "device": int(final_stat.st_dev),
+                        "inode": int(final_stat.st_ino),
+                        "mode": int(final_stat.st_mode),
+                        "size": int(final_stat.st_size),
+                        "modified_ns": int(final_stat.st_mtime_ns),
+                        "changed_ns": int(final_stat.st_ctime_ns),
+                        "link_count": int(final_stat.st_nlink),
+                    },
+                }
+            ),
+            snapshot=None,
+        )
+    return _OptionalPriorState(
+        record=MappingProxyType(
+            {
+                "provided": True,
+                "path": str(snapshot.path),
+                "sha256": snapshot.sha256,
+                "capture_status": "captured",
+                "path_state": {
+                    "device": snapshot.device,
+                    "inode": snapshot.inode,
+                    "size": snapshot.size,
+                    "modified_ns": snapshot.modified_ns,
+                    "changed_ns": snapshot.changed_ns,
+                    "link_count": snapshot.link_count,
+                },
+            }
+        ),
+        snapshot=snapshot,
+    )
+
+
+def _verify_optional_prior_state(state: _OptionalPriorState, description: str) -> None:
+    path_value = state.record["path"]
+    current = _capture_optional_prior_argument(
+        None if path_value is None else Path(str(path_value)), description
+    )
+    if dict(current.record) != dict(state.record):
+        raise HyperSCACError(f"{description}状态在拟合期间发生变化")
 
 
 def _empty_predictions(
@@ -872,6 +1197,7 @@ def _completed_payloads(
         context_ids=tuple(context.context_id for context in prepared.contexts),
         gene_names=prepared.contexts[0].gene_names,
         requested_repeats=transformed_config.bootstrap_repeats,
+        selection_threshold=transformed_config.selection_threshold,
         seed=prepared.seed,
         condition=prepared.condition,
     )
@@ -959,7 +1285,10 @@ def _validate_time_record(payload: Mapping[str, object], description: str) -> No
     duration = payload.get("duration_seconds")
     if isinstance(duration, bool) or not isinstance(duration, (int, float)):
         raise HyperSCACError(f"{description}时长必须是有限的非负秒数")
-    normalized = float(duration)
+    try:
+        normalized = float(duration)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise HyperSCACError(f"{description}时长必须是有限的非负秒数") from exc
     if not math.isfinite(normalized) or normalized < 0.0:
         raise HyperSCACError(f"{description}时长必须是有限的非负秒数")
     wall_duration = (completed - started).total_seconds()
@@ -1105,6 +1434,7 @@ def _verify_item(
             context_ids=context_ids,
             gene_names=expected_identity["ordered_genes"],  # type: ignore[arg-type]
             requested_repeats=int(expected_config["bootstrap_repeats"]),
+            selection_threshold=float(expected_config["selection_threshold"]),
             seed=int(expected_identity["seed"]),
             condition={
                 "condition": expected_identity["condition"],
@@ -1191,6 +1521,7 @@ def _reuse_batch(
     identity: Mapping[str, object],
 ) -> dict[str, str] | None:
     root = _run._lexical_absolute(output_root)
+    _run._ensure_no_symlink_component(root, "消融输出根目录")
     if root.is_symlink():
         raise HyperSCACError("消融输出根目录不能是符号链接")
     if not root.exists():
@@ -1202,6 +1533,16 @@ def _reuse_batch(
         return None
     if {entry.name for entry in entries} != set(ABLATION_IDS) | {_BATCH_MANIFEST}:
         raise HyperSCACError("已有消融批次不完整或含额外内容，不能覆盖")
+    _run._verify_output_tree_files(
+        root,
+        [Path(_BATCH_MANIFEST)]
+        + [
+            Path(ablation_id) / name
+            for ablation_id in ABLATION_IDS
+            for name in sorted(_ITEM_ARTIFACTS)
+        ],
+        "HyperSCA-C 消融输出",
+    )
     batch = _run._read_output_json(root / _BATCH_MANIFEST, "消融批次清单")
     if set(batch) != _BATCH_MANIFEST_FIELDS:
         raise HyperSCACError("已有消融批次清单字段不符合固定格式")
@@ -1290,28 +1631,31 @@ def run_hypersca_c_ablations(
         seed=seed,
         device=device,
     )
+    trust_path, trusted_entries, trust_snapshot = _load_prior_trust_registry()
+    prior_trust_registry: dict[str, object] = {
+        "path": str(trust_path),
+        "sha256": trust_snapshot.sha256,
+        "relation_fingerprint_schema": _RELATION_FINGERPRINT_SCHEMA,
+        "intersection_audit_schema": _INTERSECTION_AUDIT_SCHEMA,
+        "approved_priors": [_plain(entry) for entry in trusted_entries],
+    }
     prior_mask: np.ndarray | None = None
     prior_record: Mapping[str, object] | None = None
     prior_unavailable_detail: str | None = None
-    prior_edges_argument, prior_edges_snapshot = _capture_optional_prior_argument(
+    prior_edges_state = _capture_optional_prior_argument(
         prior_edges_path,
         "外部先验关系参数",
     )
-    prior_manifest_argument, prior_manifest_snapshot = _capture_optional_prior_argument(
+    prior_manifest_state = _capture_optional_prior_argument(
         prior_source_manifest_path,
         "外部先验来源清单参数",
-    )
-    prior_argument_snapshots = tuple(
-        snapshot
-        for snapshot in (prior_edges_snapshot, prior_manifest_snapshot)
-        if snapshot is not None
     )
     prior_arguments: dict[str, object] = {
         "pair_complete": (
             prior_edges_path is not None and prior_source_manifest_path is not None
         ),
-        "edges": prior_edges_argument,
-        "source_manifest": prior_manifest_argument,
+        "edges": _plain(prior_edges_state.record),
+        "source_manifest": _plain(prior_manifest_state.record),
     }
     if not prior_arguments["pair_complete"] and (
         prior_edges_path is not None or prior_source_manifest_path is not None
@@ -1325,10 +1669,14 @@ def run_hypersca_c_ablations(
                 prepared.contexts[0].gene_names,
             )
             if (
-                prior_edges_snapshot is None
-                or prior_manifest_snapshot is None
+                prior_edges_state.snapshot is None
+                or prior_manifest_state.snapshot is None
                 or validated_snapshots
-                != (prior_edges_snapshot, prior_manifest_snapshot)
+                != (
+                    prior_edges_state.snapshot,
+                    prior_manifest_state.snapshot,
+                    trust_snapshot,
+                )
             ):
                 raise HyperSCACError("外部先验参数在运行准备期间发生变化")
         except HyperSCACError as exc:
@@ -1342,6 +1690,7 @@ def run_hypersca_c_ablations(
         registry_snapshot=registry_snapshot,
         prior_record=prior_record,
         prior_arguments=prior_arguments,
+        prior_trust_registry=prior_trust_registry,
     )
     existing = _reuse_batch(output_root, identity)
     if existing is not None:
@@ -1437,8 +1786,9 @@ def run_hypersca_c_ablations(
             code=prepared.code,
         )
         _run._verify_file_snapshot(registry_snapshot, "HyperSCA-C 消融登记表")
-        for snapshot in prior_argument_snapshots:
-            _run._verify_file_snapshot(snapshot, "外部先验参数")
+        _run._verify_file_snapshot(trust_snapshot, "外部先验可信登记表")
+        _verify_optional_prior_state(prior_edges_state, "外部先验关系参数")
+        _verify_optional_prior_state(prior_manifest_state, "外部先验来源清单参数")
 
         completed_utc = _run._utc_now()
         batch_manifest: dict[str, object] = {
@@ -1457,6 +1807,9 @@ def run_hypersca_c_ablations(
             batch_manifest
         )
         write_json(staging / _BATCH_MANIFEST, batch_manifest)
+        verified_statuses = _reuse_batch(staging, identity)
+        if verified_statuses != statuses:
+            raise HyperSCACError("新写出的消融批次未能通过发布前完整核验")
 
         if root.exists():
             if root.is_symlink() or not root.is_dir() or next(root.iterdir(), None):

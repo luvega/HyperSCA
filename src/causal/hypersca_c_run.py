@@ -12,6 +12,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -139,9 +140,7 @@ _RUN_MANIFEST_FIELDS = _RUN_MANIFEST_STATIC_FIELDS | {
     "artifacts",
     "run_manifest_content_sha256",
 }
-_UTC_Z_PATTERN = re.compile(
-    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z"
-)
+_UTC_Z_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z")
 
 
 @dataclass(frozen=True)
@@ -534,16 +533,12 @@ def _capture_public_inventory(
                     reject_symlink=True,
                 ).stat()
             except OSError as exc:
-                raise HyperSCACError(
-                    f"无法复核公开库存 inode：{alias}"
-                ) from exc
+                raise HyperSCACError(f"无法复核公开库存 inode：{alias}") from exc
             if (
                 _stat_identity(preflight_stat) != frozen_identity
                 or _stat_identity(postflight_stat) != frozen_identity
             ):
-                raise HyperSCACError(
-                    f"公开库存 inode 在核验期间发生变化：{alias}"
-                )
+                raise HyperSCACError(f"公开库存 inode 在核验期间发生变化：{alias}")
             inventory[alias] = _FileSnapshot(
                 path=alias_path,
                 sha256=snapshot.sha256,
@@ -779,7 +774,11 @@ def _load_config(
 
 
 def _validated_seed(seed: object) -> int:
-    if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 2**64 - 1:
+    if (
+        isinstance(seed, bool)
+        or not isinstance(seed, int)
+        or not 0 <= seed <= 2**64 - 1
+    ):
         raise HyperSCACError("seed 必须是 torch 支持的非负整数")
     return int(seed)
 
@@ -899,6 +898,48 @@ def _read_output_json(path: Path, description: str) -> dict[str, object]:
     return payload
 
 
+def _verify_output_tree_files(
+    root: Path, relative_files: Sequence[Path | str], description: str
+) -> None:
+    """在读取前拒绝符号链接、硬链接和同一 inode 的输出别名。"""
+
+    absolute_root = _lexical_absolute(root)
+    _ensure_no_symlink_component(absolute_root, description)
+    try:
+        root_stat = os.lstat(absolute_root)
+    except OSError as exc:
+        raise HyperSCACError(f"无法检查{description}目录") from exc
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise HyperSCACError(f"{description}必须是普通目录")
+    seen_inodes: set[tuple[int, int]] = set()
+    for raw_relative in relative_files:
+        relative = Path(raw_relative)
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            raise HyperSCACError(f"{description}含有不安全的文件路径")
+        current = absolute_root
+        for part in relative.parts[:-1]:
+            current = current / part
+            try:
+                directory_stat = os.lstat(current)
+            except OSError as exc:
+                raise HyperSCACError(f"{description}子目录无法检查") from exc
+            if not stat.S_ISDIR(directory_stat.st_mode):
+                raise HyperSCACError(f"{description}子目录不能是符号链接")
+        path = absolute_root / relative
+        try:
+            file_stat = os.lstat(path)
+        except OSError as exc:
+            raise HyperSCACError(f"{description}文件无法检查：{relative}") from exc
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise HyperSCACError(f"{description}必须只包含普通文件")
+        if int(file_stat.st_nlink) != 1:
+            raise HyperSCACError(f"{description}文件不能有包外硬链接：{relative}")
+        identity = (int(file_stat.st_dev), int(file_stat.st_ino))
+        if identity in seen_inodes:
+            raise HyperSCACError(f"{description}文件不能共享同一 inode")
+        seen_inodes.add(identity)
+
+
 def _build_identity(
     *,
     context_records: Sequence[Mapping[str, object]],
@@ -959,9 +1000,7 @@ def _verify_run_input_snapshots(
     ):
         _verify_file_snapshot(snapshot, description)
     _verify_public_inventory(public_inventory, public_files)
-    contexts_by_inode: dict[
-        tuple[int, int], list[tuple[str, _FileSnapshot, str]]
-    ] = {}
+    contexts_by_inode: dict[tuple[int, int], list[tuple[str, _FileSnapshot, str]]] = {}
     for record in context_snapshots:
         snapshot = record[1]
         contexts_by_inode.setdefault((snapshot.device, snapshot.inode), []).append(
@@ -977,28 +1016,22 @@ def _verify_run_input_snapshots(
         assert raw_bytes is not None
         for context_id, snapshot, content_sha256 in records:
             _verify_file_snapshot_stat(snapshot, f"{context_id} context 输入文件")
-            if (
-                current.sha256 != snapshot.sha256
-                or (
-                    current.device,
-                    current.inode,
-                    current.size,
-                    current.modified_ns,
-                    current.changed_ns,
-                    current.link_count,
-                )
-                != (
-                    snapshot.device,
-                    snapshot.inode,
-                    snapshot.size,
-                    snapshot.modified_ns,
-                    snapshot.changed_ns,
-                    snapshot.link_count,
-                )
+            if current.sha256 != snapshot.sha256 or (
+                current.device,
+                current.inode,
+                current.size,
+                current.modified_ns,
+                current.changed_ns,
+                current.link_count,
+            ) != (
+                snapshot.device,
+                snapshot.inode,
+                snapshot.size,
+                snapshot.modified_ns,
+                snapshot.changed_ns,
+                snapshot.link_count,
             ):
-                raise HyperSCACError(
-                    f"{context_id} context 输入文件在拟合期间发生变化"
-                )
+                raise HyperSCACError(f"{context_id} context 输入文件在拟合期间发生变化")
             dataset = load_task_c_dataset_from_verified_bytes(
                 snapshot.path,
                 context_id=context_id,
@@ -1006,9 +1039,7 @@ def _verify_run_input_snapshots(
                 source_sha256=current.sha256,
             )
             if dataset.content_sha256 != content_sha256:
-                raise HyperSCACError(
-                    f"{context_id} context 输入内容在拟合期间发生变化"
-                )
+                raise HyperSCACError(f"{context_id} context 输入内容在拟合期间发生变化")
     if _git_state() != dict(code):
         raise HyperSCACError("运行代码在拟合期间发生变化")
 
@@ -1021,6 +1052,7 @@ def _validate_run_scientific_result(
     context_ids: Sequence[str],
     gene_names: Sequence[str],
     requested_repeats: int,
+    selection_threshold: float,
     seed: int,
     condition: Mapping[str, object],
     method_status: object | None = None,
@@ -1053,6 +1085,43 @@ def _validate_run_scientific_result(
     if len(validated.predictions) != expected_rows:
         raise HyperSCACError("原始关系表必须包含 gene-list 的全部非自身有向关系")
 
+    try:
+        threshold = float(selection_threshold)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise HyperSCACError("selection_threshold 必须是有限正数") from exc
+    if not math.isfinite(threshold) or threshold <= 0.0:
+        raise HyperSCACError("selection_threshold 必须是有限正数")
+    context_effects = validated.predictions[
+        [f"effect_{context_id}" for context_id in contexts]
+    ].to_numpy(dtype=float)
+    selected = np.abs(context_effects) >= threshold
+    positive = np.sum((context_effects > 0.0) & selected, axis=1)
+    negative = np.sum((context_effects < 0.0) & selected, axis=1)
+    selected_count = np.sum(selected, axis=1)
+    expected_consistency = np.divide(
+        np.maximum(positive, negative),
+        selected_count,
+        out=np.zeros(len(validated.predictions), dtype=float),
+        where=selected_count > 0,
+    )
+    if not np.isclose(
+        validated.predictions["context_consistency"].to_numpy(dtype=float),
+        expected_consistency,
+        rtol=1e-12,
+        atol=1e-12,
+    ).all():
+        raise HyperSCACError("context_consistency 与各细胞环境关系强度及固定阈值不一致")
+    medians = validated.predictions["median_effect"].to_numpy(dtype=float)
+    if len(contexts) == 1:
+        if not np.isclose(medians, context_effects[:, 0], rtol=1e-12, atol=1e-12).all():
+            raise HyperSCACError("单一细胞环境的 effect 必须等于总体中位关系强度")
+    else:
+        lower = np.min(context_effects, axis=1)
+        upper = np.max(context_effects, axis=1)
+        tolerance = 1e-12 + 1e-12 * np.maximum(np.abs(lower), np.abs(upper))
+        if bool(np.any((medians < lower - tolerance) | (medians > upper + tolerance))):
+            raise HyperSCACError("总体中位关系强度必须位于各细胞环境中位数范围内")
+
     core_summary = thaw_json_record(validated.summary)
     if set(core_summary) != _CORE_SUMMARY_FIELDS:
         raise HyperSCACError("拟合摘要字段集合与冻结格式不一致")
@@ -1077,7 +1146,10 @@ def _validate_run_scientific_result(
         "usable_for_ranking": successful > 0 and coverage > 0.0,
     }
     if method_status is not None:
-        if not isinstance(method_status, Mapping) or dict(method_status) != expected_status:
+        if (
+            not isinstance(method_status, Mapping)
+            or dict(method_status) != expected_status
+        ):
             raise HyperSCACError("方法状态与关系表、拟合摘要或失败记录不一致")
     return validated.predictions, disk_summary, expected_status
 
@@ -1194,10 +1266,12 @@ def _reuse_existing_output(
     context_ids: Sequence[str],
     gene_names: Sequence[str],
     requested_repeats: int,
+    selection_threshold: float,
     seed: int,
     condition: Mapping[str, object],
 ) -> dict[str, object] | None:
     output = _lexical_absolute(output_dir)
+    _ensure_no_symlink_component(output, "输出目录")
     if output.is_symlink():
         raise HyperSCACError("输出目录不能是符号链接")
     if not output.exists():
@@ -1209,6 +1283,7 @@ def _reuse_existing_output(
         return None
     if {entry.name for entry in entries} != _OUTPUT_NAMES:
         raise HyperSCACError("已有输出不完整或含额外文件，不能覆盖")
+    _verify_output_tree_files(output, sorted(_OUTPUT_NAMES), "已有 HyperSCA-C 输出")
     for entry in entries:
         if entry.is_symlink() or not entry.is_file():
             raise HyperSCACError("已有输出必须由四个普通文件组成")
@@ -1257,9 +1332,7 @@ def _reuse_existing_output(
     if set(summary) != _CORE_SUMMARY_FIELDS | {"failures"}:
         raise HyperSCACError("已有拟合摘要字段集合与冻结格式不一致")
     failures = summary["failures"]
-    core_summary = {
-        key: value for key, value in summary.items() if key != "failures"
-    }
+    core_summary = {key: value for key, value in summary.items() if key != "failures"}
     _, validated_summary, _ = _validate_run_scientific_result(
         predictions=predictions,
         summary=core_summary,
@@ -1267,6 +1340,7 @@ def _reuse_existing_output(
         context_ids=context_ids,
         gene_names=gene_names,
         requested_repeats=requested_repeats,
+        selection_threshold=selection_threshold,
         seed=seed,
         condition=condition,
         method_status=status,
@@ -1302,6 +1376,12 @@ def _write_new_output(
     run_manifest: dict[str, object],
     identity: Mapping[str, object],
     expected_static: Mapping[str, object],
+    context_ids: Sequence[str],
+    gene_names: Sequence[str],
+    requested_repeats: int,
+    selection_threshold: float,
+    seed: int,
+    condition: Mapping[str, object],
 ) -> None:
     output = _lexical_absolute(output_dir)
     parent = output.parent
@@ -1332,9 +1412,26 @@ def _write_new_output(
             method_status=method_status,
         )
         write_json(staging / "run_manifest.json", run_manifest)
+        verified = _reuse_existing_output(
+            staging,
+            identity,
+            expected_static=expected_static,
+            context_ids=context_ids,
+            gene_names=gene_names,
+            requested_repeats=requested_repeats,
+            selection_threshold=selection_threshold,
+            seed=seed,
+            condition=condition,
+        )
+        if verified is None:
+            raise HyperSCACError("新写出的运行结果未能通过发布前核验")
 
         if output.exists():
-            if output.is_symlink() or not output.is_dir() or next(output.iterdir(), None):
+            if (
+                output.is_symlink()
+                or not output.is_dir()
+                or next(output.iterdir(), None)
+            ):
                 raise HyperSCACError("输出目录在运行期间发生变化，不能写入")
             output.rmdir()
         os.replace(staging, output)
@@ -1435,9 +1532,7 @@ def run_hypersca_c(
                 "public_relative_path": relative,
             }
         )
-        context_snapshots.append(
-            (context_id, input_snapshot, dataset.content_sha256)
-        )
+        context_snapshots.append((context_id, input_snapshot, dataset.content_sha256))
     selected_public_bytes.clear()
 
     code = _git_state()
@@ -1491,6 +1586,7 @@ def run_hypersca_c(
         context_ids=context_ids,
         gene_names=selected_genes,
         requested_repeats=config.bootstrap_repeats,
+        selection_threshold=config.selection_threshold,
         seed=normalized_seed,
         condition=condition,
     )
@@ -1521,6 +1617,7 @@ def run_hypersca_c(
         context_ids=context_ids,
         gene_names=selected_genes,
         requested_repeats=config.bootstrap_repeats,
+        selection_threshold=config.selection_threshold,
         seed=normalized_seed,
         condition=condition,
     )
@@ -1541,5 +1638,11 @@ def run_hypersca_c(
         run_manifest=run_manifest,
         identity=identity,
         expected_static=expected_static,
+        context_ids=context_ids,
+        gene_names=selected_genes,
+        requested_repeats=config.bootstrap_repeats,
+        selection_threshold=config.selection_threshold,
+        seed=normalized_seed,
+        condition=condition,
     )
     return summary

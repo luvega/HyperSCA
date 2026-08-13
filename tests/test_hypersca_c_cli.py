@@ -1064,6 +1064,8 @@ def test_input_changed_during_fit_is_rejected_before_any_artifact_is_written(
         "unknown_column",
         "missing_context_effect",
         "wrong_context_effect",
+        "wrong_context_consistency",
+        "median_outside_context_range",
         "wrong_requested_repeats",
     ],
 )
@@ -1096,6 +1098,12 @@ def test_run_boundary_rejects_forged_scientific_results_before_writing(
         predictions = predictions.drop(columns="effect_rpe1")
     elif forgery == "wrong_context_effect":
         predictions = predictions.rename(columns={"effect_rpe1": "effect_HEK293"})
+    elif forgery == "wrong_context_consistency":
+        predictions.loc[0, "context_consistency"] = 1.0
+    elif forgery == "median_outside_context_range":
+        predictions.loc[0, ["effect", "median_effect"]] = 3.0
+        predictions.loc[0, ["effect_k562", "effect_rpe1"]] = [1.0, 2.0]
+        predictions.loc[0, "direction"] = 1
     elif forgery == "wrong_requested_repeats":
         summary["requested_repeats"] = 3
         failures = (*failures, "repeat_2:failed")
@@ -1126,7 +1134,43 @@ def test_run_boundary_rejects_forged_scientific_results_before_writing(
     assert not output.exists()
 
 
-@pytest.mark.parametrize("tampered_artifact", ["predictions", "summary", "status"])
+def test_single_context_effect_must_equal_the_overall_median(
+    prepared_run: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+
+    valid = _all_failed_stability_result(context_ids=("k562",))
+    predictions = valid.predictions.copy(deep=True)
+    predictions.loc[0, "effect_k562"] = 1.0
+    forged = SimpleNamespace(
+        predictions=predictions,
+        summary=dict(valid.summary),
+        failures=tuple(valid.failures),
+    )
+    monkeypatch.setattr(
+        run_module,
+        "fit_stable_hypersca_c",
+        lambda *args, **kwargs: forged,
+    )
+    output = tmp_path / "single-context-contradiction"
+    with pytest.raises(HyperSCACError, match="context|细胞环境|中位"):
+        run_module.run_hypersca_c(
+            context_values=[f"k562={prepared_run['k562']}"],
+            config_path=Path(prepared_run["config"]),
+            gene_list_path=Path(prepared_run["gene_list"]),
+            public_manifest_path=Path(prepared_run["public_manifest"]),
+            output_dir=output,
+            seed=11,
+            device="cpu",
+        )
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "tampered_artifact", ["predictions", "cross_column", "summary", "status"]
+)
 def test_reuse_rejects_semantic_tampering_even_with_synchronized_hashes(
     prepared_run: dict[str, object],
     tmp_path: Path,
@@ -1160,6 +1204,11 @@ def test_reuse_rejects_semantic_tampering_even_with_synchronized_hashes(
         artifact_name = "raw_predictions.csv"
         predictions = pd.read_csv(output / artifact_name)
         predictions["unregistered_metric"] = 0.0
+        predictions.to_csv(output / artifact_name, index=False)
+    elif tampered_artifact == "cross_column":
+        artifact_name = "raw_predictions.csv"
+        predictions = pd.read_csv(output / artifact_name)
+        predictions.loc[0, "context_consistency"] = 1.0
         predictions.to_csv(output / artifact_name, index=False)
     elif tampered_artifact == "summary":
         artifact_name = "fit_summary.json"
@@ -1324,6 +1373,74 @@ def test_new_output_rejects_reversed_run_timestamps(
             device="cpu",
         )
     assert not output.exists()
+
+
+def test_new_output_rejects_a_staging_file_with_external_hardlink(
+    prepared_run: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+
+    monkeypatch.setattr(
+        run_module,
+        "fit_stable_hypersca_c",
+        lambda *args, **kwargs: _all_failed_stability_result(),
+    )
+    original = run_module._write_csv_atomic
+    outside = tmp_path / "staging-output-alias.csv"
+
+    def write_and_link(path: Path, predictions: pd.DataFrame) -> None:
+        original(path, predictions)
+        os.link(path, outside)
+
+    monkeypatch.setattr(run_module, "_write_csv_atomic", write_and_link)
+    output = tmp_path / "hardlinked-new-output"
+    with pytest.raises(HyperSCACError, match="硬链接|普通文件|link"):
+        run_module.run_hypersca_c(
+            context_values=[
+                f"k562={prepared_run['k562']}",
+                f"rpe1={prepared_run['rpe1']}",
+            ],
+            config_path=Path(prepared_run["config"]),
+            gene_list_path=Path(prepared_run["gene_list"]),
+            public_manifest_path=Path(prepared_run["public_manifest"]),
+            output_dir=output,
+            seed=11,
+            device="cpu",
+        )
+    assert not output.exists()
+
+
+def test_output_reuse_rejects_a_file_with_external_hardlink(
+    prepared_run: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.causal.hypersca_c_run as run_module
+
+    monkeypatch.setattr(
+        run_module,
+        "fit_stable_hypersca_c",
+        lambda *args, **kwargs: _all_failed_stability_result(),
+    )
+    output = tmp_path / "hardlinked-existing-output"
+    arguments = {
+        "context_values": [
+            f"k562={prepared_run['k562']}",
+            f"rpe1={prepared_run['rpe1']}",
+        ],
+        "config_path": Path(prepared_run["config"]),
+        "gene_list_path": Path(prepared_run["gene_list"]),
+        "public_manifest_path": Path(prepared_run["public_manifest"]),
+        "output_dir": output,
+        "seed": 11,
+        "device": "cpu",
+    }
+    run_module.run_hypersca_c(**arguments)
+    os.link(output / "raw_predictions.csv", tmp_path / "existing-output-alias.csv")
+    with pytest.raises(HyperSCACError, match="硬链接|普通文件|link"):
+        run_module.run_hypersca_c(**arguments)
 
 
 def test_all_bootstrap_failures_remain_visible_and_unusable(

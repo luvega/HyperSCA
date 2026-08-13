@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from dataclasses import asdict
@@ -39,6 +40,18 @@ ARTIFACT_NAMES = {
     "method_status.json",
     "run_manifest.json",
 }
+
+
+def test_default_prior_trust_registry_is_fail_closed() -> None:
+    payload = json.loads(
+        (ROOT / "configs/hypersca_c_prior_trust_v1.json").read_text(encoding="utf-8")
+    )
+    assert payload == {
+        "schema_version": "1.0",
+        "relation_fingerprint_schema": "directed_edge_set_v1",
+        "intersection_audit_schema": "exact_directed_edge_set_intersection_v1",
+        "approved_priors": [],
+    }
 
 
 def _config(**changes: object) -> HyperSCACConfig:
@@ -180,6 +193,44 @@ def test_registry_rejects_missing_reordered_or_changed_candidate(
         _write_json(path, payload)
         with pytest.raises(HyperSCACError, match="固定|登记|顺序"):
             load_hypersca_c_ablations(path)
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    ["mode", "prior", "nested", "duplicate_items", "unknown", "nonfinite"],
+)
+def test_library_registry_argument_cannot_change_the_fixed_eight_ablations(
+    forgery: str,
+) -> None:
+    from src.causal.hypersca_c_ablation import apply_hypersca_c_ablation
+
+    registry = _registry_payload()["ablations"]
+    assert isinstance(registry, dict)
+    if forgery == "mode":
+        registry["primary"]["mode"] = "control_cells_only"  # type: ignore[index]
+    elif forgery == "prior":
+        registry["prior_on_secondary"]["configuration_changes"][  # type: ignore[index]
+            "prior_discount"
+        ] = 0.9
+    elif forgery == "nested":
+        registry["primary"]["configuration_changes"] = []  # type: ignore[index]
+    elif forgery == "duplicate_items":
+
+        class DuplicateItems(dict[str, object]):
+            def items(self) -> object:
+                return (*super().items(), ("primary", super().__getitem__("primary")))
+
+        registry = DuplicateItems(registry)
+    elif forgery == "unknown":
+        registry["primary"]["unknown"] = True  # type: ignore[index]
+    else:
+        registry["acyclicity_strong"]["configuration_changes"][  # type: ignore[index]
+            "acyclicity_weight"
+        ] = float("nan")
+    with pytest.raises(HyperSCACError, match="登记|八项|固定|重复|格式|映射"):
+        apply_hypersca_c_ablation(
+            (_context(),), _config(), "primary", registry=registry
+        )
 
 
 @pytest.mark.parametrize(
@@ -374,10 +425,50 @@ def _prior_manifest(edges: Path) -> dict[str, object]:
     }
 
 
+def _install_prior_trust(
+    module: object,
+    monkeypatch: pytest.MonkeyPatch,
+    directory: Path,
+    edges: Path,
+    source_manifest: Path,
+    *,
+    audit_status: str = "no_overlap",
+) -> Path:
+    source = json.loads(source_manifest.read_text(encoding="utf-8"))
+    trust = directory / "hypersca_c_prior_trust_v1.json"
+    _write_json(
+        trust,
+        {
+            "schema_version": "1.0",
+            "relation_fingerprint_schema": "directed_edge_set_v1",
+            "intersection_audit_schema": "exact_directed_edge_set_intersection_v1",
+            "approved_priors": [
+                {
+                    "prior_id": source["prior_id"],
+                    "source_uri": source["source_uri"],
+                    "prior_source_manifest_sha256": sha256_path(source_manifest),
+                    "prior_edges_sha256": sha256_path(edges),
+                    "relation_fingerprint": source["relation_fingerprint"],
+                    "scoring_reference_fingerprints": source[
+                        "scoring_reference_fingerprints"
+                    ],
+                    "intersection_audit": {
+                        "status": audit_status,
+                        "pooled_essentiality_overlap_count": 0,
+                        "chip_directional_reference_overlap_count": 0,
+                    },
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(module, "_DEFAULT_PRIOR_TRUST_REGISTRY", trust, raising=False)
+    return trust
+
+
 def test_prior_edges_form_ordered_mask_only_with_independent_registered_source(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.causal.hypersca_c_ablation import load_registered_prior
+    import src.causal.hypersca_c_ablation as module
 
     edges = tmp_path / "prior.csv"
     pd.DataFrame(
@@ -385,17 +476,22 @@ def test_prior_edges_form_ordered_mask_only_with_independent_registered_source(
     ).to_csv(edges, index=False)
     manifest = tmp_path / "prior_manifest.json"
     _write_json(manifest, _prior_manifest(edges))
-    mask, record, snapshots = load_registered_prior(edges, manifest, ("C", "A", "B"))
+    trust = _install_prior_trust(module, monkeypatch, tmp_path, edges, manifest)
+    mask, record, snapshots = module.load_registered_prior(
+        edges, manifest, ("C", "A", "B")
+    )
     assert mask.tolist() == [[0, 1, 0], [0, 0, 1], [0, 0, 0]]
     assert record["prior_id"] == "independent-pathway-v1"
     assert record["edge_count"] == 2
     assert record["prior_edges_sha256"] == sha256_path(edges)
     assert not mask.flags.writeable
-    assert len(snapshots) == 2
+    assert record["prior_trust_registry_path"] == str(trust)
+    assert record["intersection_audit"]["status"] == "no_overlap"
+    assert len(snapshots) == 3
 
 
 def test_relation_fingerprint_is_independent_of_csv_row_order(tmp_path: Path) -> None:
-    from src.causal.hypersca_c_ablation import load_registered_prior
+    from src.causal.hypersca_c_ablation import _directed_relation_fingerprint
 
     rows = [("C", "A"), ("A", "B")]
     first = tmp_path / "first.csv"
@@ -404,17 +500,9 @@ def test_relation_fingerprint_is_independent_of_csv_row_order(tmp_path: Path) ->
     pd.DataFrame(list(reversed(rows)), columns=["source", "target"]).to_csv(
         second, index=False
     )
-    first_manifest = tmp_path / "first.json"
-    second_manifest = tmp_path / "second.json"
-    _write_json(first_manifest, _prior_manifest(first))
-    _write_json(second_manifest, _prior_manifest(second))
-    _, first_record, _ = load_registered_prior(first, first_manifest, ("C", "A", "B"))
-    _, second_record, _ = load_registered_prior(
-        second, second_manifest, ("C", "A", "B")
-    )
     expected = _expected_relation_fingerprint(rows)
-    assert first_record["relation_fingerprint"] == expected
-    assert second_record["relation_fingerprint"] == expected
+    assert _directed_relation_fingerprint(rows) == expected
+    assert _directed_relation_fingerprint(list(reversed(rows))) == expected
     assert sha256_path(first) != sha256_path(second)
 
 
@@ -422,9 +510,9 @@ def test_relation_fingerprint_is_independent_of_csv_row_order(tmp_path: Path) ->
     "case", ["overlap", "self_edge", "unknown_gene", "extra_column"]
 )
 def test_prior_rejects_scoring_overlap_and_invalid_relations(
-    tmp_path: Path, case: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
-    from src.causal.hypersca_c_ablation import load_registered_prior
+    import src.causal.hypersca_c_ablation as module
 
     row: dict[str, str] = {"source": "A", "target": "B"}
     if case == "self_edge":
@@ -442,8 +530,90 @@ def test_prior_rejects_scoring_overlap_and_invalid_relations(
         ] = payload["relation_fingerprint"]
     manifest = tmp_path / f"{case}.json"
     _write_json(manifest, payload)
+    _install_prior_trust(module, monkeypatch, tmp_path, edges, manifest)
     with pytest.raises(HyperSCACError, match="重用|重叠|自身|基因|列"):
-        load_registered_prior(edges, manifest, ("C", "A", "B"))
+        module.load_registered_prior(edges, manifest, ("C", "A", "B"))
+
+
+def test_unanchored_prior_cannot_self_authorize_with_its_own_manifest(
+    prepared_batch: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.causal.hypersca_c_ablation as module
+
+    edges = tmp_path / "self-authorized.csv"
+    pd.DataFrame([{"source": "C", "target": "A"}]).to_csv(edges, index=False)
+    source_manifest = tmp_path / "self-authorized.json"
+    _write_json(source_manifest, _prior_manifest(edges))
+    observed: list[str] = []
+
+    def fast_fit(
+        contexts: tuple[HyperSCACContext, ...],
+        config: HyperSCACConfig,
+        ablation_id: str,
+        **kwargs: object,
+    ) -> object:
+        del kwargs
+        observed.append(ablation_id)
+        return _fast_stability_result(contexts, config)
+
+    monkeypatch.setattr(module, "fit_hypersca_c_ablation", fast_fit)
+    kwargs = _batch_kwargs(prepared_batch, output=tmp_path / "unanchored")
+    kwargs.update(
+        prior_edges_path=edges,
+        prior_source_manifest_path=source_manifest,
+    )
+    statuses = module.run_hypersca_c_ablations(**kwargs)
+    assert statuses["prior_on_secondary"] == "official_assets_unavailable"
+    assert "prior_on_secondary" not in observed
+
+
+@pytest.mark.parametrize("private_part", ["edges", "source_manifest", "trust"])
+def test_prior_boundary_rejects_any_private_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, private_part: str
+) -> None:
+    import src.causal.hypersca_c_ablation as module
+
+    edges = tmp_path / "prior.csv"
+    pd.DataFrame([{"source": "C", "target": "A"}]).to_csv(edges, index=False)
+    source_manifest = tmp_path / "prior.json"
+    _write_json(source_manifest, _prior_manifest(edges))
+    trust = _install_prior_trust(module, monkeypatch, tmp_path, edges, source_manifest)
+    private = tmp_path / "private"
+    private.mkdir()
+    chosen_edges, chosen_manifest = edges, source_manifest
+    if private_part == "edges":
+        chosen_edges = private / edges.name
+        chosen_edges.write_bytes(edges.read_bytes())
+    elif private_part == "source_manifest":
+        chosen_manifest = private / source_manifest.name
+        chosen_manifest.write_bytes(source_manifest.read_bytes())
+    else:
+        private_trust = private / trust.name
+        private_trust.write_bytes(trust.read_bytes())
+        monkeypatch.setattr(module, "_DEFAULT_PRIOR_TRUST_REGISTRY", private_trust)
+    with pytest.raises(HyperSCACError, match="private|公开|路径"):
+        module.load_registered_prior(chosen_edges, chosen_manifest, ("C", "A", "B"))
+
+
+def test_trusted_exact_intersection_audit_must_report_no_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.causal.hypersca_c_ablation as module
+
+    edges = tmp_path / "partly-overlapping.csv"
+    pd.DataFrame([{"source": "C", "target": "A"}]).to_csv(edges, index=False)
+    source_manifest = tmp_path / "partly-overlapping.json"
+    _write_json(source_manifest, _prior_manifest(edges))
+    _install_prior_trust(
+        module,
+        monkeypatch,
+        tmp_path,
+        edges,
+        source_manifest,
+        audit_status="overlap_detected",
+    )
+    with pytest.raises(HyperSCACError, match="审计|重叠|交集"):
+        module.load_registered_prior(edges, source_manifest, ("C", "A", "B"))
 
 
 def _write_raw_context(path: Path, seed: int) -> None:
@@ -777,6 +947,165 @@ def test_unexpected_abort_removes_batch_staging_and_preserves_exception(
     assert not tuple(tmp_path.glob(".aborted.staging-*"))
 
 
+def test_batch_rejects_reversed_item_time_before_publication(
+    prepared_batch: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.causal.hypersca_c_ablation as module
+
+    _install_fast_ablation_fit(module, monkeypatch)
+    values = iter(
+        [
+            "2026-08-13T12:00:00Z",
+            "2026-08-13T12:00:02Z",
+            "2026-08-13T12:00:01Z",
+        ]
+    )
+    last = [2]
+
+    def utc_now() -> str:
+        try:
+            return next(values)
+        except StopIteration:
+            last[0] += 1
+            return f"2026-08-13T12:00:{last[0]:02d}Z"
+
+    monkeypatch.setattr(module._run, "_utc_now", utc_now)
+    output = tmp_path / "reversed-item-time"
+    with pytest.raises(HyperSCACError, match="时间|UTC|时长"):
+        module.run_hypersca_c_ablations(**_batch_kwargs(prepared_batch, output=output))
+    assert not output.exists()
+    assert not tuple(tmp_path.glob(".reversed-item-time.staging-*"))
+
+
+def test_batch_time_validation_normalizes_huge_duration() -> None:
+    from src.causal.hypersca_c_ablation import _validate_time_record
+
+    with pytest.raises(HyperSCACError, match="时长|有限"):
+        _validate_time_record(
+            {
+                "started_utc": "2026-08-13T12:00:00Z",
+                "completed_utc": "2026-08-13T12:00:01Z",
+                "duration_seconds": 10**400,
+            },
+            "故障注入记录",
+        )
+
+
+def test_batch_rejects_inconsistent_item_written_to_staging(
+    prepared_batch: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.causal.hypersca_c_ablation as module
+    from src.evaluation.task_c_data import write_json
+
+    _install_fast_ablation_fit(module, monkeypatch)
+    original = module._write_item
+
+    def corrupt_one(directory: Path, **kwargs: object) -> object:
+        record = original(directory, **kwargs)
+        if directory.name == "shared_only":
+            path = directory / "method_status.json"
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["ablation_id"] = "primary"
+            write_json(path, payload)
+        return record
+
+    monkeypatch.setattr(module, "_write_item", corrupt_one)
+    output = tmp_path / "inconsistent-staging"
+    with pytest.raises(HyperSCACError, match="状态|登记|校验|改变|一致"):
+        module.run_hypersca_c_ablations(**_batch_kwargs(prepared_batch, output=output))
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("initial_state", ["missing", "symlink"])
+def test_optional_prior_argument_state_is_frozen_until_publication(
+    prepared_batch: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_state: str,
+) -> None:
+    import src.causal.hypersca_c_ablation as module
+
+    edge_argument = tmp_path / "late-prior.csv"
+    first = tmp_path / "first.csv"
+    second = tmp_path / "second.csv"
+    first.write_text("source,target\nA,B\n", encoding="utf-8")
+    second.write_text("source,target\nC,A\n", encoding="utf-8")
+    if initial_state == "symlink":
+        edge_argument.symlink_to(first)
+    changed = False
+
+    def mutate_argument(
+        contexts: tuple[HyperSCACContext, ...],
+        config: HyperSCACConfig,
+        ablation_id: str,
+        **kwargs: object,
+    ) -> object:
+        nonlocal changed
+        del ablation_id, kwargs
+        if not changed:
+            if edge_argument.is_symlink():
+                edge_argument.unlink()
+                edge_argument.symlink_to(second)
+            else:
+                edge_argument.write_bytes(first.read_bytes())
+            changed = True
+        return _fast_stability_result(contexts, config)
+
+    monkeypatch.setattr(module, "fit_hypersca_c_ablation", mutate_argument)
+    kwargs = _batch_kwargs(prepared_batch, output=tmp_path / f"state-{initial_state}")
+    kwargs["prior_edges_path"] = edge_argument
+    with pytest.raises(HyperSCACError, match="先验|变化|状态"):
+        module.run_hypersca_c_ablations(**kwargs)
+    assert not Path(kwargs["output_root"]).exists()
+
+
+def test_batch_rejects_staging_file_with_an_external_hardlink(
+    prepared_batch: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.causal.hypersca_c_ablation as module
+
+    _install_fast_ablation_fit(module, monkeypatch)
+    original = module._write_item
+    outside = tmp_path / "outside-hardlink.csv"
+
+    def link_one(directory: Path, **kwargs: object) -> object:
+        record = original(directory, **kwargs)
+        if directory.name == "primary":
+            os.link(directory / "raw_predictions.csv", outside)
+        return record
+
+    monkeypatch.setattr(module, "_write_item", link_one)
+    output = tmp_path / "hardlinked-staging"
+    with pytest.raises(HyperSCACError, match="硬链接|普通文件|link"):
+        module.run_hypersca_c_ablations(**_batch_kwargs(prepared_batch, output=output))
+    assert not output.exists()
+
+
+def test_batch_reuse_rejects_an_external_hardlink(
+    prepared_batch: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.causal.hypersca_c_ablation as module
+
+    _install_fast_ablation_fit(module, monkeypatch)
+    kwargs = _batch_kwargs(prepared_batch)
+    module.run_hypersca_c_ablations(**kwargs)
+    outside = tmp_path / "existing-output-alias.csv"
+    os.link(
+        prepared_batch["output"] / "primary/raw_predictions.csv",
+        outside,
+    )
+    with pytest.raises(HyperSCACError, match="硬链接|普通文件|link"):
+        module.run_hypersca_c_ablations(**kwargs)
+
+
 def test_reuse_rejects_resigned_item_with_changed_effective_config(
     prepared_batch: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -924,6 +1253,7 @@ def test_legal_prior_runs_only_secondary_item_with_discount_and_mask(
     pd.DataFrame([{"source": "C", "target": "A"}]).to_csv(edges, index=False)
     source_manifest = tmp_path / "prior_manifest.json"
     _write_json(source_manifest, _prior_manifest(edges))
+    trust = _install_prior_trust(module, monkeypatch, tmp_path, edges, source_manifest)
     observed: dict[str, tuple[float, np.ndarray | None]] = {}
 
     def fast_fit(
@@ -960,6 +1290,14 @@ def test_legal_prior_runs_only_secondary_item_with_discount_and_mask(
         [0, 0, 0],
         [0, 0, 0],
     ]
+    batch = json.loads(
+        (tmp_path / "with-prior/ablation_batch_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert batch["run_identity"]["registered_prior"][
+        "prior_trust_registry_sha256"
+    ] == sha256_path(trust)
 
 
 def test_one_failed_ablation_does_not_hide_other_results(
