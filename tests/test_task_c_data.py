@@ -40,6 +40,25 @@ def dataset_for_split(context_id: str) -> TaskCDataset:
     )
 
 
+def dataset_with_four_cell_f(context_id: str) -> TaskCDataset:
+    genes = ("A", "B", "C", "D", "E", "F", "Z")
+    labels = ["non-targeting"] * 10
+    for source in ("A", "B", "C", "D", "E"):
+        labels.extend([source] * 5)
+    labels.extend(["F"] * 4)
+    expression = np.arange(len(labels) * len(genes), dtype=np.float32).reshape(
+        len(labels), len(genes)
+    )
+    return TaskCDataset(
+        expression=expression,
+        interventions=np.asarray(labels, dtype=str),
+        gene_names=genes,
+        context_id=context_id,
+        source_path=Path(f"{context_id}.npz"),
+        source_sha256=f"sha256:{context_id}-four-cell-f",
+    )
+
+
 def test_shared_split_is_reproducible_disjoint_and_validated():
     k562, rpe1 = dataset_for_split("k562"), dataset_for_split("rpe1")
     first = build_shared_task_c_split(k562, rpe1, seed=11)
@@ -422,6 +441,8 @@ def test_materialized_manifests_use_relative_paths_and_verified_hashes(tmp_path:
 
     public = json.loads(Path(result["public_manifest"]).read_text(encoding="utf-8"))
     private = json.loads(Path(result["private_manifest"]).read_text(encoding="utf-8"))
+    assert public["min_cells_per_intervention"] == split.min_cells_per_intervention
+    assert private["min_cells_per_intervention"] == split.min_cells_per_intervention
     assert public["files"]
     assert private["files"]
     assert set(public["files"]).isdisjoint(private["files"])
@@ -429,6 +450,31 @@ def test_materialized_manifests_use_relative_paths_and_verified_hashes(tmp_path:
         for relative_path, digest in manifest["files"].items():
             assert not Path(relative_path).is_absolute()
             assert sha256_path(root / relative_path) == digest
+    expected_public = {
+        Path(path).resolve().relative_to(root.resolve()).as_posix()
+        for partitions in result["within"].values()
+        for name, path in partitions.items()
+        if name != "holdout"
+    }
+    expected_public.update(
+        Path(path).resolve().relative_to(root.resolve()).as_posix()
+        for partitions in result["cross"].values()
+        for name, path in partitions.items()
+        if name != "target_holdout"
+    )
+    expected_private = {
+        Path(partitions["holdout"]).resolve().relative_to(root.resolve()).as_posix()
+        for partitions in result["within"].values()
+    }
+    expected_private.update(
+        Path(partitions["target_holdout"])
+        .resolve()
+        .relative_to(root.resolve())
+        .as_posix()
+        for partitions in result["cross"].values()
+    )
+    assert set(public["files"]) == expected_public
+    assert set(private["files"]) == expected_private
 
 
 def test_materialization_rejects_incompatible_gene_order(tmp_path: Path) -> None:
@@ -460,6 +506,98 @@ def test_materialization_reuses_matching_bundle_and_rejects_changed_identity(
         materialize_task_c_split(changed, rpe1, split, root)
 
 
+def test_materialization_identity_rejects_changed_minimum_cell_threshold(
+    tmp_path: Path,
+) -> None:
+    k562 = dataset_with_four_cell_f("k562")
+    rpe1 = dataset_with_four_cell_f("rpe1")
+    root = tmp_path / "bundle"
+    five_cell_split = build_shared_task_c_split(k562, rpe1, seed=11, min_cells=5)
+    four_cell_split = build_shared_task_c_split(k562, rpe1, seed=11, min_cells=4)
+    five_cell_sources = (
+        five_cell_split.train_sources
+        + five_cell_split.tune_sources
+        + five_cell_split.holdout_sources
+    )
+    four_cell_sources = (
+        four_cell_split.train_sources
+        + four_cell_split.tune_sources
+        + four_cell_split.holdout_sources
+    )
+    assert "F" not in five_cell_sources
+    assert "F" in four_cell_sources
+    materialize_task_c_split(k562, rpe1, five_cell_split, root)
+
+    with pytest.raises(TaskCDataError, match="identity|different|existing"):
+        materialize_task_c_split(k562, rpe1, four_cell_split, root)
+
+
+def test_materialization_rejects_tampered_public_semantic_fields(tmp_path: Path) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=23)
+    root = tmp_path / "bundle"
+    result = materialize_task_c_split(k562, rpe1, split, root)
+    manifest_path = Path(result["public_manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["train_sources"] = list(reversed(manifest["train_sources"]))
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(TaskCDataError, match="manifest|semantic|record"):
+        materialize_task_c_split(k562, rpe1, split, root)
+
+
+@pytest.mark.parametrize("field", ["holdout_sources", "control_indices"])
+def test_materialization_rejects_tampered_private_semantic_fields(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=47)
+    root = tmp_path / "bundle"
+    result = materialize_task_c_split(k562, rpe1, split, root)
+    manifest_path = Path(result["private_manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if field == "holdout_sources":
+        manifest[field] = []
+    else:
+        manifest[field]["k562"]["holdout"] = []
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(TaskCDataError, match="manifest|semantic|record"):
+        materialize_task_c_split(k562, rpe1, split, root)
+
+
+@pytest.mark.parametrize(
+    "manifest_name,extra_key,extra_value",
+    [
+        ("public_manifest", "holdout_sources", ["secret"]),
+        ("public_manifest", "private_path", "private/holdout.npz"),
+        ("public_manifest", "unexpected", True),
+        ("private_manifest", "unexpected", True),
+    ],
+)
+def test_materialization_rejects_unknown_manifest_fields(
+    tmp_path: Path,
+    manifest_name: str,
+    extra_key: str,
+    extra_value: object,
+) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=71)
+    root = tmp_path / "bundle"
+    result = materialize_task_c_split(k562, rpe1, split, root)
+    manifest_path = Path(result[manifest_name])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest[extra_key] = extra_value
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(TaskCDataError, match="manifest|schema|field"):
+        materialize_task_c_split(k562, rpe1, split, root)
+
+
 def test_materialization_rejects_tampered_existing_artifact(tmp_path: Path) -> None:
     k562 = dataset_for_split("k562")
     rpe1 = dataset_for_split("rpe1")
@@ -487,3 +625,117 @@ def test_failed_npz_write_leaves_no_final_or_temporary_file(tmp_path, monkeypatc
         task_c_data._write_dataset_subset(dataset, np.asarray([0, 1]), destination)
     assert not destination.exists()
     assert list(tmp_path.iterdir()) == []
+
+
+_MATERIALIZED_CASES = [
+    *(
+        ("within", context, partition)
+        for context in ("k562", "rpe1")
+        for partition in ("train", "tune", "refit", "holdout")
+    ),
+    *(
+        ("cross", direction, partition)
+        for direction in ("k562_to_rpe1", "rpe1_to_k562")
+        for partition in (
+            "source_train",
+            "source_tune",
+            "source_refit",
+            "target_adapt_train",
+            "target_adapt_tune",
+            "target_adapt_refit",
+            "target_holdout",
+        )
+    ),
+]
+
+
+@pytest.mark.parametrize("family,scope,partition", _MATERIALIZED_CASES)
+def test_every_materialized_file_contains_exact_original_rows(
+    tmp_path: Path,
+    family: str,
+    scope: str,
+    partition: str,
+) -> None:
+    datasets = {
+        "k562": dataset_for_split("k562"),
+        "rpe1": dataset_for_split("rpe1"),
+    }
+    split = build_shared_task_c_split(datasets["k562"], datasets["rpe1"], seed=97)
+    result = materialize_task_c_split(
+        datasets["k562"], datasets["rpe1"], split, tmp_path / "bundle"
+    )
+
+    if family == "within":
+        dataset = datasets[scope]
+        source_names = {
+            "train": split.train_sources,
+            "tune": split.tune_sources,
+            "refit": split.train_sources + split.tune_sources,
+            "holdout": split.holdout_sources,
+        }[partition]
+        control_parts = {
+            "train": ("train",),
+            "tune": ("tune",),
+            "refit": ("train", "tune"),
+            "holdout": ("holdout",),
+        }[partition]
+        artifact_path = result[family][scope][partition]
+        control_context = scope
+    else:
+        source_context, target_context = scope.split("_to_")
+        if partition.startswith("source_"):
+            dataset = datasets[source_context]
+            source_names = {
+                "source_train": split.train_sources,
+                "source_tune": split.tune_sources,
+                "source_refit": split.train_sources + split.tune_sources,
+            }[partition]
+            control_parts = {
+                "source_train": ("train",),
+                "source_tune": ("tune",),
+                "source_refit": ("train", "tune"),
+            }[partition]
+            control_context = source_context
+        else:
+            dataset = datasets[target_context]
+            source_names = (
+                split.train_sources + split.tune_sources + split.holdout_sources
+                if partition == "target_holdout"
+                else ()
+            )
+            control_parts = (
+                ("holdout",)
+                if partition == "target_holdout"
+                else {
+                    "target_adapt_train": ("train",),
+                    "target_adapt_tune": ("tune",),
+                    "target_adapt_refit": ("train", "tune"),
+                }[partition]
+            )
+            control_context = target_context
+        artifact_path = result[family][scope][partition]
+
+    controls = {
+        index
+        for control_part in control_parts
+        for index in split.control_indices[control_context][control_part]
+    }
+    sources = set(source_names)
+    expected_indices = np.asarray(
+        [
+            index
+            for index, label in enumerate(dataset.interventions.tolist())
+            if label in sources or index in controls
+        ],
+        dtype=int,
+    )
+    with np.load(artifact_path, allow_pickle=False) as archive:
+        np.testing.assert_array_equal(
+            archive["expression_matrix"], dataset.expression[expected_indices]
+        )
+        np.testing.assert_array_equal(
+            archive["interventions"], dataset.interventions[expected_indices]
+        )
+        np.testing.assert_array_equal(
+            archive["var_names"], np.asarray(dataset.gene_names)
+        )

@@ -506,6 +506,7 @@ def _private_split_payload(split: TaskCSplit) -> dict[str, Any]:
         "schema_version": split.schema_version,
         "split_id": split.split_id,
         "seed": split.seed,
+        "min_cells_per_intervention": split.min_cells_per_intervention,
         "train_sources": list(split.train_sources),
         "tune_sources": list(split.tune_sources),
         "holdout_sources": list(split.holdout_sources),
@@ -546,11 +547,29 @@ def _materialization_identity(
         "schema_version": split.schema_version,
         "split_id": split.split_id,
         "seed": split.seed,
+        "min_cells_per_intervention": split.min_cells_per_intervention,
         "input_sha256": {
             "k562": k562.source_sha256,
             "rpe1": rpe1.source_sha256,
         },
         "gene_names_sha256": _gene_names_sha256(k562.gene_names),
+    }
+
+
+def _public_split_payload(
+    split: TaskCSplit,
+    identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": split.schema_version,
+        "split_id": split.split_id,
+        "seed": split.seed,
+        "min_cells_per_intervention": split.min_cells_per_intervention,
+        "train_sources": list(split.train_sources),
+        "tune_sources": list(split.tune_sources),
+        "holdout_source_count": len(split.holdout_sources),
+        "input_sha256": identity["input_sha256"],
+        "gene_names_sha256": identity["gene_names_sha256"],
     }
 
 
@@ -652,6 +671,8 @@ def _verify_artifact_inventory(
 def _reuse_existing_materialization(
     root: Path,
     identity: Mapping[str, Any],
+    public_split_payload: Mapping[str, Any],
+    private_split_payload: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     public_path = root / "public_manifest.json"
     private_path = root / "private" / "private_manifest.json"
@@ -667,10 +688,26 @@ def _reuse_existing_materialization(
         raise TaskCDataError("existing output is incomplete; choose a new output directory")
     public = _read_manifest(public_path)
     private = _read_manifest(private_path)
+    expected_public_fields = set(public_split_payload) | {
+        "materialization_identity",
+        "files",
+    }
+    expected_private_fields = set(private_split_payload) | {
+        "materialization_identity",
+        "files",
+    }
+    if set(public) != expected_public_fields:
+        raise TaskCDataError("existing public manifest fields differ from its schema")
+    if set(private) != expected_private_fields:
+        raise TaskCDataError("existing private manifest fields differ from its schema")
     if public.get("materialization_identity") != identity or private.get(
         "materialization_identity"
     ) != identity:
         raise TaskCDataError("existing output has a different materialization identity")
+    if any(public.get(key) != value for key, value in public_split_payload.items()):
+        raise TaskCDataError("existing public manifest semantic record differs from split")
+    if any(private.get(key) != value for key, value in private_split_payload.items()):
+        raise TaskCDataError("existing private manifest semantic record differs from split")
     result = _materialized_result(root)
     public_paths, private_paths = _expected_artifact_paths(result, root)
     _verify_artifact_inventory(root, public, public_paths)
@@ -695,7 +732,14 @@ def materialize_task_c_split(
 
     root = Path(output_dir).expanduser().resolve()
     identity = _materialization_identity(k562, rpe1, split)
-    reused = _reuse_existing_materialization(root, identity)
+    public_split_payload = _public_split_payload(split, identity)
+    private_split_payload = _private_split_payload(split)
+    reused = _reuse_existing_materialization(
+        root,
+        identity,
+        public_split_payload,
+        private_split_payload,
+    )
     if reused is not None:
         return reused
 
@@ -760,7 +804,7 @@ def materialize_task_c_split(
             public_paths.append(
                 _write_dataset_subset(
                     target,
-                    _validated_row_indices(target, control_indices),
+                    np.sort(_validated_row_indices(target, control_indices)),
                     Path(direction_paths[partition]),
                 )
             )
@@ -775,25 +819,20 @@ def materialize_task_c_split(
             )
         )
 
-    private_payload = _private_split_payload(split)
+    private_payload = dict(private_split_payload)
     private_payload.update(
         {
             "materialization_identity": identity,
             "files": _artifact_inventory(private_paths, root),
         }
     )
-    public_payload = {
-        "schema_version": split.schema_version,
-        "split_id": split.split_id,
-        "seed": split.seed,
-        "train_sources": list(split.train_sources),
-        "tune_sources": list(split.tune_sources),
-        "holdout_source_count": len(split.holdout_sources),
-        "input_sha256": identity["input_sha256"],
-        "gene_names_sha256": identity["gene_names_sha256"],
-        "materialization_identity": identity,
-        "files": _artifact_inventory(public_paths, root),
-    }
+    public_payload = dict(public_split_payload)
+    public_payload.update(
+        {
+            "materialization_identity": identity,
+            "files": _artifact_inventory(public_paths, root),
+        }
+    )
     write_json(result["private_manifest"], private_payload)
     write_json(result["public_manifest"], public_payload)
     return result

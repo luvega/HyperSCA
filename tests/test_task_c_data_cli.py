@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from src.evaluation.task_c_data import build_task_c_reference_provenance
+from src.evaluation.task_c_data import build_task_c_reference_provenance, sha256_path
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -253,3 +253,15 @@ def test_prepare_cli_writes_five_reproducible_splits(tmp_path: Path) -> None:
     assert (output / "provenance" / "rpe1.json").exists()
     assert (output / "provenance" / "k562_references.json").exists()
     assert (output / "provenance" / "rpe1_references.json").exists()
+    for context in ("k562", "rpe1"):
+        provenance = json.loads(
+            (output / "provenance" / f"{context}_references.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert provenance["context"] == context
+        assert provenance["context_id"] == context
+        for reference_id in ("pooled", "chipseq"):
+            source = references[f"{context}_{reference_id}"].resolve()
+            assert provenance["files"][reference_id]["path"] == str(source)
+            assert provenance["files"][reference_id]["sha256"] == sha256_path(source)
