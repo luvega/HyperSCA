@@ -253,7 +253,38 @@ def _source_file_snapshot(path: Path) -> tuple[bytes, tuple[int, ...]]:
     return bytes(payload), _identity(after)
 
 
-def _committed_blob(source: Path, relative: str, boundary: Any) -> bytes:
+def _expected_commit(value: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 40
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ScoringContractError(
+            "expected CausalBench commit must be a full lowercase SHA-1"
+        )
+    return value
+
+
+def _validate_expected_checkout(
+    source: Path, boundary: Any, expected_commit: str
+) -> Path:
+    expected = _expected_commit(expected_commit)
+    try:
+        return boundary.validate_causalbench_source(
+            source, expected_commit=expected
+        )
+    except SystemExit as exc:
+        raise ScoringContractError(str(exc)) from exc
+
+
+def _committed_blob(
+    source: Path,
+    relative: str,
+    boundary: Any,
+    *,
+    expected_commit: str,
+) -> bytes:
+    expected = _expected_commit(expected_commit)
     environment = boundary._git_environment()
     try:
         completed = subprocess.run(
@@ -263,7 +294,7 @@ def _committed_blob(source: Path, relative: str, boundary: Any) -> bytes:
                 "-C",
                 str(source),
                 "show",
-                f"HEAD:{relative}",
+                f"{expected}:{relative}",
             ],
             check=True,
             capture_output=True,
@@ -277,12 +308,25 @@ def _committed_blob(source: Path, relative: str, boundary: Any) -> bytes:
 
 
 def freeze_causalbench_python_source(
-    source: Path, boundary: Any
+    source: Path,
+    boundary: Any,
+    *,
+    expected_commit: str,
 ) -> dict[str, tuple[str, tuple[int, ...]]]:
     """Bind every tracked CausalBench Python file to its committed bytes."""
 
+    expected = _expected_commit(expected_commit)
+    source = _validate_expected_checkout(source, boundary, expected)
     try:
-        tracked = boundary._git(source, "ls-files", "causalscbench").splitlines()
+        tracked = boundary._git(
+            source,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            expected,
+            "--",
+            "causalscbench",
+        ).splitlines()
     except SystemExit as exc:
         raise ScoringContractError(str(exc)) from exc
     relatives = sorted(relative for relative in tracked if relative.endswith(".py"))
@@ -296,7 +340,12 @@ def freeze_causalbench_python_source(
             raise ScoringContractError("fixed CausalBench source inventory is unsafe")
         path = source / lexical
         payload, identity = _source_file_snapshot(path)
-        committed = _committed_blob(source, relative, boundary)
+        committed = _committed_blob(
+            source,
+            relative,
+            boundary,
+            expected_commit=expected,
+        )
         if payload != committed:
             raise ScoringContractError("fixed CausalBench source file changed")
         frozen[relative] = (hashlib.sha256(committed).hexdigest(), identity)
@@ -328,16 +377,30 @@ def _remove_private_snapshot(root: Path) -> None:
 
 @contextmanager
 def fixed_causalbench_source_snapshot(
-    source: Path, boundary: Any
+    source: Path,
+    boundary: Any,
+    *,
+    expected_commit: str,
 ) -> Iterator[tuple[Path, dict[str, tuple[str, tuple[int, ...]]]]]:
     """Loadable private copy made only from verified committed Python bytes."""
 
-    live_frozen = freeze_causalbench_python_source(source, boundary)
+    expected = _expected_commit(expected_commit)
+    source = _validate_expected_checkout(source, boundary, expected)
+    live_frozen = freeze_causalbench_python_source(
+        source,
+        boundary,
+        expected_commit=expected,
+    )
     snapshot = Path(tempfile.mkdtemp(prefix="hypersca-causalbench-evaluation-"))
     frozen: dict[str, tuple[str, tuple[int, ...]]] = {}
     try:
         for relative, (expected_hash, _live_identity) in live_frozen.items():
-            payload = _committed_blob(source, relative, boundary)
+            payload = _committed_blob(
+                source,
+                relative,
+                boundary,
+                expected_commit=expected,
+            )
             if hashlib.sha256(payload).hexdigest() != expected_hash:
                 raise ScoringContractError(
                     "fixed CausalBench committed source changed"
@@ -368,6 +431,7 @@ def fixed_causalbench_source_snapshot(
             frozen[relative] = (expected_hash, identity)
         _make_read_only_tree(snapshot)
         verify_causalbench_python_source(snapshot, frozen)
+        _validate_expected_checkout(source, boundary, expected)
         yield snapshot, frozen
     finally:
         _remove_private_snapshot(snapshot)
@@ -1010,7 +1074,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             import numpy as np
 
             with fixed_causalbench_source_snapshot(
-                source, boundary
+                source,
+                boundary,
+                expected_commit=EXPECTED_CAUSALBENCH_COMMIT,
             ) as (snapshot_source, frozen_source):
                 with boundary._verified_causalbench_imports(snapshot_source):
                     evaluation_module = importlib.import_module(

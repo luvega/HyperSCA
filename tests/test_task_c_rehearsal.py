@@ -26,6 +26,7 @@ from src.evaluation.task_c_rehearsal import (
     choose_rehearsal_genes,
     freeze_method_worker_entry,
     load_task_c_rehearsal_config,
+    run_validated_private_scoring_command,
     validate_private_scoring_command,
 )
 
@@ -1078,6 +1079,77 @@ def test_private_command_check_binds_entry_extension_and_frozen_identity(
         )
 
 
+def test_validated_launcher_executes_frozen_worker_bundle_and_cleans_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    worker = tmp_path / "worker.py"
+    dependency = tmp_path / "reviewed_dependency.py"
+    dependency.write_text("VALUE = 'frozen dependency'\n", encoding="utf-8")
+    worker.write_text(
+        "from pathlib import Path\n"
+        "dependency = Path(__file__).with_name('reviewed_dependency.py')\n"
+        "print(Path(__file__).resolve())\n"
+        "print(dependency.read_text(encoding='utf-8').strip())\n",
+        encoding="utf-8",
+    )
+    entry_snapshot = freeze_method_worker_entry(worker)
+    dependency_snapshot = freeze_method_worker_entry(dependency)
+    interpreter = Path(sys.executable).resolve(strict=True)
+    real_run = subprocess.run
+    live_marker = tmp_path / "live-worker-executed"
+
+    def replace_live_worker_then_run(command, **kwargs):
+        worker.write_text(
+            f"from pathlib import Path\nPath({str(live_marker)!r}).write_text('unsafe')\n",
+            encoding="utf-8",
+        )
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(
+        "src.evaluation.task_c_rehearsal.subprocess.run",
+        replace_live_worker_then_run,
+    )
+    completed = run_validated_private_scoring_command(
+        [str(interpreter), "-I", str(worker)],
+        private_root=private_root,
+        execution_cwd=tmp_path,
+        allowed_python_interpreters=(interpreter,),
+        allowed_worker_snapshots=(entry_snapshot, dependency_snapshot),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output_lines = completed.stdout.splitlines()
+    frozen_entry = Path(output_lines[0])
+    assert output_lines[1] == "VALUE = 'frozen dependency'"
+    assert frozen_entry != worker
+    assert "hypersca-method-worker-" in str(frozen_entry)
+    assert not frozen_entry.parent.exists()
+    assert not live_marker.exists()
+
+
+def test_validated_launcher_rejects_worker_change_before_snapshot(
+    tmp_path: Path,
+) -> None:
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    worker = tmp_path / "worker.py"
+    worker.write_text("print('reviewed')\n", encoding="utf-8")
+    snapshot = freeze_method_worker_entry(worker)
+    interpreter = Path(sys.executable).resolve(strict=True)
+    worker.write_text("print('changed')\n", encoding="utf-8")
+
+    with pytest.raises(TaskCRehearsalError, match="worker.*changed"):
+        run_validated_private_scoring_command(
+            [str(interpreter), "-I", str(worker)],
+            private_root=private_root,
+            execution_cwd=tmp_path,
+            allowed_python_interpreters=(interpreter,),
+            allowed_worker_snapshots=(snapshot,),
+        )
+
+
 def test_official_evaluation_worker_exposes_help_without_external_imports(
     tmp_path: Path,
 ) -> None:
@@ -1244,7 +1316,9 @@ def test_verified_source_snapshot_detects_a_change_before_import(tmp_path: Path)
     worker = _load_evaluation_worker()
     boundary = worker._load_causalbench_boundary_module()
     verified = boundary.validate_causalbench_source(source, revision)
-    frozen = worker.freeze_causalbench_python_source(verified, boundary)
+    frozen = worker.freeze_causalbench_python_source(
+        verified, boundary, expected_commit=revision
+    )
     evaluation_path = source / "causalscbench/evaluation/statistical_evaluation.py"
     evaluation_path.write_text(
         evaluation_path.read_text(encoding="utf-8") + "# changed before import\n",
@@ -1267,7 +1341,7 @@ def test_official_import_uses_read_only_snapshot_not_changed_live_checkout(
     snapshot_path: Path | None = None
 
     with worker.fixed_causalbench_source_snapshot(
-        verified, boundary
+        verified, boundary, expected_commit=revision
     ) as (snapshot, frozen):
         snapshot_path = snapshot
         snapshot_evaluation = (
@@ -1290,6 +1364,39 @@ def test_official_import_uses_read_only_snapshot_not_changed_live_checkout(
 
     assert snapshot_path is not None
     assert not snapshot_path.exists()
+
+
+def test_official_snapshot_uses_explicit_commit_not_a_new_head(tmp_path: Path) -> None:
+    source, revision_a = _fake_evaluation_source(tmp_path)
+    evaluation = source / "causalscbench/evaluation/statistical_evaluation.py"
+    marker = tmp_path / "revision-b-executed"
+    evaluation.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('unsafe')\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(source), "add", "causalscbench"], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "commit", "-q", "-m", "revision B"],
+        check=True,
+    )
+    revision_b = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert revision_b != revision_a
+    worker = _load_evaluation_worker()
+    boundary = worker._load_causalbench_boundary_module()
+
+    with pytest.raises((SystemExit, worker.ScoringContractError), match="revision|commit"):
+        with worker.fixed_causalbench_source_snapshot(
+            source,
+            boundary,
+            expected_commit=revision_a,
+        ):
+            raise AssertionError("a snapshot from revision B must not be yielded")
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize("mutation", ["during_import", "during_init"])

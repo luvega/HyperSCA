@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 from itertools import islice
 import json
@@ -18,7 +18,10 @@ import math
 import os
 from pathlib import Path
 import shlex
+import shutil
 import stat
+import subprocess
+import tempfile
 from types import MappingProxyType
 from typing import Any
 import unicodedata
@@ -102,6 +105,7 @@ class MethodWorkerEntrySnapshot:
     path: Path
     sha256: str
     identity: tuple[int, ...]
+    payload: bytes = field(repr=False)
 
 
 def _fixed_positive_integer(value: object, label: str) -> int:
@@ -1019,6 +1023,7 @@ def freeze_method_worker_entry(path: str | Path) -> MethodWorkerEntrySnapshot:
         path=resolved,
         sha256=hashlib.sha256(payload).hexdigest(),
         identity=identity,
+        payload=payload,
     )
 
 
@@ -1079,11 +1084,12 @@ def validate_private_scoring_command(
     allowed_python_interpreters: Sequence[str | Path] | None = None,
     allowed_worker_snapshots: Sequence[MethodWorkerEntrySnapshot] | None = None,
 ) -> None:
-    """Prove that a method process receives no path into sealed scoring data.
+    """Preflight one method command against the sealed-data boundary.
 
     Relative paths, option assignments and symbolic-link aliases are resolved
-    before comparison.  The independently run scoring process is allowed to
-    read this directory; a method-training process is not.
+    before comparison.  Passing this check is not authorization to start a live
+    worker: callers must use :func:`run_validated_private_scoring_command`,
+    which executes an immutable private copy in the same checked boundary.
     """
 
     if isinstance(command, (str, bytes)) or not isinstance(command, Sequence):
@@ -1217,3 +1223,184 @@ def validate_private_scoring_command(
         requested_worker_entry,
         snapshots_by_path[worker_entry],
     )
+
+
+def _write_worker_bundle_file(
+    bundle: Path, snapshot: MethodWorkerEntrySnapshot
+) -> Path:
+    destination = bundle / snapshot.path.name
+    try:
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            written = 0
+            while written < len(snapshot.payload):
+                written += os.write(descriptor, snapshot.payload[written:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.chmod(destination, 0o400, follow_symlinks=False)
+    except OSError as exc:
+        raise TaskCRehearsalError(
+            "private method worker bundle could not be created"
+        ) from exc
+    copied_path, copied_payload, _identity = _method_worker_bytes(destination)
+    if (
+        copied_path != destination.resolve(strict=True)
+        or copied_payload != snapshot.payload
+        or hashlib.sha256(copied_payload).hexdigest() != snapshot.sha256
+    ):
+        raise TaskCRehearsalError(
+            "private method worker bundle content changed"
+        )
+    return destination
+
+
+def _remove_worker_bundle(bundle: Path) -> None:
+    if not bundle.exists():
+        return
+    try:
+        for path in bundle.iterdir():
+            metadata = os.lstat(path)
+            if stat.S_ISLNK(metadata.st_mode):
+                raise TaskCRehearsalError(
+                    "private method worker bundle contains a symbolic link"
+                )
+            if stat.S_ISREG(metadata.st_mode):
+                os.chmod(path, 0o600, follow_symlinks=False)
+        os.chmod(bundle, 0o700, follow_symlinks=False)
+        shutil.rmtree(bundle)
+    except TaskCRehearsalError:
+        raise
+    except OSError as exc:
+        raise TaskCRehearsalError(
+            "private method worker bundle could not be removed"
+        ) from exc
+
+
+def run_validated_private_scoring_command(
+    command: Sequence[str],
+    *,
+    private_root: str | Path,
+    execution_cwd: str | Path,
+    allowed_python_interpreters: Sequence[str | Path],
+    allowed_worker_snapshots: Sequence[MethodWorkerEntrySnapshot],
+    environment: Mapping[str, str] | None = None,
+    timeout_seconds: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Validate and immediately execute a private, read-only worker copy.
+
+    The command entry is replaced with bytes frozen during review.  Reviewed
+    sibling Python files are copied beside it for this invocation only.  No live
+    worker path is executed after preflight, and the temporary bundle is removed
+    after success, failure or timeout.
+    """
+
+    validate_private_scoring_command(
+        command,
+        private_root=private_root,
+        execution_cwd=execution_cwd,
+        allowed_python_interpreters=allowed_python_interpreters,
+        allowed_worker_snapshots=allowed_worker_snapshots,
+    )
+    arguments = tuple(command)
+    cwd = _real_execution_directory(execution_cwd)
+    interpreters = _normalized_python_interpreters(allowed_python_interpreters)
+    interpreter = Path(arguments[0]).expanduser().resolve(strict=True)
+    if interpreter not in interpreters:
+        raise TaskCRehearsalError(
+            "method command Python interpreter changed before launch"
+        )
+    interpreter_before = _file_identity(
+        os.stat(interpreter, follow_symlinks=False)
+    )
+
+    snapshots = tuple(allowed_worker_snapshots)
+    entry_path = Path(arguments[2]).expanduser()
+    if not entry_path.is_absolute():
+        entry_path = cwd / entry_path
+    entry_path = entry_path.resolve(strict=True)
+    snapshots_by_path = {snapshot.path: snapshot for snapshot in snapshots}
+    if entry_path not in snapshots_by_path:
+        raise TaskCRehearsalError(
+            "method command does not use a registered worker entry"
+        )
+    if len(snapshots_by_path) != len(snapshots):
+        raise TaskCRehearsalError(
+            "allowed worker snapshots must contain unique entries"
+        )
+    parent = snapshots_by_path[entry_path].path.parent
+    if any(snapshot.path.parent != parent for snapshot in snapshots):
+        raise TaskCRehearsalError(
+            "reviewed method dependencies must be local sibling files"
+        )
+    names = [snapshot.path.name for snapshot in snapshots]
+    if len(names) != len(set(names)):
+        raise TaskCRehearsalError(
+            "reviewed method dependencies must have unique file names"
+        )
+    for snapshot in snapshots:
+        _verify_method_worker_entry(snapshot.path, snapshot)
+
+    if environment is not None:
+        if not isinstance(environment, Mapping) or any(
+            type(key) is not str
+            or type(value) is not str
+            or "\x00" in key
+            or "\x00" in value
+            or not key
+            for key, value in environment.items()
+        ):
+            raise TaskCRehearsalError(
+                "method environment must contain safe text names and values"
+            )
+        process_environment = dict(environment)
+    else:
+        process_environment = os.environ.copy()
+    if timeout_seconds is not None and (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or float(timeout_seconds) <= 0.0
+    ):
+        raise TaskCRehearsalError(
+            "method timeout must be a finite positive number of seconds"
+        )
+
+    bundle = Path(tempfile.mkdtemp(prefix="hypersca-method-worker-"))
+    try:
+        copied = {
+            snapshot.path: _write_worker_bundle_file(bundle, snapshot)
+            for snapshot in snapshots
+        }
+        os.chmod(bundle, 0o500, follow_symlinks=False)
+        launch_command = [
+            str(interpreter),
+            "-I",
+            str(copied[entry_path]),
+            *arguments[3:],
+        ]
+        interpreter_after = _file_identity(
+            os.stat(interpreter, follow_symlinks=False)
+        )
+        if interpreter_after != interpreter_before:
+            raise TaskCRehearsalError(
+                "method command Python interpreter changed before launch"
+            )
+        return subprocess.run(
+            launch_command,
+            cwd=cwd,
+            env=process_environment,
+            capture_output=True,
+            text=True,
+            timeout=(float(timeout_seconds) if timeout_seconds is not None else None),
+            check=False,
+        )
+    finally:
+        _remove_worker_bundle(bundle)
