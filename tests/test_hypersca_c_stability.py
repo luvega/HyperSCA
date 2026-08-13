@@ -252,6 +252,62 @@ def test_zero_successes_still_produce_every_directed_relationship() -> None:
     assert summary["repeat_success_fraction"] == 0.0
 
 
+def test_zero_successes_preserve_declared_context_columns() -> None:
+    table, _ = build_stability_table(
+        [],
+        ("A", "B"),
+        selection_threshold=0.1,
+        requested_repeats=2,
+        minimum_success_fraction=0.8,
+        source_variance={"A": 1.0, "B": 1.0},
+        minimum_source_variance=1e-8,
+        expected_contexts=("k562", "rpe1"),
+    )
+    assert table[["effect_k562", "effect_rpe1"]].to_numpy().tolist() == [
+        [0.0, 0.0],
+        [0.0, 0.0],
+    ]
+
+
+def test_successful_repeats_must_match_declared_contexts() -> None:
+    with pytest.raises(HyperSCACError, match="expected_contexts"):
+        build_stability_table(
+            [{"k562": np.zeros((2, 2))}],
+            ("A", "B"),
+            selection_threshold=0.1,
+            requested_repeats=1,
+            minimum_success_fraction=0.8,
+            source_variance={"A": 1.0, "B": 1.0},
+            minimum_source_variance=1e-8,
+            expected_contexts=("rpe1",),
+        )
+
+
+@pytest.mark.parametrize(
+    ("expected_contexts", "match"),
+    [
+        ((), "at least one"),
+        (("k562", "k562"), "unique"),
+        (("bad context",), "whitespace"),
+        ("k562", "sequence"),
+    ],
+)
+def test_declared_contexts_must_be_nonempty_unique_text(
+    expected_contexts: object, match: str
+) -> None:
+    with pytest.raises(HyperSCACError, match=match):
+        build_stability_table(
+            [],
+            ("A", "B"),
+            selection_threshold=0.1,
+            requested_repeats=1,
+            minimum_success_fraction=0.8,
+            source_variance={"A": 1.0, "B": 1.0},
+            minimum_source_variance=1e-8,
+            expected_contexts=expected_contexts,  # type: ignore[arg-type]
+        )
+
+
 @pytest.mark.parametrize(
     ("gene_names", "match"),
     [
@@ -485,6 +541,53 @@ def test_result_recomputes_frozen_row_contracts(
         HyperSCAStabilityResult(table, summary, ())
 
 
+def test_result_requires_every_nonself_relationship() -> None:
+    table, summary = build_stability_table(
+        [{"k562": np.zeros((3, 3))}],
+        ("A", "B", "C"),
+        selection_threshold=0.1,
+        requested_repeats=1,
+        minimum_success_fraction=1.0,
+        source_variance={"A": 1.0, "B": 1.0, "C": 1.0},
+        minimum_source_variance=1e-8,
+    )
+    incomplete = table[
+        ~((table["source"] == "A") & (table["target"] == "B"))
+    ]
+    with pytest.raises(HyperSCACError, match="complete"):
+        HyperSCAStabilityResult(incomplete, summary, ())
+
+
+def test_result_requires_equal_source_and_target_gene_sets() -> None:
+    table, summary = build_stability_table(
+        [{"k562": np.zeros((3, 3))}],
+        ("A", "B", "C"),
+        selection_threshold=0.1,
+        requested_repeats=1,
+        minimum_success_fraction=1.0,
+        source_variance={"A": 1.0, "B": 1.0, "C": 1.0},
+        minimum_source_variance=1e-8,
+    )
+    unequal = table.loc[table["source"] != "C"]
+    with pytest.raises(HyperSCACError, match="source and target gene sets"):
+        HyperSCAStabilityResult(unequal, summary, ())
+
+
+def test_result_rejects_unknown_abstention_reason() -> None:
+    table, summary = valid_table()
+    table.loc[0, "abstained"] = True
+    table.loc[0, "abstention_reason"] = "invented_reason"
+    with pytest.raises(HyperSCACError, match="abstention_reason"):
+        HyperSCAStabilityResult(table, summary, ())
+
+
+def test_result_requires_the_frozen_ranking_order() -> None:
+    table, summary = valid_table()
+    reversed_rows = table.iloc[::-1]
+    with pytest.raises(HyperSCACError, match="sorted"):
+        HyperSCAStabilityResult(reversed_rows, summary, ())
+
+
 def test_result_rejects_inconsistent_summary_and_failure_counts() -> None:
     table, summary = valid_table()
     summary["repeat_success_fraction"] = 0.5
@@ -585,9 +688,13 @@ def test_stable_fit_all_expected_failures_trigger_full_abstention(
 
     monkeypatch.setattr(stability_module, "fit_hypersca_c_once", fail_fit)
     result = fit_stable_hypersca_c(
-        [make_context()], config, seed=11, device="cpu"
+        [make_context("k562"), make_context("rpe1")],
+        config,
+        seed=11,
+        device="cpu",
     )
     assert result.predictions["abstained"].all()
+    assert (result.predictions[["effect_k562", "effect_rpe1"]] == 0.0).all().all()
     assert result.summary["successful_repeats"] == 0
     assert result.summary["coverage"] == 0.0
     assert len(result.failures) == 2

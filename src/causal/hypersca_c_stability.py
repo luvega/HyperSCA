@@ -43,6 +43,11 @@ _SUMMARY_FIELDS = (
     "abstention_rate",
     "score_formula",
 )
+_ABSTENTION_REASONS = {
+    "",
+    "insufficient_successful_bootstraps",
+    "source_has_no_control_variation",
+}
 
 
 class _FrozenJSONDict(dict[str, object]):
@@ -101,6 +106,30 @@ def _validated_genes(gene_names: Sequence[str]) -> tuple[str, ...]:
     if len(set(genes)) != len(genes):
         raise HyperSCACError("gene_names must be unique")
     return genes
+
+
+def _validated_expected_contexts(
+    expected_contexts: Sequence[str] | None,
+) -> tuple[str, ...] | None:
+    if expected_contexts is None:
+        return None
+    if isinstance(expected_contexts, (str, bytes)):
+        raise HyperSCACError("expected_contexts must be a sequence of identifiers")
+    try:
+        raw_contexts = tuple(expected_contexts)
+    except (TypeError, RuntimeError) as exc:
+        raise HyperSCACError(
+            "expected_contexts must be a sequence of identifiers"
+        ) from exc
+    if not raw_contexts:
+        raise HyperSCACError("expected_contexts must contain at least one context")
+    contexts = tuple(
+        _required_text(context, "expected_contexts identifier")
+        for context in raw_contexts
+    )
+    if len(set(contexts)) != len(contexts):
+        raise HyperSCACError("expected_contexts must be unique")
+    return contexts
 
 
 def _validated_source_variance(
@@ -176,6 +205,7 @@ def _validated_repeat_matrices(
     *,
     dimension: int,
     requested_repeats: int,
+    expected_contexts: tuple[str, ...] | None,
 ) -> tuple[tuple[dict[str, np.ndarray], ...], tuple[str, ...]]:
     if isinstance(context_matrices, (str, bytes)):
         raise HyperSCACError("context_matrices must be a sequence of mappings")
@@ -189,7 +219,10 @@ def _validated_repeat_matrices(
         raise HyperSCACError(
             "successful repeats must not exceed requested_repeats"
         )
-    expected_contexts: set[str] | None = None
+    expected_context_set = (
+        set(expected_contexts) if expected_contexts is not None else None
+    )
+    inferred_contexts: set[str] | None = None
     normalized_repeats: list[dict[str, np.ndarray]] = []
     for repeat_index, result in enumerate(repeats):
         if not isinstance(result, Mapping):
@@ -218,14 +251,24 @@ def _validated_repeat_matrices(
                 context=context,
             )
         current_contexts = set(normalized)
-        if expected_contexts is None:
-            expected_contexts = current_contexts
-        elif current_contexts != expected_contexts:
+        if (
+            expected_context_set is not None
+            and current_contexts != expected_context_set
+        ):
+            raise HyperSCACError(
+                "successful repeat contexts must exactly match expected_contexts"
+            )
+        if inferred_contexts is None:
+            inferred_contexts = current_contexts
+        elif current_contexts != inferred_contexts:
             raise HyperSCACError(
                 "all successful repeats must contain exactly the same contexts"
             )
         normalized_repeats.append(normalized)
-    context_names = tuple(sorted(expected_contexts)) if expected_contexts else ()
+    if expected_contexts is not None:
+        context_names = expected_contexts
+    else:
+        context_names = tuple(sorted(inferred_contexts)) if inferred_contexts else ()
     ordered_repeats = tuple(
         {context: result[context] for context in context_names}
         for result in normalized_repeats
@@ -288,7 +331,7 @@ def _validated_predictions(predictions: object) -> pd.DataFrame:
         )
     if predictions.empty:
         raise HyperSCACError("predictions must contain directed relationships")
-    result = predictions.copy(deep=True).reset_index(drop=True)
+    result = predictions.copy(deep=True)
 
     for column in ("source", "target"):
         for value in result[column].tolist():
@@ -297,6 +340,25 @@ def _validated_predictions(predictions: object) -> pd.DataFrame:
         raise HyperSCACError("source-target relationships must be unique")
     if bool((result["source"] == result["target"]).any()):
         raise HyperSCACError("predictions must not contain a self edge")
+    source_genes = set(result["source"].tolist())
+    target_genes = set(result["target"].tolist())
+    if source_genes != target_genes:
+        raise HyperSCACError("prediction source and target gene sets must be equal")
+    if len(source_genes) < 2:
+        raise HyperSCACError("predictions must describe at least two genes")
+    expected_relationships = {
+        (source, target)
+        for source in source_genes
+        for target in source_genes
+        if source != target
+    }
+    observed_relationships = set(
+        zip(result["source"].tolist(), result["target"].tolist())
+    )
+    if observed_relationships != expected_relationships:
+        raise HyperSCACError(
+            "predictions must be a complete set of every nonself relationship"
+        )
 
     metric_columns = [
         "effect",
@@ -370,6 +432,8 @@ def _validated_predictions(predictions: object) -> pd.DataFrame:
     for reason in result["abstention_reason"].tolist():
         if not isinstance(reason, str):
             raise HyperSCACError("abstention_reason values must be text")
+        if reason not in _ABSTENTION_REASONS:
+            raise HyperSCACError("abstention_reason is not a frozen reason")
     for _, source_rows in result.groupby("source", sort=False):
         if source_rows["abstained"].nunique(dropna=False) != 1:
             raise HyperSCACError("abstention must be consistent for each source")
@@ -383,7 +447,15 @@ def _validated_predictions(predictions: object) -> pd.DataFrame:
             raise HyperSCACError(
                 "abstention_reason must be present only for abstained sources"
             )
-    return result
+    normalized_order = result.reset_index(drop=True)
+    expected_order = result.sort_values(
+        ["abstained", "score", "source", "target"],
+        ascending=[True, False, True, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    if not normalized_order.equals(expected_order):
+        raise HyperSCACError("predictions must use the frozen sorted ranking order")
+    return normalized_order
 
 
 def _validated_summary(
@@ -506,11 +578,13 @@ def build_stability_table(
     minimum_success_fraction: float,
     source_variance: Mapping[str, float],
     minimum_source_variance: float,
+    expected_contexts: Sequence[str] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     """用固定公式形成全部有向关系，并标出无法可靠判断的来源基因。
 
-    每个细胞环境和每次成功重复具有一个等权观测。暂不判断的关系仍保留原始
-    ``score`` 以便审计，但稳定排序始终把它们放在可判断关系之后。
+    每个细胞环境和每次成功重复具有一个等权观测。暂不判断的关系仍保留
+    原始 ``score`` 以便审计，但稳定排序始终把它们放在可判断关系之后。
+    ``expected_contexts`` 可在没有成功重复时继续保留固定的环境效应列。
     """
 
     genes = _validated_genes(gene_names)
@@ -528,11 +602,13 @@ def build_stability_table(
     )
     if minimum_variance <= 0.0:
         raise HyperSCACError("minimum_source_variance must be greater than zero")
+    declared_contexts = _validated_expected_contexts(expected_contexts)
     variances = _validated_source_variance(source_variance, genes)
     repeats, contexts = _validated_repeat_matrices(
         context_matrices,
         dimension=len(genes),
         requested_repeats=requested,
+        expected_contexts=declared_contexts,
     )
 
     successful = len(repeats)
@@ -586,7 +662,11 @@ def build_stability_table(
                 selection_frequency = 0.0
                 direction_agreement = 0.0
             context_effects = {
-                context: float(np.median(context_values))
+                context: (
+                    float(np.median(context_values))
+                    if context_values.size
+                    else 0.0
+                )
                 for context, context_values in values_by_context.items()
             }
             selected_context_signs = np.asarray(
@@ -754,6 +834,9 @@ def fit_stable_hypersca_c(
         minimum_success_fraction=config.bootstrap_success_fraction,
         source_variance=source_variance,
         minimum_source_variance=config.minimum_source_variance,
+        expected_contexts=tuple(
+            context.context_id for context in normalized_contexts
+        ),
     )
     return HyperSCAStabilityResult(
         predictions=predictions,
