@@ -1479,6 +1479,58 @@ def _write_new_output(
             shutil.rmtree(staging, ignore_errors=True)
 
 
+def validate_hypersca_c_output_bundle(output_dir: Path) -> dict[str, object]:
+    """Recheck one complete HyperSCA-C raw result without fitting it again."""
+
+    output = _lexical_absolute(output_dir)
+    manifest = _read_output_json(output / "run_manifest.json", "运行清单")
+    try:
+        identity = manifest["run_identity"]
+        expected_static = {
+            field: manifest[field] for field in _RUN_MANIFEST_STATIC_FIELDS
+        }
+        contexts = expected_static["contexts"]
+        genes = expected_static["gene_selection"]
+        config = expected_static["config"]
+        if (
+            not isinstance(identity, Mapping)
+            or not isinstance(contexts, Sequence)
+            or not isinstance(genes, Mapping)
+            or not isinstance(config, Mapping)
+        ):
+            raise TypeError
+        context_ids = tuple(str(record["context_id"]) for record in contexts)
+        ordered_genes = tuple(str(gene) for gene in genes["ordered_genes"])
+        config_values = config["values"]
+        if not isinstance(config_values, Mapping):
+            raise TypeError
+        requested_repeats = int(config_values["bootstrap_repeats"])
+        selection_threshold = float(config_values["selection_threshold"])
+        seed = int(expected_static["seed"])
+        condition = {
+            field: expected_static[field]
+            for field in ("condition", "mode", "direction", "stage")
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HyperSCACError(
+            "HyperSCA-C 原始输出无法重建科学核验条件"
+        ) from exc
+    verified = _reuse_existing_output(
+        output,
+        identity,
+        expected_static=expected_static,
+        context_ids=context_ids,
+        gene_names=ordered_genes,
+        requested_repeats=requested_repeats,
+        selection_threshold=selection_threshold,
+        seed=seed,
+        condition=condition,
+    )
+    if verified is None:
+        raise HyperSCACError("HyperSCA-C 原始输出不完整")
+    return verified
+
+
 def run_hypersca_c(
     *,
     context_values: Sequence[str],

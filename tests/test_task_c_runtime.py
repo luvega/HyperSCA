@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 import json
 import hashlib
 import io
@@ -7,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -39,6 +41,7 @@ from src.evaluation.task_c_method_run import (
     MAXIMUM_TASK_C_RUN_GENES,
     TaskCMethodRunError,
     build_task_c_method_command,
+    materialize_task_c_derived_input,
     read_task_c_raw_predictions,
     run_task_c_method,
 )
@@ -46,6 +49,21 @@ from src.evaluation.task_c_method_run import (
 
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY = ROOT / "configs/task_c_methods_v1.json"
+TASK_C_RUNTIME_CLOSURE = (
+    "src/evaluation/task_c_method_run.py",
+    "scripts/run_task_c_method.py",
+    "src/evaluation/task_c_predictions.py",
+    "src/evaluation/task_c_runtime.py",
+    "src/evaluation/task_c_method_registry.py",
+    "src/evaluation/task_c_data.py",
+    "src/evaluation/task_c_benchmark.py",
+    "src/causal/hypersca_c.py",
+    "src/causal/hypersca_c_stability.py",
+    "src/causal/hypersca_c_run.py",
+    "scripts/run_hypersca_c.py",
+    "scripts/task_c_workers/causalbench_worker.py",
+    "scripts/task_c_workers/psgrn_worker.py",
+)
 
 
 def test_publication_only_method_gets_explicit_unavailable_status() -> None:
@@ -1790,10 +1808,7 @@ def test_reuse_recomputes_the_mean_difference_scientific_result(
             "sha256": f"sha256:{hashlib.sha256(payload).hexdigest()}",
             "size_bytes": len(payload),
         }
-    status_path.write_text(
-        json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    _write_resealed_outer_status(status_path, status)
 
     with pytest.raises(TaskCMethodRunError, match="scientific semantics"):
         run_task_c_method(**arguments)
@@ -1878,10 +1893,7 @@ def test_reuse_rejects_a_rewritten_environment_record_even_with_updated_hash(
         "sha256": f"sha256:{hashlib.sha256(payload).hexdigest()}",
         "size_bytes": len(payload),
     }
-    status_path.write_text(
-        json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    _write_resealed_outer_status(status_path, status)
 
     with pytest.raises(TaskCMethodRunError, match="environment.*changed"):
         run_task_c_method(**arguments)
@@ -1934,3 +1946,483 @@ def test_formal_run_rejects_a_public_manifest_with_split_identity_drift(
             public_manifest_path=manifest_path,
             project_root=ROOT,
         )
+
+
+def test_cross_environment_derived_input_is_recomputed_before_mean_run(
+    tmp_path: Path,
+) -> None:
+    bundle = _materialized_public_bundle(tmp_path)
+    derived = materialize_task_c_derived_input(
+        public_manifest_path=Path(bundle["public_manifest"]),
+        direction="k562_to_rpe1",
+        stage="refit",
+        output_dir=tmp_path / "derived",
+    )
+
+    status = run_task_c_method(
+        method_id="mean_difference",
+        input_npz=Path(derived["input_npz"]),
+        derived_input_manifest_path=Path(derived["manifest"]),
+        output_dir=tmp_path / "run",
+        seed=11,
+        registry_path=REGISTRY,
+        asset_root=tmp_path / "assets",
+        data_status="external_benchmark",
+        context_id="k562_to_rpe1",
+        min_cells=5,
+        public_manifest_path=Path(bundle["public_manifest"]),
+        project_root=ROOT,
+    )
+
+    assert status["status"] == "completed_standardized_output"
+    environment = json.loads(
+        (tmp_path / "run/environment_manifest.json").read_text(encoding="utf-8")
+    )
+    assert environment["run_identity"]["derived_input_manifest_sha256"].startswith(
+        "sha256:"
+    )
+    with np.load(Path(derived["input_npz"]), allow_pickle=False) as archive:
+        assert set(archive.files) == {
+            "expression_matrix",
+            "interventions",
+            "var_names",
+            "environment_labels",
+        }
+        assert set(archive["environment_labels"].tolist()) == {"k562", "rpe1"}
+
+
+@pytest.mark.parametrize("mutation", ["parent", "direction", "labels", "output"])
+def test_cross_environment_derived_input_rejects_identity_or_content_drift(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    bundle = _materialized_public_bundle(tmp_path)
+    derived = materialize_task_c_derived_input(
+        public_manifest_path=Path(bundle["public_manifest"]),
+        direction="k562_to_rpe1",
+        stage="refit",
+        output_dir=tmp_path / "derived",
+    )
+    input_path = Path(derived["input_npz"])
+    manifest_path = Path(derived["manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if mutation == "parent":
+        manifest["parents"][0]["sha256"] = "sha256:" + "0" * 64
+    elif mutation == "direction":
+        manifest["direction"] = "rpe1_to_k562"
+    else:
+        with np.load(input_path, allow_pickle=False) as archive:
+            arrays = {name: np.asarray(archive[name]) for name in archive.files}
+        if mutation == "labels":
+            arrays["environment_labels"] = np.asarray(
+                ["k562"] * len(arrays["environment_labels"])
+            )
+        else:
+            arrays["expression_matrix"] = arrays["expression_matrix"].copy()
+            arrays["expression_matrix"][0, 0] += 1.0
+        np.savez(input_path, **arrays)
+        payload = input_path.read_bytes()
+        manifest["output"]["sha256"] = (
+            f"sha256:{hashlib.sha256(payload).hexdigest()}"
+        )
+        manifest["output"]["size_bytes"] = len(payload)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TaskCMethodRunError, match="derived|parent|direction|environment"):
+        run_task_c_method(
+            method_id="mean_difference",
+            input_npz=input_path,
+            derived_input_manifest_path=manifest_path,
+            output_dir=tmp_path / "run",
+            seed=11,
+            registry_path=REGISTRY,
+            asset_root=tmp_path / "assets",
+            data_status="external_benchmark",
+            context_id="k562_to_rpe1",
+            min_cells=5,
+            public_manifest_path=Path(bundle["public_manifest"]),
+            project_root=ROOT,
+        )
+
+
+@pytest.mark.parametrize("changed_relative", TASK_C_RUNTIME_CLOSURE)
+def test_runtime_code_closure_is_complete_and_each_dependency_blocks_reuse(
+    tmp_path: Path,
+    changed_relative: str,
+) -> None:
+    closure = set(TASK_C_RUNTIME_CLOSURE)
+    project = tmp_path / "project"
+    for relative in closure:
+        destination = project / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / relative, destination)
+    input_path = tmp_path / "input.npz"
+    _write_method_input(input_path)
+    output = tmp_path / "run"
+    arguments = {
+        "method_id": "mean_difference",
+        "input_npz": input_path,
+        "output_dir": output,
+        "seed": 11,
+        "registry_path": REGISTRY,
+        "asset_root": tmp_path / "assets",
+        "data_status": "synthetic_smoke",
+        "context_id": "synthetic",
+        "min_cells": 2,
+        "project_root": project,
+    }
+
+    run_task_c_method(**arguments)
+    environment = json.loads(
+        (output / "environment_manifest.json").read_text(encoding="utf-8")
+    )
+    assert closure <= set(environment["code"])
+
+    changed = project / changed_relative
+    changed.write_bytes(changed.read_bytes() + b"\n# changed after the run\n")
+    with pytest.raises(TaskCMethodRunError, match="identity|environment.*changed"):
+        run_task_c_method(**arguments)
+
+
+def _patch_external_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    inner_status: str,
+    write_raw: bool,
+) -> None:
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run._asset_snapshots",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run._external_source_digest",
+        lambda *args, **kwargs: None,
+    )
+
+    def fake_run(
+        command: object,
+        *,
+        output_dir: Path,
+        timeout_seconds: object,
+    ) -> dict[str, object]:
+        del command, timeout_seconds
+        destination = Path(output_dir)
+        destination.mkdir()
+        if write_raw:
+            (destination / "worker_predictions.csv").write_text(
+                "source,target,score\nA,B,1\n",
+                encoding="utf-8",
+            )
+        status = {"schema_version": "1.0", "status": inner_status}
+        (destination / "method_status.json").write_text(
+            json.dumps(status, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        (destination / "resource_usage.json").write_text(
+            json.dumps({"schema_version": "1.0"}, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return status
+
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run.run_isolated_method",
+        fake_run,
+    )
+
+
+def _update_outer_artifact_record(output: Path, relative: str) -> None:
+    status_path = output / "method_status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    payload = (output / relative).read_bytes()
+    status["artifacts"][relative] = {
+        "sha256": f"sha256:{hashlib.sha256(payload).hexdigest()}",
+        "size_bytes": len(payload),
+    }
+    _write_resealed_outer_status(status_path, status)
+
+
+def _write_resealed_outer_status(
+    status_path: Path,
+    status: dict[str, object],
+) -> None:
+    status.pop("status_content_sha256", None)
+    encoded = json.dumps(
+        status,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    status["status_content_sha256"] = (
+        f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+    )
+    status_path.write_text(
+        json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_external_completed_output_requires_inner_completed_raw_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_external_runtime(
+        monkeypatch,
+        inner_status="completed_raw_inference",
+        write_raw=True,
+    )
+    input_path = tmp_path / "input.npz"
+    _write_method_input(input_path)
+    output = tmp_path / "run"
+    arguments = {
+        "method_id": "pc",
+        "input_npz": input_path,
+        "output_dir": output,
+        "seed": 11,
+        "registry_path": REGISTRY,
+        "asset_root": tmp_path / "assets",
+        "data_status": "synthetic_smoke",
+        "context_id": "synthetic",
+        "min_cells": 2,
+        "project_root": ROOT,
+    }
+    run_task_c_method(**arguments)
+
+    inner_path = output / "raw_runtime/method_status.json"
+    inner_path.write_text(
+        json.dumps({"schema_version": "1.0", "status": "failed_timeout"}) + "\n",
+        encoding="utf-8",
+    )
+    _update_outer_artifact_record(output, "raw_runtime/method_status.json")
+    with pytest.raises(TaskCMethodRunError, match="inner|raw inference|status"):
+        run_task_c_method(**arguments)
+
+
+def test_external_completed_output_rejects_unknown_inner_evidence_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_external_runtime(
+        monkeypatch,
+        inner_status="completed_raw_inference",
+        write_raw=True,
+    )
+    input_path = tmp_path / "input.npz"
+    _write_method_input(input_path)
+    output = tmp_path / "run"
+    arguments = {
+        "method_id": "pc",
+        "input_npz": input_path,
+        "output_dir": output,
+        "seed": 11,
+        "registry_path": REGISTRY,
+        "asset_root": tmp_path / "assets",
+        "data_status": "synthetic_smoke",
+        "context_id": "synthetic",
+        "min_cells": 2,
+        "project_root": ROOT,
+    }
+    run_task_c_method(**arguments)
+
+    unexpected = output / "raw_runtime/unexplained.bin"
+    unexpected.write_bytes(b"not part of the frozen evidence contract")
+    _update_outer_artifact_record(output, "raw_runtime/unexplained.bin")
+    with pytest.raises(TaskCMethodRunError, match="runtime|evidence|file set"):
+        run_task_c_method(**arguments)
+
+
+def test_external_failed_output_cannot_be_relabelled_or_gain_predictions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_external_runtime(
+        monkeypatch,
+        inner_status="failed_timeout",
+        write_raw=False,
+    )
+    input_path = tmp_path / "input.npz"
+    _write_method_input(input_path)
+    output = tmp_path / "run"
+    arguments = {
+        "method_id": "pc",
+        "input_npz": input_path,
+        "output_dir": output,
+        "seed": 11,
+        "registry_path": REGISTRY,
+        "asset_root": tmp_path / "assets",
+        "data_status": "synthetic_smoke",
+        "context_id": "synthetic",
+        "min_cells": 2,
+        "project_root": ROOT,
+    }
+    run_task_c_method(**arguments)
+
+    (output / "predictions.csv").write_text(
+        "source,target,score,returned_by_method\nA,B,1,True\n",
+        encoding="utf-8",
+    )
+    _update_outer_artifact_record(output, "predictions.csv")
+    status_path = output / "method_status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status["status"] = "official_code_incompatible"
+    _write_resealed_outer_status(status_path, status)
+    with pytest.raises(TaskCMethodRunError, match="failed|prediction|inner|status"):
+        run_task_c_method(**arguments)
+
+
+def test_external_failed_output_rejects_unknown_top_level_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_external_runtime(
+        monkeypatch,
+        inner_status="failed_timeout",
+        write_raw=False,
+    )
+    input_path = tmp_path / "input.npz"
+    _write_method_input(input_path)
+    output = tmp_path / "run"
+    arguments = {
+        "method_id": "pc",
+        "input_npz": input_path,
+        "output_dir": output,
+        "seed": 11,
+        "registry_path": REGISTRY,
+        "asset_root": tmp_path / "assets",
+        "data_status": "synthetic_smoke",
+        "context_id": "synthetic",
+        "min_cells": 2,
+        "project_root": ROOT,
+    }
+    run_task_c_method(**arguments)
+
+    unexpected = output / "unexplained.txt"
+    unexpected.write_text("not declared evidence\n", encoding="utf-8")
+    _update_outer_artifact_record(output, "unexplained.txt")
+    with pytest.raises(TaskCMethodRunError, match="failed|file set"):
+        run_task_c_method(**arguments)
+
+
+def test_external_method_accepts_a_recomputed_formal_cross_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _materialized_public_bundle(tmp_path)
+    derived = materialize_task_c_derived_input(
+        public_manifest_path=Path(bundle["public_manifest"]),
+        direction="k562_to_rpe1",
+        stage="refit",
+        output_dir=tmp_path / "derived",
+    )
+    _patch_external_runtime(
+        monkeypatch,
+        inner_status="completed_raw_inference",
+        write_raw=True,
+    )
+
+    status = run_task_c_method(
+        method_id="pc",
+        input_npz=Path(derived["input_npz"]),
+        derived_input_manifest_path=Path(derived["manifest"]),
+        output_dir=tmp_path / "run",
+        seed=11,
+        registry_path=REGISTRY,
+        asset_root=tmp_path / "assets",
+        data_status="external_benchmark",
+        context_id="k562_to_rpe1",
+        min_cells=5,
+        public_manifest_path=Path(bundle["public_manifest"]),
+        project_root=ROOT,
+    )
+
+    assert status["status"] == "completed_standardized_output"
+    environment = json.loads(
+        (tmp_path / "run/environment_manifest.json").read_text(encoding="utf-8")
+    )
+    assert environment["command"]["options"] == [
+        "--input-npz",
+        "--output-csv",
+        "--model-name",
+        "--causalbench-source",
+        "--training-information",
+        "--seed",
+        "--output-semantics",
+    ]
+
+
+@pytest.mark.parametrize("nested_case", ["missing_raw", "missing_evidence_files"])
+def test_hypersca_invalid_nested_output_is_classified_as_invalid_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    nested_case: str,
+) -> None:
+    bundle = _materialized_public_bundle(tmp_path)
+    config = tmp_path / "config.json"
+    config.write_text("{}\n", encoding="utf-8")
+    genes = tmp_path / "genes.json"
+    genes.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "selection_id": "nested-check",
+                "selection_basis": "核对嵌套结果分类",
+                "genes": ["A", "B"],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def fake_hypersca_run(
+        command: Sequence[str],
+        *,
+        output_dir: Path,
+        timeout_seconds: object,
+    ) -> dict[str, object]:
+        del timeout_seconds
+        runtime = Path(output_dir)
+        runtime.mkdir()
+        inner_status = {"schema_version": "1.0", "status": "completed_raw_inference"}
+        (runtime / "method_status.json").write_text(
+            json.dumps(inner_status) + "\n", encoding="utf-8"
+        )
+        (runtime / "resource_usage.json").write_text(
+            '{"schema_version":"1.0"}\n', encoding="utf-8"
+        )
+        if nested_case == "missing_evidence_files":
+            raw_output = Path(command[command.index("--output-dir") + 1])
+            raw_output.mkdir()
+            (raw_output / "raw_predictions.csv").write_text(
+                "source,target,score\nA,B,1\n",
+                encoding="utf-8",
+            )
+        return inner_status
+
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run.run_isolated_method",
+        fake_hypersca_run,
+    )
+    output = tmp_path / "run"
+    with pytest.raises(TaskCMethodRunError):
+        run_task_c_method(
+            method_id="hypersca_c",
+            input_npz=None,
+            output_dir=output,
+            seed=11,
+            registry_path=REGISTRY,
+            asset_root=tmp_path / "assets",
+            data_status="external_benchmark",
+            context_id=None,
+            public_manifest_path=Path(bundle["public_manifest"]),
+            context_values=(f"k562={bundle['within']['k562']['refit']}",),
+            hypersca_config_path=config,
+            gene_list_path=genes,
+            project_root=ROOT,
+        )
+    outer = json.loads((output / "method_status.json").read_text(encoding="utf-8"))
+    assert outer["status"] == "failed_invalid_output"
+    assert not (output / "predictions.csv").exists()

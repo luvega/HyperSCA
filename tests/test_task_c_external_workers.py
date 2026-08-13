@@ -983,6 +983,28 @@ def test_npz_contract_rejects_invalid_or_ambiguous_arrays(
     assert not destination.exists()
 
 
+def test_worker_accepts_the_validated_cross_environment_fourth_array(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "derived.npz"
+    _write_input(
+        input_path,
+        extra={
+            "environment_labels": np.asarray(["k562", "rpe1", "rpe1"]),
+        },
+    )
+
+    completed, destination, record = _run_causalbench(
+        tmp_path / "run-derived",
+        input_path=input_path,
+        model_name="grnboost",
+    )
+
+    assert completed.returncode == 0
+    assert destination.exists()
+    assert record.exists()
+
+
 def test_npz_contract_rejects_missing_array_object_dtype_and_non_regular_paths(
     tmp_path: Path,
 ) -> None:

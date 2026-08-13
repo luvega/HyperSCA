@@ -451,6 +451,35 @@ def test_hypersca_c_cli_writes_traced_raw_results_and_reuses_exact_run(
     assert _snapshot(output) == tampered
 
 
+def test_public_hypersca_output_validator_reuses_the_frozen_scientific_checks(
+    prepared_run: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    from src.causal.hypersca_c_run import (
+        run_hypersca_c,
+        validate_hypersca_c_output_bundle,
+    )
+
+    output = tmp_path / "validated-output"
+    run_hypersca_c(
+        context_values=(
+            f"k562={prepared_run['k562']}",
+            f"rpe1={prepared_run['rpe1']}",
+        ),
+        config_path=Path(prepared_run["config"]),
+        gene_list_path=Path(prepared_run["gene_list"]),
+        public_manifest_path=Path(prepared_run["public_manifest"]),
+        output_dir=output,
+        seed=11,
+        device="cpu",
+    )
+
+    validated = validate_hypersca_c_output_bundle(output)
+
+    assert validated["requested_repeats"] == 2
+    assert 0.0 <= validated["coverage"] <= 1.0
+
+
 def test_existing_partial_output_is_rejected_without_changes(
     prepared_run: dict[str, object], tmp_path: Path
 ) -> None:

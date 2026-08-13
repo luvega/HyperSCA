@@ -51,6 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-cells", default="2", help="每组至少需要的细胞数。")
     parser.add_argument("--public-manifest", type=Path, help="正式数据的公开文件清单。")
     parser.add_argument(
+        "--derived-input-manifest",
+        type=Path,
+        help="跨环境派生学习文件的来源、变换和输出校验记录。",
+    )
+    parser.add_argument(
         "--context",
         action="append",
         default=[],
@@ -86,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
             context_id=args.context_id,
             min_cells=min_cells,
             public_manifest_path=args.public_manifest,
+            derived_input_manifest_path=args.derived_input_manifest,
             context_values=args.context,
             hypersca_config_path=args.hypersca_config,
             gene_list_path=args.gene_list,

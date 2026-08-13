@@ -243,14 +243,21 @@ def load_fixed_npz(path: Path) -> tuple[Any, Any, tuple[str, ...]]:
                 raise WorkerContractError("input NPZ has an invalid or unusually large archive")
         buffer.seek(0)
         with np.load(buffer, allow_pickle=False) as archive:
-            expected = {"expression_matrix", "interventions", "var_names"}
-            if set(archive.files) != expected or len(archive.files) != len(expected):
+            base = {"expression_matrix", "interventions", "var_names"}
+            allowed = (base, base | {"environment_labels"})
+            if set(archive.files) not in allowed:
                 raise WorkerContractError(
-                    "input NPZ must contain exactly expression_matrix, interventions, and var_names"
+                    "input NPZ must contain exactly the three base arrays, with only "
+                    "the validated environment_labels array optionally added"
                 )
             expression = np.asarray(archive["expression_matrix"])
             interventions_raw = np.asarray(archive["interventions"])
             genes_raw = np.asarray(archive["var_names"])
+            environment_raw = (
+                np.asarray(archive["environment_labels"])
+                if "environment_labels" in archive.files
+                else None
+            )
     except WorkerContractError:
         raise
     except (OSError, ValueError, TypeError, EOFError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
@@ -277,6 +284,16 @@ def load_fixed_npz(path: Path) -> tuple[Any, Any, tuple[str, ...]]:
         raise WorkerContractError("gene names must be unique")
     if CONTROL_LABEL not in interventions:
         raise WorkerContractError("at least one non-targeting cell is required")
+    if environment_raw is not None:
+        environments = _canonical_text_vector(environment_raw, "environment labels")
+        if len(environments) != rows:
+            raise WorkerContractError(
+                "environment labels must equal expression rows"
+            )
+        if set(environments) != {"k562", "rpe1"}:
+            raise WorkerContractError(
+                "environment labels must contain exactly k562 and rpe1"
+            )
 
     safe_expression = np.array(expression, copy=True)
     safe_interventions = np.asarray(interventions, dtype=str)
