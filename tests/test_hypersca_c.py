@@ -276,6 +276,128 @@ def test_masked_loss_normalizes_only_over_available_values_and_keeps_gradient() 
     assert prediction.grad[0, 1].item() == 0.0
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_masked_loss_promotes_low_precision_before_reduction(
+    dtype: torch.dtype,
+) -> None:
+    prediction = torch.ones(70_000, dtype=dtype, requires_grad=True)
+    observed = torch.zeros(70_000, dtype=dtype)
+    mask = torch.ones(70_000, dtype=dtype)
+    loss = masked_sem_loss(prediction, observed, mask)
+    loss.backward()
+    assert loss.dtype == torch.float32
+    assert loss.detach().item() == pytest.approx(0.5)
+    assert prediction.grad is not None
+    assert torch.isfinite(prediction.grad).all()
+
+
+def test_masked_loss_never_computes_error_for_hidden_extreme_values() -> None:
+    largest = torch.finfo(torch.float32).max
+    prediction = torch.tensor([[1.0, largest]], requires_grad=True)
+    observed = torch.tensor([[0.0, -largest]])
+    mask = torch.tensor([[1.0, 0.0]])
+    loss = masked_sem_loss(prediction, observed, mask)
+    loss.backward()
+    assert loss.detach().item() == pytest.approx(0.5)
+    assert prediction.grad is not None
+    assert prediction.grad.tolist() == [[1.0, 0.0]]
+
+
+def test_masked_loss_rejects_nonfinite_result_from_visible_extreme_values() -> None:
+    largest = torch.finfo(torch.float32).max
+    with pytest.raises(HyperSCACError, match="loss.*finite"):
+        masked_sem_loss(
+            torch.tensor([[largest]]),
+            torch.tensor([[-largest]]),
+            torch.tensor([[1.0]]),
+        )
+
+
+def test_masked_loss_rejects_trainable_experimental_mask() -> None:
+    with pytest.raises(HyperSCACError, match="mask.*gradient"):
+        masked_sem_loss(
+            torch.ones((1, 1)),
+            torch.zeros((1, 1)),
+            torch.ones((1, 1), requires_grad=True),
+        )
+
+
+def test_masked_loss_supports_non_contiguous_tensors() -> None:
+    prediction_base = torch.tensor(
+        [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], requires_grad=True
+    )
+    prediction = prediction_base.transpose(0, 1)
+    observed = torch.zeros((2, 3)).transpose(0, 1)
+    mask = torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]).transpose(0, 1)
+    assert not prediction.is_contiguous()
+    assert not mask.is_contiguous()
+    loss = masked_sem_loss(prediction, observed, mask)
+    expected = torch.nn.functional.smooth_l1_loss(
+        prediction[mask == 1.0], observed[mask == 1.0], reduction="mean"
+    )
+    assert loss.detach().item() == pytest.approx(expected.detach().item())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_masked_loss_matches_cpu_on_cuda() -> None:
+    prediction = torch.tensor([[1.0, 3.0], [2.0, 4.0]])
+    observed = torch.zeros_like(prediction)
+    mask = torch.tensor([[1.0, 0.0], [1.0, 1.0]])
+    cpu_loss = masked_sem_loss(prediction, observed, mask)
+    cuda_loss = masked_sem_loss(
+        prediction.cuda(), observed.cuda(), mask.cuda()
+    ).cpu()
+    assert cuda_loss.item() == pytest.approx(cpu_loss.item())
+
+
+def test_masked_loss_rejects_sparse_tensors_before_numeric_operations() -> None:
+    with pytest.raises(HyperSCACError, match="dense"):
+        masked_sem_loss(
+            torch.ones((1, 1)).to_sparse(),
+            torch.zeros((1, 1)),
+            torch.ones((1, 1)),
+        )
+
+
+def test_masked_loss_rejects_complex_and_meta_tensors() -> None:
+    with pytest.raises(HyperSCACError, match="supported.*dtype"):
+        masked_sem_loss(
+            torch.ones((1, 1), dtype=torch.complex64),
+            torch.zeros((1, 1), dtype=torch.complex64),
+            torch.ones((1, 1), dtype=torch.complex64),
+        )
+    with pytest.raises(HyperSCACError, match="materialized"):
+        masked_sem_loss(
+            torch.ones((1, 1), device="meta"),
+            torch.zeros((1, 1), device="meta"),
+            torch.ones((1, 1), device="meta"),
+        )
+
+
+FLOAT8_DTYPES = tuple(
+    dtype
+    for name in (
+        "float8_e4m3fn",
+        "float8_e5m2",
+        "float8_e4m3fnuz",
+        "float8_e5m2fnuz",
+    )
+    if (dtype := getattr(torch, name, None)) is not None
+)
+
+
+@pytest.mark.parametrize("dtype", FLOAT8_DTYPES)
+def test_masked_loss_rejects_float8_without_leaking_torch_errors(
+    dtype: torch.dtype,
+) -> None:
+    with pytest.raises(HyperSCACError, match="supported.*dtype"):
+        masked_sem_loss(
+            torch.zeros((1, 1), dtype=dtype),
+            torch.zeros((1, 1), dtype=dtype),
+            torch.zeros((1, 1), dtype=dtype),
+        )
+
+
 @pytest.mark.parametrize(
     ("prediction", "observed", "mask", "match"),
     [

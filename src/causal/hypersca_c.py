@@ -250,29 +250,70 @@ def masked_sem_loss(
         raise HyperSCACError("prediction, observed, and mask must use the same device")
     if prediction.numel() == 0:
         raise HyperSCACError("prediction, observed, and mask must not be empty")
-    if any(not value.is_floating_point() for value in tensors):
+    if any(value.layout != torch.strided for value in tensors):
         raise HyperSCACError(
-            "prediction, observed, and mask must use floating-point dtypes"
+            "prediction, observed, and mask must be dense tensors"
         )
-    if prediction.dtype != observed.dtype or mask.dtype != observed.dtype:
-        raise HyperSCACError("prediction, observed, and mask must use the same dtype")
     if prediction.device.type == "meta":
         raise HyperSCACError(
             "prediction, observed, and mask must use a materialized device"
         )
+    supported_dtypes = {
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+    }
+    if any(value.dtype not in supported_dtypes for value in tensors):
+        raise HyperSCACError(
+            "prediction, observed, and mask must use a supported floating-point dtype"
+        )
+    if prediction.dtype != observed.dtype or mask.dtype != observed.dtype:
+        raise HyperSCACError("prediction, observed, and mask must use the same dtype")
+    if mask.requires_grad:
+        raise HyperSCACError(
+            "mask is a fixed experimental rule and must not require a gradient"
+        )
+
     try:
         all_finite = all(bool(torch.isfinite(value).all().item()) for value in tensors)
-    except (RuntimeError, TypeError) as exc:
+    except Exception as exc:
         raise HyperSCACError("could not validate tensor values") from exc
     if not all_finite:
         raise HyperSCACError(
             "prediction, observed, and mask must contain only finite values"
         )
-    if not bool(torch.logical_or(mask == 0.0, mask == 1.0).all().item()):
+    try:
+        mask_is_binary = bool(
+            torch.logical_or(mask == 0.0, mask == 1.0).all().item()
+        )
+    except Exception as exc:
+        raise HyperSCACError("could not validate mask values") from exc
+    if not mask_is_binary:
         raise HyperSCACError("mask values must be 0 or 1")
-    denominator = mask.sum()
-    if float(denominator.detach().cpu()) == 0.0:
+
+    usable = mask == 1.0
+    try:
+        selected_prediction = prediction[usable]
+        selected_observed = observed[usable]
+    except Exception as exc:
+        raise HyperSCACError("could not select usable expression values") from exc
+    usable_count = selected_prediction.numel()
+    if usable_count == 0:
         raise HyperSCACError("mask must contain at least one usable value")
 
-    losses = functional.smooth_l1_loss(prediction, observed, reduction="none")
-    return (losses * mask).sum() / denominator
+    if prediction.dtype in {torch.float16, torch.bfloat16}:
+        selected_prediction = selected_prediction.to(torch.float32)
+        selected_observed = selected_observed.to(torch.float32)
+    try:
+        loss = functional.smooth_l1_loss(
+            selected_prediction,
+            selected_observed,
+            reduction="sum",
+        ) / usable_count
+        loss_is_finite = bool(torch.isfinite(loss).item())
+    except Exception as exc:
+        raise HyperSCACError("could not calculate the masked expression loss") from exc
+    if not loss_is_finite:
+        raise HyperSCACError("masked expression loss must be finite")
+    return loss
