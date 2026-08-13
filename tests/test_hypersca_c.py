@@ -10,11 +10,17 @@ import torch
 
 from src.causal.hypersca_c import (
     HyperSCACConfig,
+    HyperSCACContext,
     HyperSCACError,
+    HyperSCACFit,
+    acyclicity_penalty,
     build_intervention_mask,
+    fit_hypersca_c_once,
     masked_sem_loss,
+    standardize_context,
     zero_diagonal,
 )
+from src.causal import hypersca_c as hypersca_c_module
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -443,3 +449,584 @@ def test_masked_loss_rejects_tensors_on_different_devices() -> None:
             torch.ones((1, 1), device="meta"),
             torch.ones((1, 1)),
         )
+
+
+def small_config(**changes: object) -> HyperSCACConfig:
+    payload = default_config_payload()
+    payload.update(
+        {
+            "maximum_epochs": 8,
+            "early_stopping_patience": 8,
+            "acyclicity_weight": 0.001,
+            **changes,
+        }
+    )
+    return HyperSCACConfig.from_mapping(payload)
+
+
+def small_context(
+    context_id: str = "k562",
+    *,
+    gene_names: tuple[str, ...] = ("A", "B"),
+) -> HyperSCACContext:
+    expression = np.asarray(
+        [
+            [-1.0, -1.1],
+            [1.0, 1.1],
+            [-0.5, -0.6],
+            [0.5, 0.6],
+            [-1.5, -1.8],
+            [1.5, 1.8],
+        ],
+        dtype=np.float64,
+    )
+    return HyperSCACContext(
+        context_id=context_id,
+        expression=expression,
+        interventions=np.asarray(
+            ["non-targeting"] * 4 + ["A", "A"], dtype=object
+        ),
+        gene_names=gene_names,
+    )
+
+
+def test_context_owns_read_only_normalized_copies() -> None:
+    expression = np.asarray([[0, 1], [2, 3]], dtype=np.int64)
+    interventions = np.asarray(["non-targeting", "A"], dtype=object)
+    context = HyperSCACContext(
+        context_id="k562",
+        expression=expression,
+        interventions=interventions,
+        gene_names=("A", "B"),
+    )
+    expression[0, 0] = 99
+    interventions[0] = "changed"
+    assert context.expression.dtype == np.float32
+    assert context.expression[0, 0] == 0.0
+    assert context.interventions.tolist() == ["non-targeting", "A"]
+    assert context.expression.flags.writeable is False
+    assert context.interventions.flags.writeable is False
+    with pytest.raises(ValueError):
+        context.expression[0, 0] = 2.0
+
+
+@pytest.mark.parametrize(
+    ("context_id", "expression", "interventions", "gene_names", "match"),
+    [
+        ("bad id", np.ones((2, 2)), ["non-targeting"] * 2, ("A", "B"), "context_id"),
+        ("k562", np.ones(2), ["non-targeting"] * 2, ("A", "B"), "two-dimensional"),
+        ("k562", np.empty((0, 2)), [], ("A", "B"), "at least one"),
+        ("k562", np.ones((2, 2), dtype=bool), ["non-targeting"] * 2, ("A", "B"), "numeric"),
+        ("k562", np.asarray([[1.0, np.nan], [2.0, 3.0]]), ["non-targeting"] * 2, ("A", "B"), "finite"),
+        ("k562", np.ones((2, 3)), ["non-targeting"] * 2, ("A", "B"), "shape"),
+        ("k562", np.ones((2, 2)), [1, 2], ("A", "B"), "interventions"),
+        ("k562", np.ones((2, 2)), ["non-targeting", "bad label"], ("A", "B"), "whitespace"),
+        ("k562", np.ones((2, 2)), ["non-targeting"] * 2, ("A", "A"), "unique"),
+        ("k562", np.ones((2, 1)), ["non-targeting"] * 2, tuple(), "gene_names"),
+    ],
+)
+def test_context_rejects_ambiguous_or_inconsistent_inputs(
+    context_id: object,
+    expression: object,
+    interventions: object,
+    gene_names: object,
+    match: str,
+) -> None:
+    with pytest.raises(HyperSCACError, match=match):
+        HyperSCACContext(
+            context_id=context_id,  # type: ignore[arg-type]
+            expression=expression,  # type: ignore[arg-type]
+            interventions=interventions,  # type: ignore[arg-type]
+            gene_names=gene_names,  # type: ignore[arg-type]
+        )
+
+
+def test_standardization_uses_control_cells_only_and_population_scale() -> None:
+    expression = np.asarray(
+        [[0.0, 5.0], [2.0, 5.0], [100.0, 100.0]], dtype=np.float64
+    )
+    before = expression.copy()
+    scaled, center, scale = standardize_context(
+        expression,
+        ["non-targeting", "non-targeting", "A"],
+        control_label="non-targeting",
+    )
+    assert center.tolist() == pytest.approx([1.0, 5.0])
+    assert scale.tolist() == pytest.approx([1.0, 1.0])
+    assert scaled[:2].mean(axis=0).tolist() == pytest.approx([0.0, 0.0])
+    assert scaled.dtype == center.dtype == scale.dtype == np.float32
+    assert np.isfinite(scaled).all()
+    assert np.array_equal(expression, before)
+
+
+@pytest.mark.parametrize(
+    ("expression", "labels", "control_label", "match"),
+    [
+        (np.ones(3), ["non-targeting"] * 3, "non-targeting", "two-dimensional"),
+        (np.ones((2, 2), dtype=bool), ["non-targeting"] * 2, "non-targeting", "numeric"),
+        (np.asarray([[1.0, np.inf], [2.0, 3.0]]), ["non-targeting"] * 2, "non-targeting", "finite"),
+        (np.ones((2, 2)), ["non-targeting"], "non-targeting", "rows"),
+        (np.ones((2, 2)), [1, 1], "1", "interventions"),
+        (np.ones((2, 2)), ["non-targeting", "A"], "non-targeting", "two control"),
+        (np.ones((2, 2)), ["non-targeting"] * 2, "control label", "control_label"),
+    ],
+)
+def test_standardization_rejects_invalid_inputs(
+    expression: object,
+    labels: object,
+    control_label: object,
+    match: str,
+) -> None:
+    with pytest.raises(HyperSCACError, match=match):
+        standardize_context(
+            expression,  # type: ignore[arg-type]
+            labels,  # type: ignore[arg-type]
+            control_label=control_label,  # type: ignore[arg-type]
+        )
+
+
+def test_acyclicity_penalty_distinguishes_a_dag_from_a_two_cycle() -> None:
+    dag = torch.tensor([[0.0, 1.2], [0.0, 0.0]], requires_grad=True)
+    cycle = torch.tensor([[0.0, 1.2], [0.7, 0.0]])
+    dag_penalty = acyclicity_penalty(dag)
+    cycle_penalty = acyclicity_penalty(cycle)
+    dag_penalty.backward()
+    assert dag_penalty.item() == pytest.approx(0.0, abs=1e-6)
+    assert cycle_penalty.item() > 0.0
+    assert dag.grad is not None
+    assert torch.isfinite(dag.grad).all()
+
+
+@pytest.mark.parametrize(
+    ("adjacency", "match"),
+    [
+        ([[0.0]], "tensor"),
+        (torch.empty((0, 0)), "at least one"),
+        (torch.ones(2), "two-dimensional"),
+        (torch.ones((2, 3)), "square"),
+        (torch.ones((2, 2), dtype=torch.int64), "floating-point"),
+        (torch.ones((2, 2), dtype=torch.complex64), "supported"),
+        (torch.tensor([[0.0, float("nan")], [0.0, 0.0]]), "finite"),
+        (torch.ones((2, 2)).to_sparse(), "dense"),
+        (torch.ones((2, 2), device="meta"), "materialized"),
+    ],
+)
+def test_acyclicity_penalty_wraps_invalid_tensor_inputs(
+    adjacency: object, match: str
+) -> None:
+    with pytest.raises(HyperSCACError, match=match):
+        acyclicity_penalty(adjacency)  # type: ignore[arg-type]
+
+
+def test_joint_fit_returns_immutable_shared_and_context_specific_matrices() -> None:
+    contexts = [small_context("k562"), small_context("rpe1")]
+    config = small_config()
+    result = fit_hypersca_c_once(
+        contexts, config, seed=11, device="cpu"
+    )
+    assert result.shared.shape == (2, 2)
+    assert list(result.context_adjustments) == ["k562", "rpe1"]
+    assert list(result.context_adjacencies) == ["k562", "rpe1"]
+    assert np.diag(result.shared).tolist() == pytest.approx([0.0, 0.0])
+    assert np.isfinite(result.loss_history).all()
+    assert result.epochs_run == len(result.loss_history)
+    assert 1 <= result.epochs_run <= config.maximum_epochs
+    assert result.config is config
+    for name in ("k562", "rpe1"):
+        assert np.array_equal(
+            result.context_adjacencies[name],
+            result.shared + result.context_adjustments[name],
+        )
+        assert np.diag(result.context_adjacencies[name]).tolist() == pytest.approx(
+            [0.0, 0.0]
+        )
+        assert result.context_adjustments[name].flags.writeable is False
+        assert result.context_adjacencies[name].flags.writeable is False
+    assert result.shared.flags.writeable is False
+    assert result.loss_history.flags.writeable is False
+    with pytest.raises(TypeError):
+        result.context_adjustments["new"] = np.zeros((2, 2))  # type: ignore[index]
+
+
+def test_disabled_context_adjustments_are_exactly_zero_and_not_optimized() -> None:
+    result = fit_hypersca_c_once(
+        [small_context("k562"), small_context("rpe1")],
+        small_config(enable_context_adjustments=False),
+        seed=3,
+        device="cpu",
+    )
+    for name in result.context_adjustments:
+        assert np.array_equal(result.context_adjustments[name], np.zeros((2, 2)))
+        assert np.array_equal(result.context_adjacencies[name], result.shared)
+
+
+def test_fit_preserves_global_random_number_generator_states() -> None:
+    np_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state().clone()
+    fit_hypersca_c_once(
+        [small_context()], small_config(maximum_epochs=2), seed=11, device="cpu"
+    )
+    after_np_state = np.random.get_state()
+    assert np_state[0] == after_np_state[0]
+    assert np.array_equal(np_state[1], after_np_state[1])
+    assert np_state[2:] == after_np_state[2:]
+    assert torch.equal(torch.random.get_rng_state(), torch_state)
+
+
+def test_same_seed_repeats_the_same_fit() -> None:
+    contexts = [small_context("k562"), small_context("rpe1")]
+    first = fit_hypersca_c_once(contexts, small_config(), seed=47, device="cpu")
+    second = fit_hypersca_c_once(contexts, small_config(), seed=47, device="cpu")
+    assert np.array_equal(first.shared, second.shared)
+    assert np.array_equal(first.loss_history, second.loss_history)
+    for name in first.context_adjustments:
+        assert np.array_equal(
+            first.context_adjustments[name], second.context_adjustments[name]
+        )
+
+
+def test_prior_discount_zero_makes_binary_prior_irrelevant() -> None:
+    context = [small_context()]
+    without_prior = fit_hypersca_c_once(
+        context, small_config(prior_discount=0.0), seed=11, device="cpu"
+    )
+    with_prior = fit_hypersca_c_once(
+        context,
+        small_config(prior_discount=0.0),
+        seed=11,
+        device="cpu",
+        prior_mask=np.asarray([[0, 1], [1, 0]], dtype=np.int64),
+    )
+    assert np.array_equal(without_prior.shared, with_prior.shared)
+    assert np.array_equal(without_prior.loss_history, with_prior.loss_history)
+
+
+def test_diagonal_prior_values_do_not_change_the_fit() -> None:
+    config = small_config(prior_discount=0.5)
+    context = [small_context()]
+    zero_prior = fit_hypersca_c_once(
+        context, config, seed=11, device="cpu", prior_mask=np.zeros((2, 2))
+    )
+    diagonal_prior = fit_hypersca_c_once(
+        context, config, seed=11, device="cpu", prior_mask=np.eye(2)
+    )
+    assert np.array_equal(zero_prior.shared, diagonal_prior.shared)
+    assert np.array_equal(zero_prior.loss_history, diagonal_prior.loss_history)
+
+
+@pytest.mark.parametrize(
+    ("prior", "match"),
+    [
+        (np.ones((2, 3)), "shape"),
+        (np.asarray([[0, 2], [1, 0]]), "0 or 1"),
+        (np.asarray([[0.0, np.nan], [1.0, 0.0]]), "finite"),
+        (np.asarray([["0", "1"], ["1", "0"]]), "numeric"),
+        (np.asarray([[0.0 + 0.0j, 1.0], [1.0, 0.0]]), "numeric"),
+        (torch.ones((2, 2)).to_sparse(), "dense"),
+    ],
+)
+def test_fit_rejects_invalid_prior_masks(prior: object, match: str) -> None:
+    with pytest.raises(HyperSCACError, match=match):
+        fit_hypersca_c_once(
+            [small_context()],
+            small_config(maximum_epochs=1),
+            seed=11,
+            device="cpu",
+            prior_mask=prior,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("seed", [True, -1, 2**64, 1.5, "11"])
+def test_fit_rejects_invalid_seeds(seed: object) -> None:
+    with pytest.raises(HyperSCACError, match="seed"):
+        fit_hypersca_c_once(
+            [small_context()],
+            small_config(maximum_epochs=1),
+            seed=seed,  # type: ignore[arg-type]
+            device="cpu",
+        )
+
+
+@pytest.mark.parametrize("device", ["not-a-device", "meta", 1])
+def test_fit_wraps_invalid_devices_in_domain_error(device: object) -> None:
+    with pytest.raises(HyperSCACError, match="device"):
+        fit_hypersca_c_once(
+            [small_context()],
+            small_config(maximum_epochs=1),
+            seed=11,
+            device=device,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.skipif(torch.cuda.is_available(), reason="CUDA is available")
+def test_fit_rejects_unavailable_cuda_device() -> None:
+    with pytest.raises(HyperSCACError, match="device"):
+        fit_hypersca_c_once(
+            [small_context()], small_config(maximum_epochs=1), seed=11, device="cuda"
+        )
+
+
+def test_fit_requires_unique_contexts_with_identical_ordered_genes() -> None:
+    with pytest.raises(HyperSCACError, match="unique"):
+        fit_hypersca_c_once(
+            [small_context("same"), small_context("same")],
+            small_config(maximum_epochs=1),
+            seed=11,
+            device="cpu",
+        )
+    with pytest.raises(HyperSCACError, match="same ordered genes"):
+        fit_hypersca_c_once(
+            [small_context("one"), small_context("two", gene_names=("B", "A"))],
+            small_config(maximum_epochs=1),
+            seed=11,
+            device="cpu",
+        )
+
+
+def test_fit_requires_at_least_one_context_two_genes_and_two_controls() -> None:
+    with pytest.raises(HyperSCACError, match="at least one context"):
+        fit_hypersca_c_once([], small_config(), seed=11, device="cpu")
+    one_gene = HyperSCACContext(
+        context_id="one",
+        expression=np.ones((2, 1)),
+        interventions=np.asarray(["non-targeting"] * 2),
+        gene_names=("A",),
+    )
+    with pytest.raises(HyperSCACError, match="at least two genes"):
+        fit_hypersca_c_once([one_gene], small_config(), seed=11, device="cpu")
+    one_control = HyperSCACContext(
+        context_id="few-controls",
+        expression=np.asarray([[0.0, 0.0], [1.0, 1.0]]),
+        interventions=np.asarray(["non-targeting", "A"]),
+        gene_names=("A", "B"),
+    )
+    with pytest.raises(HyperSCACError, match="two control"):
+        fit_hypersca_c_once([one_control], small_config(), seed=11, device="cpu")
+
+
+def _objective_for_fit(
+    result: object,
+    contexts: list[HyperSCACContext],
+    config: HyperSCACConfig,
+) -> float:
+    fit = result
+    shared = torch.as_tensor(fit.shared.copy())
+    total = config.shared_l1 * shared.abs().mean()
+    for context in contexts:
+        values, _, _ = standardize_context(
+            context.expression,
+            context.interventions,
+            control_label=config.control_label,
+        )
+        observed = torch.as_tensor(values)
+        mask = torch.as_tensor(
+            build_intervention_mask(
+                context.interventions,
+                context.gene_names,
+                excluded_label=config.excluded_label,
+            )
+        )
+        delta = torch.as_tensor(fit.context_adjustments[context.context_id].copy())
+        adjacency = torch.as_tensor(
+            fit.context_adjacencies[context.context_id].copy()
+        )
+        total = total + masked_sem_loss(observed @ adjacency, observed, mask)
+        total = total + config.context_l1 * delta.abs().mean()
+        total = total + config.acyclicity_weight * acyclicity_penalty(adjacency)
+    return float(total)
+
+
+def test_best_state_matches_the_best_recorded_loss() -> None:
+    contexts = [small_context()]
+    config = small_config(maximum_epochs=7, early_stopping_patience=7)
+    result = fit_hypersca_c_once(contexts, config, seed=11, device="cpu")
+    returned_loss = _objective_for_fit(result, contexts, config)
+    assert returned_loss == pytest.approx(float(result.loss_history.min()), abs=2e-6)
+
+
+def test_best_state_keeps_even_a_small_recorded_improvement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = HyperSCACContext(
+        context_id="small-improvement",
+        expression=np.asarray([[-1.0, -1.0], [1.0, 1.0], [2.0, 3.0], [2.0, 3.0]]),
+        interventions=np.asarray(["non-targeting", "non-targeting", "A", "A"]),
+        gene_names=("A", "B"),
+    )
+
+    def linear_loss(
+        prediction: torch.Tensor,
+        observed: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return prediction.sum()
+
+    def tiny_step(self: torch.optim.Adam, closure: object = None) -> None:
+        with torch.no_grad():
+            for group in self.param_groups:
+                for parameter in group["params"]:
+                    parameter.add_(-1e-9)
+
+    monkeypatch.setattr(hypersca_c_module, "masked_sem_loss", linear_loss)
+    monkeypatch.setattr(torch.optim.Adam, "step", tiny_step)
+    result = fit_hypersca_c_once(
+        [context],
+        small_config(
+            maximum_epochs=2,
+            early_stopping_patience=2,
+            enable_context_adjustments=False,
+            shared_l1=0.0,
+            context_l1=0.0,
+            acyclicity_weight=0.0,
+        ),
+        seed=11,
+        device="cpu",
+    )
+    assert result.loss_history[1] < result.loss_history[0]
+    assert result.shared[0, 1] != 0.0
+
+
+def test_converged_only_means_patience_stopped_the_fit(monkeypatch: pytest.MonkeyPatch) -> None:
+    full = fit_hypersca_c_once(
+        [small_context()],
+        small_config(maximum_epochs=2, early_stopping_patience=5),
+        seed=11,
+        device="cpu",
+    )
+    assert full.epochs_run == 2
+    assert full.converged is False
+
+    def no_step(self: object, closure: object = None) -> None:
+        return None
+
+    monkeypatch.setattr(torch.optim.Adam, "step", no_step)
+    stopped = fit_hypersca_c_once(
+        [small_context()],
+        small_config(maximum_epochs=8, early_stopping_patience=2),
+        seed=11,
+        device="cpu",
+    )
+    assert stopped.epochs_run == 3
+    assert stopped.converged is True
+
+
+def test_nonfinite_gradient_is_reported_as_domain_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FiniteForwardNanGradient(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx: object, value: torch.Tensor) -> torch.Tensor:
+            ctx.input_shape = value.shape  # type: ignore[attr-defined]
+            return value.sum() * 0.0
+
+        @staticmethod
+        def backward(ctx: object, gradient: torch.Tensor) -> tuple[torch.Tensor]:
+            return (
+                torch.full(ctx.input_shape, float("nan")),  # type: ignore[attr-defined]
+            )
+
+    def broken_loss(
+        prediction: torch.Tensor,
+        observed: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return FiniteForwardNanGradient.apply(prediction)
+
+    monkeypatch.setattr(hypersca_c_module, "masked_sem_loss", broken_loss)
+    with pytest.raises(HyperSCACError, match="gradient.*finite"):
+        fit_hypersca_c_once(
+            [small_context()],
+            small_config(maximum_epochs=1),
+            seed=11,
+            device="cpu",
+        )
+
+
+def test_source_target_direction_uses_prediction_x_times_adjacency() -> None:
+    rng = np.random.default_rng(11)
+    rows = 120
+    source = rng.normal(size=rows)
+    target = 1.6 * source + rng.normal(scale=0.04, size=rows)
+    unrelated = rng.normal(size=rows)
+    context = HyperSCACContext(
+        context_id="direction",
+        expression=np.column_stack([source, target, unrelated]),
+        interventions=np.asarray(["non-targeting"] * 20 + ["A"] * 100),
+        gene_names=("A", "B", "C"),
+    )
+    result = fit_hypersca_c_once(
+        [context],
+        small_config(
+            maximum_epochs=80,
+            early_stopping_patience=20,
+            enable_context_adjustments=False,
+        ),
+        seed=11,
+        device="cpu",
+    )
+    # adjacency[source, target] and prediction = expression @ adjacency.
+    assert abs(result.shared[0, 1]) > abs(result.shared[1, 0])
+    assert abs(result.shared[0, 1]) > abs(result.shared[2, 1])
+
+
+def valid_fit_payload() -> dict[str, object]:
+    shared = np.asarray([[0.0, 0.2], [0.0, 0.0]], dtype=np.float64)
+    delta = np.asarray([[0.0, 0.1], [0.0, 0.0]], dtype=np.float64)
+    return {
+        "shared": shared,
+        "context_adjustments": {"k562": delta},
+        "context_adjacencies": {"k562": shared + delta},
+        "loss_history": np.asarray([1.0, 0.5]),
+        "converged": False,
+        "epochs_run": 2,
+        "seed": 11,
+        "config": small_config(maximum_epochs=2),
+    }
+
+
+def test_direct_fit_construction_normalizes_and_protects_valid_results() -> None:
+    payload = valid_fit_payload()
+    shared_input = payload["shared"]
+    fit = HyperSCACFit(**payload)  # type: ignore[arg-type]
+    shared_input[0, 1] = 9.0  # type: ignore[index]
+    assert fit.shared[0, 1] == pytest.approx(0.2)
+    assert fit.shared.dtype == np.float32
+    assert fit.loss_history.dtype == np.float64
+    assert fit.config is payload["config"]
+    assert fit.shared.flags.writeable is False
+    assert fit.context_adjustments["k562"].flags.writeable is False
+    assert fit.context_adjacencies["k562"].flags.writeable is False
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [
+        ({"shared": np.ones((2, 3))}, "shared.*square"),
+        ({"shared": np.asarray([[0.0, np.nan], [0.0, 0.0]])}, "shared.*finite"),
+        ({"shared": np.eye(2)}, "shared.*diagonal"),
+        ({"shared": np.asarray([[1e-50, 0.2], [0.0, 0.0]])}, "shared.*diagonal"),
+        ({"context_adjustments": {"bad id": np.zeros((2, 2))}}, "context.*whitespace"),
+        ({"context_adjustments": {"k562": np.ones((2, 3))}}, "adjustment.*shape"),
+        ({"context_adjustments": {"k562": np.eye(2)}}, "adjustment.*diagonal"),
+        ({"context_adjacencies": {"rpe1": np.zeros((2, 2))}}, "same context"),
+        ({"context_adjacencies": {"k562": np.zeros((2, 2))}}, "shared.*adjustment"),
+        ({"loss_history": np.asarray([])}, "loss_history.*at least one"),
+        ({"loss_history": np.asarray([1.0, np.inf])}, "loss_history.*finite"),
+        ({"converged": 0}, "converged.*bool"),
+        ({"epochs_run": 1}, "epochs_run.*history"),
+        ({"epochs_run": True}, "epochs_run.*integer"),
+        (
+            {"loss_history": np.asarray([1.0, 0.5, 0.4]), "epochs_run": 3},
+            "maximum_epochs",
+        ),
+        ({"seed": True}, "seed"),
+        ({"config": object()}, "config"),
+    ],
+)
+def test_direct_fit_construction_rejects_inconsistent_results(
+    change: dict[str, object], match: str
+) -> None:
+    payload = valid_fit_payload()
+    payload.update(change)
+    with pytest.raises(HyperSCACError, match=match):
+        HyperSCACFit(**payload)  # type: ignore[arg-type]
