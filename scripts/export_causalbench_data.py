@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import io
 import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,22 +47,57 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _description(data_dir: Path, use_filter: bool) -> dict[str, object]:
+    datasets = [
+        name.replace(".npz", "_filtered.npz") if use_filter else name
+        for name in DATASETS
+    ]
     return {
         "schema_version": "1.0",
         "repository": REPOSITORY,
         "commit": COMMIT,
-        "datasets": DATASETS,
+        "datasets": datasets,
         "references": REFERENCES,
         "data_dir": str(data_dir),
         "filter": bool(use_filter),
     }
 
 
+def _write_atomic(path: Path, content: str) -> None:
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.",
+            suffix=".tmp", delete=False
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def _write_edges(path: Path, edges: set[tuple[str, str]]) -> None:
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["source", "target"])
-        writer.writerows(sorted(edges))
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(["source", "target"])
+    writer.writerows(sorted(edges))
+    _write_atomic(path, output.getvalue())
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _relative_path(path: Path, data_dir: Path) -> str:
+    return os.path.relpath(path.resolve(), data_dir.resolve())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -82,10 +121,11 @@ def main(argv: list[str] | None = None) -> int:
     k562_path, rpe1_path = CreateDataset(
         str(args.data_dir), bool(args.filter)
     ).load()
-    description["paths"] = {
+    dataset_paths = {
         "k562": str(Path(k562_path).resolve()),
         "rpe1": str(Path(rpe1_path).resolve()),
     }
+    description["paths"] = dataset_paths
 
     reference_paths: dict[str, str] = {}
     for context_id, dataset_name in (
@@ -116,18 +156,30 @@ def main(argv: list[str] | None = None) -> int:
         ),
     }
     description["reference_sources"] = {
-        "corum": "https://mips.helmholtz-muenchen.de/corum/",
+        "corum": "https://mips.helmholtz-muenchen.de/corum/download/releases/current/humanComplexes.txt.zip",
         "ligand_receptor": (
-            "https://github.com/LewisLabUCSD/Ligand-Receptor-Pairs/"
-            "tree/ba44c3c4b4a3e501667309dd9ce7208501aeb961"
+            "https://raw.githubusercontent.com/LewisLabUCSD/Ligand-Receptor-Pairs/"
+            "ba44c3c4b4a3e501667309dd9ce7208501aeb961/Human/Human-2020-Shao-LR-pairs.txt"
         ),
-        "string_db": "https://string-db.org/cgi/download.pl",
-        "chip_atlas": "https://dbarchive.biosciencedbc.jp/en/chip-atlas/lic.html",
+        "string_network": "https://stringdb-static.org/download/protein.links.detailed.v11.5/9606.protein.links.detailed.v11.5.txt.gz",
+        "string_physical": "https://stringdb-static.org/download/protein.physical.links.detailed.v11.5/9606.protein.physical.links.detailed.v11.5.txt.gz",
+        "chip_atlas_license": "https://dbarchive.biosciencedbc.jp/en/chip-atlas/lic.html",
     }
-    description["downloaded_at_utc"] = datetime.now(timezone.utc).isoformat()
-    (args.data_dir / "export_manifest.json").write_text(
+    description["downloaded_at_utc"] = None
+    description["acquisition_time_note"] = (
+        "CausalBench may reuse existing caches; acquisition time is not provable from this export."
+    )
+    description["exported_at_utc"] = datetime.now(timezone.utc).isoformat()
+    artifact_paths = [Path(path) for path in dataset_paths.values()] + [
+        Path(path) for path in reference_paths.values()
+    ]
+    description["sha256"] = {
+        _relative_path(path, args.data_dir): _sha256(path) for path in artifact_paths
+    }
+    manifest_path = args.data_dir / "export_manifest.json"
+    _write_atomic(
+        manifest_path,
         json.dumps(description, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
     )
     print(json.dumps(description, ensure_ascii=False, sort_keys=True))
     return 0

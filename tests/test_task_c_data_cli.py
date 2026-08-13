@@ -1,6 +1,12 @@
 import json
+import importlib.util
 import subprocess
 import sys
+import types
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_export_command_reports_pinned_source_without_downloading(tmp_path):
@@ -8,7 +14,7 @@ def test_export_command_reports_pinned_source_without_downloading(tmp_path):
     result = subprocess.run(
         [
             sys.executable,
-            "scripts/export_causalbench_data.py",
+            str(ROOT / "scripts/export_causalbench_data.py"),
             "--data-dir",
             str(data_dir),
             "--describe-only",
@@ -16,6 +22,7 @@ def test_export_command_reports_pinned_source_without_downloading(tmp_path):
         check=False,
         capture_output=True,
         text=True,
+        cwd=ROOT,
     )
 
     assert result.returncode == 0, result.stderr
@@ -29,3 +36,130 @@ def test_export_command_reports_pinned_source_without_downloading(tmp_path):
         "reference_rpe1_pooled.csv",
         "reference_rpe1_chipseq.csv",
     ]
+    assert not data_dir.exists()
+
+
+def test_describe_only_reports_filtered_dataset_names(tmp_path):
+    data_dir = tmp_path / "filtered"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/export_causalbench_data.py"),
+            "--data-dir",
+            str(data_dir),
+            "--filter",
+            "--describe-only",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+
+    assert result.returncode == 0, result.stderr
+    description = json.loads(result.stdout)
+    assert description["datasets"] == [
+        "dataset_k562_filtered.npz",
+        "dataset_rpe1_filtered.npz",
+    ]
+    assert description["filter"] is True
+    assert not data_dir.exists()
+
+
+def test_operational_export_uses_stubs_and_records_reproducible_artifacts(
+    tmp_path, monkeypatch
+):
+    script_path = ROOT / "scripts" / "export_causalbench_data.py"
+    spec = importlib.util.spec_from_file_location("export_causalbench_data", script_path)
+    exporter = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(exporter)
+
+    calls = {"dataset": [], "evaluations": []}
+
+    class FakeDataset:
+        def __init__(self, data_dir, use_filter):
+            calls["dataset"].append((data_dir, use_filter))
+            self.data_dir = Path(data_dir)
+            self.use_filter = use_filter
+
+        def load(self):
+            paths = []
+            for name in ("k562", "rpe1"):
+                suffix = "_filtered" if self.use_filter else ""
+                path = self.data_dir / f"dataset_{name}{suffix}.npz"
+                path.write_bytes(f"{name}:{self.use_filter}".encode())
+                paths.append(str(path))
+            return paths
+
+    class FakeEvaluations:
+        def __init__(self, data_dir, dataset_name):
+            calls["evaluations"].append((data_dir, dataset_name))
+
+        def load(self):
+            return (
+                {("a", "b")},
+                {("b", "c")},
+                {("c", "d")},
+                {("d", "e")},
+                {("z", "a"), ("b", "a")},
+            )
+
+    package = types.ModuleType("causalscbench")
+    data_access = types.ModuleType("causalscbench.data_access")
+    dataset_module = types.ModuleType("causalscbench.data_access.create_dataset")
+    evaluations_module = types.ModuleType(
+        "causalscbench.data_access.create_evaluation_datasets"
+    )
+    dataset_module.CreateDataset = FakeDataset
+    evaluations_module.CreateEvaluationDatasets = FakeEvaluations
+    monkeypatch.setitem(sys.modules, "causalscbench", package)
+    monkeypatch.setitem(sys.modules, "causalscbench.data_access", data_access)
+    monkeypatch.setitem(sys.modules, dataset_module.__name__, dataset_module)
+    monkeypatch.setitem(sys.modules, evaluations_module.__name__, evaluations_module)
+
+    data_dir = tmp_path / "raw"
+    assert exporter.main(["--data-dir", str(data_dir), "--filter"]) == 0
+
+    assert calls["dataset"] == [(str(data_dir), True)]
+    assert [name for _, name in calls["evaluations"]] == [
+        "weissmann_k562",
+        "weissmann_rpe1",
+    ]
+    assert (data_dir / "dataset_k562_filtered.npz").exists()
+    assert (data_dir / "dataset_rpe1_filtered.npz").exists()
+    assert (data_dir / "reference_k562_pooled.csv").read_text() == (
+        "source,target\n"
+        "a,b\n"
+        "a,z\n"
+        "b,a\n"
+        "b,c\n"
+        "c,b\n"
+        "c,d\n"
+        "d,c\n"
+        "d,e\n"
+        "e,d\n"
+        "z,a\n"
+    )
+    assert (data_dir / "reference_k562_chipseq.csv").read_text() == (
+        "source,target\n"
+        "b,a\n"
+        "z,a\n"
+    )
+    manifest = json.loads((data_dir / "export_manifest.json").read_text())
+    assert manifest["datasets"] == [
+        "dataset_k562_filtered.npz",
+        "dataset_rpe1_filtered.npz",
+    ]
+    assert manifest["downloaded_at_utc"] is None
+    assert manifest["exported_at_utc"]
+    assert set(manifest["sha256"]) == {
+        "dataset_k562_filtered.npz",
+        "dataset_rpe1_filtered.npz",
+        "reference_k562_pooled.csv",
+        "reference_k562_chipseq.csv",
+        "reference_rpe1_pooled.csv",
+        "reference_rpe1_chipseq.csv",
+    }
+    assert all(value.startswith("sha256:") for value in manifest["sha256"].values())
+    assert all(not Path(path).is_absolute() for path in manifest["sha256"])
