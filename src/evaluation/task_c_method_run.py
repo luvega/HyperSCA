@@ -750,7 +750,6 @@ def _build_hypersca_command(
     seed: int,
     device: str,
     profile_input_path: Path | None = None,
-    profile_identity_input_path: Path | None = None,
     profile_manifest_path: Path | None = None,
 ) -> tuple[str, ...]:
     context_arguments = tuple(
@@ -762,8 +761,6 @@ def _build_hypersca_command(
         (
             "--profile-input",
             str(profile_input_path),
-            "--profile-identity-input",
-            str(profile_identity_input_path or profile_input_path),
             "--profile-manifest",
             str(profile_manifest_path),
         )
@@ -918,7 +915,6 @@ def _safe_command_record(command: Sequence[str]) -> dict[str, object]:
         "--gene-list",
         "--public-manifest",
         "--profile-input",
-        "--profile-identity-input",
         "--profile-manifest",
         "--output-dir",
     }
@@ -1966,9 +1962,6 @@ def run_task_c_method(
                 seed=seed,
                 device=device,
                 profile_input_path=(fixed_input_path if profile_mode else None),
-                profile_identity_input_path=(
-                    input_snapshot.path if profile_mode and input_snapshot is not None else None
-                ),
                 profile_manifest_path=(
                     derived_input_manifest_path if profile_mode else None
                 ),
@@ -1978,7 +1971,6 @@ def run_task_c_method(
                 execution_hypersca_validation_inputs = {
                     **(hypersca_validation_inputs or {}),
                     "profile_input_path": fixed_input_path,
-                    "profile_identity_path": input_snapshot.path,
                 }
         command_record = _safe_command_record(command) if command else None
         environment = _environment_manifest(

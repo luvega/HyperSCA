@@ -32,12 +32,16 @@ CROSS_TRANSFORMATION = "per_environment_control_zscore_then_row_concatenate_v1"
 GENE_SELECTION_RULE = (
     "mean_context_control_population_variance_desc_then_gene_lexicographic_v1"
 )
-CELL_SELECTION_RULE = "label_stratified_without_replacement_seed_11_v1"
+CELL_SELECTION_RULE = (
+    "label_stratified_minimum_reserved_without_replacement_seed_11_v2"
+)
 MAXIMUM_FILE_BYTES = 512 * 1024 * 1024
 MAXIMUM_MANIFEST_BYTES = 4 * 1024 * 1024
 MAXIMUM_TOTAL_PARENT_BYTES = 1024 * 1024 * 1024
 MAXIMUM_TOTAL_EXPANDED_PARENT_BYTES = 2 * 1024 * 1024 * 1024
+MAXIMUM_EXPANDED_PARENT_BYTES = 1024 * 1024 * 1024
 MAXIMUM_PROFILE_INPUT_BYTES = 512 * 1024 * 1024
+MAXIMUM_NPY_HEADER_BYTES = 64 * 1024
 
 _PUBLIC_MANIFEST_FIELDS = frozenset(
     {
@@ -402,11 +406,90 @@ def _text_vector(values: np.ndarray, label: str) -> tuple[str, ...]:
     return result
 
 
+def _preflight_parent_archive(payload: bytes) -> None:
+    expected_names = {
+        "expression_matrix.npy",
+        "interventions.npy",
+        "var_names.npy",
+    }
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload), mode="r") as archive:
+            members = archive.infolist()
+            names = [member.filename for member in members]
+            if len(names) != len(set(names)):
+                raise TaskCProfileInputError("public parent ZIP has duplicate members")
+            if set(names) != expected_names or len(names) != len(expected_names):
+                raise TaskCProfileInputError("public parent ZIP members changed")
+            if any(member.is_dir() or member.flag_bits & 0x1 for member in members):
+                raise TaskCProfileInputError(
+                    "public parent ZIP members must be regular and unencrypted"
+                )
+            if sum(int(member.file_size) for member in members) > MAXIMUM_EXPANDED_PARENT_BYTES:
+                raise TaskCProfileInputError("public parent expanded members are too large")
+            total_array_bytes = 0
+            for member in members:
+                with archive.open(member, mode="r") as handle:
+                    version = np.lib.format.read_magic(handle)
+                    if version == (1, 0):
+                        shape, _, dtype = np.lib.format.read_array_header_1_0(
+                            handle,
+                            max_header_size=MAXIMUM_NPY_HEADER_BYTES,
+                        )
+                    elif version == (2, 0):
+                        shape, _, dtype = np.lib.format.read_array_header_2_0(
+                            handle,
+                            max_header_size=MAXIMUM_NPY_HEADER_BYTES,
+                        )
+                    else:
+                        raise TaskCProfileInputError(
+                            "public parent NPY version is not allowed"
+                        )
+                    dtype = np.dtype(dtype)
+                    if dtype.hasobject:
+                        raise TaskCProfileInputError(
+                            "public parent NPY object arrays are not allowed"
+                        )
+                    array_bytes = int(dtype.itemsize)
+                    for dimension in shape:
+                        if (
+                            isinstance(dimension, bool)
+                            or not isinstance(dimension, int)
+                            or dimension < 0
+                            or (
+                                dimension
+                                and array_bytes
+                                > MAXIMUM_EXPANDED_PARENT_BYTES // dimension
+                            )
+                        ):
+                            raise TaskCProfileInputError(
+                                "public parent NPY array bytes exceed the limit"
+                            )
+                        array_bytes *= dimension
+                    if handle.tell() > MAXIMUM_NPY_HEADER_BYTES + 16:
+                        raise TaskCProfileInputError(
+                            "public parent NPY header exceeds the limit"
+                        )
+                    if handle.tell() + array_bytes != int(member.file_size):
+                        raise TaskCProfileInputError(
+                            "public parent NPY header disagrees with member size"
+                        )
+                    total_array_bytes += array_bytes
+                    if total_array_bytes > MAXIMUM_EXPANDED_PARENT_BYTES:
+                        raise TaskCProfileInputError(
+                            "public parent expanded array bytes exceed the limit"
+                        )
+    except TaskCProfileInputError:
+        raise
+    except (OSError, ValueError, EOFError, zipfile.BadZipFile) as exc:
+        raise TaskCProfileInputError("public parent ZIP or NPY header is invalid") from exc
+
+
 def _load_parent(
     snapshot: _FileSnapshot,
 ) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
     if snapshot.payload is None:
         raise TaskCProfileInputError("selected public parent bytes were not retained")
+    _preflight_parent_archive(snapshot.payload)
     try:
         with np.load(io.BytesIO(snapshot.payload), allow_pickle=False) as archive:
             if set(archive.files) != {
@@ -460,10 +543,16 @@ def _selected_genes(
     inventory: Mapping[str, _FileSnapshot],
     gene_limit: int,
     *,
+    cell_limit: int,
     eligible_sources: Sequence[str],
     minimum_cells: int,
     load_parent: Any,
-) -> tuple[tuple[str, ...], tuple[int, ...], tuple[dict[str, object], ...]]:
+) -> tuple[
+    tuple[str, ...],
+    tuple[int, ...],
+    tuple[dict[str, object], ...],
+    tuple[str, ...],
+]:
     loaded = []
     parents = []
     for context in ("k562", "rpe1"):
@@ -508,50 +597,69 @@ def _selected_genes(
         (index for index, gene in enumerate(genes) if gene in candidates),
         key=lambda index: (-mean_variance[index], genes[index]),
     )
-    selected_indices = tuple(int(index) for index in ranked[: min(gene_limit, len(ranked))])
+    maximum_sources_by_cell_budget = cell_limit // minimum_cells - 1
+    if maximum_sources_by_cell_budget < 2:
+        raise TaskCProfileInputError(
+            "cell cap cannot retain controls and at least two intervention sources"
+        )
+    selection_count = min(
+        gene_limit,
+        maximum_sources_by_cell_budget,
+        len(ranked),
+    )
+    selected_indices = tuple(int(index) for index in ranked[:selection_count])
     if len(selected_indices) < 2:
         raise TaskCProfileInputError("profile needs at least two selected genes")
+    otherwise_selected = ranked[: min(gene_limit, len(ranked))]
+    dropped_due_to_cell_budget = tuple(
+        genes[index] for index in otherwise_selected[selection_count:]
+    )
     return (
         tuple(genes[index] for index in selected_indices),
         selected_indices,
         tuple(parents),
+        dropped_due_to_cell_budget,
     )
 
 
-def _quota_by_label(labels: np.ndarray, limit: int) -> dict[str, int]:
+def _quota_by_label(
+    labels: np.ndarray,
+    limit: int,
+    *,
+    minimum_per_label: int,
+) -> dict[str, int]:
     unique, counts = np.unique(labels, return_counts=True)
-    if len(unique) > limit:
-        raise TaskCProfileInputError("cell cap is smaller than the number of labels")
-    total = len(labels)
-    exact = {str(label): limit * int(count) / total for label, count in zip(unique, counts)}
-    quotas = {
-        str(label): min(int(count), max(1, int(np.floor(exact[str(label)]))))
-        for label, count in zip(unique, counts)
+    if minimum_per_label < 1 or any(int(count) < minimum_per_label for count in counts):
+        raise TaskCProfileInputError(
+            "every retained label needs the public minimum number of cells"
+        )
+    required = minimum_per_label * len(unique)
+    if required > limit:
+        raise TaskCProfileInputError(
+            "cell cap is smaller than the reserved label minimums"
+        )
+    count_by_label = {
+        str(label): int(count) for label, count in zip(unique, counts)
     }
-    while sum(quotas.values()) > limit:
-        candidates = sorted(
-            (label for label, value in quotas.items() if value > 1),
-            key=lambda label: (exact[label] - np.floor(exact[label]), label),
-        )
-        if not candidates:
-            raise TaskCProfileInputError("stratified cell quotas cannot meet the cap")
-        quotas[candidates[0]] -= 1
-    count_by_label = {str(label): int(count) for label, count in zip(unique, counts)}
-    while sum(quotas.values()) < limit:
-        candidates = sorted(
-            (
-                label
-                for label, value in quotas.items()
-                if value < count_by_label[label]
-            ),
-            key=lambda label: (-(exact[label] - np.floor(exact[label])), label),
-        )
-        if not candidates:
-            break
-        for label in candidates:
-            if sum(quotas.values()) == limit:
-                break
-            quotas[label] += 1
+    quotas = {str(label): minimum_per_label for label in unique}
+    remaining = limit - required
+    capacities = {
+        label: count - minimum_per_label for label, count in count_by_label.items()
+    }
+    capacity_total = sum(capacities.values())
+    exact = {
+        label: (remaining * capacity / capacity_total if capacity_total else 0.0)
+        for label, capacity in capacities.items()
+    }
+    for label in quotas:
+        quotas[label] += min(capacities[label], int(np.floor(exact[label])))
+    unassigned = limit - sum(quotas.values())
+    candidates = sorted(
+        (label for label in quotas if quotas[label] < count_by_label[label]),
+        key=lambda label: (-(exact[label] - np.floor(exact[label])), label),
+    )
+    for label in candidates[:unassigned]:
+        quotas[label] += 1
     if sum(quotas.values()) != limit:
         raise TaskCProfileInputError("stratified cell quotas do not fill the cap")
     return quotas
@@ -561,13 +669,23 @@ def _stratified_cell_indices(
     labels: np.ndarray,
     *,
     limit: int,
+    minimum_per_label: int = 1,
 ) -> np.ndarray:
     values = np.asarray(labels)
     if values.ndim != 1 or limit < 1:
         raise TaskCProfileInputError("cell labels and cap are invalid")
+    _, counts = np.unique(values, return_counts=True)
+    if any(int(count) < minimum_per_label for count in counts):
+        raise TaskCProfileInputError(
+            "every retained label needs the public minimum number of cells"
+        )
     if len(values) <= limit:
         return np.arange(len(values), dtype=np.int64)
-    quotas = _quota_by_label(values, limit)
+    quotas = _quota_by_label(
+        values,
+        limit,
+        minimum_per_label=minimum_per_label,
+    )
     selected: list[int] = []
     for label in sorted(quotas):
         candidates = np.flatnonzero(values == label)
@@ -712,9 +830,10 @@ def _build_profile(
         or minimum_cells < 1
     ):
         raise TaskCProfileInputError("public minimum cell count is invalid")
-    genes, gene_indices, gene_parents = _selected_genes(
+    genes, gene_indices, gene_parents, dropped_due_to_cell_budget = _selected_genes(
         inventory,
         gene_limit,
+        cell_limit=cell_limit,
         eligible_sources=eligible_sources,
         minimum_cells=minimum_cells,
         load_parent=load_parent,
@@ -733,7 +852,11 @@ def _build_profile(
         retained_indices = np.flatnonzero(retained)
         dropped_indices = np.flatnonzero(~retained)
         retained_labels = labels[retained_indices]
-        relative_rows = _stratified_cell_indices(retained_labels, limit=cell_limit)
+        relative_rows = _stratified_cell_indices(
+            retained_labels,
+            limit=cell_limit,
+            minimum_per_label=minimum_cells,
+        )
         rows = retained_indices[relative_rows]
         selected_expression = np.asarray(
             expression[np.ix_(rows, np.asarray(gene_indices, dtype=int))],
@@ -768,6 +891,7 @@ def _build_profile(
                 "dropped_original_row_count": int(len(dropped_indices)),
                 "dropped_by_label": _counts(labels[dropped_indices]),
                 "cell_selection_rule": CELL_SELECTION_RULE,
+                "minimum_cells_per_retained_label": minimum_cells,
                 "selected_sorted_indices": rows.tolist(),
                 "label_counts_before": _counts(labels),
                 "retained_label_counts_before_sampling": _counts(retained_labels),
@@ -777,6 +901,13 @@ def _build_profile(
         actual_snapshots.append(snapshot)
     expression_out = np.concatenate(expressions, axis=0)
     interventions_out = np.concatenate(labels_out)
+    final_counts = Counter(interventions_out.tolist())
+    if final_counts.get(CONTROL_LABEL, 0) < minimum_cells or any(
+        final_counts.get(gene, 0) < minimum_cells for gene in genes
+    ):
+        raise TaskCProfileInputError(
+            "profile output does not retain the public minimum for every selected source"
+        )
     arrays: dict[str, np.ndarray] = {
         "expression_matrix": expression_out,
         "interventions": interventions_out,
@@ -823,6 +954,7 @@ def _build_profile(
             "parents": list(gene_parents),
             "ordered_genes": list(genes),
             "ordered_indices": list(gene_indices),
+            "dropped_due_to_cell_budget": list(dropped_due_to_cell_budget),
         },
         "contexts": context_records,
         "environment_labels": environment_record,

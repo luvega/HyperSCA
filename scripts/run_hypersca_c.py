@@ -41,11 +41,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="统一比较输入的来源、抽样位置和转换记录。",
     )
-    parser.add_argument(
-        "--profile-identity-input",
-        type=Path,
-        help="统一比较输入的稳定记录路径；实际读取可使用已核验的临时副本。",
-    )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--gene-list", type=Path, required=True)
     parser.add_argument("--public-manifest", type=Path, required=True)
@@ -66,7 +61,6 @@ def main(argv: list[str] | None = None) -> int:
         summary = run_hypersca_c(
             context_values=args.context or (),
             profile_input_path=args.profile_input,
-            profile_identity_path=args.profile_identity_input,
             profile_manifest_path=args.profile_manifest,
             config_path=args.config,
             gene_list_path=args.gene_list,

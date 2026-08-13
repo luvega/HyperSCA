@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from collections.abc import Sequence
+import zipfile
 
 import numpy as np
 import pytest
@@ -12,6 +13,7 @@ from src.evaluation.task_c_data import (
     load_task_c_dataset,
     materialize_task_c_split,
 )
+from src.evaluation.task_c_benchmark import score_mean_difference_network
 from src.evaluation.task_c_profile_input import (
     PROFILE_LIMITS,
     TaskCProfileInputError,
@@ -154,6 +156,85 @@ def test_profiles_freeze_gene_and_cell_limits_for_within_and_cross(
     }
 
 
+def _sparse_intervention_bundle(tmp_path: Path) -> dict[str, object]:
+    genes = tuple(f"S{index}" for index in range(8))
+    labels = ["non-targeting"] * 3_000 + [
+        gene for gene in genes[:5] for _ in range(5)
+    ]
+    datasets = {}
+    for context, seed in (("k562", 31), ("rpe1", 37)):
+        path = tmp_path / f"{context}.npz"
+        expression = np.random.default_rng(seed).normal(
+            size=(len(labels), len(genes))
+        )
+        np.savez(
+            path,
+            expression_matrix=expression,
+            interventions=np.asarray(labels),
+            var_names=np.asarray(genes),
+        )
+        datasets[context] = load_task_c_dataset(path, context_id=context)
+    split = build_shared_task_c_split(
+        datasets["k562"], datasets["rpe1"], seed=11, min_cells=5
+    )
+    return materialize_task_c_split(
+        datasets["k562"], datasets["rpe1"], split, tmp_path / "public"
+    )
+
+
+def test_profile_reserves_the_public_minimum_for_every_retained_label(
+    tmp_path: Path,
+) -> None:
+    bundle = _sparse_intervention_bundle(tmp_path)
+    created = materialize_task_c_profile_input(
+        public_manifest_path=Path(bundle["public_manifest"]),
+        profile="connection",
+        condition="within_environment",
+        context_id="k562",
+        output_dir=tmp_path / "profile",
+    )
+    with np.load(created["input_npz"], allow_pickle=False) as archive:
+        expression = archive["expression_matrix"]
+        interventions = archive["interventions"]
+        genes = tuple(archive["var_names"].tolist())
+    counts = dict(zip(*np.unique(interventions, return_counts=True)))
+    assert counts["non-targeting"] >= 5
+    assert all(counts[gene] >= 5 for gene in genes)
+    result = score_mean_difference_network(
+        expression,
+        interventions,
+        genes,
+        min_cells_per_intervention=5,
+    )
+    assert not result.scores.empty
+
+
+def test_gene_selection_shrinks_deterministically_to_fit_minimum_cell_quotas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.evaluation.task_c_profile_input as profile_module
+
+    bundle = _sparse_intervention_bundle(tmp_path)
+    monkeypatch.setitem(profile_module.PROFILE_LIMITS, "connection", (64, 15))
+    created = materialize_task_c_profile_input(
+        public_manifest_path=Path(bundle["public_manifest"]),
+        profile="connection",
+        condition="within_environment",
+        context_id="k562",
+        output_dir=tmp_path / "profile",
+    )
+    manifest = json.loads(Path(created["manifest"]).read_text(encoding="utf-8"))
+    assert len(manifest["gene_selection"]["ordered_genes"]) == 2
+    assert manifest["gene_selection"]["dropped_due_to_cell_budget"]
+    with np.load(created["input_npz"], allow_pickle=False) as archive:
+        labels, counts = np.unique(archive["interventions"], return_counts=True)
+    assert dict(zip(labels.tolist(), counts.tolist())) == {
+        "non-targeting": 5,
+        **{gene: 5 for gene in manifest["gene_selection"]["ordered_genes"]},
+    }
+
+
 def test_profile_materialization_is_deterministic_and_validator_recomputes_parents(
     large_public_bundle: dict[str, object],
     tmp_path: Path,
@@ -233,6 +314,100 @@ def test_profile_rejects_selected_parents_whose_arrays_expand_past_budget(
             context_id="k562",
             output_dir=tmp_path / "too-expanded",
         )
+
+
+def _small_parent_archive(path: Path) -> None:
+    np.savez(
+        path,
+        expression_matrix=np.arange(12, dtype=np.float64).reshape(6, 2),
+        interventions=np.asarray(["non-targeting"] * 3 + ["A"] * 3),
+        var_names=np.asarray(["A", "B"]),
+    )
+
+
+def test_parent_zip_preflight_rejects_expanded_arrays_before_numpy_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.evaluation.task_c_profile_input as profile_module
+
+    path = tmp_path / "parent.npz"
+    _small_parent_archive(path)
+    snapshot = profile_module._capture(
+        path, "parent", maximum_bytes=profile_module.MAXIMUM_FILE_BYTES
+    )
+    called = 0
+    original_load = profile_module.np.load
+
+    def counting_load(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called += 1
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(profile_module.np, "load", counting_load)
+    monkeypatch.setattr(profile_module, "MAXIMUM_EXPANDED_PARENT_BYTES", 1)
+    with pytest.raises(TaskCProfileInputError, match="expanded|array bytes"):
+        profile_module._load_parent(snapshot)
+    assert called == 0
+
+
+def test_parent_zip_preflight_rejects_duplicate_members_before_numpy_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.evaluation.task_c_profile_input as profile_module
+
+    source = tmp_path / "source.npz"
+    path = tmp_path / "duplicate.npz"
+    _small_parent_archive(source)
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        with zipfile.ZipFile(source) as original, zipfile.ZipFile(path, "w") as target:
+            for name in original.namelist():
+                target.writestr(name, original.read(name))
+            target.writestr(
+                "expression_matrix.npy", original.read("expression_matrix.npy")
+            )
+    snapshot = profile_module._capture(
+        path, "parent", maximum_bytes=profile_module.MAXIMUM_FILE_BYTES
+    )
+    called = 0
+
+    def forbidden_load(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called += 1
+        raise AssertionError("np.load must not see a duplicate archive")
+
+    monkeypatch.setattr(profile_module.np, "load", forbidden_load)
+    with pytest.raises(TaskCProfileInputError, match="duplicate|members"):
+        profile_module._load_parent(snapshot)
+    assert called == 0
+
+
+def test_parent_zip_preflight_accepts_a_valid_fixed_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.evaluation.task_c_profile_input as profile_module
+
+    path = tmp_path / "parent.npz"
+    _small_parent_archive(path)
+    snapshot = profile_module._capture(
+        path, "parent", maximum_bytes=profile_module.MAXIMUM_FILE_BYTES
+    )
+    called = 0
+    original_load = profile_module.np.load
+
+    def counting_load(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called += 1
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(profile_module.np, "load", counting_load)
+    expression, labels, genes = profile_module._load_parent(snapshot)
+    assert called == 1
+    assert expression.shape == (6, 2)
+    assert labels.shape == (6,)
+    assert genes == ("A", "B")
 
 
 def test_validator_rejects_manifest_replacement_after_initial_capture(
@@ -399,6 +574,11 @@ def test_hypersca_uses_the_same_capped_profile_cells(
 
     assert observed_shapes == [(2_000, 64)]
     run_manifest = json.loads((output / "run_manifest.json").read_text(encoding="utf-8"))
+    assert run_manifest["profile_input"]["input_path"] == "<verified-profile-input>"
+    assert run_manifest["contexts"][0]["input_path"] == "<verified-profile-input>"
+    assert run_manifest["run_identity"]["contexts"][0]["input_path"] == (
+        "<verified-profile-input>"
+    )
     assert run_manifest["profile_input"]["manifest_sha256"].startswith("sha256:")
     assert run_manifest["profile_input"]["record"]["contexts"][0][
         "selected_sorted_indices"
@@ -431,6 +611,7 @@ def test_hypersca_cli_accepts_an_explicit_profile_pair(tmp_path: Path) -> None:
             "11",
         ]
     )
+    assert not hasattr(parsed, "profile_identity_input")
     assert parsed.context is None
     assert parsed.profile_input == tmp_path / "profile.npz"
     assert parsed.profile_manifest == tmp_path / "profile.json"

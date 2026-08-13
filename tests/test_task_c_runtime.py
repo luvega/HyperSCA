@@ -2748,9 +2748,7 @@ def test_hypersca_dispatches_the_exact_validated_profile_subset(
     dispatched_input = Path(command[command.index("--profile-input") + 1])
     assert dispatched_input != Path(profile["input_npz"])
     assert dispatched_input.name == "profile_input.npz"
-    assert command[command.index("--profile-identity-input") + 1] == str(
-        profile["input_npz"]
-    )
+    assert "--profile-identity-input" not in command
     assert command[command.index("--profile-manifest") + 1] == str(
         profile["manifest"]
     )
