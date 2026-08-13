@@ -197,6 +197,138 @@ def _all_failed_stability_result(
     )
 
 
+def _one_success_stability_result() -> object:
+    from src.causal.hypersca_c_stability import (
+        HyperSCAStabilityResult,
+        build_stability_table,
+    )
+
+    k562 = np.zeros((3, 3), dtype=np.float32)
+    rpe1 = np.zeros((3, 3), dtype=np.float32)
+    k562[0, 1] = -1.0
+    rpe1[0, 1] = 1.0
+    predictions, summary = build_stability_table(
+        [{"k562": k562, "rpe1": rpe1}],
+        ("C", "A", "B"),
+        selection_threshold=0.1,
+        requested_repeats=2,
+        minimum_success_fraction=0.8,
+        source_variance={"C": 1.0, "A": 1.0, "B": 1.0},
+        minimum_source_variance=1e-8,
+        expected_contexts=("k562", "rpe1"),
+    )
+    return HyperSCAStabilityResult(
+        predictions=predictions,
+        summary=summary,
+        failures=("repeat_1:failed",),
+    )
+
+
+def _within_refit_condition() -> dict[str, str]:
+    return {
+        "condition": "within_refit_k562_rpe1",
+        "mode": "within",
+        "direction": "none",
+        "stage": "refit",
+    }
+
+
+def test_shared_run_validator_accepts_exact_one_repeat_context_aggregation() -> None:
+    import src.causal.hypersca_c_run as run_module
+
+    result = _one_success_stability_result()
+    predictions, _, _ = run_module._validate_run_scientific_result(
+        predictions=result.predictions,
+        summary=result.summary,
+        failures=result.failures,
+        context_ids=("k562", "rpe1"),
+        gene_names=("C", "A", "B"),
+        requested_repeats=2,
+        selection_threshold=0.1,
+        seed=11,
+        condition=_within_refit_condition(),
+    )
+    pd.testing.assert_frame_equal(predictions, result.predictions)
+
+
+def test_shared_run_validator_rejects_synchronized_one_repeat_median_forgery() -> None:
+    import src.causal.hypersca_c_run as run_module
+
+    result = _one_success_stability_result()
+    predictions = result.predictions.copy(deep=True)
+    edge = (predictions["source"] == "C") & (predictions["target"] == "A")
+    predictions.loc[edge, ["effect", "median_effect"]] = 0.5
+    predictions.loc[edge, "direction"] = 1
+    predictions.loc[edge, "score"] = 0.25
+    predictions = predictions.sort_values(
+        ["abstained", "score", "source", "target"],
+        ascending=[True, False, True, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
+
+    with pytest.raises(HyperSCACError, match="一次|聚合|中位|selection"):
+        run_module._validate_run_scientific_result(
+            predictions=predictions,
+            summary=result.summary,
+            failures=result.failures,
+            context_ids=("k562", "rpe1"),
+            gene_names=("C", "A", "B"),
+            requested_repeats=2,
+            selection_threshold=0.1,
+            seed=11,
+            condition=_within_refit_condition(),
+        )
+
+
+def test_shared_run_validator_does_not_infer_multi_repeat_values_from_context_medians() -> None:
+    import src.causal.hypersca_c_run as run_module
+    from src.causal.hypersca_c_stability import build_stability_table
+
+    first_k562 = np.zeros((3, 3), dtype=np.float32)
+    first_rpe1 = np.zeros((3, 3), dtype=np.float32)
+    second_k562 = np.zeros((3, 3), dtype=np.float32)
+    second_rpe1 = np.zeros((3, 3), dtype=np.float32)
+    first_k562[0, 1], second_k562[0, 1] = -2.0, -1.0
+    first_rpe1[0, 1], second_rpe1[0, 1] = 1.0, 2.0
+    predictions, summary = build_stability_table(
+        [
+            {"k562": first_k562, "rpe1": first_rpe1},
+            {"k562": second_k562, "rpe1": second_rpe1},
+        ],
+        ("C", "A", "B"),
+        selection_threshold=0.1,
+        requested_repeats=2,
+        minimum_success_fraction=0.8,
+        source_variance={"C": 1.0, "A": 1.0, "B": 1.0},
+        minimum_source_variance=1e-8,
+        expected_contexts=("k562", "rpe1"),
+    )
+    edge = (predictions["source"] == "C") & (predictions["target"] == "A")
+    predictions.loc[edge, ["effect", "median_effect"]] = 0.5
+    predictions.loc[edge, "direction"] = 1
+    predictions.loc[edge, "selection_frequency"] = 0.75
+    predictions.loc[edge, "direction_agreement"] = 0.75
+    predictions.loc[edge, "score"] = 0.28125
+    predictions = predictions.sort_values(
+        ["abstained", "score", "source", "target"],
+        ascending=[True, False, True, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
+
+    validated, _, _ = run_module._validate_run_scientific_result(
+        predictions=predictions,
+        summary=summary,
+        failures=(),
+        context_ids=("k562", "rpe1"),
+        gene_names=("C", "A", "B"),
+        requested_repeats=2,
+        selection_threshold=0.1,
+        seed=11,
+        condition=_within_refit_condition(),
+    )
+    assert float(validated.loc[0, "median_effect"]) == pytest.approx(0.5)
+
+
 def test_hypersca_c_cli_writes_traced_raw_results_and_reuses_exact_run(
     prepared_run: dict[str, object], tmp_path: Path
 ) -> None:

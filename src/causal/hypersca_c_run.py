@@ -1129,6 +1129,42 @@ def _validate_run_scientific_result(
         raise HyperSCACError("拟合摘要 requested_repeats 与固定设置不一致")
     disk_summary = {**core_summary, "failures": list(validated.failures)}
     successful = int(core_summary["successful_repeats"])
+    if successful == 1:
+        expected_medians = np.median(context_effects, axis=1)
+        expected_selection_frequency = selected.mean(axis=1)
+        expected_direction_agreement = np.divide(
+            np.maximum(positive, negative),
+            selected_count,
+            out=np.zeros(len(validated.predictions), dtype=float),
+            where=selected_count > 0,
+        )
+        one_repeat_checks = (
+            (
+                "median_effect",
+                medians,
+                expected_medians,
+            ),
+            (
+                "selection_frequency",
+                validated.predictions["selection_frequency"].to_numpy(dtype=float),
+                expected_selection_frequency,
+            ),
+            (
+                "direction_agreement",
+                validated.predictions["direction_agreement"].to_numpy(dtype=float),
+                expected_direction_agreement,
+            ),
+        )
+        for field, observed, expected in one_repeat_checks:
+            if not np.isclose(
+                observed,
+                expected,
+                rtol=1e-12,
+                atol=1e-12,
+            ).all():
+                raise HyperSCACError(
+                    f"一次成功重复的 {field} 与各细胞环境等权聚合不一致"
+                )
     coverage = float(core_summary["coverage"])
     expected_status: dict[str, object] = {
         "schema_version": "1.0",
