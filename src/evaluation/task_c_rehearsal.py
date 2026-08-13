@@ -21,6 +21,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from types import MappingProxyType
 from typing import Any
@@ -30,6 +31,7 @@ from urllib.parse import unquote, urlparse
 import numpy as np
 
 from src.evaluation.task_c_profile_input import (
+    CROSS_TRANSFORMATION,
     MAXIMUM_DISTINCT_LABELS,
     MAXIMUM_PARENT_CELLS,
     MAXIMUM_PARENT_GENES,
@@ -95,10 +97,169 @@ _REQUIRED_ARTIFACTS = (
     "promotion_decision.json",
 )
 _FULL_RUN_SEEDS = (11, 23, 47, 71, 97)
+REHEARSAL_CONDITIONS = (
+    "within_k562",
+    "within_rpe1",
+    "k562_to_rpe1",
+    "rpe1_to_k562",
+)
+_FINAL_REHEARSAL_STATUSES = frozenset(
+    {
+        "passed_real_rehearsal",
+        "failed_timeout",
+        "failed_resource_limit",
+        "failed_runtime_unavailable",
+        "failed_launch",
+        "failed_invalid_output",
+        "failed_private_scoring",
+        "failed_null_control",
+        "official_code_incompatible",
+        "official_assets_unavailable",
+    }
+)
+_INNER_TO_REHEARSAL_STATUS = {
+    "completed_standardized_output": "passed_real_rehearsal",
+    "failed_timeout": "failed_timeout",
+    "failed_resource_limit": "failed_resource_limit",
+    "failed_runtime_unavailable": "failed_runtime_unavailable",
+    "failed_launch": "failed_launch",
+    "failed_invalid_output": "failed_invalid_output",
+    "official_code_incompatible": "official_code_incompatible",
+    "official_assets_unavailable": "official_assets_unavailable",
+}
+_REHEARSAL_EXTRA_ARTIFACTS = (
+    "method_status.json",
+    "resource_usage.json",
+    "environment_manifest.json",
+)
 
 
 class TaskCRehearsalError(ValueError):
     """The rehearsal rule or supplied research data are not safe to use."""
+
+
+def build_rehearsal_run_id(
+    *, profile: str, condition: str, method_id: str, seed: int
+) -> str:
+    """Build the stable name used for one method-condition rehearsal."""
+
+    if isinstance(seed, bool) or type(seed) is not int or not 0 <= seed <= MAXIMUM_SEED:
+        raise TaskCRehearsalError("run identity seed is outside the allowed range")
+    safe = (profile, condition, method_id, f"seed-{seed}")
+    allowed = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-")
+    if any(
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or "/" in value
+        or "\\" in value
+        or ".." in value
+        or any(character not in allowed for character in value)
+        for value in safe
+    ):
+        raise TaskCRehearsalError("run identity contains unsafe text")
+    return "__".join(safe)
+
+
+def validate_required_run_artifacts(
+    run_dir: str | Path, required_artifacts: Sequence[str]
+) -> None:
+    """Require the complete, fixed scientific record for a successful run."""
+
+    required = _fixed_text_tuple(
+        required_artifacts, "required analysis output files"
+    )
+    expected = frozenset((*required, *_REHEARSAL_EXTRA_ARTIFACTS))
+    destination = Path(run_dir)
+    try:
+        names = {
+            entry.name
+            for entry in os.scandir(destination)
+            if entry.is_file(follow_symlinks=False)
+        }
+        non_files = [
+            entry.name
+            for entry in os.scandir(destination)
+            if not entry.is_file(follow_symlinks=False)
+        ]
+    except OSError as exc:
+        raise TaskCRehearsalError(
+            "run result directory cannot be inspected"
+        ) from exc
+    missing = sorted(expected - names)
+    extra = sorted(names - expected)
+    if missing:
+        raise TaskCRehearsalError(
+            f"run is missing required artifacts: {missing}"
+        )
+    if extra or non_files:
+        raise TaskCRehearsalError(
+            f"run contains unexpected analysis outputs: {sorted(set(extra + non_files))}"
+        )
+
+
+def classify_rehearsal_method_status(inner_status: str) -> str:
+    """Translate a method result without weakening or hiding a failure."""
+
+    if type(inner_status) is not str or inner_status not in _INNER_TO_REHEARSAL_STATUS:
+        raise TaskCRehearsalError("method returned an unrecognized final status")
+    return _INNER_TO_REHEARSAL_STATUS[inner_status]
+
+
+def _classify_controller_failure(
+    error: BaseException | str, inner_status: str | None
+) -> str:
+    if (
+        inner_status in _INNER_TO_REHEARSAL_STATUS
+        and inner_status != "completed_standardized_output"
+    ):
+        return classify_rehearsal_method_status(str(inner_status))
+    message = str(error).casefold()
+    if "sealed" in message or "private" in message:
+        return "failed_private_scoring"
+    if "null" in message or "zero-effect" in message:
+        return "failed_null_control"
+    if "selection" in message or "prediction" in message:
+        return "failed_invalid_output"
+    return "failed_runtime_unavailable"
+
+
+def build_rehearsal_execution_plan(
+    *, profile: str, method_ids: Sequence[str]
+) -> Mapping[str, Mapping[str, object]]:
+    """Return the fixed four-condition train, tune and final-fit design."""
+
+    if profile not in _PROFILE_VALUES:
+        raise TaskCRehearsalError("profile must be connection or comprehensive")
+    methods = _fixed_text_tuple(method_ids, "rehearsal methods")
+    if len(set(methods)) != len(methods):
+        raise TaskCRehearsalError("rehearsal methods must be unique")
+    trial_counts = {
+        method: (
+            2
+            if profile == "connection"
+            and method in {"hypersca_c", "mean_difference"}
+            else 0
+        )
+        for method in methods
+    }
+    selected = tuple(
+        method
+        for method in ("hypersca_c", "mean_difference")
+        if trial_counts.get(method) == 2
+    )
+    return MappingProxyType(
+        {
+            condition: MappingProxyType(
+                {
+                    "stages": ("train", "tune", "refit"),
+                    "trial_counts": MappingProxyType(dict(trial_counts)),
+                    "selection_bound_refit": selected,
+                }
+            )
+            for condition in REHEARSAL_CONDITIONS
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1202,6 +1363,7 @@ def validate_private_scoring_command(
     execution_cwd: str | Path | None = None,
     allowed_python_interpreters: Sequence[str | Path] | None = None,
     allowed_worker_snapshots: Sequence[MethodWorkerEntrySnapshot] | None = None,
+    allowed_private_inputs: Sequence[str | Path] = (),
 ) -> None:
     """Preflight one method command against the sealed-data boundary.
 
@@ -1219,6 +1381,40 @@ def validate_private_scoring_command(
             "method execution directory is required for path checking"
         )
     cwd = _real_execution_directory(execution_cwd)
+    if isinstance(allowed_private_inputs, (str, bytes)) or not isinstance(
+        allowed_private_inputs, Sequence
+    ):
+        raise TaskCRehearsalError(
+            "allowed private scoring inputs must be an ordered path list"
+        )
+    if len(allowed_private_inputs) > MAXIMUM_METHOD_BOUNDARY_FILES:
+        raise TaskCRehearsalError("too many private scoring inputs were allowed")
+    allowed_private: set[Path] = set()
+    for raw_private_input in allowed_private_inputs:
+        if not isinstance(raw_private_input, (str, Path)):
+            raise TaskCRehearsalError(
+                "allowed private scoring inputs must contain only paths"
+            )
+        candidate = Path(
+            os.path.abspath(os.fspath(Path(raw_private_input).expanduser()))
+        )
+        try:
+            metadata = os.lstat(candidate)
+            resolved = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise TaskCRehearsalError(
+                "allowed private scoring input must be a real regular file"
+            ) from exc
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or not _path_is_within(resolved, private)
+        ):
+            raise TaskCRehearsalError(
+                "allowed private scoring input must be a single-link regular file under the private root"
+            )
+        allowed_private.add(resolved)
     first_name = Path(arguments[0]).name.casefold()
     if first_name in {
         "sh",
@@ -1246,28 +1442,35 @@ def validate_private_scoring_command(
     private_text = os.fspath(private)
     for argument in arguments:
         for candidate_text in _command_path_candidates(argument):
-            if private_text in candidate_text:
-                raise TaskCRehearsalError(
-                    "method command contains a private scoring path"
-                )
             try:
                 candidate = Path(candidate_text).expanduser()
                 if not candidate.is_absolute():
                     candidate = cwd / candidate
                 lexical = Path(os.path.normpath(os.fspath(candidate)))
                 if _path_is_within(lexical, private):
-                    raise TaskCRehearsalError(
-                        "method command contains a private scoring path"
-                    )
+                    try:
+                        exact = candidate.resolve(strict=True)
+                    except OSError:
+                        exact = lexical
+                    if exact not in allowed_private:
+                        raise TaskCRehearsalError(
+                            "method command contains a private scoring path"
+                        )
+                    continue
                 resolved = candidate.resolve(strict=False)
             except TaskCRehearsalError:
                 raise
             except (OSError, RuntimeError, ValueError):
+                if private_text in candidate_text:
+                    raise TaskCRehearsalError(
+                        "method command contains a private scoring path"
+                    )
                 continue
             if resolved == private or private in resolved.parents:
-                raise TaskCRehearsalError(
-                    "method command contains a private scoring path"
-                )
+                if resolved not in allowed_private:
+                    raise TaskCRehearsalError(
+                        "method command contains a private scoring path"
+                    )
     interpreter_values = _allowed_interpreter_snapshot(
         allowed_python_interpreters
     )
@@ -1389,6 +1592,7 @@ def run_validated_private_scoring_command(
     execution_cwd: str | Path,
     allowed_python_interpreters: Sequence[str | Path],
     allowed_worker_snapshots: Sequence[MethodWorkerEntrySnapshot],
+    allowed_private_inputs: Sequence[str | Path] = (),
     environment: Mapping[str, str] | None = None,
     timeout_seconds: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -1412,6 +1616,7 @@ def run_validated_private_scoring_command(
         execution_cwd=execution_cwd,
         allowed_python_interpreters=interpreter_values,
         allowed_worker_snapshots=snapshots,
+        allowed_private_inputs=allowed_private_inputs,
     )
     cwd = _real_execution_directory(execution_cwd)
     interpreters = _normalized_python_interpreters(interpreter_values)
@@ -1491,3 +1696,1839 @@ def run_validated_private_scoring_command(
         )
     finally:
         _remove_worker_bundle(bundle)
+
+
+def _strict_json_bytes(payload: object) -> bytes:
+    try:
+        return (
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError, UnicodeError) as exc:
+        raise TaskCRehearsalError(
+            "rehearsal record contains a value that cannot be recorded safely"
+        ) from exc
+
+
+def _strict_json_file(path: Path, label: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_nonfinite_json,
+        )
+    except TaskCRehearsalError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise TaskCRehearsalError(f"{label} is not valid UTF-8 JSON") from exc
+    if not isinstance(payload, dict):
+        raise TaskCRehearsalError(f"{label} must contain one JSON object")
+    return payload
+
+
+def _write_new_record(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    encoded = _strict_json_bytes(payload)
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            offset = 0
+            while offset < len(encoded):
+                offset += os.write(descriptor, encoded[offset:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except FileExistsError as exc:
+        raise TaskCRehearsalError(
+            f"analysis output already exists and will not be overwritten: {path.name}"
+        ) from exc
+    except OSError as exc:
+        raise TaskCRehearsalError(
+            f"analysis output could not be written safely: {path.name}"
+        ) from exc
+
+
+def _sha256_file(path: Path) -> str:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except OSError as exc:
+        raise TaskCRehearsalError(f"analysis input cannot be read: {path}") from exc
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _canonical_sha256(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _has_private_component(path: Path) -> bool:
+    return any(part.casefold().startswith("private") for part in path.parts)
+
+
+def _condition_scope(condition: str) -> dict[str, str | None]:
+    if condition == "within_k562":
+        return {
+            "profile_condition": "within_environment",
+            "context_id": "k562",
+            "direction": None,
+            "target_context": "k562",
+        }
+    if condition == "within_rpe1":
+        return {
+            "profile_condition": "within_environment",
+            "context_id": "rpe1",
+            "direction": None,
+            "target_context": "rpe1",
+        }
+    if condition in {"k562_to_rpe1", "rpe1_to_k562"}:
+        return {
+            "profile_condition": "cross_environment",
+            "context_id": condition,
+            "direction": condition,
+            "target_context": condition.split("_to_", 1)[1],
+        }
+    raise TaskCRehearsalError("rehearsal condition is not recognized")
+
+
+def _safe_failure_reason(error: BaseException | str) -> str:
+    value = str(error).strip() or "the rehearsal step did not complete"
+    cleaned = " ".join(value.replace("\x00", " ").split())
+    return cleaned[:500]
+
+
+def _tree_inventory(root: Path, *, exclude: frozenset[str] = frozenset()) -> dict[str, str]:
+    inventory: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_dir() and not path.is_symlink():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if relative in exclude:
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise TaskCRehearsalError(
+                f"rehearsal output contains an unsupported path: {relative}"
+            )
+        inventory[relative] = _sha256_file(path)
+    return inventory
+
+
+def _profile_inputs(
+    *, public_manifest: Path, profile: str, staging: Path
+) -> dict[str, dict[str, dict[str, Path]]]:
+    from src.evaluation.task_c_profile_input import (
+        TaskCProfileInputError,
+        materialize_task_c_profile_input,
+        validate_task_c_profile_input,
+    )
+
+    profiles: dict[str, dict[str, dict[str, Path]]] = {}
+    for condition in REHEARSAL_CONDITIONS:
+        scope = _condition_scope(condition)
+        profiles[condition] = {}
+        for stage in ("train", "tune", "refit"):
+            output = staging / "profiles" / condition / stage
+            try:
+                created = materialize_task_c_profile_input(
+                    public_manifest_path=public_manifest,
+                    profile=profile,
+                    condition=str(scope["profile_condition"]),
+                    stage=stage,
+                    context_id=scope["context_id"] if scope["direction"] is None else None,
+                    direction=scope["direction"],
+                    output_dir=output,
+                )
+                validated = validate_task_c_profile_input(
+                    input_path=Path(created["input_npz"]),
+                    profile_manifest_path=Path(created["manifest"]),
+                    public_manifest_path=public_manifest,
+                )
+            except TaskCProfileInputError as exc:
+                raise TaskCRehearsalError(
+                    f"public profile input could not be verified: {exc}"
+                ) from exc
+            profiles[condition][stage] = {
+                "input": validated.input_path,
+                "manifest": validated.manifest_path,
+            }
+    return profiles
+
+
+def _read_profile_arrays(profile_record: Mapping[str, Path]) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
+    try:
+        with np.load(profile_record["input"], allow_pickle=False) as archive:
+            expression = np.asarray(archive["expression_matrix"], dtype=np.float64)
+            labels = np.asarray(archive["interventions"], dtype=str)
+            genes = tuple(str(value) for value in archive["var_names"].tolist())
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise TaskCRehearsalError("profile arrays could not be read") from exc
+    return expression, labels, genes
+
+
+def materialize_sealed_scoring_subset(
+    *,
+    source_path: Path,
+    public_profile_input: Path,
+    destination: Path,
+    maximum_cells: int,
+    seed: int,
+) -> Path:
+    """Create the private scoring view that matches the public method scope.
+
+    The public profile supplies only the already fixed gene order.  Rows are
+    then filtered and, when needed, sampled inside the sealed scoring step; the
+    resulting file is never supplied to a comparison method.
+    """
+
+    if (
+        isinstance(maximum_cells, bool)
+        or type(maximum_cells) is not int
+        or maximum_cells < 1
+    ):
+        raise TaskCRehearsalError("sealed scoring cell limit must be positive")
+    try:
+        with np.load(public_profile_input, allow_pickle=False) as profile_archive:
+            profile_genes = _canonical_texts(
+                np.asarray(profile_archive["var_names"]),
+                "public profile genes",
+                require_unique=True,
+                maximum_items=MAXIMUM_PARENT_GENES,
+            )
+        with np.load(source_path, allow_pickle=False) as source_archive:
+            if set(source_archive.files) != {
+                "expression_matrix",
+                "interventions",
+                "var_names",
+            }:
+                raise TaskCRehearsalError(
+                    "sealed source must contain exactly the three registered arrays"
+                )
+            expression = np.asarray(source_archive["expression_matrix"])
+            labels = np.asarray(source_archive["interventions"])
+            source_genes = _canonical_texts(
+                np.asarray(source_archive["var_names"]),
+                "sealed source genes",
+                require_unique=True,
+                maximum_items=MAXIMUM_PARENT_GENES,
+            )
+    except TaskCRehearsalError:
+        raise
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise TaskCRehearsalError("sealed scoring arrays could not be read") from exc
+    source_by_gene = {gene: index for index, gene in enumerate(source_genes)}
+    if any(gene not in source_by_gene for gene in profile_genes):
+        raise TaskCRehearsalError(
+            "public profile genes are absent from the sealed scoring source"
+        )
+    canonical_labels = _canonical_texts(
+        labels,
+        "sealed intervention labels",
+        require_unique=False,
+        maximum_items=MAXIMUM_PARENT_CELLS,
+    )
+    values = _numeric_matrix(
+        expression,
+        "sealed expression",
+        expected_columns=len(source_genes),
+    )
+    profile_gene_set = set(profile_genes)
+    retained = np.fromiter(
+        (
+            label in {CONTROL_LABEL, "excluded"} or label in profile_gene_set
+            for label in canonical_labels
+        ),
+        dtype=bool,
+        count=len(canonical_labels),
+    )
+    if not np.any(retained):
+        raise TaskCRehearsalError("sealed scoring scope retained no cells")
+    selected_labels = np.asarray(canonical_labels, dtype=str)[retained]
+    selected_expression = values[retained][
+        :, [source_by_gene[gene] for gene in profile_genes]
+    ]
+    selected_indices = choose_rehearsal_cells(
+        selected_labels,
+        min(maximum_cells, len(selected_labels)),
+        seed,
+        minimum_cells_per_group=1,
+    )
+    selected_expression = selected_expression[selected_indices]
+    selected_labels = selected_labels[selected_indices]
+    if CONTROL_LABEL not in set(selected_labels.tolist()):
+        raise TaskCRehearsalError("sealed scoring scope retained no control cells")
+
+    destination = Path(os.path.abspath(os.fspath(destination.expanduser())))
+    private = _real_private_directory(destination.parent)
+    if destination.parent.resolve(strict=True) != private or destination.exists():
+        raise TaskCRehearsalError(
+            "sealed scoring destination must be a new file in the private root"
+        )
+    from src.evaluation.task_c_profile_input import _deterministic_npz
+
+    payload = _deterministic_npz(
+        {
+            "expression_matrix": np.asarray(selected_expression),
+            "interventions": np.asarray(selected_labels),
+            "var_names": np.asarray(profile_genes),
+        }
+    )
+    try:
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(descriptor, payload[offset:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise TaskCRehearsalError(
+            "sealed scoring subset could not be written safely"
+        ) from exc
+    return destination
+
+
+def _synthetic_predictions(
+    *, method_id: str, profile_record: Mapping[str, Path], seed: int
+) -> Any:
+    import pandas as pd
+
+    from src.evaluation.task_c_benchmark import (
+        TaskCBenchmarkError,
+        score_mean_difference_network,
+    )
+    from src.evaluation.task_c_predictions import (
+        TaskCPredictionError,
+        normalize_task_c_predictions,
+    )
+
+    expression, labels, genes = _read_profile_arrays(profile_record)
+    if method_id in {"hypersca_c", "mean_difference"}:
+        try:
+            raw = score_mean_difference_network(
+                expression,
+                labels,
+                genes,
+                min_cells_per_intervention=1,
+            ).scores[["source", "target", "score"]]
+        except TaskCBenchmarkError as exc:
+            raise TaskCRehearsalError(str(exc)) from exc
+    else:
+        relations = [
+            (source, target)
+            for source in genes
+            for target in genes
+            if source != target
+        ]
+        rng = np.random.default_rng(seed + int.from_bytes(method_id.encode("utf-8")[:4], "little"))
+        order = rng.permutation(len(relations))
+        limit = min(1_000, len(relations))
+        raw = pd.DataFrame(
+            [(*relations[int(index)], float(limit - rank)) for rank, index in enumerate(order[:limit])],
+            columns=["source", "target", "score"],
+        )
+    try:
+        return normalize_task_c_predictions(raw, genes)
+    except TaskCPredictionError as exc:
+        raise TaskCRehearsalError(str(exc)) from exc
+
+
+def _null_control_records(
+    *,
+    predictions: Any,
+    profile_record: Mapping[str, Path],
+    seed: int,
+    synthetic_smoke: bool,
+) -> dict[str, object]:
+    from sklearn.metrics import average_precision_score
+
+    from src.evaluation.task_c_null_controls import (
+        build_control_resampling_null,
+        empirical_null_check,
+        null_check_to_json_record,
+        permute_intervention_labels,
+    )
+    from src.evaluation.task_c_tuning import (
+        TaskCTuningError,
+        build_tuning_response_edges,
+    )
+
+    expression, labels, genes = _read_profile_arrays(profile_record)
+    relations = list(
+        zip(
+            predictions["source"].astype(str),
+            predictions["target"].astype(str),
+            strict=True,
+        )
+    )
+    scores = np.asarray(predictions["score"], dtype=float)
+
+    def response_metric(values: np.ndarray, groups: np.ndarray) -> float:
+        sources = set(groups.tolist()) - {CONTROL_LABEL, "excluded"}
+        try:
+            positives = build_tuning_response_edges(
+                values,
+                groups,
+                genes,
+                eligible_sources=sources,
+                q_value_threshold=0.1,
+            )
+        except TaskCTuningError:
+            return 0.0
+        if not positives:
+            return 0.0
+        truth = np.asarray([relation in positives for relation in relations], dtype=int)
+        if int(truth.sum()) in {0, len(truth)}:
+            return 0.0
+        return float(average_precision_score(truth, scores))
+
+    if synthetic_smoke:
+        real_metric = 1.0
+        label_metrics = [0.0] * 20
+        resampling_metrics = [0.0] * 20
+    else:
+        real_metric = response_metric(expression, labels)
+        label_metrics = []
+        resampling_metrics = []
+        for repeat in range(20):
+            label_seed = seed + repeat + 1
+            resampling_seed = seed + repeat + 101
+            permuted = permute_intervention_labels(labels, label_seed)
+            label_metrics.append(response_metric(expression, permuted))
+            sampled_expression, sampled_labels = build_control_resampling_null(
+                expression,
+                labels,
+                resampling_seed,
+            )
+            resampling_metrics.append(
+                response_metric(sampled_expression, sampled_labels)
+            )
+
+    result: dict[str, object] = {}
+    for name, values, offset, transformation in (
+        (
+            "label_permutation",
+            label_metrics,
+            1,
+            "intervention labels shuffled while retaining group sizes",
+        ),
+        (
+            "control_resampling",
+            resampling_metrics,
+            101,
+            "all expression rows resampled from control cells",
+        ),
+    ):
+        checked = empirical_null_check(real_metric, values, 0.05, 0.0)
+        record: dict[str, object] = dict(null_check_to_json_record(checked))
+        record.update(
+            {
+                "seeds": [seed + repeat + offset for repeat in range(20)],
+                "metrics": [float(value) for value in values],
+                "transformation": transformation,
+            }
+        )
+        result[name] = record
+    return result
+
+
+def _hypersca_gene_list(
+    *, profile_record: Mapping[str, Path], destination: Path, profile: str
+) -> Path:
+    manifest = _strict_json_file(
+        profile_record["manifest"], "profile input record"
+    )
+    selection = manifest.get("gene_selection")
+    if not isinstance(selection, dict) or not isinstance(
+        selection.get("ordered_genes"), list
+    ):
+        raise TaskCRehearsalError("profile input record lacks the fixed gene order")
+    _write_new_record(
+        destination,
+        {
+            "schema_version": "1.0",
+            "selection_id": f"task-c-{profile}-seed-11",
+            "selection_basis": (
+                "公开训练对照细胞中共同表达基因的变异度排序；"
+                "该清单只固定本次对照评估范围。"
+            ),
+            "genes": selection["ordered_genes"],
+        },
+    )
+    return destination
+
+
+def _hypersca_trial_configs(
+    *, base_config: Path, work_dir: Path
+) -> tuple[Path, Path]:
+    base = _strict_json_file(base_config, "HyperSCA-C fixed settings")
+    second = dict(base)
+    shared_l1 = second.get("shared_l1")
+    if isinstance(shared_l1, bool) or not isinstance(shared_l1, (int, float)):
+        raise TaskCRehearsalError("HyperSCA-C shared_l1 setting is invalid")
+    second["shared_l1"] = float(shared_l1) * 2.0
+    first_path = work_dir / "hypersca_config_trial_0.json"
+    second_path = work_dir / "hypersca_config_trial_1.json"
+    _write_new_record(first_path, base)
+    _write_new_record(second_path, second)
+    return first_path, second_path
+
+
+def _run_method_bundle(
+    *,
+    method_id: str,
+    profile_record: Mapping[str, Path] | None,
+    output_dir: Path,
+    seed: int,
+    registry_path: Path,
+    asset_root: Path,
+    public_manifest: Path,
+    context_id: str,
+    min_cells: int,
+    timeout_seconds: int,
+    project_root: Path,
+    hypersca_config: Path | None = None,
+    gene_list: Path | None = None,
+    trial_candidate: Path | None = None,
+    selection_arguments: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    from src.evaluation.task_c_method_run import (
+        TaskCMethodRunError,
+        run_task_c_method,
+    )
+
+    arguments: dict[str, object] = {
+        "method_id": method_id,
+        "input_npz": profile_record["input"] if profile_record else None,
+        "output_dir": output_dir,
+        "seed": seed,
+        "registry_path": registry_path,
+        "asset_root": asset_root,
+        "data_status": "external_benchmark" if profile_record else None,
+        "context_id": context_id if profile_record else None,
+        "min_cells": min_cells,
+        "public_manifest_path": public_manifest if profile_record else None,
+        "derived_input_manifest_path": (
+            profile_record["manifest"] if profile_record else None
+        ),
+        "hypersca_config_path": hypersca_config,
+        "gene_list_path": gene_list,
+        "timeout_seconds": timeout_seconds,
+        "trial_parameters_path": trial_candidate,
+        "project_root": project_root,
+    }
+    if selection_arguments:
+        arguments.update(selection_arguments)
+    try:
+        return run_task_c_method(**arguments)  # type: ignore[arg-type]
+    except TaskCMethodRunError:
+        raise
+
+
+def _method_bundle_status(path: Path) -> tuple[str | None, str | None]:
+    status_path = path / "method_status.json"
+    if not status_path.is_file():
+        return None, None
+    payload = _strict_json_file(status_path, "method result status")
+    status = payload.get("status")
+    reason = payload.get("reason")
+    return (
+        status if isinstance(status, str) else None,
+        reason if isinstance(reason, str) else None,
+    )
+
+
+def _find_failed_method_bundle(
+    work_dir: Path,
+) -> tuple[Path | None, str | None, str | None]:
+    """Find a recorded inner failure without relabeling it as a generic error."""
+
+    for status_path in sorted(work_dir.rglob("method_status.json")):
+        status, reason = _method_bundle_status(status_path.parent)
+        if status in _INNER_TO_REHEARSAL_STATUS and status != (
+            "completed_standardized_output"
+        ):
+            return status_path.parent, status, reason
+    return None, None, None
+
+
+def _select_connection_configuration(
+    *,
+    method_id: str,
+    condition: str,
+    profiles: Mapping[str, Mapping[str, Path]],
+    work_dir: Path,
+    seed: int,
+    registry_path: Path,
+    asset_root: Path,
+    public_manifest: Path,
+    min_cells: int,
+    timeout_seconds: int,
+    project_root: Path,
+    base_hypersca_config: Path,
+) -> tuple[Path, dict[str, object]]:
+    trial_root = work_dir / "trials"
+    trial_root.mkdir(parents=True, mode=0o700)
+    gene_list: Path | None = None
+    configs: tuple[Path | None, Path | None] = (None, None)
+    if method_id == "hypersca_c":
+        gene_list = _hypersca_gene_list(
+            profile_record=profiles["train"],
+            destination=work_dir / "genes.json",
+            profile="connection",
+        )
+        configs = _hypersca_trial_configs(
+            base_config=base_hypersca_config,
+            work_dir=work_dir,
+        )
+
+    trial_dirs: list[Path] = []
+    for trial_index in (0, 1):
+        candidate = work_dir / f"trial_candidate_{trial_index}.json"
+        parameters = (
+            _strict_json_file(configs[trial_index], "HyperSCA-C trial settings")
+            if configs[trial_index] is not None
+            else {}
+        )
+        _write_new_record(
+            candidate,
+            {
+                "schema_version": "1.0",
+                "trial_index": trial_index,
+                "parameters": parameters,
+            },
+        )
+        trial_dir = trial_root / f"trial_{trial_index}"
+        _run_method_bundle(
+            method_id=method_id,
+            profile_record=profiles["train"],
+            output_dir=trial_dir,
+            seed=seed,
+            registry_path=registry_path,
+            asset_root=asset_root,
+            public_manifest=public_manifest,
+            context_id=condition.replace("within_", "") if condition.startswith("within_") else condition,
+            min_cells=min_cells,
+            timeout_seconds=timeout_seconds,
+            project_root=project_root,
+            hypersca_config=configs[trial_index],
+            gene_list=gene_list,
+            trial_candidate=candidate,
+        )
+        inner_status, _reason = _method_bundle_status(trial_dir)
+        if inner_status != "completed_standardized_output":
+            raise TaskCRehearsalError(
+                f"training trial {trial_index} did not produce a complete relation table"
+            )
+        from src.evaluation.task_c_method_run import (
+            TaskCMethodRunError,
+            validate_task_c_method_output_bundle,
+        )
+
+        try:
+            validate_task_c_method_output_bundle(
+                output_dir=trial_dir,
+                input_npz=profiles["train"]["input"],
+                registry_path=registry_path,
+                asset_root=asset_root,
+                public_manifest_path=public_manifest,
+                derived_input_manifest_path=profiles["train"]["manifest"],
+                hypersca_config_path=configs[trial_index],
+                gene_list_path=gene_list,
+                project_root=project_root,
+            )
+        except TaskCMethodRunError as exc:
+            raise TaskCRehearsalError(
+                f"training trial {trial_index} failed reconstruction: {exc}"
+            ) from exc
+        trial_dirs.append(trial_dir)
+
+    selection = work_dir / "selection_record.json"
+    selection_status = Path(f"{selection}.status.json")
+    command = [
+        sys.executable,
+        str(project_root / "scripts/select_task_c_configuration.py"),
+        "--tune-npz",
+        str(profiles["tune"]["input"]),
+        "--profile-manifest",
+        str(profiles["tune"]["manifest"]),
+        "--public-manifest",
+        str(public_manifest),
+        "--output-json",
+        str(selection),
+        "--status-json",
+        str(selection_status),
+        "--config",
+        str(project_root / "configs/task_c_tuning_v1.json"),
+        "--registry",
+        str(registry_path),
+        "--asset-root",
+        str(asset_root),
+    ]
+    for index, trial_dir in enumerate(trial_dirs):
+        command.extend(("--trial-dir", str(trial_dir)))
+        command.extend(
+            ("--trial-input", f"{trial_dir}={profiles['train']['input']}")
+        )
+        command.extend(
+            (
+                "--trial-profile-manifest",
+                f"{trial_dir}={profiles['train']['manifest']}",
+            )
+        )
+        if method_id == "hypersca_c":
+            assert configs[index] is not None and gene_list is not None
+            command.extend(
+                ("--trial-hypersca-config", f"{trial_dir}={configs[index]}")
+            )
+            command.extend(("--trial-gene-list", f"{trial_dir}={gene_list}"))
+    completed = subprocess.run(
+        command,
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise TaskCRehearsalError(
+            "public tuning selection failed: " + _safe_failure_reason(completed.stderr)
+        )
+    selected = _strict_json_file(selection, "selection record")
+    selected_parameters = selected.get("selected_parameters")
+    if not isinstance(selected_parameters, dict):
+        raise TaskCRehearsalError("selection record lacks selected settings")
+    refit_config: Path | None = None
+    if method_id == "hypersca_c":
+        refit_config = work_dir / "selected_refit_config.json"
+        _write_new_record(refit_config, selected_parameters)
+
+    refit = work_dir / "refit"
+    input_bindings = {
+        trial.resolve(): profiles["train"]["input"] for trial in trial_dirs
+    }
+    profile_bindings = {
+        trial.resolve(): profiles["train"]["manifest"] for trial in trial_dirs
+    }
+    selection_arguments: dict[str, object] = {
+        "selection_record_path": selection,
+        "selection_status_path": selection_status,
+        "selection_tune_input_path": profiles["tune"]["input"],
+        "selection_tune_profile_manifest_path": profiles["tune"]["manifest"],
+        "selection_config_path": project_root / "configs/task_c_tuning_v1.json",
+        "selection_trial_directories": tuple(trial_dirs),
+        "selection_trial_input_bindings": input_bindings,
+        "selection_trial_profile_bindings": profile_bindings,
+    }
+    if method_id == "hypersca_c":
+        assert gene_list is not None
+        selection_arguments["selection_trial_hypersca_configs"] = {
+            trial.resolve(): configs[index]
+            for index, trial in enumerate(trial_dirs)
+        }
+        selection_arguments["selection_trial_gene_lists"] = {
+            trial.resolve(): gene_list for trial in trial_dirs
+        }
+    status = _run_method_bundle(
+        method_id=method_id,
+        profile_record=profiles["refit"],
+        output_dir=refit,
+        seed=seed,
+        registry_path=registry_path,
+        asset_root=asset_root,
+        public_manifest=public_manifest,
+        context_id=condition.replace("within_", "") if condition.startswith("within_") else condition,
+        min_cells=min_cells,
+        timeout_seconds=timeout_seconds,
+        project_root=project_root,
+        hypersca_config=refit_config,
+        gene_list=gene_list,
+        selection_arguments=selection_arguments,
+    )
+    return refit, status
+
+
+def _run_formal_final_method(
+    *,
+    method_id: str,
+    condition: str,
+    profile: str,
+    profiles: Mapping[str, Mapping[str, Path]],
+    work_dir: Path,
+    seed: int,
+    registry_path: Path,
+    asset_root: Path,
+    public_manifest: Path,
+    min_cells: int,
+    timeout_seconds: int,
+    project_root: Path,
+    source_kind: str,
+) -> tuple[Path, dict[str, object]]:
+    if profile == "connection" and method_id in {"hypersca_c", "mean_difference"}:
+        return _select_connection_configuration(
+            method_id=method_id,
+            condition=condition,
+            profiles=profiles,
+            work_dir=work_dir,
+            seed=seed,
+            registry_path=registry_path,
+            asset_root=asset_root,
+            public_manifest=public_manifest,
+            min_cells=min_cells,
+            timeout_seconds=timeout_seconds,
+            project_root=project_root,
+            base_hypersca_config=project_root / "configs/hypersca_c_v1.json",
+        )
+
+    refit = work_dir / "refit"
+    if source_kind == "publication_only":
+        status = _run_method_bundle(
+            method_id=method_id,
+            profile_record=None,
+            output_dir=refit,
+            seed=seed,
+            registry_path=registry_path,
+            asset_root=asset_root,
+            public_manifest=public_manifest,
+            context_id=condition,
+            min_cells=min_cells,
+            timeout_seconds=timeout_seconds,
+            project_root=project_root,
+        )
+        return refit, status
+
+    gene_list: Path | None = None
+    config: Path | None = None
+    if method_id == "hypersca_c":
+        gene_list = _hypersca_gene_list(
+            profile_record=profiles["refit"],
+            destination=work_dir / "genes.json",
+            profile=profile,
+        )
+        config = project_root / "configs/hypersca_c_v1.json"
+    status = _run_method_bundle(
+        method_id=method_id,
+        profile_record=profiles["refit"],
+        output_dir=refit,
+        seed=seed,
+        registry_path=registry_path,
+        asset_root=asset_root,
+        public_manifest=public_manifest,
+        context_id=condition.replace("within_", "") if condition.startswith("within_") else condition,
+        min_cells=min_cells,
+        timeout_seconds=timeout_seconds,
+        project_root=project_root,
+        hypersca_config=config,
+        gene_list=gene_list,
+    )
+    return refit, status
+
+
+def _causalbench_python(asset_root: Path, environment_name: str) -> Path:
+    try:
+        completed = subprocess.run(
+            ("conda", "env", "list", "--json"),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        payload = json.loads(completed.stdout)
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+        raise TaskCRehearsalError(
+            "the fixed CausalBench environment cannot be located"
+        ) from exc
+    environments = payload.get("envs") if isinstance(payload, dict) else None
+    if not isinstance(environments, list):
+        raise TaskCRehearsalError(
+            "the fixed CausalBench environment cannot be located"
+        )
+    candidates = [
+        Path(value) / "bin/python"
+        for value in environments
+        if isinstance(value, str) and Path(value).name == environment_name
+    ]
+    if len(candidates) != 1 or not candidates[0].is_file():
+        raise TaskCRehearsalError(
+            "the fixed CausalBench environment cannot be located"
+        )
+    del asset_root
+    return candidates[0].resolve(strict=True)
+
+
+def _reference_edges(path: Path, expected_sha256: str) -> set[tuple[str, str]]:
+    import csv
+
+    observed = _sha256_file(path).removeprefix("sha256:")
+    if expected_sha256.removeprefix("sha256:") != observed:
+        raise TaskCRehearsalError("reference-relation file fingerprint changed")
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            rows = csv.reader(handle)
+            if next(rows, None) != ["source", "target"]:
+                raise TaskCRehearsalError(
+                    "reference-relation table must use source,target columns"
+                )
+            edges = {(source, target) for source, target in rows}
+    except TaskCRehearsalError:
+        raise
+    except (OSError, UnicodeError, csv.Error, ValueError) as exc:
+        raise TaskCRehearsalError(
+            "reference-relation table could not be read"
+        ) from exc
+    if not edges:
+        raise TaskCRehearsalError("reference-relation table is empty")
+    return edges
+
+
+def _formal_scoring(
+    *,
+    condition: str,
+    predictions: Path,
+    prepared_root: Path,
+    asset_root: Path,
+    work_dir: Path,
+    seed: int,
+    registry: Any,
+    project_root: Path,
+    public_profile_input: Path,
+    maximum_cells: int,
+) -> dict[str, object]:
+    scope = _condition_scope(condition)
+    if scope["direction"] is None:
+        source_heldout = prepared_root / "private" / "within" / str(scope["context_id"]) / "holdout.npz"
+    else:
+        source_heldout = prepared_root / "private" / "cross" / condition / "target_holdout.npz"
+    private_root = Path(tempfile.mkdtemp(prefix="private-task-c-scoring-"))
+    try:
+        heldout = materialize_sealed_scoring_subset(
+            source_path=source_heldout,
+            public_profile_input=public_profile_input,
+            destination=private_root / "heldout-profile.npz",
+            maximum_cells=maximum_cells,
+            seed=seed,
+        )
+        metrics = _formal_scoring_subset(
+            condition=condition,
+            predictions=predictions,
+            prepared_root=prepared_root,
+            asset_root=asset_root,
+            work_dir=work_dir,
+            seed=seed,
+            registry=registry,
+            project_root=project_root,
+            heldout=heldout,
+            private_root=private_root,
+        )
+        metrics["sealed_scoring_input"] = {
+            "source_sha256": _sha256_file(source_heldout),
+            "profile_subset_sha256": _sha256_file(heldout),
+            "public_profile_input_sha256": _sha256_file(public_profile_input),
+        }
+        return metrics
+    finally:
+        if private_root.exists() and not private_root.is_symlink():
+            shutil.rmtree(private_root)
+
+
+def _formal_scoring_subset(
+    *,
+    condition: str,
+    predictions: Path,
+    prepared_root: Path,
+    asset_root: Path,
+    work_dir: Path,
+    seed: int,
+    registry: Any,
+    project_root: Path,
+    heldout: Path,
+    private_root: Path,
+) -> dict[str, object]:
+    import pandas as pd
+
+    from src.evaluation.task_c_aggregation import (
+        TaskCAggregationError,
+        evaluate_declared_references,
+        task_c_aggregation_to_jsonable,
+    )
+
+    scope = _condition_scope(condition)
+    prediction_sha256 = _sha256_file(predictions)
+    heldout_sha256 = _sha256_file(heldout)
+    evaluation_worker = project_root / "scripts/task_c_workers/causalbench_evaluation_worker.py"
+    boundary_worker = project_root / "scripts/task_c_workers/causalbench_worker.py"
+    python = _causalbench_python(
+        asset_root, str(registry.causalbench["environment"])
+    )
+    official_output = work_dir / "sealed_scoring.json"
+    command = (
+        str(python),
+        "-I",
+        str(evaluation_worker),
+        "--prediction-csv",
+        str(predictions),
+        "--heldout-npz",
+        str(heldout),
+        "--output-json",
+        str(official_output),
+        "--seed",
+        str(seed),
+        "--causalbench-source",
+        str(asset_root / "sources/causalbench"),
+    )
+    snapshots = (
+        freeze_method_worker_entry(evaluation_worker),
+        freeze_method_worker_entry(boundary_worker),
+    )
+    completed = run_validated_private_scoring_command(
+        command,
+        private_root=private_root,
+        execution_cwd=project_root,
+        allowed_python_interpreters=(python,),
+        allowed_worker_snapshots=snapshots,
+        allowed_private_inputs=(heldout,),
+        timeout_seconds=1_800,
+    )
+    official = _strict_json_file(official_output, "sealed scoring result")
+    if (
+        _sha256_file(predictions) != prediction_sha256
+        or _sha256_file(heldout) != heldout_sha256
+    ):
+        raise TaskCRehearsalError(
+            "sealed scoring inputs changed while the approved worker was running"
+        )
+    if completed.returncode != 0 or official.get("status") != (
+        "supplementary_official_metrics"
+    ):
+        raise TaskCRehearsalError(
+            "sealed scoring did not complete: "
+            + _safe_failure_reason(official.get("error", completed.stderr))
+        )
+    if "metrics" not in official:
+        raise TaskCRehearsalError(
+            "sealed scoring result lacks the official supplementary metrics"
+        )
+
+    provenance_root = prepared_root.parents[1] / "provenance"
+    reference = _strict_json_file(
+        provenance_root / f"{scope['target_context']}_references.json",
+        "reference-relation provenance",
+    )
+    files = reference.get("files")
+    if not isinstance(files, dict):
+        raise TaskCRehearsalError("reference-relation provenance lacks files")
+    pooled_record = files.get("pooled")
+    chip_record = files.get("chipseq")
+    if not isinstance(pooled_record, dict) or not isinstance(chip_record, dict):
+        raise TaskCRehearsalError("reference-relation provenance lacks file records")
+    pooled = _reference_edges(
+        Path(str(pooled_record.get("path"))), str(pooled_record.get("sha256"))
+    )
+    chip = _reference_edges(
+        Path(str(chip_record.get("path"))), str(chip_record.get("sha256"))
+    )
+    try:
+        with np.load(heldout, allow_pickle=False) as archive:
+            labels = np.asarray(archive["interventions"], dtype=str)
+        eligible_sources = set(labels.tolist()) - {CONTROL_LABEL, "excluded"}
+        scores = pd.read_csv(predictions)
+        biological = evaluate_declared_references(
+            scores,
+            pooled_reference=pooled,
+            directed_chip_reference=chip,
+            eligible_sources=eligible_sources,
+            directed_reference_context_match=(scope["target_context"] == "k562"),
+            precision_values=(1_000, 5_000),
+        )
+    except (OSError, ValueError, KeyError, TaskCAggregationError) as exc:
+        raise TaskCRehearsalError(
+            f"sealed biological-reference scoring failed: {exc}"
+        ) from exc
+    metrics = task_c_aggregation_to_jsonable(biological)
+    if (
+        _sha256_file(predictions) != prediction_sha256
+        or _sha256_file(heldout) != heldout_sha256
+    ):
+        raise TaskCRehearsalError(
+            "sealed scoring inputs changed during biological-reference scoring"
+        )
+    assert isinstance(metrics, dict)
+    metrics["supplementary_official_metrics"] = official["metrics"]
+    metrics["sealed_scoring_status"] = official["status"]
+    return metrics
+
+
+def _promotion_record() -> dict[str, object]:
+    return {
+        "schema_version": "1.0",
+        "status": "workflow_validation_only",
+        "claim_level": "workflow_validation_only",
+        "promotion_eligible": False,
+        "reason": (
+            "Single-seed reduced-data rehearsal validates execution and resource readiness only."
+        ),
+    }
+
+
+def _outer_environment_record(
+    *,
+    method_id: str,
+    condition: str,
+    profile: str,
+    synthetic_smoke: bool,
+    inner_dir: Path | None,
+) -> dict[str, object]:
+    return {
+        "schema_version": "1.0",
+        "method_id": method_id,
+        "condition": condition,
+        "profile": profile,
+        "data_scope": "synthetic_smoke" if synthetic_smoke else "external_benchmark",
+        "python": {
+            "version": ".".join(str(value) for value in sys.version_info[:3]),
+            "executable_sha256": _sha256_file(Path(sys.executable).resolve()),
+        },
+        "inner_method_evidence": (
+            str(inner_dir.relative_to(inner_dir.parents[3]))
+            if inner_dir is not None and len(inner_dir.parents) > 3
+            else None
+        ),
+        "private_data_received_by_method": False,
+    }
+
+
+def _resource_record(inner_dir: Path | None, *, null_repeat_count: int) -> dict[str, object]:
+    inner: object = None
+    if inner_dir is not None:
+        candidates = sorted(inner_dir.rglob("resource_usage.json"))
+        if candidates:
+            inner = _strict_json_file(candidates[-1], "method resource record")
+    return {
+        "schema_version": "1.0",
+        "resource_scope": "single-seed reduced-data rehearsal",
+        "method_resource_record": inner,
+        "null_control_repeat_count_per_type": null_repeat_count,
+    }
+
+
+def _publish_outer_success(
+    *,
+    destination: Path,
+    method_id: str,
+    condition: str,
+    profile: str,
+    seed: int,
+    predictions: Any,
+    metrics: Mapping[str, object],
+    input_summary: Mapping[str, object],
+    inner_dir: Path | None,
+    synthetic_smoke: bool,
+    required_artifacts: Sequence[str],
+) -> None:
+    staging = destination.parent / f".{destination.name}.staging"
+    if staging.exists() or destination.exists():
+        raise TaskCRehearsalError("run result directory already exists")
+    staging.mkdir(parents=True, mode=0o700)
+    try:
+        predictions.to_csv(staging / "predictions.csv", index=False)
+        run_identity = {
+            "schema_version": "1.0",
+            "profile": profile,
+            "condition": condition,
+            "method_id": method_id,
+            "seed": seed,
+            "input_summary_sha256": _canonical_sha256(input_summary),
+            "prediction_sha256": _sha256_file(staging / "predictions.csv"),
+        }
+        identity_sha256 = _canonical_sha256(run_identity)
+        _write_new_record(
+            staging / "run_manifest.json",
+            {
+                **run_identity,
+                "run_identity_sha256": identity_sha256,
+                "claim_level": "workflow_validation_only",
+            },
+        )
+        _write_new_record(staging / "input_summary.json", dict(input_summary))
+        _write_new_record(staging / "metrics.json", dict(metrics))
+        _write_new_record(staging / "promotion_decision.json", _promotion_record())
+        _write_new_record(
+            staging / "environment_manifest.json",
+            _outer_environment_record(
+                method_id=method_id,
+                condition=condition,
+                profile=profile,
+                synthetic_smoke=synthetic_smoke,
+                inner_dir=inner_dir,
+            ),
+        )
+        _write_new_record(
+            staging / "resource_usage.json",
+            _resource_record(inner_dir, null_repeat_count=20),
+        )
+        _write_new_record(
+            staging / "method_status.json",
+            {
+                "schema_version": "1.0",
+                "method_id": method_id,
+                "condition": condition,
+                "seed": seed,
+                "run_identity_sha256": identity_sha256,
+                "status": "passed_real_rehearsal",
+                "controller_validation": "verified_task_c_rehearsal_bundle_v1",
+            },
+        )
+        validate_required_run_artifacts(staging, required_artifacts)
+        os.rename(staging, destination)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
+
+def _publish_outer_failure(
+    *,
+    destination: Path,
+    method_id: str,
+    condition: str,
+    profile: str,
+    seed: int,
+    status: str,
+    reason: str,
+    inner_dir: Path | None,
+    synthetic_smoke: bool,
+) -> None:
+    if status not in _FINAL_REHEARSAL_STATUSES - {"passed_real_rehearsal"}:
+        raise TaskCRehearsalError("failure status is not recognized")
+    staging = destination.parent / f".{destination.name}.staging"
+    if staging.exists() or destination.exists():
+        raise TaskCRehearsalError("run result directory already exists")
+    staging.mkdir(parents=True, mode=0o700)
+    try:
+        identity_sha256 = _canonical_sha256(
+            {
+                "profile": profile,
+                "condition": condition,
+                "method_id": method_id,
+                "seed": seed,
+                "failure_status": status,
+            }
+        )
+        _write_new_record(
+            staging / "environment_manifest.json",
+            _outer_environment_record(
+                method_id=method_id,
+                condition=condition,
+                profile=profile,
+                synthetic_smoke=synthetic_smoke,
+                inner_dir=inner_dir,
+            ),
+        )
+        _write_new_record(
+            staging / "resource_usage.json",
+            _resource_record(inner_dir, null_repeat_count=0),
+        )
+        _write_new_record(
+            staging / "method_status.json",
+            {
+                "schema_version": "1.0",
+                "method_id": method_id,
+                "condition": condition,
+                "seed": seed,
+                "run_identity_sha256": identity_sha256,
+                "status": status,
+                "controller_validation": "verified_task_c_rehearsal_bundle_v1",
+                "reason": _safe_failure_reason(reason),
+            },
+        )
+        os.rename(staging, destination)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
+
+def _validate_prepared_rehearsal_inputs(
+    *,
+    prepared_root: Path,
+    method_assets_root: Path,
+    synthetic_smoke: bool,
+) -> tuple[Path, dict[str, Any]]:
+    public_manifest = prepared_root / "public_manifest.json"
+    public = _strict_json_file(public_manifest, "public data record")
+    if public.get("seed") != 11:
+        raise TaskCRehearsalError("rehearsal public data must use fixed seed 11")
+    files = public.get("files")
+    if not isinstance(files, dict) or not files:
+        raise TaskCRehearsalError("public data record lacks its fixed file inventory")
+    for relative, expected in files.items():
+        if not isinstance(relative, str) or not isinstance(expected, str):
+            raise TaskCRehearsalError("public data file inventory is malformed")
+        path = prepared_root / relative
+        if _sha256_file(path).removeprefix("sha256:") != expected.removeprefix(
+            "sha256:"
+        ):
+            raise TaskCRehearsalError(
+                f"public data file fingerprint changed: {relative}"
+            )
+    if synthetic_smoke:
+        return public_manifest, public
+
+    private_manifest = prepared_root / "private/private_manifest.json"
+    private = _strict_json_file(private_manifest, "sealed data record")
+    private_files = private.get("files")
+    if not isinstance(private_files, dict) or not private_files:
+        raise TaskCRehearsalError("sealed data record lacks its fixed file inventory")
+    for relative, expected in private_files.items():
+        if not isinstance(relative, str) or not isinstance(expected, str):
+            raise TaskCRehearsalError("sealed data file inventory is malformed")
+        path = prepared_root / relative
+        if _sha256_file(path).removeprefix("sha256:") != expected.removeprefix(
+            "sha256:"
+        ):
+            raise TaskCRehearsalError(
+                f"sealed data file fingerprint changed: {relative}"
+            )
+    if prepared_root.name != "seed_11":
+        raise TaskCRehearsalError("formal rehearsal must use the seed_11 split directory")
+    split_root = prepared_root.parent
+    for split_seed in _FULL_RUN_SEEDS:
+        sibling = split_root / f"seed_{split_seed}/public_manifest.json"
+        sibling_record = _strict_json_file(
+            sibling, f"public data record for seed {split_seed}"
+        )
+        if sibling_record.get("seed") != split_seed:
+            raise TaskCRehearsalError(
+                f"public data record for seed {split_seed} has the wrong identity"
+            )
+        sibling_files = sibling_record.get("files")
+        if not isinstance(sibling_files, dict) or not sibling_files:
+            raise TaskCRehearsalError(
+                f"public data record for seed {split_seed} lacks its file inventory"
+            )
+        for relative, expected in sibling_files.items():
+            if not isinstance(relative, str) or not isinstance(expected, str):
+                raise TaskCRehearsalError(
+                    f"public data file inventory for seed {split_seed} is malformed"
+                )
+            if _sha256_file(sibling.parent / relative).removeprefix(
+                "sha256:"
+            ) != expected.removeprefix("sha256:"):
+                raise TaskCRehearsalError(
+                    f"public data file fingerprint changed for seed {split_seed}: {relative}"
+                )
+    provenance = prepared_root.parents[1] / "provenance"
+    for context in ("k562", "rpe1"):
+        _strict_json_file(provenance / f"{context}.json", "expression provenance")
+        reference = _strict_json_file(
+            provenance / f"{context}_references.json",
+            "reference-relation provenance",
+        )
+        records = reference.get("files")
+        if not isinstance(records, dict):
+            raise TaskCRehearsalError(
+                "reference-relation provenance lacks file records"
+            )
+        for kind in ("pooled", "chipseq"):
+            record = records.get(kind)
+            if not isinstance(record, dict):
+                raise TaskCRehearsalError(
+                    "reference-relation provenance lacks a required file"
+                )
+            _reference_edges(
+                Path(str(record.get("path"))), str(record.get("sha256"))
+            )
+    for required in (
+        method_assets_root / "bootstrap_identity.json",
+        method_assets_root / "bootstrap_manifest.json",
+    ):
+        _strict_json_file(required, "fixed method-asset record")
+    return public_manifest, public
+
+
+def _controller_identity(
+    *,
+    profile: str,
+    methods: tuple[str, ...],
+    synthetic_smoke: bool,
+    public_manifest: Path,
+    registry_path: Path,
+    rehearsal_config_path: Path,
+    method_assets_root: Path,
+) -> dict[str, object]:
+    asset_identity = None
+    if not synthetic_smoke:
+        asset_identity = _sha256_file(method_assets_root / "bootstrap_identity.json")
+    return {
+        "schema_version": "1.0",
+        "profile": profile,
+        "methods": list(methods),
+        "conditions": list(REHEARSAL_CONDITIONS),
+        "seed": 11,
+        "synthetic_smoke": synthetic_smoke,
+        "public_manifest_sha256": _sha256_file(public_manifest),
+        "method_registry_sha256": _sha256_file(registry_path),
+        "rehearsal_config_sha256": _sha256_file(rehearsal_config_path),
+        "method_assets_identity_sha256": asset_identity,
+        "claim_level": "workflow_validation_only",
+        "promotion_eligible": False,
+    }
+
+
+def _resume_verified_rehearsal(
+    *,
+    output_root: Path,
+    expected_identity: Mapping[str, object],
+    required_artifacts: Sequence[str],
+) -> dict[str, object]:
+    manifest_path = output_root / "controller_manifest.json"
+    observed = _strict_json_file(manifest_path, "rehearsal controller record")
+    if observed.get("identity") != dict(expected_identity):
+        raise TaskCRehearsalError(
+            "existing rehearsal identity differs from the requested inputs"
+        )
+    run_dirs = sorted((output_root / "runs").iterdir())
+    for run_dir in run_dirs:
+        status = _strict_json_file(run_dir / "method_status.json", "method status")
+        if status.get("status") == "passed_real_rehearsal":
+            validate_required_run_artifacts(run_dir, required_artifacts)
+    expected_inventory = observed.get("file_inventory")
+    actual_inventory = _tree_inventory(
+        output_root, exclude=frozenset({"controller_manifest.json"})
+    )
+    if expected_inventory != actual_inventory:
+        raise TaskCRehearsalError(
+            "existing rehearsal output fingerprint changed"
+        )
+    summary = observed.get("summary")
+    if not isinstance(summary, dict):
+        raise TaskCRehearsalError("existing rehearsal summary is missing")
+    return {**summary, "resume_status": "verified_existing_output"}
+
+
+def _outer_input_summary(
+    *,
+    condition: str,
+    profile: str,
+    profile_records: Mapping[str, Mapping[str, Path]],
+    method_id: str,
+    synthetic_smoke: bool,
+) -> dict[str, object]:
+    stages: dict[str, object] = {}
+    for stage in ("train", "tune", "refit"):
+        manifest = _strict_json_file(
+            profile_records[stage]["manifest"], "profile input record"
+        )
+        transformation = manifest.get("transformation")
+        standardization = None
+        if transformation == CROSS_TRANSFORMATION:
+            standardization = {
+                "center": "control mean in each environment",
+                "control_label": CONTROL_LABEL,
+                "low_scale_replacement": 1.0,
+                "low_scale_threshold": 1e-6,
+                "scale": "control population standard deviation (ddof=0)",
+            }
+        stages[stage] = {
+            "input_sha256": _sha256_file(profile_records[stage]["input"]),
+            "profile_manifest_sha256": _sha256_file(
+                profile_records[stage]["manifest"]
+            ),
+            "parent_files": [
+                {
+                    "public_relative_path": context.get("public_relative_path"),
+                    "role": context.get("role"),
+                }
+                for context in manifest.get("contexts", [])
+                if isinstance(context, dict)
+            ],
+            "transformation": transformation,
+            "control_standardization": standardization,
+            "environment_labels": manifest.get("environment_labels"),
+        }
+    return {
+        "schema_version": "1.0",
+        "profile": profile,
+        "condition": condition,
+        "method_id": method_id,
+        "stages": stages,
+        "training_tuning_and_final_fit_are_separate": True,
+        "private_data_received_by_method": False,
+        "data_scope": "synthetic_smoke" if synthetic_smoke else "external_benchmark",
+        "interpretation": (
+            "This reduced, single-seed run checks execution and evidence boundaries; "
+            "it is not a real-data performance conclusion."
+        ),
+    }
+
+
+def run_task_c_rehearsal(
+    *,
+    profile: str,
+    prepared_root: Path,
+    method_assets_root: Path,
+    output_root: Path,
+    method_ids: Sequence[str],
+    resume: bool = False,
+    synthetic_smoke: bool = False,
+    project_root: Path | None = None,
+) -> dict[str, object]:
+    """Run the fixed four-condition rehearsal without raising its claim level."""
+
+    from src.evaluation.task_c_method_registry import (
+        TaskCMethodRegistryError,
+        load_task_c_method_registry,
+    )
+    from src.evaluation.task_c_method_run import TaskCMethodRunError
+
+    if type(resume) is not bool or type(synthetic_smoke) is not bool:
+        raise TaskCRehearsalError("resume and synthetic_smoke must be true or false")
+    root = (project_root or Path(__file__).resolve().parents[2]).resolve(strict=True)
+    config_path = root / "configs/task_c_rehearsal_v1.json"
+    registry_path = root / "configs/task_c_methods_v1.json"
+    config = load_task_c_rehearsal_config(config_path)
+    if profile not in config.profiles:
+        raise TaskCRehearsalError("profile must be connection or comprehensive")
+    methods = _fixed_text_tuple(method_ids, "rehearsal methods")
+    if len(set(methods)) != len(methods):
+        raise TaskCRehearsalError("rehearsal methods must be unique")
+    try:
+        registry = load_task_c_method_registry(registry_path)
+    except TaskCMethodRegistryError as exc:
+        raise TaskCRehearsalError(str(exc)) from exc
+    unknown = [method for method in methods if method not in registry.methods]
+    if unknown:
+        raise TaskCRehearsalError(f"methods are not registered: {unknown}")
+
+    prepared = Path(os.path.abspath(os.fspath(prepared_root.expanduser())))
+    assets = Path(os.path.abspath(os.fspath(method_assets_root.expanduser())))
+    output = Path(os.path.abspath(os.fspath(output_root.expanduser())))
+    if _has_private_component(prepared) or _has_private_component(output):
+        raise TaskCRehearsalError(
+            "public rehearsal inputs and outputs must not use a private path"
+        )
+    public_manifest, public = _validate_prepared_rehearsal_inputs(
+        prepared_root=prepared,
+        method_assets_root=assets,
+        synthetic_smoke=synthetic_smoke,
+    )
+    identity = _controller_identity(
+        profile=profile,
+        methods=methods,
+        synthetic_smoke=synthetic_smoke,
+        public_manifest=public_manifest,
+        registry_path=registry_path,
+        rehearsal_config_path=config_path,
+        method_assets_root=assets,
+    )
+    if output.exists() or output.is_symlink():
+        if not resume:
+            raise TaskCRehearsalError(
+                "output root already exists; use --resume only for an exact verified run"
+            )
+        return _resume_verified_rehearsal(
+            output_root=output,
+            expected_identity=identity,
+            required_artifacts=config.required_artifacts,
+        )
+
+    output.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{output.name}.staging-", dir=output.parent)
+    )
+    published = False
+    try:
+        profiles = _profile_inputs(
+            public_manifest=public_manifest,
+            profile=profile,
+            staging=staging,
+        )
+        (staging / "runs").mkdir(mode=0o700)
+        (staging / "work").mkdir(mode=0o700)
+        statuses: dict[str, str] = {}
+        min_cells = public.get("min_cells_per_intervention")
+        if isinstance(min_cells, bool) or not isinstance(min_cells, int):
+            raise TaskCRehearsalError("public minimum cell count is invalid")
+        timeout = config.profiles[profile].timeout_seconds_per_method
+
+        for condition in REHEARSAL_CONDITIONS:
+            condition_profiles = profiles[condition]
+            for method_id in methods:
+                run_id = build_rehearsal_run_id(
+                    profile=profile,
+                    condition=condition,
+                    method_id=method_id,
+                    seed=config.seed,
+                )
+                outer = staging / "runs" / run_id
+                work = staging / "work" / condition / method_id
+                work.mkdir(parents=True, mode=0o700)
+                inner_dir: Path | None = None
+                status_name: str | None = None
+                reason: str | None = None
+                try:
+                    spec = registry.methods[method_id]
+                    if spec.source_kind == "publication_only":
+                        status_name = "official_assets_unavailable"
+                        reason = (
+                            "The registered publication has no runnable official assets; "
+                            "no substitute prediction was created."
+                        )
+                    elif synthetic_smoke:
+                        predictions = _synthetic_predictions(
+                            method_id=method_id,
+                            profile_record=condition_profiles["refit"],
+                            seed=config.seed,
+                        )
+                        if profile == "connection" and method_id in {
+                            "hypersca_c",
+                            "mean_difference",
+                        }:
+                            _write_new_record(
+                                work / "selection_record.json",
+                                {
+                                    "schema_version": "1.0",
+                                    "status": "synthetic_selection_closure",
+                                    "trial_count": 2,
+                                    "selected_trial_index": 0,
+                                    "train_input_sha256": _sha256_file(
+                                        condition_profiles["train"]["input"]
+                                    ),
+                                    "tune_input_sha256": _sha256_file(
+                                        condition_profiles["tune"]["input"]
+                                    ),
+                                    "refit_input_sha256": _sha256_file(
+                                        condition_profiles["refit"]["input"]
+                                    ),
+                                    "claim_level": "workflow_validation_only",
+                                },
+                            )
+                        metrics: dict[str, object] = {
+                            "average_precision": 1.0,
+                            "metric_scope": "synthetic workflow closure only",
+                        }
+                        if method_id in {"hypersca_c", "mean_difference"}:
+                            try:
+                                metrics["null_controls"] = _null_control_records(
+                                    predictions=predictions,
+                                    profile_record=condition_profiles["refit"],
+                                    seed=config.seed,
+                                    synthetic_smoke=True,
+                                )
+                            except (ValueError, TypeError, OSError) as exc:
+                                raise TaskCRehearsalError(
+                                    f"null-control workflow failed: {exc}"
+                                ) from exc
+                        _publish_outer_success(
+                            destination=outer,
+                            method_id=method_id,
+                            condition=condition,
+                            profile=profile,
+                            seed=config.seed,
+                            predictions=predictions,
+                            metrics=metrics,
+                            input_summary=_outer_input_summary(
+                                condition=condition,
+                                profile=profile,
+                                profile_records=condition_profiles,
+                                method_id=method_id,
+                                synthetic_smoke=True,
+                            ),
+                            inner_dir=None,
+                            synthetic_smoke=True,
+                            required_artifacts=config.required_artifacts,
+                        )
+                        status_name = "passed_real_rehearsal"
+                    else:
+                        inner_dir, inner = _run_formal_final_method(
+                            method_id=method_id,
+                            condition=condition,
+                            profile=profile,
+                            profiles=condition_profiles,
+                            work_dir=work,
+                            seed=config.seed,
+                            registry_path=registry_path,
+                            asset_root=assets,
+                            public_manifest=public_manifest,
+                            min_cells=min_cells,
+                            timeout_seconds=timeout,
+                            project_root=root,
+                            source_kind=spec.source_kind,
+                        )
+                        inner_name = inner.get("status")
+                        if not isinstance(inner_name, str):
+                            raise TaskCRehearsalError(
+                                "method result lacks a final status"
+                            )
+                        status_name = classify_rehearsal_method_status(inner_name)
+                        if status_name != "passed_real_rehearsal":
+                            _inner_status, inner_reason = _method_bundle_status(inner_dir)
+                            reason = inner_reason or f"method ended with {inner_name}"
+                        else:
+                            predictions_path = inner_dir / "predictions.csv"
+                            # Connection trials are reconstructed inside the fixed
+                            # selector.  The final selected refit is then validated by
+                            # run_task_c_method's selection replay before publication.
+                            if not predictions_path.is_file():
+                                raise TaskCRehearsalError(
+                                    "completed method lacks the complete relation table"
+                                )
+                            import pandas as pd
+
+                            predictions = pd.read_csv(predictions_path)
+                            metrics = _formal_scoring(
+                                condition=condition,
+                                predictions=predictions_path,
+                                prepared_root=prepared,
+                                asset_root=assets,
+                                work_dir=work,
+                                seed=config.seed,
+                                registry=registry,
+                                project_root=root,
+                                public_profile_input=condition_profiles["refit"]["input"],
+                                maximum_cells=config.profiles[
+                                    profile
+                                ].maximum_cells_per_context,
+                            )
+                            if method_id in {"hypersca_c", "mean_difference"}:
+                                try:
+                                    metrics["null_controls"] = _null_control_records(
+                                        predictions=predictions,
+                                        profile_record=condition_profiles["refit"],
+                                        seed=config.seed,
+                                        synthetic_smoke=False,
+                                    )
+                                except (ValueError, TypeError, OSError) as exc:
+                                    raise TaskCRehearsalError(
+                                        f"null-control workflow failed: {exc}"
+                                    ) from exc
+                            _publish_outer_success(
+                                destination=outer,
+                                method_id=method_id,
+                                condition=condition,
+                                profile=profile,
+                                seed=config.seed,
+                                predictions=predictions,
+                                metrics=metrics,
+                                input_summary=_outer_input_summary(
+                                    condition=condition,
+                                    profile=profile,
+                                    profile_records=condition_profiles,
+                                    method_id=method_id,
+                                    synthetic_smoke=False,
+                                ),
+                                inner_dir=inner_dir,
+                                synthetic_smoke=False,
+                                required_artifacts=config.required_artifacts,
+                            )
+                    if status_name != "passed_real_rehearsal":
+                        assert status_name is not None
+                        _publish_outer_failure(
+                            destination=outer,
+                            method_id=method_id,
+                            condition=condition,
+                            profile=profile,
+                            seed=config.seed,
+                            status=status_name,
+                            reason=reason or status_name,
+                            inner_dir=inner_dir,
+                            synthetic_smoke=synthetic_smoke,
+                        )
+                except (
+                    TaskCMethodRunError,
+                    TaskCRehearsalError,
+                    OSError,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                ) as exc:
+                    if outer.exists():
+                        raise
+                    if inner_dir is None:
+                        candidate = work / "refit"
+                        inner_dir = candidate if candidate.exists() else None
+                    inner_status, inner_reason = (
+                        _method_bundle_status(inner_dir)
+                        if inner_dir is not None
+                        else (None, None)
+                    )
+                    if inner_status not in _INNER_TO_REHEARSAL_STATUS:
+                        found_dir, found_status, found_reason = (
+                            _find_failed_method_bundle(work)
+                        )
+                        if found_dir is not None:
+                            inner_dir = found_dir
+                            inner_status = found_status
+                            inner_reason = found_reason
+                    status_name = _classify_controller_failure(exc, inner_status)
+                    reason = inner_reason or _safe_failure_reason(exc)
+                    _publish_outer_failure(
+                        destination=outer,
+                        method_id=method_id,
+                        condition=condition,
+                        profile=profile,
+                        seed=config.seed,
+                        status=status_name,
+                        reason=reason,
+                        inner_dir=inner_dir,
+                        synthetic_smoke=synthetic_smoke,
+                    )
+                statuses[f"{condition}/{method_id}"] = str(status_name)
+
+        summary: dict[str, object] = {
+            "schema_version": "1.0",
+            "profile": profile,
+            "attempted_methods": list(methods),
+            "conditions": list(REHEARSAL_CONDITIONS),
+            "attempted_run_count": len(methods) * len(REHEARSAL_CONDITIONS),
+            "status_counts": dict(sorted(Counter(statuses.values()).items())),
+            "claim_level": "workflow_validation_only",
+            "promotion_eligible": False,
+            "resume_status": "new_run",
+        }
+        inventory = _tree_inventory(staging)
+        _write_new_record(
+            staging / "controller_manifest.json",
+            {
+                "schema_version": "1.0",
+                "identity": identity,
+                "identity_sha256": _canonical_sha256(identity),
+                "file_inventory": inventory,
+                "summary": summary,
+            },
+        )
+        if output.exists() or output.is_symlink():
+            raise TaskCRehearsalError("output root appeared before publication")
+        os.rename(staging, output)
+        published = True
+        return summary
+    finally:
+        if not published and staging.exists() and not staging.is_symlink():
+            shutil.rmtree(staging)
