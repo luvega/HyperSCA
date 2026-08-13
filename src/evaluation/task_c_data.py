@@ -86,12 +86,15 @@ def load_task_c_dataset(path: Path | str, *, context_id: str) -> TaskCDataset:
 
     if expression.ndim != 2:
         raise TaskCDataError("expression_matrix must be two-dimensional")
-    if expression.shape[0] == 0 or expression.shape[1] < 1:
-        raise TaskCDataError("expression_matrix must have rows and at least one gene column")
+    if expression.shape[0] == 0 or expression.shape[1] < 2:
+        raise TaskCDataError("expression_matrix must have rows and at least two gene columns")
     if not np.issubdtype(expression.dtype, np.number) or not np.all(np.isfinite(expression)):
         raise TaskCDataError("expression_matrix values must be finite numeric values")
-    labels = _text_vector(interventions_raw, "intervention labels")
-    genes = _text_vector(genes_raw, "gene names")
+    try:
+        labels = _text_vector(interventions_raw, "intervention labels")
+        genes = _text_vector(genes_raw, "gene names")
+    except UnicodeError as exc:
+        raise TaskCDataError("intervention labels or gene names contain invalid UTF-8") from exc
     if expression.shape[0] != len(labels):
         raise TaskCDataError("expression rows must equal intervention labels")
     if expression.shape[1] != len(genes):

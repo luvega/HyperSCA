@@ -44,13 +44,20 @@ def test_duplicate_genes_are_rejected(tmp_path):
 
 def test_provenance_is_pinned_and_json_safe(tmp_path):
     path = tmp_path / "dataset.npz"
-    write_dataset(path, ["A"], ["non-targeting"])
+    write_dataset(path, ["A", "B"], ["non-targeting"])
     dataset = load_task_c_dataset(path, context_id="k562")
     provenance = build_task_c_provenance(dataset)
     assert provenance["context"] == "k562"
     assert provenance["commit"] == CAUSALBENCH_COMMIT
     assert provenance["input_sha256"].startswith("sha256:")
     json.dumps(provenance, allow_nan=False)
+
+
+def test_one_gene_dataset_is_rejected(tmp_path):
+    path = tmp_path / "one-gene.npz"
+    write_dataset(path, ["A"], ["non-targeting"])
+    with pytest.raises(TaskCDataError, match="at least two gene columns"):
+        load_task_c_dataset(path, context_id="k562")
 
 
 def test_reference_provenance_distinguishes_primary_and_directed_sources(tmp_path):
@@ -76,18 +83,36 @@ def test_missing_array_is_rejected(tmp_path):
 
 def test_nonfinite_expression_is_rejected(tmp_path):
     path = tmp_path / "nonfinite.npz"
-    np.savez(path, expression_matrix=np.asarray([[np.nan]]),
-             interventions=np.asarray(["non-targeting"]), var_names=np.asarray(["A"]))
+    np.savez(path, expression_matrix=np.asarray([[np.nan, 0.0]]),
+             interventions=np.asarray(["non-targeting"]), var_names=np.asarray(["A", "B"]))
     with pytest.raises(TaskCDataError, match="finite"):
         load_task_c_dataset(path, context_id="k562")
 
 
 def test_empty_intervention_label_is_rejected(tmp_path):
     path = tmp_path / "empty-label.npz"
-    write_dataset(path, ["A"], ["non-targeting"])
-    np.savez(path, expression_matrix=np.ones((2, 1)),
-             interventions=np.asarray(["non-targeting", ""]), var_names=np.asarray(["A"]))
+    write_dataset(path, ["A", "B"], ["non-targeting", "A"])
+    np.savez(path, expression_matrix=np.ones((2, 2)),
+             interventions=np.asarray(["non-targeting", ""]), var_names=np.asarray(["A", "B"]))
     with pytest.raises(TaskCDataError, match="intervention labels"):
+        load_task_c_dataset(path, context_id="k562")
+
+
+def test_invalid_utf8_intervention_bytes_are_rejected(tmp_path):
+    path = tmp_path / "bad-intervention-encoding.npz"
+    np.savez(path, expression_matrix=np.ones((1, 2)),
+             interventions=np.asarray([b"non-targeting\xff"]),
+             var_names=np.asarray(["A", "B"]))
+    with pytest.raises(TaskCDataError, match="intervention labels"):
+        load_task_c_dataset(path, context_id="k562")
+
+
+def test_invalid_utf8_gene_bytes_are_rejected(tmp_path):
+    path = tmp_path / "bad-gene-encoding.npz"
+    np.savez(path, expression_matrix=np.ones((1, 2)),
+             interventions=np.asarray(["non-targeting"]),
+             var_names=np.asarray([b"A\xff", b"B"]))
+    with pytest.raises(TaskCDataError, match="gene names"):
         load_task_c_dataset(path, context_id="k562")
 
 
