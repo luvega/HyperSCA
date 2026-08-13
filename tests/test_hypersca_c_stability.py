@@ -22,6 +22,27 @@ from src.causal.hypersca_c_stability import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class DuplicateItems(Mapping[str, object]):
+    def __init__(self, pairs: tuple[tuple[str, object], ...]) -> None:
+        self._pairs = pairs
+        self._keys = tuple(dict.fromkeys(key for key, _ in pairs))
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._keys)
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+    def __getitem__(self, key: str) -> object:
+        for candidate, value in self._pairs:
+            if candidate == key:
+                return value
+        raise KeyError(key)
+
+    def items(self) -> object:
+        return self._pairs
+
+
 def default_config(**changes: object) -> HyperSCACConfig:
     payload = json.loads(
         (ROOT / "configs/hypersca_c_v1.json").read_text(encoding="utf-8")
@@ -488,15 +509,51 @@ def test_result_owns_predictions_and_deep_freezes_json_safe_summary() -> None:
     summary["details"]["labels"].append("changed")  # type: ignore[index,union-attr]
     assert result.predictions.loc[0, "score"] != 999.0
     assert result.summary["details"]["labels"] == ("stable", "screened")  # type: ignore[index]
-    assert json.loads(json.dumps(result.summary, ensure_ascii=False))["details"] == {
+    thawed = stability_module.thaw_json_record(result.summary)
+    assert json.loads(json.dumps(thawed, ensure_ascii=False))["details"] == {
         "labels": ["stable", "screened"]
     }
+    thawed["details"]["labels"].append("local change")  # type: ignore[index,union-attr]
+    assert result.summary["details"]["labels"] == ("stable", "screened")  # type: ignore[index]
     with pytest.raises(TypeError):
         result.summary["new"] = 1  # type: ignore[index]
     with pytest.raises(TypeError):
         result.summary["details"]["new"] = 1  # type: ignore[index]
+    with pytest.raises(TypeError):
+        dict.__setitem__(result.summary, "bypass", True)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        dict.update(result.summary, {"bypass": True})  # type: ignore[arg-type]
     result.predictions.loc[0, "score"] = 5.0
     assert result.predictions.loc[0, "score"] == 5.0
+
+
+def test_result_rejects_duplicate_top_level_summary_items() -> None:
+    table, summary = valid_table()
+    duplicate = DuplicateItems(
+        (*tuple(summary.items()), ("coverage", summary["coverage"]))
+    )
+    with pytest.raises(HyperSCACError, match="duplicate"):
+        HyperSCAStabilityResult(table, duplicate, ())
+
+
+def test_result_rejects_duplicate_nested_summary_items() -> None:
+    table, summary = valid_table()
+    summary["details"] = DuplicateItems(
+        (("labels", ["stable"]), ("labels", ["changed"]))
+    )
+    with pytest.raises(HyperSCACError, match="duplicate"):
+        HyperSCAStabilityResult(table, summary, ())
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    ({"bad": float("nan")}, {"bad": ["mutable"]}, {1: "non-text key"}),
+)
+def test_thaw_json_record_rejects_values_outside_frozen_json_semantics(
+    unsafe: object,
+) -> None:
+    with pytest.raises(HyperSCACError, match="frozen JSON"):
+        stability_module.thaw_json_record(unsafe)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(

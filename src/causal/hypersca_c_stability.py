@@ -6,6 +6,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Integral, Real
+from types import MappingProxyType
 
 import numpy as np
 import pandas as pd
@@ -48,23 +49,6 @@ _ABSTENTION_REASONS = {
     "insufficient_successful_bootstraps",
     "source_has_no_control_variation",
 }
-
-
-class _FrozenJSONDict(dict[str, object]):
-    """A JSON-serializable dictionary whose public mutations are disabled."""
-
-    @staticmethod
-    def _read_only(*args: object, **kwargs: object) -> None:
-        raise TypeError("frozen JSON mappings are read-only")
-
-    __setitem__ = _read_only
-    __delitem__ = _read_only
-    clear = _read_only
-    pop = _read_only
-    popitem = _read_only
-    setdefault = _read_only
-    update = _read_only
-    __ior__ = _read_only
 
 
 def _required_text(value: object, name: str) -> str:
@@ -277,7 +261,7 @@ def _validated_repeat_matrices(
 
 
 def _freeze_json(value: object, path: str) -> object:
-    """Validate JSON-compatible content and return a recursively read-only copy."""
+    """Validate JSON semantics and return a recursively read-only copy."""
 
     if value is None or isinstance(value, (str, bool)):
         return value
@@ -297,14 +281,61 @@ def _freeze_json(value: object, path: str) -> object:
         for key, nested in items:
             if not isinstance(key, str):
                 raise HyperSCACError(f"{path} JSON mapping keys must be text")
+            if key in copied:
+                raise HyperSCACError(f"{path} must not contain duplicate JSON keys")
             copied[key] = _freeze_json(nested, f"{path}.{key}")
-        return _FrozenJSONDict(copied)
+        return MappingProxyType(copied)
     if isinstance(value, (list, tuple)):
         return tuple(
             _freeze_json(nested, f"{path}[{index}]")
             for index, nested in enumerate(value)
         )
     raise HyperSCACError(f"{path} must contain only JSON-compatible values")
+
+
+def thaw_json_record(value: Mapping[str, object]) -> dict[str, object]:
+    """Copy a frozen JSON-semantic record into ordinary dicts and lists.
+
+    ``HyperSCAStabilityResult.summary`` is recursively read-only. Call this helper
+    before passing it to a JSON writer or before adding output-only fields. The
+    returned record owns all mutable containers and cannot change the result.
+    """
+
+    if not isinstance(value, Mapping):
+        raise HyperSCACError("frozen JSON record must be a mapping")
+
+    def thaw(nested: object) -> object:
+        if nested is None or isinstance(nested, (str, bool)):
+            return nested
+        if isinstance(nested, Integral) and not isinstance(nested, bool):
+            return int(nested)
+        if isinstance(nested, Real) and not isinstance(nested, bool):
+            numeric = float(nested)
+            if not math.isfinite(numeric):
+                raise HyperSCACError(
+                    "frozen JSON record must contain finite numbers"
+                )
+            return numeric
+        if isinstance(nested, Mapping):
+            items = tuple(nested.items())
+            copied: dict[str, object] = {}
+            for key, item in items:
+                if not isinstance(key, str):
+                    raise HyperSCACError("frozen JSON record keys must be text")
+                if key in copied:
+                    raise HyperSCACError(
+                        "frozen JSON record must not contain duplicate keys"
+                    )
+                copied[key] = thaw(item)
+            return copied
+        if isinstance(nested, tuple):
+            return [thaw(item) for item in nested]
+        raise HyperSCACError("frozen JSON record contains an unsupported value")
+
+    result = thaw(value)
+    if not isinstance(result, dict):  # pragma: no cover - guarded above
+        raise HyperSCACError("frozen JSON record must thaw to a dictionary")
+    return result
 
 
 def _validated_failures(failures: object) -> tuple[str, ...]:
@@ -466,9 +497,16 @@ def _validated_summary(
     if not isinstance(summary, Mapping):
         raise HyperSCACError("summary must be a mapping of JSON-safe values")
     try:
-        payload = dict(summary)
+        items = tuple(summary.items())
     except Exception as exc:
         raise HyperSCACError("summary could not be read") from exc
+    payload: dict[str, object] = {}
+    for key, value in items:
+        if not isinstance(key, str):
+            raise HyperSCACError("summary JSON mapping keys must be text")
+        if key in payload:
+            raise HyperSCACError("summary must not contain duplicate JSON keys")
+        payload[key] = value
     missing = set(_SUMMARY_FIELDS) - set(payload)
     if missing:
         raise HyperSCACError(f"summary is missing required fields: {sorted(missing)}")
@@ -529,7 +567,11 @@ def _validated_summary(
 
 @dataclass(frozen=True)
 class HyperSCAStabilityResult:
-    """重复拟合后的完整关系表、覆盖范围和可预期失败。"""
+    """重复拟合后的完整关系表、覆盖范围和可预期失败。
+
+    ``summary`` 是冻结的 JSON 语义记录；写文件前须用
+    :func:`thaw_json_record` 转为普通字典和列表。
+    """
 
     predictions: pd.DataFrame
     summary: Mapping[str, object]
@@ -582,8 +624,8 @@ def build_stability_table(
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     """用固定公式形成全部有向关系，并标出无法可靠判断的来源基因。
 
-    每个细胞环境和每次成功重复具有一个等权观测。暂不判断的关系仍保留
-    原始 ``score`` 以便审计，但稳定排序始终把它们放在可判断关系之后。
+    每个细胞环境和每次成功重复具有一个等权观测。暂不判断的关系仍保留原始
+    ``score`` 以便审计，但稳定排序始终把它们放在可判断关系之后。
     ``expected_contexts`` 可在没有成功重复时继续保留固定的环境效应列。
     """
 
