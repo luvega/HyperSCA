@@ -188,6 +188,17 @@ def task_c_aggregation_to_jsonable(value: Any) -> Any:
     return value
 
 
+def thaw_task_c_rehearsal_plan(value: Mapping[str, object]) -> dict[str, object]:
+    """Copy one frozen rehearsal plan into ordinary JSON-ready containers."""
+
+    if not isinstance(value, Mapping):
+        raise TaskCAggregationError("rehearsal plan must be a mapping")
+    thawed = task_c_aggregation_to_jsonable(value)
+    if not isinstance(thawed, dict):  # pragma: no cover - guarded above
+        raise TaskCAggregationError("rehearsal plan could not be copied")
+    return thawed
+
+
 def _valid_name(value: object, label: str) -> str:
     if type(value) is not str or not value or value != value.strip():
         raise TaskCAggregationError(f"{label} must contain non-empty text")
@@ -1044,30 +1055,111 @@ def evaluate_rehearsal_readiness(
     }
 
 
+def _snapshot_sequence_once(
+    value: Sequence[object], *, label: str, maximum_items: int
+) -> tuple[object, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TaskCAggregationError(f"{label} must be an ordered list")
+    try:
+        declared_size = len(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise TaskCAggregationError(f"{label} has an invalid size") from exc
+    if declared_size < 0 or declared_size > maximum_items:
+        raise TaskCAggregationError(f"{label} has too many items")
+    iterator = iter(value)
+    snapshot: list[object] = []
+    for _index in range(maximum_items + 1):
+        try:
+            snapshot.append(next(iterator))
+        except StopIteration:
+            break
+    if len(snapshot) != declared_size:
+        raise TaskCAggregationError(f"{label} changed while it was copied")
+    return tuple(snapshot)
+
+
+def _snapshot_runtime_mapping_once(
+    value: Mapping[str, float], *, expected_methods: tuple[str, ...]
+) -> Mapping[str, float]:
+    if not isinstance(value, Mapping):
+        raise TaskCAggregationError("runtime estimates must be a mapping")
+    try:
+        declared_size = len(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise TaskCAggregationError("runtime estimates have an invalid size") from exc
+    if declared_size < 0 or declared_size > len(REGISTERED_METHODS):
+        raise TaskCAggregationError("runtime estimates have too many items")
+    try:
+        iterator = iter(value.items())
+        pairs: list[object] = []
+        for _index in range(len(REGISTERED_METHODS) + 1):
+            try:
+                pairs.append(next(iterator))
+            except StopIteration:
+                break
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise TaskCAggregationError("runtime estimates could not be copied") from exc
+    if len(pairs) != declared_size:
+        raise TaskCAggregationError(
+            "runtime estimate items disagree with their declared size"
+        )
+    copied: dict[str, float] = {}
+    for pair in pairs:
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise TaskCAggregationError("runtime estimate items are malformed")
+        method, value_seconds = pair
+        if type(method) is not str or method in copied:
+            raise TaskCAggregationError(
+                "runtime estimates must contain each method exactly once"
+            )
+        if (
+            isinstance(value_seconds, bool)
+            or not isinstance(value_seconds, (int, float))
+            or not math.isfinite(float(value_seconds))
+            or float(value_seconds) < 0.0
+        ):
+            raise TaskCAggregationError(
+                "runtime estimates must be finite non-negative seconds"
+            )
+        copied[method] = float(value_seconds)
+    if set(copied) != set(expected_methods):
+        raise TaskCAggregationError(
+            "each runnable method needs one rehearsal-based runtime estimate"
+        )
+    return MappingProxyType(copied)
+
+
 def build_full_run_draft(
     *,
     runnable_methods: Sequence[str],
     conditions: Sequence[str],
     seeds: Sequence[int],
-    median_runtime_seconds: dict[str, float],
+    median_runtime_seconds: Mapping[str, float],
     maximum_tuning_trials: int,
-) -> dict[str, object]:
+) -> Mapping[str, object]:
     """建立不可执行的五份正式比较作业草案。"""
 
-    if isinstance(runnable_methods, (str, bytes)) or not isinstance(
-        runnable_methods, Sequence
-    ):
-        raise TaskCAggregationError("runnable methods must be an ordered list")
-    methods = tuple(runnable_methods)
+    methods_raw = _snapshot_sequence_once(
+        runnable_methods, label="runnable methods", maximum_items=len(REGISTERED_METHODS)
+    )
+    methods = methods_raw
     if any(type(method) is not str for method in methods) or len(set(methods)) != len(
         methods
     ):
         raise TaskCAggregationError("runnable methods must be unique registered names")
     if not set(methods) <= REGISTERED_METHODS:
         raise TaskCAggregationError("full-run draft contains an unregistered method")
-    if tuple(conditions) != REHEARSAL_CONDITIONS:
+    conditions_snapshot = _snapshot_sequence_once(
+        conditions,
+        label="full-run conditions",
+        maximum_items=len(REHEARSAL_CONDITIONS),
+    )
+    if conditions_snapshot != REHEARSAL_CONDITIONS:
         raise TaskCAggregationError("full-run conditions must remain at the fixed four")
-    if tuple(seeds) != FULL_RUN_SEEDS:
+    seeds_snapshot = _snapshot_sequence_once(
+        seeds, label="full-run seeds", maximum_items=len(FULL_RUN_SEEDS)
+    )
+    if seeds_snapshot != FULL_RUN_SEEDS:
         raise TaskCAggregationError("full-run seeds must remain at the fixed five")
     if type(maximum_tuning_trials) is not int or (
         maximum_tuning_trials != MAXIMUM_TUNING_TRIALS
@@ -1075,25 +1167,9 @@ def build_full_run_draft(
         raise TaskCAggregationError(
             "the maximum number of settings tried per method must remain 20"
         )
-    if not isinstance(median_runtime_seconds, dict) or set(
-        median_runtime_seconds
-    ) != set(methods):
-        raise TaskCAggregationError(
-            "each runnable method needs one rehearsal-based runtime estimate"
-        )
-    runtimes: dict[str, float] = {}
-    for method in methods:
-        value = median_runtime_seconds[method]
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-            or float(value) < 0.0
-        ):
-            raise TaskCAggregationError(
-                "runtime estimates must be finite non-negative seconds"
-            )
-        runtimes[method] = float(value)
+    runtimes = _snapshot_runtime_mapping_once(
+        median_runtime_seconds, expected_methods=methods
+    )
 
     tuning_jobs = [
         {
@@ -1104,8 +1180,8 @@ def build_full_run_draft(
             "seed": int(seed),
         }
         for method in sorted(methods)
-        for condition in conditions
-        for seed in seeds
+        for condition in conditions_snapshot
+        for seed in seeds_snapshot
         for trial_index in range(maximum_tuning_trials)
     ]
     final_jobs = [
@@ -1116,29 +1192,32 @@ def build_full_run_draft(
             "seed": int(seed),
         }
         for method in sorted(methods)
-        for condition in conditions
-        for seed in seeds
+        for condition in conditions_snapshot
+        for seed in seeds_snapshot
     ]
     jobs = tuning_jobs + final_jobs
     estimated_seconds = sum(
         runtimes[method] * (maximum_tuning_trials + 1)
         for method in methods
-        for _condition in conditions
-        for _seed in seeds
+        for _condition in conditions_snapshot
+        for _seed in seeds_snapshot
     )
-    return {
-        "schema_version": "1.0",
-        "job_count": len(jobs),
-        "tuning_job_count": len(tuning_jobs),
-        "final_fit_job_count": len(final_jobs),
-        "maximum_tuning_trials_per_method": maximum_tuning_trials,
-        "full_run_seeds": list(seeds),
-        "conditions": list(conditions),
-        "estimated_serial_runtime_seconds": estimated_seconds,
-        "jobs": jobs,
-        "authorization_status": "not_authorized_to_start",
-        "execution_commands_included": False,
-    }
+    return _deep_freeze(
+        {
+            "schema_version": "1.0",
+            "job_count": len(jobs),
+            "tuning_job_count": len(tuning_jobs),
+            "final_fit_job_count": len(final_jobs),
+            "maximum_tuning_trials_per_method": maximum_tuning_trials,
+            "full_run_seeds": list(seeds_snapshot),
+            "conditions": list(conditions_snapshot),
+            "estimated_serial_runtime_seconds": estimated_seconds,
+            "runtime_estimate_kind": "worst_case_upper_bound",
+            "jobs": jobs,
+            "authorization_status": "not_authorized_to_start",
+            "execution_commands_included": False,
+        }
+    )
 
 
 def _overall_method_status(statuses: Sequence[str]) -> str:
@@ -1229,22 +1308,51 @@ def _evidence_gates(
         is True
         for run in selected.values()
     )
+    profile = identity.get("profile")
+
+    def tuning_record_matches(run: Mapping[str, object]) -> bool:
+        input_summary = run["input_summary"]
+        if not isinstance(input_summary, Mapping):
+            return False
+        if run["method_id"] == "mean_difference":
+            return (
+                input_summary.get("used_stages") == ["refit"]
+                and input_summary.get(
+                    "training_tuning_and_final_fit_are_separate"
+                )
+                is False
+                and input_summary.get("settings_policy")
+                == "fixed no-tuning reference; registered settings used for public refit"
+            )
+        if run["method_id"] != "hypersca_c":
+            return False
+        if profile == "connection":
+            return (
+                input_summary.get("used_stages") == ["train", "tune", "refit"]
+                and input_summary.get(
+                    "training_tuning_and_final_fit_are_separate"
+                )
+                is True
+                and input_summary.get("settings_policy")
+                == (
+                    "two public training candidates, separate public tuning, "
+                    "selected public refit"
+                )
+            )
+        if profile == "comprehensive":
+            return (
+                input_summary.get("used_stages") == ["refit"]
+                and input_summary.get(
+                    "training_tuning_and_final_fit_are_separate"
+                )
+                is False
+                and input_summary.get("settings_policy")
+                == "registered default settings used for public refit"
+            )
+        return False
+
     tuning_boundary = set(selected) == required and all(
-        (
-            run["input_summary"].get("used_stages") == ["train", "tune", "refit"]
-            and run["input_summary"].get(
-                "training_tuning_and_final_fit_are_separate"
-            )
-            is True
-        )
-        if run["method_id"] == "hypersca_c"
-        else (
-            run["input_summary"].get("used_stages") == ["refit"]
-            and str(run["input_summary"].get("settings_policy", "")).startswith(
-                "fixed no-tuning reference"
-            )
-        )
-        for run in selected.values()
+        tuning_record_matches(run) for run in selected.values()
     )
     return {
         "data_checks_passed": bool(data_checks),
@@ -1480,6 +1588,21 @@ def _publish_summary_files(
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
+        staging_identity = _run_directory_identity(staging)
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        staging_descriptor = os.open(staging, directory_flags)
+        try:
+            opened = os.fstat(staging_descriptor)
+            if (int(opened.st_dev), int(opened.st_ino)) != staging_identity[:2]:
+                raise TaskCAggregationError("汇总暂存目录在发布前发生变化")
+            os.fsync(staging_descriptor)
+        finally:
+            os.close(staging_descriptor)
         _atomic_publish_directory(staging, output)
         published = True
     except OSError as exc:
@@ -1491,7 +1614,10 @@ def _publish_summary_files(
 
 
 def summarize_task_c_rehearsal(
-    *, rehearsal_root: str | Path, output_dir: str | Path
+    *,
+    rehearsal_root: str | Path,
+    output_dir: str | Path,
+    expected_resume_token: str,
 ) -> dict[str, object]:
     """只读核对 Task C 预演并写出四份不可执行的研究计划文件。"""
 
@@ -1504,7 +1630,9 @@ def summarize_task_c_rehearsal(
     )
 
     try:
-        evidence = inspect_task_c_rehearsal_evidence(root)
+        evidence = inspect_task_c_rehearsal_evidence(
+            root, expected_resume_token=expected_resume_token
+        )
     except TaskCRehearsalError as exc:
         raise TaskCAggregationError(str(exc)) from exc
     identity = evidence["identity"]
@@ -1527,12 +1655,14 @@ def summarize_task_c_rehearsal(
         for method, status in method_statuses.items()
         if status == _PASSED_STATUS
     )
-    draft = build_full_run_draft(
-        runnable_methods=runnable,
-        conditions=REHEARSAL_CONDITIONS,
-        seeds=FULL_RUN_SEEDS,
-        median_runtime_seconds=runtime_medians,
-        maximum_tuning_trials=MAXIMUM_TUNING_TRIALS,
+    draft = thaw_task_c_rehearsal_plan(
+        build_full_run_draft(
+            runnable_methods=runnable,
+            conditions=REHEARSAL_CONDITIONS,
+            seeds=FULL_RUN_SEEDS,
+            median_runtime_seconds=runtime_medians,
+            maximum_tuning_trials=MAXIMUM_TUNING_TRIALS,
+        )
     )
     inventory_sha256 = _canonical_sha256(evidence["file_inventory"])
     resource_estimate = {

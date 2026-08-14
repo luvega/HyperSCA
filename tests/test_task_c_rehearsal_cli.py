@@ -465,7 +465,13 @@ def test_resume_requires_the_token_returned_by_initial_publication(
     output = tmp_path / "results"
     first = _run_cli(prepared_root, output, methods="mean_difference")
     assert first.returncode == 0, first.stderr
-    summary = json.loads(first.stdout)
+    external_stdout_record = tmp_path / "initial-synthetic-stdout.json"
+    with external_stdout_record.open("x", encoding="utf-8") as handle:
+        handle.write(first.stdout)
+        handle.flush()
+        os.fsync(handle.fileno())
+    assert output not in external_stdout_record.parents
+    summary = json.loads(external_stdout_record.read_text(encoding="utf-8"))
     token = summary["resume_token"]
     assert len(token) == 71 and token.startswith("sha256:")
     controller = json.loads(

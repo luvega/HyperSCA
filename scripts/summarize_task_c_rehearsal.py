@@ -43,6 +43,14 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="保存四份汇总文件的新目录；若目录已存在则停止，不会覆盖。",
     )
+    parser.add_argument(
+        "--resume-token",
+        required=True,
+        help=(
+            "初次预演标准输出中独立保存的 sha256 恢复令牌；"
+            "不能从预演目录的控制文件中复制。"
+        ),
+    )
     return parser
 
 
@@ -53,6 +61,7 @@ def main(argv: list[str] | None = None) -> int:
         result = summarize_task_c_rehearsal(
             rehearsal_root=args.rehearsal_root,
             output_dir=args.output_dir,
+            expected_resume_token=args.resume_token,
         )
     except (TaskCAggregationError, OSError, ValueError) as exc:
         parser.error(str(exc))

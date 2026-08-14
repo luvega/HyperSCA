@@ -4,8 +4,10 @@ import json
 import hashlib
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
+from collections.abc import Iterator, Mapping, Sequence
 from types import MappingProxyType
 
 import numpy as np
@@ -13,6 +15,7 @@ import pandas as pd
 import pytest
 
 from src.evaluation import task_c_aggregation as aggregation_module
+from src.evaluation import task_c_rehearsal as rehearsal_module
 from src.evaluation.task_c_aggregation import (
     TaskCAggregationError,
     aggregate_task_c_runs,
@@ -21,6 +24,7 @@ from src.evaluation.task_c_aggregation import (
     evaluate_rehearsal_readiness,
     paired_cluster_interval,
     task_c_aggregation_to_jsonable,
+    thaw_task_c_rehearsal_plan,
 )
 
 
@@ -124,6 +128,7 @@ def _make_run(
     condition: str = "within_k562",
     seed: int = 11,
     identity_character: str = "a",
+    profile: str = "comprehensive",
 ) -> Path:
     root.mkdir()
     passed = status in {"passed_real_rehearsal", "passed_synthetic_smoke"}
@@ -140,7 +145,7 @@ def _make_run(
         }
         input_summary = {
             "schema_version": "1.0",
-            "profile": "comprehensive",
+            "profile": profile,
             "condition": condition,
             "method_id": method_id,
             "used_stages": ["refit"],
@@ -153,7 +158,7 @@ def _make_run(
                 else "external_benchmark"
             ),
         }
-        if method_id == "hypersca_c":
+        if method_id == "hypersca_c" and profile == "connection":
             input_summary.update(
                 {
                     "used_stages": ["train", "tune", "refit"],
@@ -201,7 +206,7 @@ def _make_run(
             "schema_version": "1.0",
             "method_id": method_id,
             "condition": condition,
-            "profile": "comprehensive",
+            "profile": profile,
             "data_scope": input_summary["data_scope"],
             "private_data_received_by_method": False,
         }
@@ -215,7 +220,7 @@ def _make_run(
         }
         identity = {
             "schema_version": "1.0",
-            "profile": "comprehensive",
+            "profile": profile,
             "condition": condition,
             "method_id": method_id,
             "seed": seed,
@@ -261,7 +266,7 @@ def _make_run(
                 "schema_version": "1.0",
                 "method_id": method_id,
                 "condition": condition,
-                "profile": "comprehensive",
+                "profile": profile,
                 "data_scope": "external_benchmark",
                 "private_data_received_by_method": False,
             },
@@ -892,7 +897,106 @@ def test_full_run_draft_has_five_seeds_and_never_starts_jobs() -> None:
     assert draft["tuning_job_count"] == 1200
     assert draft["final_fit_job_count"] == 60
     assert draft["authorization_status"] == "not_authorized_to_start"
+    assert draft["runtime_estimate_kind"] == "worst_case_upper_bound"
     assert all("command" not in job for job in draft["jobs"])
+    assert isinstance(draft, MappingProxyType)
+    assert isinstance(draft["jobs"], tuple)
+    assert isinstance(draft["jobs"][0], MappingProxyType)
+    with pytest.raises(TypeError):
+        draft["authorization_status"] = "authorized"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        draft["jobs"][0]["phase"] = "run"  # type: ignore[index]
+
+    thawed = thaw_task_c_rehearsal_plan(draft)
+    assert isinstance(thawed, dict)
+    assert isinstance(thawed["jobs"], list)
+    assert json.loads(json.dumps(thawed))["job_count"] == 1260
+
+
+class _FlipSequence(Sequence[object]):
+    def __init__(self, values: Sequence[object]) -> None:
+        self._values = tuple(values)
+        self.iteration_count = 0
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __getitem__(self, index: int) -> object:
+        return self._values[index]
+
+    def __iter__(self) -> Iterator[object]:
+        self.iteration_count += 1
+        if self.iteration_count == 1:
+            return iter(self._values)
+        return iter(tuple(reversed(self._values)))
+
+
+class _DuplicateItemsRuntime(Mapping[str, float]):
+    def __getitem__(self, key: str) -> float:
+        return 1.0
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(("hypersca_c",))
+
+    def __len__(self) -> int:
+        return 2
+
+    def items(self):  # type: ignore[override]
+        return iter((("hypersca_c", 1.0), ("hypersca_c", 2.0)))
+
+
+class _OnePassRuntime(Mapping[str, float]):
+    def __init__(self) -> None:
+        self.items_call_count = 0
+
+    def __getitem__(self, key: str) -> float:
+        if key != "hypersca_c":
+            raise KeyError(key)
+        return 10.0
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(("hypersca_c",))
+
+    def __len__(self) -> int:
+        return 1
+
+    def items(self):  # type: ignore[override]
+        self.items_call_count += 1
+        if self.items_call_count > 1:
+            raise AssertionError("runtime mapping items were read more than once")
+        return iter((("hypersca_c", 10.0),))
+
+
+def test_full_run_draft_copies_each_caller_input_only_once() -> None:
+    methods = _FlipSequence(["hypersca_c"])
+    conditions = _FlipSequence(CONDITIONS)
+    seeds = _FlipSequence([11, 23, 47, 71, 97])
+    runtimes = _OnePassRuntime()
+
+    draft = build_full_run_draft(
+        runnable_methods=methods,  # type: ignore[arg-type]
+        conditions=conditions,  # type: ignore[arg-type]
+        seeds=seeds,  # type: ignore[arg-type]
+        median_runtime_seconds=runtimes,
+        maximum_tuning_trials=20,
+    )
+
+    assert draft["job_count"] == 420
+    assert methods.iteration_count == 1
+    assert conditions.iteration_count == 1
+    assert seeds.iteration_count == 1
+    assert runtimes.items_call_count == 1
+
+
+def test_full_run_draft_rejects_mapping_with_duplicate_items() -> None:
+    with pytest.raises(TaskCAggregationError, match="runtime"):
+        build_full_run_draft(
+            runnable_methods=["hypersca_c"],
+            conditions=list(CONDITIONS),
+            seeds=[11, 23, 47, 71, 97],
+            median_runtime_seconds=_DuplicateItemsRuntime(),  # type: ignore[arg-type]
+            maximum_tuning_trials=20,
+        )
 
 
 @pytest.mark.parametrize(
@@ -930,17 +1034,19 @@ def _make_rehearsal_root(
     *,
     statuses: dict[str, str],
     synthetic_smoke: bool = False,
-) -> Path:
+    profile: str = "comprehensive",
+) -> tuple[Path, str]:
     runs = root / "runs"
     runs.mkdir(parents=True)
     for condition in CONDITIONS:
         for method_index, (method, status) in enumerate(sorted(statuses.items())):
             _make_run(
-                runs / f"comprehensive__{condition}__{method}__seed-11",
+                runs / f"{profile}__{condition}__{method}__seed-11",
                 method_id=method,
                 status=("passed_synthetic_smoke" if synthetic_smoke and status == "passed_real_rehearsal" else status),
                 condition=condition,
                 identity_character=format(method_index % 16, "x"),
+                profile=profile,
             )
     observed_statuses = []
     for path in sorted(runs.iterdir()):
@@ -952,7 +1058,7 @@ def _make_rehearsal_root(
     }
     identity = {
         "schema_version": "1.0",
-        "profile": "comprehensive",
+        "profile": profile,
         "methods": sorted(statuses),
         "conditions": list(CONDITIONS),
         "seed": 11,
@@ -965,7 +1071,7 @@ def _make_rehearsal_root(
     }
     rebuilt_summary = {
         "schema_version": "1.0",
-        "profile": "comprehensive",
+        "profile": profile,
         "attempted_methods": sorted(statuses),
         "conditions": list(CONDITIONS),
         "attempted_run_count": len(statuses) * len(CONDITIONS),
@@ -997,10 +1103,14 @@ def _make_rehearsal_root(
             "resume_token": resume_token,
         },
     )
-    return root
+    return root, resume_token
 
 
-def _run_summary_cli(rehearsal_root: Path, output: Path) -> subprocess.CompletedProcess[str]:
+def _run_summary_cli(
+    rehearsal_root: Path,
+    output: Path,
+    resume_token: str,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             sys.executable,
@@ -1009,6 +1119,8 @@ def _run_summary_cli(rehearsal_root: Path, output: Path) -> subprocess.Completed
             str(rehearsal_root),
             "--output-dir",
             str(output),
+            "--resume-token",
+            resume_token,
         ],
         cwd=ROOT,
         capture_output=True,
@@ -1017,10 +1129,140 @@ def _run_summary_cli(rehearsal_root: Path, output: Path) -> subprocess.Completed
     )
 
 
+def _resign_rehearsal_after_metric_change(root: Path) -> str:
+    run = next((root / "runs").iterdir())
+    metrics_path = run / "metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics["average_precision"] = 0.91
+    _write_json(metrics_path, metrics)
+
+    manifest_path = run / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["evidence_sha256"]["metrics.json"] = _record_sha256(metrics)
+    identity = {
+        key: value
+        for key, value in manifest.items()
+        if key not in {"run_identity_sha256", "claim_level"}
+    }
+    changed_run_token = _canonical_sha256(identity)
+    manifest["run_identity_sha256"] = changed_run_token
+    _write_json(manifest_path, manifest)
+    status_path = run / "method_status.json"
+    status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+    status_payload["run_identity_sha256"] = changed_run_token
+    _write_json(status_path, status_payload)
+
+    controller_path = root / "controller_manifest.json"
+    controller = json.loads(controller_path.read_text(encoding="utf-8"))
+    controller["file_inventory"] = _tree_hashes(root)
+    rebuilt_summary = {
+        key: value
+        for key, value in controller["summary"].items()
+        if key not in {"resume_status", "resume_token"}
+    }
+    changed_token = _canonical_sha256(
+        {
+            "controller_identity": controller["identity"],
+            "file_inventory": controller["file_inventory"],
+            "rebuilt_summary": rebuilt_summary,
+        }
+    )
+    controller["resume_token"] = changed_token
+    controller["summary"]["resume_token"] = changed_token
+    _write_json(controller_path, controller)
+    return changed_token
+
+
+@pytest.mark.parametrize("profile", ["connection", "comprehensive"])
+def test_summary_accepts_task5_real_profile_specific_stage_records(
+    tmp_path: Path, profile: str
+) -> None:
+    rehearsal, resume_token = _make_rehearsal_root(
+        tmp_path / profile,
+        statuses={
+            "hypersca_c": "passed_real_rehearsal",
+            "mean_difference": "passed_real_rehearsal",
+        },
+        profile=profile,
+    )
+
+    completed = _run_summary_cli(
+        rehearsal, tmp_path / f"{profile}-summary", resume_token
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    summary = json.loads(
+        (tmp_path / f"{profile}-summary" / "rehearsal_summary.json").read_text()
+    )
+    assert summary["readiness"]["checks"]["tuning_boundary"] is True
+
+
+def test_summary_cli_requires_independently_retained_resume_token(
+    tmp_path: Path,
+) -> None:
+    rehearsal, _resume_token = _make_rehearsal_root(
+        tmp_path / "rehearsal",
+        statuses={"hypersca_c": "passed_real_rehearsal"},
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/summarize_task_c_rehearsal.py"),
+            "--rehearsal-root",
+            str(rehearsal),
+            "--output-dir",
+            str(tmp_path / "summary"),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "resume-token" in completed.stderr
+    assert not (tmp_path / "summary").exists()
+
+
+def test_external_resume_token_rejects_fully_resigned_internal_evidence(
+    tmp_path: Path,
+) -> None:
+    rehearsal, retained_token = _make_rehearsal_root(
+        tmp_path / "rehearsal",
+        statuses={"hypersca_c": "passed_real_rehearsal"},
+    )
+    changed_token = _resign_rehearsal_after_metric_change(rehearsal)
+    assert changed_token != retained_token
+
+    completed = _run_summary_cli(
+        rehearsal, tmp_path / "summary", retained_token
+    )
+
+    assert completed.returncode != 0
+    assert "external resume token" in completed.stderr
+    assert not (tmp_path / "summary").exists()
+
+
+def test_inspection_limits_total_retained_json_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rehearsal, resume_token = _make_rehearsal_root(
+        tmp_path / "rehearsal", statuses=_formal_method_statuses()
+    )
+    monkeypatch.setattr(
+        rehearsal_module, "MAXIMUM_REHEARSAL_SUMMARY_JSON_BYTES", 512
+    )
+
+    with pytest.raises(rehearsal_module.TaskCRehearsalError, match="total|budget"):
+        rehearsal_module.inspect_task_c_rehearsal_evidence(
+            rehearsal, expected_resume_token=resume_token
+        )
+
+
 def test_summary_cli_is_read_only_writes_four_plans_and_keeps_unknown_gates_closed(
     tmp_path: Path,
 ) -> None:
-    rehearsal = _make_rehearsal_root(
+    rehearsal, resume_token = _make_rehearsal_root(
         tmp_path / "rehearsal", statuses=_formal_method_statuses()
     )
     before = {
@@ -1029,7 +1271,7 @@ def test_summary_cli_is_read_only_writes_four_plans_and_keeps_unknown_gates_clos
         if path.is_file()
     }
     output = tmp_path / "summary"
-    completed = _run_summary_cli(rehearsal, output)
+    completed = _run_summary_cli(rehearsal, output, resume_token)
 
     assert completed.returncode == 0, completed.stderr
     stdout = json.loads(completed.stdout)
@@ -1081,7 +1323,7 @@ def test_summary_cli_is_read_only_writes_four_plans_and_keeps_unknown_gates_clos
     assert draft["authorization_status"] == "not_authorized_to_start"
     assert draft["job_count"] == 2940
 
-    second = _run_summary_cli(rehearsal, output)
+    second = _run_summary_cli(rehearsal, output, resume_token)
     assert second.returncode != 0
     assert "不会覆盖" in second.stderr
 
@@ -1089,13 +1331,13 @@ def test_summary_cli_is_read_only_writes_four_plans_and_keeps_unknown_gates_clos
 def test_summary_cli_never_treats_synthetic_smoke_as_real_readiness(
     tmp_path: Path,
 ) -> None:
-    rehearsal = _make_rehearsal_root(
+    rehearsal, resume_token = _make_rehearsal_root(
         tmp_path / "synthetic",
         statuses=_formal_method_statuses(),
         synthetic_smoke=True,
     )
     output = tmp_path / "summary"
-    completed = _run_summary_cli(rehearsal, output)
+    completed = _run_summary_cli(rehearsal, output, resume_token)
     assert completed.returncode == 0, completed.stderr
     summary = json.loads((output / "rehearsal_summary.json").read_text())
     assert summary["readiness"]["ready_for_full_run"] is False
@@ -1109,7 +1351,7 @@ def test_summary_cli_never_treats_synthetic_smoke_as_real_readiness(
 def test_summary_cli_rejects_unsafe_or_changed_rehearsal_evidence(
     tmp_path: Path, hazard: str
 ) -> None:
-    rehearsal = _make_rehearsal_root(
+    rehearsal, resume_token = _make_rehearsal_root(
         tmp_path / "rehearsal", statuses={"hypersca_c": "passed_real_rehearsal"}
     )
     run = next((rehearsal / "runs").iterdir())
@@ -1145,7 +1387,7 @@ def test_summary_cli_rejects_unsafe_or_changed_rehearsal_evidence(
         controller["file_inventory"] = _tree_hashes(rehearsal)
         _write_json(rehearsal / "controller_manifest.json", controller)
 
-    completed = _run_summary_cli(rehearsal, tmp_path / "summary")
+    completed = _run_summary_cli(rehearsal, tmp_path / "summary", resume_token)
     assert completed.returncode != 0
     assert not (tmp_path / "summary").exists()
 
@@ -1165,3 +1407,32 @@ def test_atomic_directory_publication_never_replaces_an_existing_empty_target(
     assert output.is_dir()
     assert list(output.iterdir()) == []
     assert (staging / "rehearsal_summary.json").is_file()
+
+
+def test_summary_fsyncs_staging_directory_before_exclusive_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory_fsynced = False
+    real_fsync = aggregation_module.os.fsync
+    real_publish = aggregation_module._atomic_publish_directory
+
+    def observed_fsync(descriptor: int) -> None:
+        nonlocal directory_fsynced
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            directory_fsynced = True
+        real_fsync(descriptor)
+
+    def checked_publish(staging: Path, output: Path) -> None:
+        assert directory_fsynced is True
+        real_publish(staging, output)
+
+    monkeypatch.setattr(aggregation_module.os, "fsync", observed_fsync)
+    monkeypatch.setattr(
+        aggregation_module, "_atomic_publish_directory", checked_publish
+    )
+
+    paths = aggregation_module._publish_summary_files(
+        tmp_path / "summary", {"rehearsal_summary.json": b"{}\n"}
+    )
+
+    assert Path(paths["rehearsal_summary.json"]).is_file()

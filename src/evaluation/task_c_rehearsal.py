@@ -50,6 +50,7 @@ MAXIMUM_METHOD_COMMAND_ARGUMENTS = 512
 MAXIMUM_METHOD_BOUNDARY_FILES = 64
 MAXIMUM_METHOD_ENVIRONMENT_ENTRIES = 4_096
 MAXIMUM_REHEARSAL_JSON_BYTES = 16 * 1024 * 1024
+MAXIMUM_REHEARSAL_SUMMARY_JSON_BYTES = 128 * 1024 * 1024
 MAXIMUM_REHEARSAL_INPUT_BYTES = 1024 * 1024 * 1024
 MAXIMUM_REHEARSAL_REFERENCE_BYTES = 512 * 1024 * 1024
 MAXIMUM_REHEARSAL_PREDICTION_BYTES = 64 * 1024 * 1024
@@ -1834,6 +1835,34 @@ def _strict_json_file(path: Path, label: str) -> dict[str, Any]:
         maximum_bytes=MAXIMUM_REHEARSAL_JSON_BYTES,
     )
     return _strict_json_payload(payload_bytes, label)
+
+
+def _strict_json_file_with_total_budget(
+    path: Path, *, label: str, remaining_bytes: int
+) -> tuple[dict[str, Any], int]:
+    """Read one retained JSON object without exceeding the snapshot-wide budget."""
+
+    if type(remaining_bytes) is not int or remaining_bytes < 1:
+        raise TaskCRehearsalError(
+            "rehearsal summary exceeded its total JSON evidence budget"
+        )
+    try:
+        observed = os.lstat(path)
+    except OSError as exc:
+        raise TaskCRehearsalError(f"{label} could not be inspected safely") from exc
+    if int(observed.st_size) > remaining_bytes:
+        raise TaskCRehearsalError(
+            "rehearsal summary exceeded its total JSON evidence budget"
+        )
+    payload_bytes, _identity = _capture_regular_bytes(
+        path,
+        label=label,
+        maximum_bytes=min(MAXIMUM_REHEARSAL_JSON_BYTES, remaining_bytes),
+    )
+    return (
+        _strict_json_payload(payload_bytes, label),
+        remaining_bytes - len(payload_bytes),
+    )
 
 
 def _write_new_record(path: Path, payload: object) -> None:
@@ -5420,29 +5449,34 @@ def _resume_verified_rehearsal(
 
 def inspect_task_c_rehearsal_evidence(
     output_root: str | Path,
+    *,
+    expected_resume_token: str,
 ) -> dict[str, object]:
     """Return a read-only snapshot after rechecking one Task C rehearsal.
 
-    This uses the controller's recorded token to check internal consistency.  It
-    does not replace the independently retained token required to resume a run,
-    and it never authorizes or starts the five-seed comparison.
+    The caller must supply the token retained outside the rehearsal directory.
+    The controller's own copy is evidence, never the expected value.  This
+    function never authorizes or starts the five-seed comparison.
     """
 
+    if not _is_sha256_text(expected_resume_token):
+        raise TaskCRehearsalError(
+            "external resume token must be one sha256 fingerprint"
+        )
     output = Path(os.path.abspath(os.fspath(Path(output_root).expanduser())))
     manifest = _strict_json_file(
         output / "controller_manifest.json", "rehearsal controller record"
     )
     identity = manifest.get("identity")
-    recorded_token = manifest.get("resume_token")
-    if not isinstance(identity, dict) or not _is_sha256_text(recorded_token):
+    if not isinstance(identity, dict):
         raise TaskCRehearsalError(
-            "rehearsal controller record lacks a valid identity or internal token"
+            "rehearsal controller record lacks a valid identity"
         )
     summary = _resume_verified_rehearsal(
         output_root=output,
         expected_identity=identity,
         required_artifacts=_REQUIRED_ARTIFACTS,
-        expected_resume_token=str(recorded_token),
+        expected_resume_token=expected_resume_token,
     )
     methods = _fixed_text_tuple(identity.get("methods"), "rehearsal methods")
     conditions = _fixed_text_tuple(
@@ -5457,6 +5491,7 @@ def inspect_task_c_rehearsal_evidence(
     ):
         raise TaskCRehearsalError("rehearsal controller identity is malformed")
     records: list[dict[str, object]] = []
+    remaining_json_bytes = MAXIMUM_REHEARSAL_SUMMARY_JSON_BYTES
     for condition in conditions:
         for method in methods:
             run_dir = output / "runs" / build_rehearsal_run_id(
@@ -5465,12 +5500,20 @@ def inspect_task_c_rehearsal_evidence(
                 method_id=method,
                 seed=seed,
             )
-            status = _strict_json_file(run_dir / "method_status.json", "method status")
-            resource = _strict_json_file(
-                run_dir / "resource_usage.json", "run resource record"
+            status, remaining_json_bytes = _strict_json_file_with_total_budget(
+                run_dir / "method_status.json",
+                label="method status",
+                remaining_bytes=remaining_json_bytes,
             )
-            environment = _strict_json_file(
-                run_dir / "environment_manifest.json", "run environment record"
+            resource, remaining_json_bytes = _strict_json_file_with_total_budget(
+                run_dir / "resource_usage.json",
+                label="run resource record",
+                remaining_bytes=remaining_json_bytes,
+            )
+            environment, remaining_json_bytes = _strict_json_file_with_total_budget(
+                run_dir / "environment_manifest.json",
+                label="run environment record",
+                remaining_bytes=remaining_json_bytes,
             )
             record: dict[str, object] = {
                 "method_id": method,
@@ -5484,12 +5527,20 @@ def inspect_task_c_rehearsal_evidence(
                 "passed_real_rehearsal",
                 "passed_synthetic_smoke",
             }:
-                record["metrics"] = _strict_json_file(
-                    run_dir / "metrics.json", "run metrics"
+                metrics, remaining_json_bytes = _strict_json_file_with_total_budget(
+                    run_dir / "metrics.json",
+                    label="run metrics",
+                    remaining_bytes=remaining_json_bytes,
                 )
-                record["input_summary"] = _strict_json_file(
-                    run_dir / "input_summary.json", "run input summary"
+                input_summary, remaining_json_bytes = (
+                    _strict_json_file_with_total_budget(
+                        run_dir / "input_summary.json",
+                        label="run input summary",
+                        remaining_bytes=remaining_json_bytes,
+                    )
                 )
+                record["metrics"] = metrics
+                record["input_summary"] = input_summary
             records.append(record)
     inventory = _tree_inventory(
         output, exclude=frozenset({"controller_manifest.json"})
@@ -5503,9 +5554,12 @@ def inspect_task_c_rehearsal_evidence(
         "summary": summary,
         "file_inventory": inventory,
         "runs": records,
+        "retained_run_json_bytes": (
+            MAXIMUM_REHEARSAL_SUMMARY_JSON_BYTES - remaining_json_bytes
+        ),
         "validation_scope": (
-            "已重新核对任务 C 预演目录内部记录；本次没有提供独立保存的恢复令牌，"
-            "也没有授权启动五份数据划分的正式比较"
+            "已用预演目录之外独立保存的恢复令牌重新核对任务 C 全部记录；"
+            "本次只做汇总，也没有授权启动五份数据划分的正式比较"
         ),
     }
 

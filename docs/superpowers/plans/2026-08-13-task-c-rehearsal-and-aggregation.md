@@ -962,6 +962,10 @@ parser.add_argument("--synthetic-smoke", action="store_true")
 
 - [ ] **Step 5: 运行模拟闭环并提交**
 
+模拟闭环测试也必须把初次命令的完整标准输出排他写到输出根目录之外，再从这份
+外部记录读取 `resume_token`；不能直接从控制器记录取令牌，也不能用内部令牌替代
+调用者独立保存的副本。
+
 ```bash
 pytest tests/test_task_c_rehearsal_cli.py -q -p no:cacheprovider
 git add src/evaluation/task_c_rehearsal.py scripts/run_task_c_rehearsal.py tests/test_task_c_rehearsal_cli.py
@@ -974,6 +978,7 @@ Expected: test PASS，模拟结果仍为 `workflow_validation_only`。
 
 **Files:**
 - Modify: `src/evaluation/task_c_aggregation.py`
+- Modify: `src/evaluation/task_c_rehearsal.py`
 - Create: `scripts/summarize_task_c_rehearsal.py`
 - Modify: `tests/test_task_c_aggregation.py`
 
@@ -1160,19 +1165,23 @@ def build_full_run_draft(
 
 - [ ] **Step 3: 实现只读汇总命令**
 
-创建 `scripts/summarize_task_c_rehearsal.py`，接收 `--rehearsal-root` 和 `--output-dir`。它必须：
+创建 `scripts/summarize_task_c_rehearsal.py`，接收 `--rehearsal-root`、`--output-dir`
+和必填的 `--resume-token`。令牌必须来自初次预演标准输出在结果目录之外独立保存的
+记录；汇总命令不得从 `controller_manifest.json` 读取令牌作为预期值。它必须：
 
 - 读取而不修改每个方法运行目录；
 - 对完整运行计算指标，对失败运行只汇总状态；
 - 写 `rehearsal_summary.json`、`method_compatibility.csv`、`resource_estimate.json`、`full_run_jobs_draft.json`；
 - 不调用 `evaluate_promotion()`，不启动草案中的任何命令；
 - 标准输出只给出 `ready_for_full_run`、阻断项和四个汇总文件路径。
+- 以外部令牌重新核对全部证据，并限制汇总期间保留的运行 JSON 总字节数；
+- 把 20 次调节试验明确标作保守的 `worst_case_upper_bound`，不把预演说成正式资源实测。
 
 - [ ] **Step 4: 运行测试并提交**
 
 ```bash
 pytest tests/test_task_c_aggregation.py -q -p no:cacheprovider
-git add src/evaluation/task_c_aggregation.py scripts/summarize_task_c_rehearsal.py tests/test_task_c_aggregation.py
+git add src/evaluation/task_c_aggregation.py src/evaluation/task_c_rehearsal.py scripts/summarize_task_c_rehearsal.py tests/test_task_c_aggregation.py
 git commit -m "feat: summarize Task C rehearsal readiness"
 ```
 
@@ -1259,23 +1268,55 @@ print(value)
 PY
 )"
 export TASK_C_PREPARED_IDENTITY_SHA256
-conda run -n hypersca python scripts/run_task_c_rehearsal.py \
-  --profile connection \
-  --prepared-root "$TASK_C_DATA_ROOT/prepared/splits/seed_11" \
-  --prepared-identity-sha256 "$TASK_C_PREPARED_IDENTITY_SHA256" \
-  --method-assets-root "$TASK_C_DATA_ROOT/method_assets" \
-  --output-root results/benchmarks/task_c/connection \
-  --methods hypersca_c,mean_difference,random1000,grnboost,pc,notears_linear,gies
+export TASK_C_CONNECTION_STDOUT_RECORD="$TASK_C_DATA_ROOT/connection_rehearsal_initial_stdout.json"
+TASK_C_CONNECTION_STDOUT_TMP="$(mktemp "$TASK_C_DATA_ROOT/.connection_rehearsal_stdout.XXXXXX")"
+if conda run --no-capture-output -n hypersca python scripts/run_task_c_rehearsal.py \
+    --profile connection \
+    --prepared-root "$TASK_C_DATA_ROOT/prepared/splits/seed_11" \
+    --prepared-identity-sha256 "$TASK_C_PREPARED_IDENTITY_SHA256" \
+    --method-assets-root "$TASK_C_DATA_ROOT/method_assets" \
+    --output-root results/benchmarks/task_c/connection \
+    --methods hypersca_c,mean_difference,random1000,grnboost,pc,notears_linear,gies \
+    > "$TASK_C_CONNECTION_STDOUT_TMP"; then
+  chmod 0400 "$TASK_C_CONNECTION_STDOUT_TMP"
+  if ! ln -T -- "$TASK_C_CONNECTION_STDOUT_TMP" "$TASK_C_CONNECTION_STDOUT_RECORD"; then
+    rm -f "$TASK_C_CONNECTION_STDOUT_TMP"
+    echo "connection stdout record already exists; refusing to replace it" >&2
+    exit 1
+  fi
+  rm -f "$TASK_C_CONNECTION_STDOUT_TMP"
+else
+  rm -f "$TASK_C_CONNECTION_STDOUT_TMP"
+  exit 1
+fi
 ```
 
 Expected: 64 个共同基因、每环境不超过 2,000 个细胞、种子 11；所有预演决定保持 `workflow_validation_only`。
+初次标准输出只在命令成功后排他发布到结果目录之外；目标已存在时停止，不能覆盖。
 
 - [ ] **Step 4: 检查连接结果而不解读性能优劣**
 
 ```bash
+export TASK_C_DATA_ROOT=/home/a/Data/HyperSCA_external/task_c
+export TASK_C_CONNECTION_STDOUT_RECORD="$TASK_C_DATA_ROOT/connection_rehearsal_initial_stdout.json"
+TASK_C_CONNECTION_RESUME_TOKEN="$(
+  conda run --no-capture-output -n hypersca python - "$TASK_C_CONNECTION_STDOUT_RECORD" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    record = json.load(handle)
+value = record.get("resume_token")
+if not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+    raise SystemExit("independently saved connection resume token is malformed")
+print(value)
+PY
+)"
 conda run -n hypersca python scripts/summarize_task_c_rehearsal.py \
   --rehearsal-root results/benchmarks/task_c/connection \
-  --output-dir results/benchmarks/task_c/connection_summary
+  --output-dir results/benchmarks/task_c/connection_summary \
+  --resume-token "$TASK_C_CONNECTION_RESUME_TOKEN"
 ```
 
 只有数据、路径隔离、结果完整性或核心方法连接失败时才修复代码；不得根据 AP 高低调整已冻结基因、划分、评分或零效应阈值。
@@ -1312,16 +1353,31 @@ print(value)
 PY
 )"
 export TASK_C_PREPARED_IDENTITY_SHA256
-conda run -n hypersca python scripts/run_task_c_rehearsal.py \
-  --profile comprehensive \
-  --prepared-root "$TASK_C_DATA_ROOT/prepared/splits/seed_11" \
-  --prepared-identity-sha256 "$TASK_C_PREPARED_IDENTITY_SHA256" \
-  --method-assets-root "$TASK_C_DATA_ROOT/method_assets" \
-  --output-root results/benchmarks/task_c/comprehensive \
-  --methods hypersca_c,mean_difference,random1000,grnboost,pc,ges,gies,gsp,igsp,notears_linear,dcdi_g,dcdi_dsf,dcdfg_linear,dcdfg_mlp,sortnregress,guanlab_psgrn,betterboost,sparse_rc,catran
+export TASK_C_COMPREHENSIVE_STDOUT_RECORD="$TASK_C_DATA_ROOT/comprehensive_rehearsal_initial_stdout.json"
+TASK_C_COMPREHENSIVE_STDOUT_TMP="$(mktemp "$TASK_C_DATA_ROOT/.comprehensive_rehearsal_stdout.XXXXXX")"
+if conda run --no-capture-output -n hypersca python scripts/run_task_c_rehearsal.py \
+    --profile comprehensive \
+    --prepared-root "$TASK_C_DATA_ROOT/prepared/splits/seed_11" \
+    --prepared-identity-sha256 "$TASK_C_PREPARED_IDENTITY_SHA256" \
+    --method-assets-root "$TASK_C_DATA_ROOT/method_assets" \
+    --output-root results/benchmarks/task_c/comprehensive \
+    --methods hypersca_c,mean_difference,random1000,grnboost,pc,ges,gies,gsp,igsp,notears_linear,dcdi_g,dcdi_dsf,dcdfg_linear,dcdfg_mlp,sortnregress,guanlab_psgrn,betterboost,sparse_rc,catran \
+    > "$TASK_C_COMPREHENSIVE_STDOUT_TMP"; then
+  chmod 0400 "$TASK_C_COMPREHENSIVE_STDOUT_TMP"
+  if ! ln -T -- "$TASK_C_COMPREHENSIVE_STDOUT_TMP" "$TASK_C_COMPREHENSIVE_STDOUT_RECORD"; then
+    rm -f "$TASK_C_COMPREHENSIVE_STDOUT_TMP"
+    echo "comprehensive stdout record already exists; refusing to replace it" >&2
+    exit 1
+  fi
+  rm -f "$TASK_C_COMPREHENSIVE_STDOUT_TMP"
+else
+  rm -f "$TASK_C_COMPREHENSIVE_STDOUT_TMP"
+  exit 1
+fi
 ```
 
 Expected: 每个方法得到六种允许状态之一；BetterBoost、SparseRC 和 CATRAN 若仍无官方可执行资产，记录 `official_assets_unavailable`，不编写替代实现。
+初次标准输出必须独立留在结果目录之外，后续汇总只接受这里保存的令牌。
 
 - [ ] **Step 2: 运行全部预先登记消融**
 
@@ -1341,9 +1397,26 @@ Expected: 主版本、共享关系、分开环境、不使用干预、无稳定�
 - [ ] **Step 3: 生成资源和阻断汇总**
 
 ```bash
+export TASK_C_DATA_ROOT=/home/a/Data/HyperSCA_external/task_c
+export TASK_C_COMPREHENSIVE_STDOUT_RECORD="$TASK_C_DATA_ROOT/comprehensive_rehearsal_initial_stdout.json"
+TASK_C_COMPREHENSIVE_RESUME_TOKEN="$(
+  conda run --no-capture-output -n hypersca python - "$TASK_C_COMPREHENSIVE_STDOUT_RECORD" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    record = json.load(handle)
+value = record.get("resume_token")
+if not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+    raise SystemExit("independently saved comprehensive resume token is malformed")
+print(value)
+PY
+)"
 conda run -n hypersca python scripts/summarize_task_c_rehearsal.py \
   --rehearsal-root results/benchmarks/task_c/comprehensive \
-  --output-dir results/benchmarks/task_c/comprehensive_summary
+  --output-dir results/benchmarks/task_c/comprehensive_summary \
+  --resume-token "$TASK_C_COMPREHENSIVE_RESUME_TOKEN"
 ```
 
 核对 19 个方法和八项消融均进入兼容性记录，并确认作业草案为 `not_authorized_to_start`。
