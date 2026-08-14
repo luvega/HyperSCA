@@ -915,26 +915,36 @@ def validate_required_run_artifacts(
 ```python
 parser.add_argument("--profile", choices=["connection", "comprehensive"], required=True)
 parser.add_argument("--prepared-root", type=Path, required=True)
+parser.add_argument("--prepared-identity-sha256")
 parser.add_argument("--method-assets-root", type=Path, required=True)
 parser.add_argument("--output-root", type=Path, required=True)
 parser.add_argument("--methods", required=True)
 parser.add_argument("--resume", action="store_true")
+parser.add_argument("--resume-token")
 parser.add_argument("--synthetic-smoke", action="store_true")
 ```
 
+正式预演的 `--prepared-identity-sha256` 必须来自准备命令标准输出中 seed 11
+对应的 `materialization_identity_sha256`，并由调用者保存在准备目录之外；从当前
+`public_manifest.json` 重新计算的本地散列不是外部身份锚。`--resume-token` 只能与
+`--resume` 一起使用，且必须来自初次运行标准输出并独立保存，不能从控制器目录内
+重新取值。
+
 主流程必须按下列固定顺序执行：
 
-1. 核对数据、划分、参考关系和方法登记指纹；
-2. 只从公开学习/调节文件选择基因和细胞；
-3. 依次建立 `within_k562`、`within_rpe1`、`k562_to_rpe1`、`rpe1_to_k562` 四种条件；
-4. 细胞系内部最终拟合使用公开 `refit.npz`；跨环境时 HyperSCA-C 接收来源环境 `source_refit.npz` 和目标环境 `target_adapt_refit.npz` 两个上下文，其他方法接收由 `center_and_merge_allowed_contexts` 生成的临时合并 NPZ，并在其中保留 `environment_labels` 供支持环境标签的方法读取；
-5. 连接检查为 HyperSCA-C 和 Mean Difference 各建立两个调节试验，调用 `select_task_c_configuration.py` 核验“调节文件选择、公开 refit 重拟合、封存评分”边界；全方法预演只测登记默认配置，不能把单试验预演描述为正式参数公平比较；
-6. 向每个方法只传上述允许的公开文件，并把合并方式和中心化参数写入 `input_summary.json`；
-7. 将原始输出转换为完整有向关系表；
-8. 在独立评分步骤读取封存文件和两类参考关系；
-9. 对 HyperSCA-C 和 Mean Difference 各运行 20 次两类零效应检查；
-10. 写强制文件、失败状态和资源记录；
-11. 将所有预演 `promotion_decision.json` 固定为：
+1. 若请求 `--resume`，先要求输出根目录已经存在；缺失时立即拒绝，不创建目录、
+   不核对输入，也不启动任何方法；
+2. 核对数据、划分、参考关系和方法登记指纹；
+3. 只从公开学习/调节文件选择基因和细胞；
+4. 依次建立 `within_k562`、`within_rpe1`、`k562_to_rpe1`、`rpe1_to_k562` 四种条件；
+5. 细胞系内部最终拟合使用公开 `refit.npz`；跨环境时 HyperSCA-C 接收来源环境 `source_refit.npz` 和目标环境 `target_adapt_refit.npz` 两个上下文，其他方法接收由 `center_and_merge_allowed_contexts` 生成的临时合并 NPZ，并在其中保留 `environment_labels` 供支持环境标签的方法读取；
+6. 连接检查为 HyperSCA-C 和 Mean Difference 各建立两个调节试验，调用 `select_task_c_configuration.py` 核验“调节文件选择、公开 refit 重拟合、封存评分”边界；全方法预演只测登记默认配置，不能把单试验预演描述为正式参数公平比较；
+7. 向每个方法只传上述允许的公开文件，并把合并方式和中心化参数写入 `input_summary.json`；
+8. 将原始输出转换为完整有向关系表；
+9. 在独立评分步骤读取封存文件和两类参考关系；
+10. 对 HyperSCA-C 和 Mean Difference 各运行 20 次两类零效应检查；
+11. 写强制文件、失败状态和资源记录；
+12. 将所有预演 `promotion_decision.json` 固定为：
 
 ```json
 {
@@ -946,7 +956,9 @@ parser.add_argument("--synthetic-smoke", action="store_true")
 }
 ```
 
-任何已有运行目录若身份或输入指纹不同则拒绝覆盖；`--resume` 只跳过身份、指纹和强制文件都完整的运行。
+任何已有运行目录若身份或输入指纹不同则拒绝覆盖；`--resume` 只复用身份、实际
+文件、重建摘要和外部 `--resume-token` 全部一致的完整运行。没有独立保存初次标准
+输出中的 token 时不得恢复，必须重新运行。
 
 - [ ] **Step 5: 运行模拟闭环并提交**
 
@@ -1187,31 +1199,65 @@ conda run -n hypersca python scripts/validate_env.py
 - [ ] **Step 2: 获取官方数据、参考关系和方法资产**
 
 ```bash
+set -euo pipefail
 export TASK_C_DATA_ROOT=/home/a/Data/HyperSCA_external/task_c
 mkdir -p "$TASK_C_DATA_ROOT/raw" "$TASK_C_DATA_ROOT/prepared" "$TASK_C_DATA_ROOT/method_assets"
 conda run -n hypersca-task-c-causalbench python scripts/export_causalbench_data.py --data-dir "$TASK_C_DATA_ROOT/raw"
-conda run -n hypersca python scripts/prepare_task_c_data.py \
-  --k562-npz "$TASK_C_DATA_ROOT/raw/dataset_k562.npz" \
-  --rpe1-npz "$TASK_C_DATA_ROOT/raw/dataset_rpe1.npz" \
-  --k562-pooled-reference "$TASK_C_DATA_ROOT/raw/reference_k562_pooled.csv" \
-  --k562-chipseq-reference "$TASK_C_DATA_ROOT/raw/reference_k562_chipseq.csv" \
-  --rpe1-pooled-reference "$TASK_C_DATA_ROOT/raw/reference_rpe1_pooled.csv" \
-  --rpe1-chipseq-reference "$TASK_C_DATA_ROOT/raw/reference_rpe1_chipseq.csv" \
-  --output-dir "$TASK_C_DATA_ROOT/prepared"
+export TASK_C_PREPARED_IDENTITY_RECORD="$TASK_C_DATA_ROOT/prepared_identity_summary.json"
+test ! -e "$TASK_C_PREPARED_IDENTITY_RECORD"
+TASK_C_PREPARED_IDENTITY_TMP="$(mktemp "$TASK_C_DATA_ROOT/.prepared_identity_summary.XXXXXX")"
+if conda run -n hypersca python scripts/prepare_task_c_data.py \
+    --k562-npz "$TASK_C_DATA_ROOT/raw/dataset_k562.npz" \
+    --rpe1-npz "$TASK_C_DATA_ROOT/raw/dataset_rpe1.npz" \
+    --k562-pooled-reference "$TASK_C_DATA_ROOT/raw/reference_k562_pooled.csv" \
+    --k562-chipseq-reference "$TASK_C_DATA_ROOT/raw/reference_k562_chipseq.csv" \
+    --rpe1-pooled-reference "$TASK_C_DATA_ROOT/raw/reference_rpe1_pooled.csv" \
+    --rpe1-chipseq-reference "$TASK_C_DATA_ROOT/raw/reference_rpe1_chipseq.csv" \
+    --output-dir "$TASK_C_DATA_ROOT/prepared" \
+    > "$TASK_C_PREPARED_IDENTITY_TMP"; then
+  mv "$TASK_C_PREPARED_IDENTITY_TMP" "$TASK_C_PREPARED_IDENTITY_RECORD"
+  chmod 0400 "$TASK_C_PREPARED_IDENTITY_RECORD"
+else
+  rm -f "$TASK_C_PREPARED_IDENTITY_TMP"
+  exit 1
+fi
 conda run -n hypersca python scripts/bootstrap_task_c_methods.py --cache-root "$TASK_C_DATA_ROOT/method_assets"
 ```
 
-核对 `raw/export_manifest.json` 的下载时间、来源和官方提交，以及 `prepared/provenance/` 中两个表达缓存、汇总生物关系和 ChIP 有向关系的许可与 SHA-256。
+`prepared_identity_summary.json` 位于 `prepared/` 之外，并且在准备命令成功后才以同目录
+原子重命名发布；它是调用者独立保留的身份记录，不是数字签名。核对
+`raw/export_manifest.json` 的下载时间、来源和官方提交，以及 `prepared/provenance/` 中
+两个表达缓存、汇总生物关系和 ChIP 有向关系的许可与 SHA-256。
 
 - [ ] **Step 3: 重现五份划分并运行连接检查**
 
 ```bash
+set -euo pipefail
 for TASK_C_SEED in 11 23 47 71 97; do
   test -f "$TASK_C_DATA_ROOT/prepared/splits/seed_$TASK_C_SEED/public_manifest.json"
 done
+TASK_C_PREPARED_IDENTITY_SHA256="$(
+  conda run -n hypersca python - "$TASK_C_PREPARED_IDENTITY_RECORD" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    summary = json.load(handle)
+matches = [entry for entry in summary.get("splits", []) if entry.get("seed") == 11]
+if len(matches) != 1:
+    raise SystemExit("prepared identity record must contain exactly one seed 11 split")
+value = matches[0].get("materialization_identity_sha256")
+if not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+    raise SystemExit("seed 11 prepared identity fingerprint is malformed")
+print(value)
+PY
+)"
+export TASK_C_PREPARED_IDENTITY_SHA256
 conda run -n hypersca python scripts/run_task_c_rehearsal.py \
   --profile connection \
   --prepared-root "$TASK_C_DATA_ROOT/prepared/splits/seed_11" \
+  --prepared-identity-sha256 "$TASK_C_PREPARED_IDENTITY_SHA256" \
   --method-assets-root "$TASK_C_DATA_ROOT/method_assets" \
   --output-root results/benchmarks/task_c/connection \
   --methods hypersca_c,mean_difference,random1000,grnboost,pc,notears_linear,gies
@@ -1240,10 +1286,31 @@ conda run -n hypersca python scripts/summarize_task_c_rehearsal.py \
 - [ ] **Step 1: 尝试全部登记方法**
 
 ```bash
+set -euo pipefail
 export TASK_C_DATA_ROOT=/home/a/Data/HyperSCA_external/task_c
+export TASK_C_PREPARED_IDENTITY_RECORD="$TASK_C_DATA_ROOT/prepared_identity_summary.json"
+TASK_C_PREPARED_IDENTITY_SHA256="$(
+  conda run -n hypersca python - "$TASK_C_PREPARED_IDENTITY_RECORD" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    summary = json.load(handle)
+matches = [entry for entry in summary.get("splits", []) if entry.get("seed") == 11]
+if len(matches) != 1:
+    raise SystemExit("prepared identity record must contain exactly one seed 11 split")
+value = matches[0].get("materialization_identity_sha256")
+if not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+    raise SystemExit("seed 11 prepared identity fingerprint is malformed")
+print(value)
+PY
+)"
+export TASK_C_PREPARED_IDENTITY_SHA256
 conda run -n hypersca python scripts/run_task_c_rehearsal.py \
   --profile comprehensive \
   --prepared-root "$TASK_C_DATA_ROOT/prepared/splits/seed_11" \
+  --prepared-identity-sha256 "$TASK_C_PREPARED_IDENTITY_SHA256" \
   --method-assets-root "$TASK_C_DATA_ROOT/method_assets" \
   --output-root results/benchmarks/task_c/comprehensive \
   --methods hypersca_c,mean_difference,random1000,grnboost,pc,ges,gies,gsp,igsp,notears_linear,dcdi_g,dcdi_dsf,dcdfg_linear,dcdfg_mlp,sortnregress,guanlab_psgrn,betterboost,sparse_rc,catran

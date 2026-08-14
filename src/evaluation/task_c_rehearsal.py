@@ -5529,6 +5529,10 @@ def run_task_c_rehearsal(
             )
     elif not _is_sha256_text(prepared_identity_sha256):
         raise TaskCRehearsalError("prepared identity fingerprint is malformed")
+    output = Path(os.path.abspath(os.fspath(output_root.expanduser())))
+    _reject_output_symbolic_links(output)
+    if resume and not output.exists():
+        raise TaskCRehearsalError("resume output root does not exist")
     root = (project_root or Path(__file__).resolve().parents[2]).resolve(strict=True)
     config_path = root / "configs/task_c_rehearsal_v1.json"
     registry_path = root / "configs/task_c_methods_v1.json"
@@ -5548,8 +5552,6 @@ def run_task_c_rehearsal(
 
     prepared = Path(os.path.abspath(os.fspath(prepared_root.expanduser())))
     assets = Path(os.path.abspath(os.fspath(method_assets_root.expanduser())))
-    output = Path(os.path.abspath(os.fspath(output_root.expanduser())))
-    _reject_output_symbolic_links(output)
     if _has_private_component(prepared) or _has_private_component(output):
         raise TaskCRehearsalError(
             "public rehearsal inputs and outputs must not use a private path"

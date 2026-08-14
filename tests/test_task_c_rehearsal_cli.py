@@ -503,6 +503,48 @@ def test_resume_requires_the_token_returned_by_initial_publication(
     assert json.loads(resumed.stdout)["resume_token"] == token
 
 
+def test_resume_api_rejects_a_missing_output_root_without_creating_it(
+    prepared_root: Path,
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "missing-api-results"
+
+    with pytest.raises(TaskCRehearsalError, match="resume.*does not exist"):
+        rehearsal_module.run_task_c_rehearsal(
+            profile="connection",
+            prepared_root=prepared_root,
+            method_assets_root=prepared_root.parent / "method_assets",
+            output_root=output,
+            method_ids=("mean_difference",),
+            expected_resume_token="sha256:" + "0" * 64,
+            resume=True,
+            synthetic_smoke=True,
+            project_root=ROOT,
+        )
+
+    assert not output.exists()
+
+
+def test_resume_cli_rejects_a_missing_output_root_without_creating_it(
+    prepared_root: Path,
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "missing-cli-results"
+
+    completed = _run_cli(
+        prepared_root,
+        output,
+        "--resume",
+        "--resume-token",
+        "sha256:" + "0" * 64,
+        methods="mean_difference",
+    )
+
+    assert completed.returncode != 0
+    assert "resume" in completed.stderr and "does not exist" in completed.stderr
+    assert not output.exists()
+
+
 def test_resume_external_token_rejects_fully_resigned_success_bundle(
     prepared_root: Path,
     tmp_path: Path,
@@ -754,6 +796,7 @@ def test_help_uses_biomedical_language_and_keeps_fixed_arguments() -> None:
     assert "真实数据性能" in completed.stdout
     assert "独立保存" in completed.stdout
     assert "不是签名" in completed.stdout
+    assert "输出根目录必须已经存在" in completed.stdout
 
 
 def test_scoring_boundary_allows_only_the_exact_registered_sealed_input(

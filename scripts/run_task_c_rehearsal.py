@@ -70,7 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         action="store_true",
         help=(
-            "只复用完整重验通过且与外部 resume token 一致的既有预演；"
+            "输出根目录必须已经存在；只复用完整重验通过且与外部 "
+            "resume token 一致的既有预演；"
             "内部记录可被同步改写，不能替代该外部值。"
         ),
     )
