@@ -7,8 +7,12 @@ import hashlib
 from pathlib import Path
 
 import numpy as np
+import pytest
+import pandas as pd
+import anndata as ad
 
 from src.evaluation.task_c_data import build_task_c_reference_provenance, sha256_path
+from src.evaluation import task_c_acquisition as acquisition_module
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -69,6 +73,123 @@ def test_describe_only_reports_filtered_dataset_names(tmp_path):
     ]
     assert description["filter"] is True
     assert not data_dir.exists()
+
+
+def test_formal_export_requires_an_independent_acquisition_manifest(tmp_path):
+    script_path = ROOT / "scripts" / "export_causalbench_data.py"
+    spec = importlib.util.spec_from_file_location("formal_export", script_path)
+    exporter = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(exporter)
+
+    with pytest.raises(SystemExit, match="acquisition|获取记录"):
+        exporter.main(
+            [
+                "--data-dir",
+                str(tmp_path / "raw"),
+                "--require-acquisition-manifest",
+            ]
+        )
+
+
+def test_formal_export_records_and_rechecks_the_acquisition_manifest(
+    tmp_path, monkeypatch
+):
+    data_dir = tmp_path / "raw"
+    data_dir.mkdir()
+    mirrors = {}
+    converted = {}
+    specs = {}
+    obs = pd.DataFrame({"perturbation": ["control", "A"]}, index=["c1", "c2"])
+    base_var = pd.DataFrame(
+        {"ensembl_id": ["ENSG000001", "ENSG000002"], "chr": ["1", "2"]},
+        index=["GENE1", "GENE2"],
+    )
+    expression = np.asarray([[0.0, 1.0], [2.0, 0.0]], dtype=np.float32)
+    for context in ("k562", "rpe1"):
+        mirror = tmp_path / f"{context}-official.h5ad"
+        transformed = data_dir / f"{context}.h5ad"
+        ad.AnnData(X=expression, obs=obs, var=base_var).write_h5ad(mirror)
+        converted_var = base_var.copy()
+        converted_var["gene_name"] = converted_var.index.to_numpy(copy=True)
+        converted_var.index = converted_var["ensembl_id"].to_numpy(copy=True)
+        ad.AnnData(X=expression, obs=obs, var=converted_var).write_h5ad(transformed)
+        mirrors[context] = mirror
+        converted[context] = transformed
+        specs[context] = acquisition_module.AcquisitionFileSpec(
+            context_id=context,
+            file_name=mirror.name,
+            size_bytes=mirror.stat().st_size,
+            md5=hashlib.md5(mirror.read_bytes()).hexdigest(),  # noqa: S324
+            zenodo_content_url=(
+                f"https://zenodo.org/api/records/7041849/files/{mirror.name}/content"
+            ),
+            figshare_original_url=f"https://plus.figshare.com/{context}",
+        )
+    monkeypatch.setattr(acquisition_module, "OFFICIAL_ACQUISITION_FILES", specs)
+    acquisition_path = tmp_path / "acquisition_manifest.json"
+    acquisition_module.create_task_c_acquisition_manifest(
+        mirror_paths=mirrors,
+        converted_paths=converted,
+        output_path=acquisition_path,
+        authoritative_files=specs,
+        requested_chunk_rows=1,
+    )
+
+    class FakeDataset:
+        def __init__(self, data_dir, use_filter):
+            self.data_dir = Path(data_dir)
+            self.use_filter = use_filter
+
+        def load(self):
+            paths = []
+            for context in ("k562", "rpe1"):
+                path = self.data_dir / f"dataset_{context}.npz"
+                path.write_bytes(context.encode("utf-8"))
+                paths.append(str(path))
+            return paths
+
+    class FakeEvaluations:
+        def __init__(self, data_dir, dataset_name):
+            del data_dir, dataset_name
+
+        def load(self):
+            return ({("A", "B")}, set(), set(), set(), {("A", "B")})
+
+    package = types.ModuleType("causalscbench")
+    data_access = types.ModuleType("causalscbench.data_access")
+    dataset_module = types.ModuleType("causalscbench.data_access.create_dataset")
+    evaluations_module = types.ModuleType(
+        "causalscbench.data_access.create_evaluation_datasets"
+    )
+    dataset_module.CreateDataset = FakeDataset
+    evaluations_module.CreateEvaluationDatasets = FakeEvaluations
+    monkeypatch.setitem(sys.modules, "causalscbench", package)
+    monkeypatch.setitem(sys.modules, "causalscbench.data_access", data_access)
+    monkeypatch.setitem(sys.modules, dataset_module.__name__, dataset_module)
+    monkeypatch.setitem(sys.modules, evaluations_module.__name__, evaluations_module)
+    script_path = ROOT / "scripts" / "export_causalbench_data.py"
+    module_spec = importlib.util.spec_from_file_location("formal_export_valid", script_path)
+    exporter = importlib.util.module_from_spec(module_spec)
+    assert module_spec.loader is not None
+    module_spec.loader.exec_module(exporter)
+
+    assert exporter.main(
+        [
+            "--data-dir",
+            str(data_dir),
+            "--require-acquisition-manifest",
+            "--acquisition-manifest",
+            str(acquisition_path),
+        ]
+    ) == 0
+
+    exported = json.loads((data_dir / "export_manifest.json").read_text())
+    assert exported["acquisition_manifest"]["sha256"] == (
+        "sha256:" + hashlib.sha256(acquisition_path.read_bytes()).hexdigest()
+    )
+    assert exported["acquisition_manifest"]["path"] == "../acquisition_manifest.json"
+    assert set(exported["verified_converted_sources"]) == {"k562", "rpe1"}
 
 
 def test_operational_export_uses_stubs_and_records_reproducible_artifacts(

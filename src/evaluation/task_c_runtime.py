@@ -313,6 +313,7 @@ def _snapshot_regular_file(
     label: str,
     *,
     maximum_bytes: int = MAXIMUM_BOOTSTRAP_INPUT_BYTES,
+    allow_empty: bool = False,
 ) -> _FileSnapshot:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
@@ -323,7 +324,7 @@ def _snapshot_regular_file(
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             raise TaskCRuntimeError(f"{label} must be one regular, unlinked file")
-        if before.st_size <= 0 or before.st_size > maximum_bytes:
+        if (before.st_size == 0 and not allow_empty) or before.st_size > maximum_bytes:
             raise TaskCRuntimeError(f"{label} is empty or unusually large")
         chunks: list[bytes] = []
         remaining = maximum_bytes + 1
@@ -1280,10 +1281,15 @@ def _validate_source_checkout(
             if path.is_symlink():
                 raise TaskCRuntimeError("official source contains a symbolic link")
             relative = path.relative_to(source).as_posix()
+            if relative not in tracked:
+                raise TaskCRuntimeError(
+                    "official source contains an untracked worktree file"
+                )
             snapshot = _snapshot_regular_file(
                 path,
                 f"official source file {relative}",
                 maximum_bytes=512 * 1024 * 1024,
+                allow_empty=True,
             )
             worktree_files.add(relative)
             digest.update(relative.encode("utf-8"))

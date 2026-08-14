@@ -27,10 +27,14 @@ cd /home/a/.config/superpowers/worktrees/HyperSCA/real-data-readiness-design
 - Create: `scripts/task_c_workers/causalbench_evaluation_worker.py` — 在官方环境中计算补充干预分布指标。
 - Create: `scripts/run_task_c_rehearsal.py` — 运行连接检查或全方法预演。
 - Create: `scripts/summarize_task_c_rehearsal.py` — 只读汇总并生成全量作业清单草案。
+- Create: `src/evaluation/task_c_acquisition.py` — 核对公开镜像、H5AD 转换和外部来源记录。
+- Create: `scripts/verify_task_c_acquisition.py` — 不联网的公开数据来源核对命令。
+- Modify: `scripts/export_causalbench_data.py` — 正式导出绑定独立来源记录。
 - Create: `tests/test_task_c_rehearsal.py`
 - Create: `tests/test_task_c_null_controls.py`
 - Create: `tests/test_task_c_aggregation.py`
 - Create: `tests/test_task_c_rehearsal_cli.py`
+- Create: `tests/test_task_c_acquisition.py`
 - Create: `docs/research/task_c_rehearsal_v1.md` — 真实预演结果、阻断和资源报告。
 - Modify: `docs/research/task_c_mean_difference_baseline_v1.md` — 声明共同参考关系和完整评分范围。
 - Modify: `docs/technical_roadmap.md` — 记录任务 C 能否进入正式实测。
@@ -1211,7 +1215,21 @@ conda run -n hypersca python scripts/validate_env.py
 set -euo pipefail
 export TASK_C_DATA_ROOT=/home/a/Data/HyperSCA_external/task_c
 mkdir -p "$TASK_C_DATA_ROOT/raw" "$TASK_C_DATA_ROOT/prepared" "$TASK_C_DATA_ROOT/method_assets"
-conda run -n hypersca-task-c-causalbench python scripts/export_causalbench_data.py --data-dir "$TASK_C_DATA_ROOT/raw"
+export TASK_C_ACQUISITION_MANIFEST="$TASK_C_DATA_ROOT/acquisition_manifest.json"
+test ! -e "$TASK_C_ACQUISITION_MANIFEST" && test ! -L "$TASK_C_ACQUISITION_MANIFEST"
+conda run --no-capture-output -n hypersca python scripts/verify_task_c_acquisition.py \
+    --mirror-k562-h5ad "$TASK_C_DATA_ROOT/raw/ReplogleWeissman2022_K562_essential.h5ad" \
+    --mirror-rpe1-h5ad "$TASK_C_DATA_ROOT/raw/ReplogleWeissman2022_rpe1.h5ad" \
+    --converted-k562-h5ad "$TASK_C_DATA_ROOT/raw/k562.h5ad" \
+    --converted-rpe1-h5ad "$TASK_C_DATA_ROOT/raw/rpe1.h5ad" \
+    --k562-figshare-403-evidence "$TASK_C_DATA_ROOT/raw/failed_downloads/k562.figshare-403.html" \
+    --rpe1-figshare-403-evidence "$TASK_C_DATA_ROOT/raw/failed_downloads/rpe1.figshare-403.html" \
+    --output-manifest "$TASK_C_ACQUISITION_MANIFEST"
+conda run --no-capture-output -n hypersca-task-c-causalbench python \
+    scripts/export_causalbench_data.py \
+    --data-dir "$TASK_C_DATA_ROOT/raw" \
+    --require-acquisition-manifest \
+    --acquisition-manifest "$TASK_C_ACQUISITION_MANIFEST"
 export TASK_C_PREPARED_IDENTITY_RECORD="$TASK_C_DATA_ROOT/prepared_identity_summary.json"
 if [ -e "$TASK_C_PREPARED_IDENTITY_RECORD" ] || [ -L "$TASK_C_PREPARED_IDENTITY_RECORD" ]; then
   echo "prepared identity record already exists; refusing to start" >&2
@@ -1240,11 +1258,18 @@ fi
 conda run -n hypersca python scripts/bootstrap_task_c_methods.py --cache-root "$TASK_C_DATA_ROOT/method_assets"
 ```
 
+`verify_task_c_acquisition.py` 不联网下载；它先以 Zenodo 记录 7041849 的固定文件名、
+大小和 MD5 核对两个公开镜像，再逐块确认转换文件只把基因符号索引改为 Ensembl ID，
+并把来源、许可、SHA-256、MD5、转换规则和可选的 Figshare 403 证据写入不可覆盖的
+`acquisition_manifest.json`。其中本机修改时间只表示“核对时看到的文件系统属性”，
+不是服务器下载时间。正式导出同时传 `--require-acquisition-manifest`，因此缺少或被改写
+的来源记录会在 CausalBench 导出前停止；模拟测试仍可省略该正式闸门。
+
 `prepared_identity_summary.json` 位于 `prepared/` 之外，并且在准备命令成功后才用同目录
 硬链接排他发布。运行前发现目标或悬空符号链接时立即停止；若发布时发生竞态，临时
 记录已设为只读，必须保留并在错误信息中报告它的精确路径。只有准备命令本身失败
 才删除不可信的临时输出；正常发布后才删除临时文件名。它是调用者独立保留的身份记录，不是数字签名。核对
-`raw/export_manifest.json` 的下载时间、来源和官方提交，以及 `prepared/provenance/` 中
+`raw/export_manifest.json` 的来源、官方提交、获取记录指纹（下载时间保持未知），以及 `prepared/provenance/` 中
 两个表达缓存、汇总生物关系和 ChIP 有向关系的许可与 SHA-256。
 
 - [ ] **Step 3: 重现五份划分并运行连接检查**

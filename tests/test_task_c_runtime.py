@@ -1094,6 +1094,39 @@ class _FakeBootstrapRunner:
         raise AssertionError(f"unexpected bootstrap command: {command}")
 
 
+class _EmptyTrackedSourceRunner(_FakeBootstrapRunner):
+    def __init__(self, *, defect: str | None = None) -> None:
+        super().__init__()
+        self.defect = defect
+
+    def __call__(self, command: list[str], **kwargs: object) -> _FakeCompleted:
+        if command[:2] == ["git", "clone"]:
+            result = super().__call__(command, **kwargs)
+            source = Path(command[3])
+            package = source / "causalscbench"
+            package.mkdir()
+            if self.defect == "symlink":
+                (package / "__init__.py").symlink_to(source / "README.md")
+            elif self.defect != "missing":
+                (package / "__init__.py").write_bytes(b"")
+            if self.defect == "unregistered":
+                (source / "empty-unregistered.py").write_bytes(b"")
+            return result
+        if command[0:2] == ["git", "-C"]:
+            operation = command[3:]
+            if operation and operation[0] == "status" and self.defect == "dirty":
+                return _FakeCompleted(stdout=" M causalscbench/__init__.py\n")
+            if operation[:3] == ["ls-files", "-z", "--cached"]:
+                return _FakeCompleted(
+                    stdout="README.md\x00causalscbench/__init__.py\x00"
+                )
+            if operation[:4] == ["ls-tree", "-r", "-z", "--name-only"]:
+                return _FakeCompleted(
+                    stdout="README.md\x00causalscbench/__init__.py\x00"
+                )
+        return super().__call__(command, **kwargs)
+
+
 class _FailingCloneRunner(_FakeBootstrapRunner):
     def __call__(self, command: list[str], **kwargs: object) -> _FakeCompleted:
         if command[:2] == ["git", "clone"]:
@@ -1176,6 +1209,55 @@ def test_bootstrap_uses_fixed_sources_environments_and_explicit_unavailability(
     assert all(path.is_relative_to(cache) for path in runner.environment_files_seen)
     assert not list(cache.rglob("*.tmp"))
     assert not list(cache.glob(".bootstrap-staging-*"))
+
+
+def test_bootstrap_accepts_an_empty_file_tracked_by_the_fixed_source_commit(
+    tmp_path: Path,
+) -> None:
+    summary = bootstrap_task_c_methods(
+        cache_root=tmp_path / "method-assets",
+        registry_path=REGISTRY,
+        project_root=ROOT,
+        run_command=_EmptyTrackedSourceRunner(),
+    )
+
+    assert summary["status"] == "assets_and_environments_recorded"
+
+
+@pytest.mark.parametrize(
+    ("defect", "message"),
+    [
+        ("unregistered", "untracked|tracked files|official source"),
+        ("symlink", "symbolic link|official source"),
+        ("dirty", "changed|official source"),
+        ("missing", "missing|tracked files|official source"),
+    ],
+)
+def test_empty_source_exception_does_not_admit_untrusted_worktree_states(
+    tmp_path: Path,
+    defect: str,
+    message: str,
+) -> None:
+    with pytest.raises(TaskCRuntimeError, match=message):
+        bootstrap_task_c_methods(
+            cache_root=tmp_path / "method-assets",
+            registry_path=REGISTRY,
+            project_root=ROOT,
+            run_command=_EmptyTrackedSourceRunner(defect=defect),
+        )
+
+
+def test_empty_non_source_bootstrap_input_is_still_rejected(tmp_path: Path) -> None:
+    registry = tmp_path / "empty-registry.json"
+    registry.write_bytes(b"")
+
+    with pytest.raises(TaskCRuntimeError, match="empty"):
+        bootstrap_task_c_methods(
+            cache_root=tmp_path / "method-assets",
+            registry_path=registry,
+            project_root=ROOT,
+            run_command=_FakeBootstrapRunner(),
+        )
 
 
 def test_exact_bootstrap_rerun_reuses_sources_and_updates_environments(

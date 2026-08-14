@@ -48,6 +48,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="仅输出固定来源说明，不下载数据或导入 CausalBench。",
     )
+    parser.add_argument(
+        "--acquisition-manifest",
+        type=Path,
+        help="独立保存的公开镜像与 H5AD 转换核对记录。",
+    )
+    parser.add_argument(
+        "--require-acquisition-manifest",
+        action="store_true",
+        help="正式数据导出必须提供并核对 --acquisition-manifest。",
+    )
     return parser
 
 
@@ -112,6 +122,26 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(description, ensure_ascii=False, sort_keys=True))
         return 0
 
+    if args.require_acquisition_manifest and args.acquisition_manifest is None:
+        raise SystemExit(
+            "正式数据导出缺少独立的获取记录：请提供 --acquisition-manifest。"
+        )
+    acquisition = None
+    acquisition_reference = None
+    if args.acquisition_manifest is not None:
+        from src.evaluation.task_c_acquisition import (
+            TaskCAcquisitionError,
+            load_task_c_acquisition_manifest,
+        )
+
+        try:
+            acquisition, acquisition_reference = load_task_c_acquisition_manifest(
+                args.acquisition_manifest,
+                require_official_metadata=True,
+            )
+        except TaskCAcquisitionError as exc:
+            raise SystemExit(f"公开数据获取记录无效：{exc}") from exc
+
     try:
         from causalscbench.data_access.create_dataset import CreateDataset
         from causalscbench.data_access.create_evaluation_datasets import (
@@ -131,6 +161,28 @@ def main(argv: list[str] | None = None) -> int:
         "rpe1": str(Path(rpe1_path).resolve()),
     }
     description["paths"] = dataset_paths
+    if acquisition is not None:
+        from src.evaluation.task_c_acquisition import (
+            TaskCAcquisitionError,
+            verify_export_sources_against_acquisition,
+        )
+
+        try:
+            observed_sources = verify_export_sources_against_acquisition(
+                acquisition,
+                {
+                    "k562": args.data_dir / "k562.h5ad",
+                    "rpe1": args.data_dir / "rpe1.h5ad",
+                },
+            )
+        except TaskCAcquisitionError as exc:
+            raise SystemExit(f"导出所用 H5AD 与获取记录不一致：{exc}") from exc
+        assert acquisition_reference is not None
+        description["acquisition_manifest"] = {
+            **acquisition_reference,
+            "path": _relative_path(args.acquisition_manifest, args.data_dir),
+        }
+        description["verified_converted_sources"] = observed_sources
 
     reference_paths: dict[str, str] = {}
     for context_id, dataset_name in (
