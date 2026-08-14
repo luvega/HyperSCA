@@ -83,6 +83,30 @@ def prepared_root(tmp_path: Path) -> Path:
     return root
 
 
+def _formal_validation_dependencies(prepared_root: Path, tmp_path: Path) -> Path:
+    provenance = prepared_root.parents[1] / "provenance"
+    provenance.mkdir(parents=True)
+    for context in ("k562", "rpe1"):
+        (provenance / f"{context}.json").write_text("{}\n", encoding="utf-8")
+        references: dict[str, dict[str, str]] = {}
+        for kind in ("pooled", "chipseq"):
+            path = tmp_path / f"{context}-{kind}.csv"
+            path.write_text("source,target\nG00,G01\n", encoding="utf-8")
+            references[kind] = {
+                "path": str(path),
+                "sha256": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        (provenance / f"{context}_references.json").write_text(
+            json.dumps({"files": references}) + "\n",
+            encoding="utf-8",
+        )
+    assets = tmp_path / "method-assets"
+    assets.mkdir()
+    for name in ("bootstrap_identity.json", "bootstrap_manifest.json"):
+        (assets / name).write_text("{}\n", encoding="utf-8")
+    return assets
+
+
 def _run_cli(
     prepared_root: Path,
     output_root: Path,
@@ -1063,6 +1087,195 @@ def test_rehearsal_closure_detects_code_change_after_freezing(tmp_path: Path) ->
         rehearsal_module._verify_rehearsal_closure(closure)
 
 
+def test_formal_validation_rejects_unrelated_absolute_private_inventory(
+    prepared_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assets = _formal_validation_dependencies(prepared_root, tmp_path)
+    manifest_path = prepared_root / "private/private_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    unrelated = tmp_path / "unrelated.npz"
+    unrelated.write_bytes(b"not one of the four registered holdouts")
+    manifest["files"] = {
+        str(unrelated.resolve()): "sha256:"
+        + hashlib.sha256(unrelated.read_bytes()).hexdigest()
+    }
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    (prepared_root / "private/within/k562/holdout.npz").write_bytes(b"")
+    monkeypatch.setattr(rehearsal_module, "_FULL_RUN_SEEDS", (11,))
+
+    with pytest.raises(TaskCRehearsalError, match="sealed|private|holdout|inventory"):
+        rehearsal_module._validate_prepared_rehearsal_inputs(
+            prepared_root=prepared_root,
+            method_assets_root=assets,
+            synthetic_smoke=False,
+        )
+
+
+def test_formal_validation_accepts_exact_registered_private_split(
+    prepared_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assets = _formal_validation_dependencies(prepared_root, tmp_path)
+    monkeypatch.setattr(rehearsal_module, "_FULL_RUN_SEEDS", (11,))
+
+    manifest_path, public = rehearsal_module._validate_prepared_rehearsal_inputs(
+        prepared_root=prepared_root,
+        method_assets_root=assets,
+        synthetic_smoke=False,
+    )
+
+    assert manifest_path == prepared_root / "public_manifest.json"
+    assert public["materialization_identity"]["seed"] == 11
+
+
+def test_formal_validation_rejects_changed_private_split_semantics(
+    prepared_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assets = _formal_validation_dependencies(prepared_root, tmp_path)
+    manifest_path = prepared_root / "private/private_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["holdout_sources"] = []
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    monkeypatch.setattr(rehearsal_module, "_FULL_RUN_SEEDS", (11,))
+
+    with pytest.raises(TaskCRehearsalError, match="sealed|private|split|semantic"):
+        rehearsal_module._validate_prepared_rehearsal_inputs(
+            prepared_root=prepared_root,
+            method_assets_root=assets,
+            synthetic_smoke=False,
+        )
+
+
+def test_formal_validation_rejects_resigned_invalid_gene_projection(
+    prepared_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assets = _formal_validation_dependencies(prepared_root, tmp_path)
+    public_path = prepared_root / "public_manifest.json"
+    private_path = prepared_root / "private/private_manifest.json"
+    public = json.loads(public_path.read_text(encoding="utf-8"))
+    private = json.loads(private_path.read_text(encoding="utf-8"))
+    projection = public["gene_projection"]
+    count = projection["common"]["count"]
+    projection["contexts"]["k562"]["selected_original_indices"] = [0] * count
+    for manifest in (public, private):
+        manifest["gene_projection"] = projection
+        manifest["materialization_identity"]["gene_projection"] = projection
+    public_path.write_text(json.dumps(public) + "\n", encoding="utf-8")
+    private_path.write_text(json.dumps(private) + "\n", encoding="utf-8")
+    monkeypatch.setattr(rehearsal_module, "_FULL_RUN_SEEDS", (11,))
+
+    with pytest.raises(TaskCRehearsalError, match="projection|gene|semantic"):
+        rehearsal_module._validate_prepared_rehearsal_inputs(
+            prepared_root=prepared_root,
+            method_assets_root=assets,
+            synthetic_smoke=False,
+        )
+
+
+def test_rehearsal_closure_freezes_all_four_private_holdouts(
+    prepared_root: Path,
+    tmp_path: Path,
+) -> None:
+    assets = _formal_validation_dependencies(prepared_root, tmp_path)
+    paths = rehearsal_module._rehearsal_closure_paths(
+        project_root=ROOT,
+        prepared_root=prepared_root,
+        method_assets_root=assets,
+        synthetic_smoke=False,
+    )
+    private_labels = {
+        label for label in paths if label.startswith("private_holdout:")
+    }
+    assert private_labels == {
+        "private_holdout:private/within/k562/holdout.npz",
+        "private_holdout:private/within/rpe1/holdout.npz",
+        "private_holdout:private/cross/k562_to_rpe1/target_holdout.npz",
+        "private_holdout:private/cross/rpe1_to_k562/target_holdout.npz",
+    }
+    closure = rehearsal_module._freeze_rehearsal_closure(paths)
+    relative = "private/within/k562/holdout.npz"
+    changed = prepared_root / relative
+    changed.write_bytes(b"changed after the round was frozen")
+    private_manifest = prepared_root / "private/private_manifest.json"
+    resigned = json.loads(private_manifest.read_text(encoding="utf-8"))
+    resigned["files"][relative] = (
+        "sha256:" + hashlib.sha256(changed.read_bytes()).hexdigest()
+    )
+    private_manifest.write_text(json.dumps(resigned) + "\n", encoding="utf-8")
+
+    with pytest.raises(TaskCRehearsalError, match="closure.*changed"):
+        rehearsal_module._verify_rehearsal_closure(closure)
+
+
+def test_formal_scoring_rechecks_private_holdouts_after_scoring(
+    prepared_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_paths = {
+        "private_manifest": prepared_root / "private/private_manifest.json",
+        **{
+            f"private_holdout:{relative}": prepared_root / relative
+            for relative in rehearsal_module._PRIVATE_HOLDOUT_PATHS
+        },
+    }
+    closure = rehearsal_module._freeze_rehearsal_closure(private_paths)
+    profile = rehearsal_module._profile_inputs(
+        public_manifest=prepared_root / "public_manifest.json",
+        profile="connection",
+        staging=tmp_path / "profiles",
+    )["within_k562"]["refit"]
+    _expression, _labels, genes = rehearsal_module._read_profile_arrays(profile)
+    raw_predictions = tmp_path / "predictions.csv"
+    pd.DataFrame(
+        [
+            (source, target, 0.0, False)
+            for source in genes
+            for target in genes
+            if source != target
+        ],
+        columns=["source", "target", "score", "returned_by_method"],
+    ).to_csv(raw_predictions, index=False)
+    snapshot = rehearsal_module.freeze_rehearsal_predictions(
+        source_path=raw_predictions,
+        destination=tmp_path / "frozen-predictions.csv",
+        expected_genes=genes,
+    )
+    changed_holdout = prepared_root / "private/within/k562/holdout.npz"
+
+    def change_private_input_after_scoring(**_kwargs: object) -> dict[str, object]:
+        changed_holdout.write_bytes(b"changed during private scoring")
+        return {"average_precision": 0.0}
+
+    monkeypatch.setattr(
+        rehearsal_module,
+        "_formal_scoring_subset",
+        change_private_input_after_scoring,
+    )
+
+    with pytest.raises(TaskCRehearsalError, match="closure.*changed"):
+        rehearsal_module._formal_scoring(
+            condition="within_k562",
+            predictions=snapshot,
+            prepared_root=prepared_root,
+            asset_root=tmp_path / "assets",
+            work_dir=tmp_path / "work",
+            seed=11,
+            registry=object(),
+            project_root=ROOT,
+            public_profile_input=profile["input"],
+            maximum_cells=20,
+            rehearsal_closure=closure,
+        )
+
+
 def _small_profile_record(tmp_path: Path) -> dict[str, Path]:
     genes = np.asarray(["A", "B", "C", "D"])
     labels = np.asarray(["non-targeting"] * 12 + ["A"] * 6 + ["B"] * 6)
@@ -1155,20 +1368,23 @@ def test_formal_null_seed_sequence_has_no_overlap_across_types_and_contexts() ->
     assert all(0 <= value <= 2**64 - 1 for value in seeds)
 
 
-def test_formal_null_hypersca_settings_use_one_frozen_bootstrap(tmp_path: Path) -> None:
+def test_formal_null_hypersca_settings_preserve_selected_bootstrap(
+    tmp_path: Path,
+) -> None:
     selected = tmp_path / "selected.json"
-    selected.write_text(
-        (ROOT / "configs/hypersca_c_v1.json").read_text(encoding="utf-8"),
-        encoding="utf-8",
+    selected_payload = json.loads(
+        (ROOT / "configs/hypersca_c_v1.json").read_text(encoding="utf-8")
     )
+    assert selected_payload["bootstrap_repeats"] == 20
+    assert selected_payload["bootstrap_success_fraction"] == 0.8
+    selected.write_text(json.dumps(selected_payload) + "\n", encoding="utf-8")
     created = rehearsal_module._materialize_formal_null_hypersca_config(
         selected_config=selected,
         destination=tmp_path / "formal-null.json",
     )
 
     payload = json.loads(created.read_text(encoding="utf-8"))
-    assert payload["bootstrap_repeats"] == 1
-    assert payload["bootstrap_success_fraction"] == 1.0
+    assert payload == selected_payload
 
 
 def test_formal_null_failure_is_retained_and_prevents_gate(

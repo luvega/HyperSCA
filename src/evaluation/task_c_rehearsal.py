@@ -104,6 +104,43 @@ _REQUIRED_ARTIFACTS = (
     "promotion_decision.json",
 )
 _FULL_RUN_SEEDS = (11, 23, 47, 71, 97)
+_PRIVATE_HOLDOUT_PATHS = frozenset(
+    {
+        "private/within/k562/holdout.npz",
+        "private/within/rpe1/holdout.npz",
+        "private/cross/k562_to_rpe1/target_holdout.npz",
+        "private/cross/rpe1_to_k562/target_holdout.npz",
+    }
+)
+_MATERIALIZATION_IDENTITY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "split_id",
+        "seed",
+        "min_cells_per_intervention",
+        "input_sha256",
+        "content_sha256",
+        "gene_names_sha256",
+        "gene_projection",
+    }
+)
+_PRIVATE_MANIFEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "split_id",
+        "seed",
+        "min_cells_per_intervention",
+        "train_sources",
+        "tune_sources",
+        "holdout_sources",
+        "control_indices",
+        "content_sha256",
+        "gene_names_sha256",
+        "gene_projection",
+        "materialization_identity",
+        "files",
+    }
+)
 REHEARSAL_CONDITIONS = (
     "within_k562",
     "within_rpe1",
@@ -163,7 +200,6 @@ class FrozenRehearsalFile:
     """One identity-bound file in the controller's whole-round closure."""
 
     path: Path
-    payload: bytes = field(repr=False)
     sha256: str
     identity: tuple[int, int, int, int, int]
 
@@ -1764,12 +1800,7 @@ def _strict_json_bytes(payload: object) -> bytes:
         ) from exc
 
 
-def _strict_json_file(path: Path, label: str) -> dict[str, Any]:
-    payload_bytes, _identity = _capture_regular_bytes(
-        path,
-        label=label,
-        maximum_bytes=MAXIMUM_REHEARSAL_JSON_BYTES,
-    )
+def _strict_json_payload(payload_bytes: bytes, label: str) -> dict[str, Any]:
     try:
         decoded = payload_bytes.decode("utf-8", errors="strict")
         payload = json.loads(
@@ -1791,6 +1822,15 @@ def _strict_json_file(path: Path, label: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise TaskCRehearsalError(f"{label} must contain one JSON object")
     return payload
+
+
+def _strict_json_file(path: Path, label: str) -> dict[str, Any]:
+    payload_bytes, _identity = _capture_regular_bytes(
+        path,
+        label=label,
+        maximum_bytes=MAXIMUM_REHEARSAL_JSON_BYTES,
+    )
+    return _strict_json_payload(payload_bytes, label)
 
 
 def _write_new_record(path: Path, payload: object) -> None:
@@ -2242,7 +2282,6 @@ def _freeze_rehearsal_closure(
         seen_inodes.add(inode)
         frozen[label] = FrozenRehearsalFile(
             path=absolute,
-            payload=payload,
             sha256=_bytes_sha256(payload),
             identity=identity,
         )
@@ -2260,32 +2299,58 @@ def _freeze_rehearsal_closure(
     )
 
 
+def _verify_frozen_rehearsal_file(label: str, snapshot: FrozenRehearsalFile) -> None:
+    maximum = (
+        MAXIMUM_REHEARSAL_REFERENCE_BYTES
+        if snapshot.path.suffix.casefold() == ".csv"
+        else MAXIMUM_REHEARSAL_INPUT_BYTES
+        if snapshot.path.suffix.casefold() == ".npz"
+        else MAXIMUM_METHOD_WORKER_BYTES
+        if snapshot.path.suffix.casefold() == ".py"
+        else MAXIMUM_REHEARSAL_JSON_BYTES
+    )
+    payload, identity = _capture_regular_bytes(
+        snapshot.path,
+        label=f"rehearsal closure file {label}",
+        maximum_bytes=maximum,
+    )
+    if (
+        _bytes_sha256(payload) != snapshot.sha256
+        or identity != snapshot.identity
+    ):
+        raise TaskCRehearsalError(
+            f"rehearsal closure changed after launch: {label}"
+        )
+
+
 def _verify_rehearsal_closure(closure: FrozenRehearsalClosure) -> None:
     if not isinstance(closure, FrozenRehearsalClosure):
         raise TaskCRehearsalError("rehearsal closure is invalid")
     for label, snapshot in closure.files.items():
-        maximum = (
-            MAXIMUM_REHEARSAL_REFERENCE_BYTES
-            if snapshot.path.suffix.casefold() == ".csv"
-            else MAXIMUM_REHEARSAL_INPUT_BYTES
-            if snapshot.path.suffix.casefold() == ".npz"
-            else MAXIMUM_METHOD_WORKER_BYTES
-            if snapshot.path.suffix.casefold() == ".py"
-            else MAXIMUM_REHEARSAL_JSON_BYTES
-        )
-        payload, identity = _capture_regular_bytes(
-            snapshot.path,
-            label=f"rehearsal closure file {label}",
-            maximum_bytes=maximum,
-        )
-        if (
-            payload != snapshot.payload
-            or _bytes_sha256(payload) != snapshot.sha256
-            or identity != snapshot.identity
+        _verify_frozen_rehearsal_file(label, snapshot)
+
+
+def _verify_private_rehearsal_closure(
+    closure: FrozenRehearsalClosure | None, *, prepared_root: Path
+) -> None:
+    if not isinstance(closure, FrozenRehearsalClosure):
+        raise TaskCRehearsalError("private rehearsal closure is invalid")
+    expected = {
+        "private_manifest": prepared_root / "private/private_manifest.json",
+        **{
+            f"private_holdout:{relative}": prepared_root / relative
+            for relative in _PRIVATE_HOLDOUT_PATHS
+        },
+    }
+    for label, path in expected.items():
+        snapshot = closure.files.get(label)
+        if snapshot is None or snapshot.path != Path(
+            os.path.abspath(os.fspath(path.expanduser()))
         ):
             raise TaskCRehearsalError(
-                f"rehearsal closure changed after launch: {label}"
+                "private rehearsal closure lacks one fixed sealed input"
             )
+        _verify_frozen_rehearsal_file(label, snapshot)
 
 
 def materialize_hypersca_profile_contexts(
@@ -2830,11 +2895,9 @@ def _materialize_formal_null_hypersca_config(
     selected = _strict_json_file(
         selected_config, "selected HyperSCA-C settings for formal null analyses"
     )
-    lightweight = dict(selected)
-    lightweight["bootstrap_repeats"] = 1
-    lightweight["bootstrap_success_fraction"] = 1.0
-    HyperSCACConfig.from_mapping(lightweight)
-    _write_new_record(destination, lightweight)
+    frozen_settings = dict(selected)
+    HyperSCACConfig.from_mapping(frozen_settings)
+    _write_new_record(destination, frozen_settings)
     return destination
 
 
@@ -3888,11 +3951,16 @@ def _formal_scoring(
     project_root: Path,
     public_profile_input: Path,
     maximum_cells: int,
+    rehearsal_closure: FrozenRehearsalClosure | None = None,
 ) -> dict[str, object]:
     if not isinstance(predictions, FrozenRehearsalPredictions):
         raise TaskCRehearsalError(
             "formal scoring requires one frozen prediction snapshot"
         )
+    _verify_private_rehearsal_closure(
+        rehearsal_closure,
+        prepared_root=prepared_root,
+    )
     _verify_frozen_predictions(predictions)
     prediction_path = predictions.path
     scope = _condition_scope(condition)
@@ -3930,8 +3998,14 @@ def _formal_scoring(
         metrics["prediction_sha256"] = predictions.sha256
         return metrics
     finally:
-        if private_root.exists() and not private_root.is_symlink():
-            shutil.rmtree(private_root)
+        try:
+            _verify_private_rehearsal_closure(
+                rehearsal_closure,
+                prepared_root=prepared_root,
+            )
+        finally:
+            if private_root.exists() and not private_root.is_symlink():
+                shutil.rmtree(private_root)
 
 
 def _formal_scoring_subset_unrecorded(
@@ -4498,6 +4572,303 @@ def _publish_outer_failure(
             shutil.rmtree(staging)
 
 
+def _is_sha256_text(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 71
+        and value.startswith("sha256:")
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
+
+
+def _validated_private_control_indices(value: object) -> dict[str, dict[str, tuple[int, ...]]]:
+    if not isinstance(value, dict) or set(value) != {"k562", "rpe1"}:
+        raise TaskCRehearsalError(
+            "sealed split control indices must contain exactly k562 and rpe1"
+        )
+    validated: dict[str, dict[str, tuple[int, ...]]] = {}
+    for context in ("k562", "rpe1"):
+        partitions = value[context]
+        if not isinstance(partitions, dict) or set(partitions) != {
+            "train",
+            "tune",
+            "holdout",
+        }:
+            raise TaskCRehearsalError(
+                "sealed split control partitions must contain train, tune, and holdout"
+            )
+        checked: dict[str, tuple[int, ...]] = {}
+        observed: set[int] = set()
+        for partition in ("train", "tune", "holdout"):
+            raw = partitions[partition]
+            if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence) or not raw:
+                raise TaskCRehearsalError(
+                    "sealed split control partitions must be non-empty index lists"
+                )
+            indices = tuple(raw)
+            if any(
+                isinstance(index, bool) or not isinstance(index, int) or index < 0
+                for index in indices
+            ) or len(set(indices)) != len(indices):
+                raise TaskCRehearsalError(
+                    "sealed split control indices must be unique non-negative integers"
+                )
+            if observed.intersection(indices):
+                raise TaskCRehearsalError(
+                    "sealed split control partitions must not overlap"
+                )
+            observed.update(indices)
+            checked[partition] = indices
+        validated[context] = checked
+    return validated
+
+
+def _validate_private_rehearsal_inputs(
+    *, prepared_root: Path, public: Mapping[str, object]
+) -> dict[str, Path]:
+    """Validate the fixed private split and its four sealed scoring files."""
+
+    from src.evaluation.task_c_data import (
+        TaskCDataError,
+        load_task_c_dataset_from_verified_bytes,
+    )
+
+    manifest_path = prepared_root / "private/private_manifest.json"
+    manifest_bytes, manifest_identity = _capture_regular_bytes(
+        manifest_path,
+        label="sealed data record",
+        maximum_bytes=MAXIMUM_REHEARSAL_JSON_BYTES,
+    )
+    private = _strict_json_payload(manifest_bytes, "sealed data record")
+    if set(private) != _PRIVATE_MANIFEST_FIELDS:
+        raise TaskCRehearsalError("sealed data record fields differ from its schema")
+    identity = public.get("materialization_identity")
+    if not isinstance(identity, dict) or set(identity) != _MATERIALIZATION_IDENTITY_FIELDS:
+        raise TaskCRehearsalError("public materialization identity is incomplete")
+    if any(identity.get(field) != public.get(field) for field in _MATERIALIZATION_IDENTITY_FIELDS):
+        raise TaskCRehearsalError("public materialization identity changed")
+    if private.get("materialization_identity") != identity:
+        raise TaskCRehearsalError(
+            "sealed and public data must share one materialization identity"
+        )
+    shared_fields = (
+        "schema_version",
+        "split_id",
+        "seed",
+        "min_cells_per_intervention",
+        "train_sources",
+        "tune_sources",
+        "content_sha256",
+        "gene_names_sha256",
+        "gene_projection",
+    )
+    if any(private.get(field) != public.get(field) for field in shared_fields):
+        raise TaskCRehearsalError(
+            "sealed split semantics disagree with the public split record"
+        )
+    if (
+        private.get("schema_version") != "1.0"
+        or private.get("seed") != 11
+        or private.get("split_id") != "C-context-intervention-holdout-v1-seed-11"
+        or isinstance(private.get("min_cells_per_intervention"), bool)
+        or not isinstance(private.get("min_cells_per_intervention"), int)
+        or int(private["min_cells_per_intervention"]) <= 0
+    ):
+        raise TaskCRehearsalError("sealed split identity or schema changed")
+    train_sources = _canonical_texts(
+        private.get("train_sources"),
+        "sealed train sources",
+        require_unique=True,
+        maximum_items=MAXIMUM_PARENT_GENES,
+    )
+    tune_sources = _canonical_texts(
+        private.get("tune_sources"),
+        "sealed tune sources",
+        require_unique=True,
+        maximum_items=MAXIMUM_PARENT_GENES,
+    )
+    holdout_sources = _canonical_texts(
+        private.get("holdout_sources"),
+        "sealed holdout sources",
+        require_unique=True,
+        maximum_items=MAXIMUM_PARENT_GENES,
+    )
+    if (
+        CONTROL_LABEL in {*train_sources, *tune_sources, *holdout_sources}
+        or set(train_sources) & set(tune_sources)
+        or set(train_sources) & set(holdout_sources)
+        or set(tune_sources) & set(holdout_sources)
+        or public.get("holdout_source_count") != len(holdout_sources)
+    ):
+        raise TaskCRehearsalError("sealed source partitions are incomplete or overlap")
+    controls = _validated_private_control_indices(private.get("control_indices"))
+    for field in ("input_sha256", "content_sha256"):
+        hashes = identity.get(field)
+        if not isinstance(hashes, dict) or set(hashes) != {"k562", "rpe1"} or any(
+            not _is_sha256_text(value) for value in hashes.values()
+        ):
+            raise TaskCRehearsalError(
+                f"sealed materialization {field} fingerprints are malformed"
+            )
+    if not _is_sha256_text(identity.get("gene_names_sha256")):
+        raise TaskCRehearsalError(
+            "sealed materialization gene fingerprint is malformed"
+        )
+    projection = identity.get("gene_projection")
+    if not isinstance(projection, dict) or set(projection) != {
+        "projection_rule",
+        "common",
+        "contexts",
+    }:
+        raise TaskCRehearsalError("sealed materialization gene projection is malformed")
+    common = projection.get("common")
+    contexts = projection.get("contexts")
+    if (
+        projection.get("projection_rule") != "sorted_common_gene_intersection_v1"
+        or not isinstance(common, dict)
+        or set(common) != {"count", "ordered_genes", "sha256"}
+        or not isinstance(contexts, dict)
+        or set(contexts) != {"k562", "rpe1"}
+    ):
+        raise TaskCRehearsalError("sealed materialization gene projection changed")
+    genes = _canonical_texts(
+        common.get("ordered_genes"),
+        "sealed common genes",
+        require_unique=True,
+        maximum_items=MAXIMUM_PARENT_GENES,
+    )
+    expected_gene_hash = _bytes_sha256(
+        json.dumps(genes, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+    if (
+        genes != tuple(sorted(genes))
+        or common.get("count") != len(genes)
+        or common.get("sha256") != expected_gene_hash
+        or identity.get("gene_names_sha256") != expected_gene_hash
+    ):
+        raise TaskCRehearsalError("sealed common-gene identity changed")
+    for context in ("k562", "rpe1"):
+        record = contexts[context]
+        if not isinstance(record, dict) or set(record) != {
+            "original_gene_count",
+            "original_gene_names_sha256",
+            "selected_original_indices",
+            "mapping_sha256",
+        }:
+            raise TaskCRehearsalError(
+                "sealed gene-projection context schema changed"
+            )
+        original_count = record.get("original_gene_count")
+        indices = record.get("selected_original_indices")
+        if (
+            isinstance(original_count, bool)
+            or not isinstance(original_count, int)
+            or not len(genes) <= original_count <= MAXIMUM_PARENT_GENES
+            or not _is_sha256_text(record.get("original_gene_names_sha256"))
+            or isinstance(indices, (str, bytes))
+            or not isinstance(indices, Sequence)
+            or len(indices) != len(genes)
+            or any(
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or not 0 <= index < original_count
+                for index in indices
+            )
+            or len(set(indices)) != len(indices)
+        ):
+            raise TaskCRehearsalError(
+                "sealed gene-projection context semantics changed"
+            )
+        mapping = {
+            "common_ordered_genes": list(genes),
+            "selected_original_indices": list(indices),
+        }
+        if record.get("mapping_sha256") != _canonical_sha256(mapping):
+            raise TaskCRehearsalError(
+                "sealed gene-projection context fingerprint changed"
+            )
+
+    files = private.get("files")
+    if not isinstance(files, dict) or set(files) != _PRIVATE_HOLDOUT_PATHS:
+        raise TaskCRehearsalError(
+            "sealed data record must inventory exactly the four fixed holdouts"
+        )
+    snapshots: list[tuple[Path, str, tuple[int, int, int, int, int]]] = []
+    paths: dict[str, Path] = {}
+    all_sources = train_sources + tune_sources + holdout_sources
+    for relative in sorted(_PRIVATE_HOLDOUT_PATHS):
+        expected_hash = files[relative]
+        if not _is_sha256_text(expected_hash):
+            raise TaskCRehearsalError(
+                f"sealed holdout fingerprint is malformed: {relative}"
+            )
+        path = prepared_root / relative
+        payload, file_identity = _capture_regular_bytes(
+            path,
+            label=f"sealed holdout {relative}",
+            maximum_bytes=MAXIMUM_REHEARSAL_INPUT_BYTES,
+        )
+        actual_hash = _bytes_sha256(payload)
+        if actual_hash != expected_hash:
+            raise TaskCRehearsalError(
+                f"sealed holdout fingerprint changed: {relative}"
+            )
+        context = (
+            relative.split("/")[2]
+            if relative.startswith("private/within/")
+            else relative.split("/")[2].split("_to_")[1]
+        )
+        expected_sources = (
+            holdout_sources
+            if relative.startswith("private/within/")
+            else all_sources
+        )
+        try:
+            dataset = load_task_c_dataset_from_verified_bytes(
+                path,
+                context_id=context,
+                source_bytes=payload,
+                source_sha256=actual_hash,
+            )
+        except TaskCDataError as exc:
+            raise TaskCRehearsalError(
+                f"sealed holdout arrays are invalid: {relative}"
+            ) from exc
+        labels = tuple(str(value) for value in dataset.interventions.tolist())
+        counts = Counter(labels)
+        if (
+            dataset.gene_names != genes
+            or set(counts) != {CONTROL_LABEL, *expected_sources}
+            or any(
+                counts[source] < int(private["min_cells_per_intervention"])
+                for source in expected_sources
+            )
+            or counts[CONTROL_LABEL] != len(controls[context]["holdout"])
+        ):
+            raise TaskCRehearsalError(
+                f"sealed holdout semantics changed: {relative}"
+            )
+        paths[f"private_holdout:{relative}"] = path
+        snapshots.append((path, actual_hash, file_identity))
+
+    final_manifest_bytes, final_manifest_identity = _capture_regular_bytes(
+        manifest_path,
+        label="sealed data record",
+        maximum_bytes=MAXIMUM_REHEARSAL_JSON_BYTES,
+    )
+    if final_manifest_bytes != manifest_bytes or final_manifest_identity != manifest_identity:
+        raise TaskCRehearsalError("sealed data record changed during validation")
+    for path, expected_hash, expected_identity in snapshots:
+        final_payload, final_identity = _capture_regular_bytes(
+            path,
+            label=f"sealed holdout {path.name}",
+            maximum_bytes=MAXIMUM_REHEARSAL_INPUT_BYTES,
+        )
+        if _bytes_sha256(final_payload) != expected_hash or final_identity != expected_identity:
+            raise TaskCRehearsalError("sealed holdout changed during validation")
+    return paths
+
+
 def _validate_prepared_rehearsal_inputs(
     *,
     prepared_root: Path,
@@ -4524,21 +4895,7 @@ def _validate_prepared_rehearsal_inputs(
     if synthetic_smoke:
         return public_manifest, public
 
-    private_manifest = prepared_root / "private/private_manifest.json"
-    private = _strict_json_file(private_manifest, "sealed data record")
-    private_files = private.get("files")
-    if not isinstance(private_files, dict) or not private_files:
-        raise TaskCRehearsalError("sealed data record lacks its fixed file inventory")
-    for relative, expected in private_files.items():
-        if not isinstance(relative, str) or not isinstance(expected, str):
-            raise TaskCRehearsalError("sealed data file inventory is malformed")
-        path = prepared_root / relative
-        if _sha256_file(path).removeprefix("sha256:") != expected.removeprefix(
-            "sha256:"
-        ):
-            raise TaskCRehearsalError(
-                f"sealed data file fingerprint changed: {relative}"
-            )
+    _validate_private_rehearsal_inputs(prepared_root=prepared_root, public=public)
     if prepared_root.name != "seed_11":
         raise TaskCRehearsalError("formal rehearsal must use the seed_11 split directory")
     split_root = prepared_root.parent
@@ -4673,6 +5030,12 @@ def _rehearsal_closure_paths(
             "private_manifest": prepared_root / "private/private_manifest.json",
             "method_asset_identity": method_assets_root / "bootstrap_identity.json",
             "method_asset_manifest": method_assets_root / "bootstrap_manifest.json",
+        }
+    )
+    paths.update(
+        {
+            f"private_holdout:{relative}": prepared_root / relative
+            for relative in _PRIVATE_HOLDOUT_PATHS
         }
     )
     provenance = prepared_root.parents[1] / "provenance"
@@ -5093,6 +5456,9 @@ def run_task_c_rehearsal(
             synthetic_smoke=synthetic_smoke,
         )
     )
+    if not synthetic_smoke:
+        _validate_private_rehearsal_inputs(prepared_root=prepared, public=public)
+        _verify_private_rehearsal_closure(closure, prepared_root=prepared)
     identity = _controller_identity(
         profile=profile,
         methods=methods,
@@ -5280,6 +5646,7 @@ def run_task_c_rehearsal(
                                 maximum_cells=config.profiles[
                                     profile
                                 ].maximum_cells_per_context,
+                                rehearsal_closure=closure,
                             )
                             if method_id in {"hypersca_c", "mean_difference"}:
                                 try:
