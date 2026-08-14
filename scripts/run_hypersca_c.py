@@ -37,6 +37,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="从公开父文件重算并限制基因、细胞数量的统一比较输入。",
     )
     parser.add_argument(
+        "--profile-context",
+        action="append",
+        help=(
+            "跨环境统一比较中的独立细胞背景，格式为 k562=path 或 "
+            "rpe1=path；必须按来源、目标调节顺序提供两次。"
+        ),
+    )
+    parser.add_argument(
         "--profile-manifest",
         type=Path,
         help="统一比较输入的来源、抽样位置和转换记录。",
@@ -60,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
             raise HyperSCACError("seed 必须是整数") from exc
         summary = run_hypersca_c(
             context_values=args.context or (),
+            profile_context_values=args.profile_context or (),
             profile_input_path=args.profile_input,
             profile_manifest_path=args.profile_manifest,
             config_path=args.config,

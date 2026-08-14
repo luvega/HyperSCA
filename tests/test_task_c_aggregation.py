@@ -387,7 +387,7 @@ def test_failed_runs_remain_in_read_only_method_summary(tmp_path: Path) -> None:
     assert summary["status_counts"]["failed_timeout"] == 1
     assert summary["validation_scope"] == (
         "formal completion requires the verified Task C rehearsal bundle "
-        "declaration; explicit legacy mode is structural only"
+        "declaration; synthetic smoke and explicit legacy mode are structural only"
     )
     assert isinstance(summary["runs"], tuple)
     assert [run["method_id"] for run in summary["runs"]] == ["pc", "gies"]

@@ -153,13 +153,15 @@ def test_execution_plan_has_four_conditions_and_real_selection_closure() -> None
         assert condition["stages"] == ("train", "tune", "refit")
         assert condition["trial_counts"] == {
             "hypersca_c": 2,
-            "mean_difference": 2,
+            "mean_difference": 0,
             "random1000": 0,
         }
-        assert condition["selection_bound_refit"] == (
-            "hypersca_c",
-            "mean_difference",
-        )
+        assert condition["selection_bound_refit"] == ("hypersca_c",)
+        assert condition["method_stages"] == {
+            "hypersca_c": ("train", "tune", "refit"),
+            "mean_difference": ("refit",),
+            "random1000": ("refit",),
+        }
 
     comprehensive = build_rehearsal_execution_plan(
         profile="comprehensive", method_ids=("hypersca_c", "mean_difference")
@@ -252,13 +254,18 @@ def test_synthetic_cli_publishes_four_conditions_and_required_scientific_files(
     for run_dir in run_dirs:
         assert {path.name for path in run_dir.iterdir()} == REQUIRED
         status = json.loads((run_dir / "method_status.json").read_text())
-        assert status["status"] == "passed_real_rehearsal"
+        assert status["status"] == "passed_synthetic_smoke"
+        assert status["controller_validation"] == (
+            "verified_task_c_synthetic_smoke_bundle_v1"
+        )
         promotion = json.loads((run_dir / "promotion_decision.json").read_text())
         assert promotion["status"] == "workflow_validation_only"
         assert promotion["promotion_eligible"] is False
 
     aggregated = aggregate_task_c_runs(run_dirs)
-    assert aggregated["verified_completed_run_count"] == 12
+    assert aggregated["verified_completed_run_count"] == 0
+    assert aggregated["synthetic_structural_run_count"] == 12
+    assert aggregated["not_formally_completed_count"] == 12
     cross_run = next(
         run_dir for run_dir in run_dirs if "__k562_to_rpe1__mean_difference__" in run_dir.name
     )
@@ -278,10 +285,22 @@ def test_synthetic_cli_publishes_four_conditions_and_required_scientific_files(
                 continue
             metrics = json.loads((run_dir / "metrics.json").read_text())
             controls = metrics["null_controls"]
+            assert controls["scope"] == "synthetic_orchestration_only"
+            assert controls["formal_null_gate_passed"] is False
             assert controls["label_permutation"]["repeat_count"] == 20
             assert controls["control_resampling"]["repeat_count"] == 20
             assert len(controls["label_permutation"]["seeds"]) == 20
             assert len(controls["control_resampling"]["seeds"]) == 20
+
+    for run_dir in run_dirs:
+        resource = json.loads((run_dir / "resource_usage.json").read_text())
+        method = json.loads((run_dir / "method_status.json").read_text())["method_id"]
+        assert resource["null_control_analysis_count"] == 0
+        assert resource["null_control_repeat_count_per_type"] == 0
+        if method == "hypersca_c":
+            assert resource["used_stages"] == ["synthetic_smoke"]
+        else:
+            assert resource["used_stages"] == ["synthetic_smoke"]
 
 
 def test_resume_reuses_only_exact_verified_identity_and_detects_tampering(
@@ -357,6 +376,36 @@ def test_output_parent_symbolic_link_is_rejected(
     assert completed.returncode != 0
     assert "symbolic" in completed.stderr
     assert not (real_parent / "results").exists()
+
+
+def test_output_root_and_grandparent_symbolic_links_are_rejected_before_resume(
+    prepared_root: Path, tmp_path: Path
+) -> None:
+    real_output = tmp_path / "real-output"
+    real_output.mkdir()
+    output_alias = tmp_path / "output-alias"
+    output_alias.symlink_to(real_output, target_is_directory=True)
+    direct = _run_cli(
+        prepared_root,
+        output_alias,
+        "--resume",
+        methods="mean_difference",
+    )
+    assert direct.returncode != 0
+    assert "symbolic" in direct.stderr
+
+    real_parent = tmp_path / "deep-real"
+    real_parent.mkdir()
+    grandparent_alias = tmp_path / "grandparent-alias"
+    grandparent_alias.symlink_to(real_parent, target_is_directory=True)
+    nested = _run_cli(
+        prepared_root,
+        grandparent_alias / "child" / "results",
+        methods="mean_difference",
+    )
+    assert nested.returncode != 0
+    assert "symbolic" in nested.stderr
+    assert not (real_parent / "child").exists()
 
 
 def test_help_uses_biomedical_language_and_keeps_fixed_arguments() -> None:
@@ -570,6 +619,12 @@ def test_formal_scoring_is_started_only_by_the_validated_launcher(
     assert command[:2] == (str(Path(sys.executable).resolve()), "-I")
     snapshots = launched["allowed_worker_snapshots"]
     assert len(snapshots) == 2  # type: ignore[arg-type]
+    scoring_resource = json.loads(
+        (work / "sealed_scoring.resource.json").read_text(encoding="utf-8")
+    )
+    assert scoring_resource["component_kind"] == "sealed_scoring"
+    assert scoring_resource["stage"] == "scoring"
+    assert scoring_resource["status"] == "completed"
 
 
 def test_connection_controller_runs_two_train_trials_then_selected_refit(
@@ -617,7 +672,7 @@ def test_connection_controller_runs_two_train_trials_then_selected_refit(
         lambda **_kwargs: {"status": "completed_standardized_output"},
     )
     final, status = rehearsal_module._select_connection_configuration(
-        method_id="mean_difference",
+        method_id="hypersca_c",
         condition="within_k562",
         profiles=profiles,
         work_dir=tmp_path / "work",
@@ -638,3 +693,306 @@ def test_connection_controller_runs_two_train_trials_then_selected_refit(
         for call in calls
     ] == ["train", "train", "refit"]
     assert calls[-1]["selection_arguments"] is not None
+
+
+def test_connection_selector_rejects_fixed_no_tuning_baseline(
+    prepared_root: Path, tmp_path: Path
+) -> None:
+    profiles = rehearsal_module._profile_inputs(
+        public_manifest=prepared_root / "public_manifest.json",
+        profile="connection",
+        staging=tmp_path / "profiles",
+    )["within_k562"]
+
+    with pytest.raises(TaskCRehearsalError, match="HyperSCA-C"):
+        rehearsal_module._select_connection_configuration(
+            method_id="mean_difference",
+            condition="within_k562",
+            profiles=profiles,
+            work_dir=tmp_path / "work",
+            seed=11,
+            registry_path=ROOT / "configs/task_c_methods_v1.json",
+            asset_root=tmp_path / "assets",
+            public_manifest=prepared_root / "public_manifest.json",
+            min_cells=5,
+            timeout_seconds=60,
+            project_root=ROOT,
+            base_hypersca_config=ROOT / "configs/hypersca_c_v1.json",
+        )
+
+
+def test_cross_hypersca_profile_contexts_preserve_frozen_rows_and_gene_order(
+    prepared_root: Path, tmp_path: Path
+) -> None:
+    profile = rehearsal_module._profile_inputs(
+        public_manifest=prepared_root / "public_manifest.json",
+        profile="connection",
+        staging=tmp_path / "profiles",
+    )["k562_to_rpe1"]["refit"]
+
+    contexts = rehearsal_module.materialize_hypersca_profile_contexts(
+        profile_record=profile,
+        output_dir=tmp_path / "hypersca-contexts",
+    )
+
+    assert tuple(contexts) == ("k562", "rpe1")
+    with np.load(profile["input"], allow_pickle=False) as merged:
+        genes = merged["var_names"].tolist()
+        labels = merged["environment_labels"].astype(str)
+        merged_expression = merged["expression_matrix"]
+        merged_interventions = merged["interventions"].astype(str)
+    for context_id, path in contexts.items():
+        with np.load(path, allow_pickle=False) as context:
+            assert set(context.files) == {
+                "expression_matrix",
+                "interventions",
+                "var_names",
+            }
+            assert context["var_names"].tolist() == genes
+            selected = labels == context_id
+            np.testing.assert_array_equal(
+                context["expression_matrix"], merged_expression[selected]
+            )
+            np.testing.assert_array_equal(
+                context["interventions"].astype(str),
+                merged_interventions[selected],
+            )
+
+
+def test_hypersca_command_boundary_uses_two_profile_contexts_not_merged_input(
+    tmp_path: Path,
+) -> None:
+    from src.evaluation.task_c_method_run import _build_hypersca_command
+
+    command = _build_hypersca_command(
+        project_root=ROOT,
+        context_values=(),
+        profile_context_values=(
+            f"k562={tmp_path / 'source.npz'}",
+            f"rpe1={tmp_path / 'target-adapt.npz'}",
+        ),
+        config_path=ROOT / "configs/hypersca_c_v1.json",
+        gene_list_path=tmp_path / "genes.json",
+        public_manifest_path=tmp_path / "public_manifest.json",
+        output_dir=tmp_path / "output",
+        seed=11,
+        device="cpu",
+        profile_manifest_path=tmp_path / "profile_manifest.json",
+    )
+
+    assert command.count("--profile-context") == 2
+    assert "--profile-manifest" in command
+    assert "--profile-input" not in command
+    assert "--context" not in command
+
+
+def test_trial_reconstruction_rebuilds_separate_cross_profile_contexts(
+    prepared_root: Path, tmp_path: Path
+) -> None:
+    from src.evaluation.task_c_method_run import (
+        _materialize_validation_profile_contexts,
+    )
+
+    profile = rehearsal_module._profile_inputs(
+        public_manifest=prepared_root / "public_manifest.json",
+        profile="connection",
+        staging=tmp_path / "profiles",
+    )["rpe1_to_k562"]["train"]
+
+    values = _materialize_validation_profile_contexts(
+        input_npz=profile["input"],
+        derived_input_manifest_path=profile["manifest"],
+        output_dir=tmp_path / "reconstruction-contexts",
+    )
+
+    assert [value.split("=", 1)[0] for value in values] == ["rpe1", "k562"]
+    assert all(Path(value.split("=", 1)[1]).is_file() for value in values)
+
+
+def test_cross_hypersca_orchestration_passes_source_and_target_adapt_separately(
+    prepared_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = rehearsal_module._profile_inputs(
+        public_manifest=prepared_root / "public_manifest.json",
+        profile="connection",
+        staging=tmp_path / "profiles",
+    )["k562_to_rpe1"]["refit"]
+    captured: dict[str, object] = {}
+
+    def fake_run_task_c_method(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"status": "completed_standardized_output"}
+
+    monkeypatch.setattr(
+        "src.evaluation.task_c_method_run.run_task_c_method",
+        fake_run_task_c_method,
+    )
+    rehearsal_module._run_method_bundle(
+        method_id="hypersca_c",
+        profile_record=profile,
+        output_dir=tmp_path / "method-output",
+        seed=11,
+        registry_path=ROOT / "configs/task_c_methods_v1.json",
+        asset_root=tmp_path / "assets",
+        public_manifest=prepared_root / "public_manifest.json",
+        context_id="k562_to_rpe1",
+        min_cells=5,
+        timeout_seconds=60,
+        project_root=ROOT,
+        hypersca_config=ROOT / "configs/hypersca_c_v1.json",
+        gene_list=tmp_path / "genes.json",
+    )
+
+    values = tuple(captured["profile_context_values"])  # type: ignore[arg-type]
+    assert [value.split("=", 1)[0] for value in values] == ["k562", "rpe1"]
+    assert captured["input_npz"] == profile["input"]
+    for value in values:
+        assert Path(value.split("=", 1)[1]).is_file()
+
+
+def test_formal_fixed_baseline_runs_real_method_orchestration(
+    prepared_root: Path, tmp_path: Path
+) -> None:
+    profiles = rehearsal_module._profile_inputs(
+        public_manifest=prepared_root / "public_manifest.json",
+        profile="connection",
+        staging=tmp_path / "profiles",
+    )["within_k562"]
+
+    final, status = rehearsal_module._run_formal_final_method(
+        method_id="mean_difference",
+        condition="within_k562",
+        profile="connection",
+        profiles=profiles,
+        work_dir=tmp_path / "formal-work",
+        seed=11,
+        registry_path=ROOT / "configs/task_c_methods_v1.json",
+        asset_root=tmp_path / "assets",
+        public_manifest=prepared_root / "public_manifest.json",
+        min_cells=5,
+        timeout_seconds=60,
+        project_root=ROOT,
+        source_kind="local",
+    )
+
+    assert status["status"] == "completed_standardized_output"
+    assert (final / "predictions.csv").is_file()
+    assert not (tmp_path / "formal-work/trials").exists()
+    resource = json.loads(
+        (tmp_path / "formal-work/refit.resource.json").read_text(encoding="utf-8")
+    )
+    assert resource["stage"] == "refit"
+
+
+def _small_profile_record(tmp_path: Path) -> dict[str, Path]:
+    genes = np.asarray(["A", "B", "C", "D"])
+    labels = np.asarray(["non-targeting"] * 12 + ["A"] * 6 + ["B"] * 6)
+    expression = np.zeros((len(labels), len(genes)), dtype=np.float64)
+    expression[:, :] = np.arange(len(labels), dtype=float)[:, None] * 0.001
+    expression[labels == "A", 1] += 3.0
+    expression[labels == "B", 2] -= 2.0
+    input_path = tmp_path / "profile.npz"
+    np.savez(
+        input_path,
+        expression_matrix=expression,
+        interventions=labels,
+        var_names=genes,
+    )
+    manifest = tmp_path / "profile_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "condition": "within_environment",
+                "context_id": "k562",
+                "direction": None,
+                "contexts": [{"context_id": "k562", "role": "within_refit"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return {"input": input_path, "manifest": manifest}
+
+
+def test_formal_mean_difference_nulls_rerun_all_40_transformed_inputs(
+    tmp_path: Path,
+) -> None:
+    profile = _small_profile_record(tmp_path)
+    predictions = rehearsal_module._scientific_null_predictions(
+        method_id="mean_difference",
+        profile_record=profile,
+        seed=11,
+        min_cells=2,
+        hypersca_config_path=None,
+    )
+
+    controls = rehearsal_module._run_formal_null_controls(
+        method_id="mean_difference",
+        predictions=predictions,
+        profile_record=profile,
+        seed=11,
+        min_cells=2,
+        hypersca_config_path=None,
+        work_dir=tmp_path / "null-work",
+    )
+
+    assert controls["scope"] == "formal_scientific_inference_rerun"
+    assert controls["formal_null_gate_passed"] is True
+    analyses = [
+        *controls["label_permutation"]["analyses"],
+        *controls["control_resampling"]["analyses"],
+    ]
+    assert len(analyses) == 40
+    assert all(record["status"] == "completed" for record in analyses)
+    assert all(record["input_sha256"].startswith("sha256:") for record in analyses)
+    assert all(
+        record["prediction_sha256"].startswith("sha256:") for record in analyses
+    )
+    resources = sorted((tmp_path / "null-work").rglob("analysis.resource.json"))
+    assert len(resources) == 40
+    assert all(
+        json.loads(path.read_text(encoding="utf-8"))["stage"] == "null_control"
+        for path in resources
+    )
+
+
+def test_formal_null_failure_is_retained_and_prevents_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = _small_profile_record(tmp_path)
+    predictions = rehearsal_module._scientific_null_predictions(
+        method_id="mean_difference",
+        profile_record=profile,
+        seed=11,
+        min_cells=2,
+        hypersca_config_path=None,
+    )
+    original = rehearsal_module._scientific_null_predictions
+
+    def fail_one(**kwargs: object) -> pd.DataFrame:
+        if kwargs["seed"] == 12:
+            raise TaskCRehearsalError("deliberate repeat failure")
+        return original(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(rehearsal_module, "_scientific_null_predictions", fail_one)
+    with pytest.raises(TaskCRehearsalError, match="null-control analyses"):
+        rehearsal_module._run_formal_null_controls(
+            method_id="mean_difference",
+            predictions=predictions,
+            profile_record=profile,
+            seed=11,
+            min_cells=2,
+            hypersca_config_path=None,
+            work_dir=tmp_path / "null-work",
+        )
+
+    resources = [
+        json.loads(path.read_text())
+        for path in sorted((tmp_path / "null-work").rglob("analysis.resource.json"))
+    ]
+    assert len(resources) == 40
+    failed = [record for record in resources if record["status"] == "failed"]
+    assert len(failed) == 1
+    assert "deliberate repeat failure" in failed[0]["reason"]

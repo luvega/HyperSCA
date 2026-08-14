@@ -45,6 +45,7 @@ MAXIMUM_METRICS_BYTES = 4 * 1024 * 1024
 MAXIMUM_EVIDENCE_BYTES = 64 * 1024 * 1024
 MAXIMUM_JSON_DEPTH = 32
 _PASSED_STATUS = "passed_real_rehearsal"
+_SYNTHETIC_STATUS = "passed_synthetic_smoke"
 _FAILED_OR_UNAVAILABLE_STATUSES = frozenset(
     {
         "failed_timeout",
@@ -671,7 +672,11 @@ def _validate_method_status(status_payload: dict[str, Any]) -> bool:
     ):
         raise TaskCAggregationError("method identity contains unsafe text")
     status = status_payload.get("status")
-    if status not in {_PASSED_STATUS, *_FAILED_OR_UNAVAILABLE_STATUSES}:
+    if status not in {
+        _PASSED_STATUS,
+        _SYNTHETIC_STATUS,
+        *_FAILED_OR_UNAVAILABLE_STATUSES,
+    }:
         raise TaskCAggregationError("method status is not a final rehearsal status")
     if fields == _MINIMAL_STATUS_FIELDS:
         return False
@@ -692,15 +697,17 @@ def _validate_method_status(status_payload: dict[str, Any]) -> bool:
         or any(character not in "0123456789abcdef" for character in identity[7:])
     ):
         raise TaskCAggregationError("method status run identity is invalid")
-    if (
-        status_payload.get("controller_validation")
-        != "verified_task_c_rehearsal_bundle_v1"
-    ):
+    expected_controller = (
+        "verified_task_c_synthetic_smoke_bundle_v1"
+        if status == _SYNTHETIC_STATUS
+        else "verified_task_c_rehearsal_bundle_v1"
+    )
+    if status_payload.get("controller_validation") != expected_controller:
         raise TaskCAggregationError(
             "method status lacks the rehearsal controller validation declaration"
         )
     reason = status_payload.get("reason")
-    if status == _PASSED_STATUS and "reason" in status_payload:
+    if status in {_PASSED_STATUS, _SYNTHETIC_STATUS} and "reason" in status_payload:
         raise TaskCAggregationError("passed method status must not contain a failure reason")
     if "reason" in status_payload:
         _valid_name(reason, "failure reason")
@@ -809,7 +816,7 @@ def aggregate_task_c_runs(
             )
 
         status_name = str(method_status["status"])
-        if status_name == _PASSED_STATUS:
+        if status_name in {_PASSED_STATUS, _SYNTHETIC_STATUS}:
             required_files = frozenset({"method_status.json", "metrics.json"})
             allowed_files = _KNOWN_PASSED_FILES
             if extended_status:
@@ -862,28 +869,30 @@ def aggregate_task_c_runs(
 
         record = dict(method_status)
         record["controller_validation_status"] = (
-            "verified_task_c_rehearsal_bundle_v1"
+            str(method_status["controller_validation"])
             if extended_status
             else "unverified_legacy_record"
         )
-        if status_name == _PASSED_STATUS:
+        if status_name in {_PASSED_STATUS, _SYNTHETIC_STATUS}:
             metrics = captured_json["metrics.json"]
             _validate_metrics(metrics)
             record["metrics"] = metrics
-            if extended_status:
+            if extended_status and status_name == _PASSED_STATUS:
                 verified_completed += 1
-            else:
+            elif not extended_status:
                 legacy_structural_completed += 1
         run_records.append(record)
         statuses.append(status_name)
 
     counts = Counter(statuses)
-    structural_completed = counts.get(_PASSED_STATUS, 0)
+    synthetic_structural = counts.get(_SYNTHETIC_STATUS, 0)
+    structural_completed = counts.get(_PASSED_STATUS, 0) + synthetic_structural
     result = {
         "attempted_run_count": len(run_records),
         "completed_run_count": verified_completed,
         "verified_completed_run_count": verified_completed,
         "legacy_structural_completed_count": legacy_structural_completed,
+        "synthetic_structural_run_count": synthetic_structural,
         "structural_completed_run_count": structural_completed,
         "not_formally_completed_count": len(run_records) - verified_completed,
         "failed_or_unavailable_count": len(run_records) - structural_completed,
@@ -891,7 +900,7 @@ def aggregate_task_c_runs(
         "runs": run_records,
         "validation_scope": (
             "formal completion requires the verified Task C rehearsal bundle "
-            "declaration; explicit legacy mode is structural only"
+            "declaration; synthetic smoke and explicit legacy mode are structural only"
         ),
         "independent_bundle_verification": False,
     }

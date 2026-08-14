@@ -23,6 +23,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from types import MappingProxyType
 from typing import Any
 import unicodedata
@@ -106,6 +107,7 @@ REHEARSAL_CONDITIONS = (
 _FINAL_REHEARSAL_STATUSES = frozenset(
     {
         "passed_real_rehearsal",
+        "passed_synthetic_smoke",
         "failed_timeout",
         "failed_resource_limit",
         "failed_runtime_unavailable",
@@ -238,14 +240,14 @@ def build_rehearsal_execution_plan(
         method: (
             2
             if profile == "connection"
-            and method in {"hypersca_c", "mean_difference"}
+            and method == "hypersca_c"
             else 0
         )
         for method in methods
     }
     selected = tuple(
         method
-        for method in ("hypersca_c", "mean_difference")
+        for method in ("hypersca_c",)
         if trial_counts.get(method) == 2
     )
     return MappingProxyType(
@@ -255,6 +257,16 @@ def build_rehearsal_execution_plan(
                     "stages": ("train", "tune", "refit"),
                     "trial_counts": MappingProxyType(dict(trial_counts)),
                     "selection_bound_refit": selected,
+                    "method_stages": MappingProxyType(
+                        {
+                            method: (
+                                ("train", "tune", "refit")
+                                if trial_counts[method] == 2
+                                else ("refit",)
+                            )
+                            for method in methods
+                        }
+                    ),
                 }
             )
             for condition in REHEARSAL_CONDITIONS
@@ -1837,6 +1849,27 @@ def _tree_inventory(root: Path, *, exclude: frozenset[str] = frozenset()) -> dic
     return inventory
 
 
+def _reject_output_symbolic_links(path: Path) -> None:
+    """Reject an output name reached through any symbolic-link component."""
+
+    absolute = Path(os.path.abspath(os.fspath(path.expanduser())))
+    cursor = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        cursor = cursor / component
+        try:
+            metadata = os.lstat(cursor)
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            raise TaskCRehearsalError(
+                "output path components could not be inspected"
+            ) from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise TaskCRehearsalError(
+                "output root and its parents must not use symbolic links"
+            )
+
+
 def _profile_inputs(
     *, public_manifest: Path, profile: str, staging: Path
 ) -> dict[str, dict[str, dict[str, Path]]]:
@@ -1887,6 +1920,124 @@ def _read_profile_arrays(profile_record: Mapping[str, Path]) -> tuple[np.ndarray
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise TaskCRehearsalError("profile arrays could not be read") from exc
     return expression, labels, genes
+
+
+def _read_profile_arrays_with_environments(
+    profile_record: Mapping[str, Path],
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], np.ndarray | None]:
+    try:
+        with np.load(profile_record["input"], allow_pickle=False) as archive:
+            expression = np.asarray(archive["expression_matrix"], dtype=np.float64)
+            labels = np.asarray(archive["interventions"], dtype=str)
+            genes = tuple(str(value) for value in archive["var_names"].tolist())
+            environments = (
+                np.asarray(archive["environment_labels"], dtype=str)
+                if "environment_labels" in archive.files
+                else None
+            )
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise TaskCRehearsalError("profile arrays could not be read") from exc
+    return expression, labels, genes, environments
+
+
+def _write_new_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(descriptor, payload[offset:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except FileExistsError as exc:
+        raise TaskCRehearsalError(
+            f"analysis output already exists and will not be overwritten: {path.name}"
+        ) from exc
+    except OSError as exc:
+        raise TaskCRehearsalError(
+            f"analysis output could not be written safely: {path.name}"
+        ) from exc
+
+
+def materialize_hypersca_profile_contexts(
+    *, profile_record: Mapping[str, Path], output_dir: Path
+) -> Mapping[str, Path]:
+    """Write the two already-frozen cross-environment contexts separately."""
+
+    from src.evaluation.task_c_profile_input import _deterministic_npz
+
+    expression, labels, genes, environments = _read_profile_arrays_with_environments(
+        profile_record
+    )
+    manifest = _strict_json_file(profile_record["manifest"], "profile input record")
+    if manifest.get("condition") != "cross_environment" or environments is None:
+        raise TaskCRehearsalError(
+            "separate HyperSCA-C profile contexts require one cross-environment profile"
+        )
+    contexts = manifest.get("contexts")
+    if not isinstance(contexts, list) or len(contexts) != 2:
+        raise TaskCRehearsalError(
+            "cross-environment profile must record source and target-adapt contexts"
+        )
+    destination = Path(os.path.abspath(os.fspath(output_dir.expanduser())))
+    if destination.exists() or destination.is_symlink():
+        raise TaskCRehearsalError("HyperSCA-C context output already exists")
+    destination.mkdir(parents=True, mode=0o700)
+    created: dict[str, Path] = {}
+    records: list[dict[str, object]] = []
+    for index, record in enumerate(contexts):
+        if not isinstance(record, dict):
+            raise TaskCRehearsalError("profile context record is invalid")
+        context_id = record.get("context_id")
+        role = record.get("role")
+        if context_id not in {"k562", "rpe1"} or not isinstance(role, str):
+            raise TaskCRehearsalError("profile context identity is invalid")
+        selected = environments == context_id
+        if not np.any(selected) or context_id in created:
+            raise TaskCRehearsalError("profile context cells are incomplete")
+        path = destination / (
+            "source_profile.npz" if index == 0 else "target_adapt_profile.npz"
+        )
+        payload = _deterministic_npz(
+            {
+                "expression_matrix": expression[selected],
+                "interventions": labels[selected],
+                "var_names": np.asarray(genes),
+            }
+        )
+        _write_new_bytes(path, payload)
+        created[str(context_id)] = path
+        records.append(
+            {
+                "context_id": context_id,
+                "role": role,
+                "file_name": path.name,
+                "sha256": _sha256_file(path),
+                "cell_count": int(selected.sum()),
+                "parent_sha256": record.get("parent_sha256"),
+                "selected_sorted_indices": record.get("selected_sorted_indices"),
+            }
+        )
+    _write_new_record(
+        destination / "context_manifest.json",
+        {
+            "schema_version": "1.0",
+            "profile_input_sha256": _sha256_file(profile_record["input"]),
+            "profile_manifest_sha256": _sha256_file(profile_record["manifest"]),
+            "gene_order": list(genes),
+            "contexts": records,
+        },
+    )
+    return MappingProxyType(created)
 
 
 def materialize_sealed_scoring_subset(
@@ -2163,6 +2314,341 @@ def _null_control_records(
     return result
 
 
+def _scientific_null_predictions(
+    *,
+    method_id: str,
+    profile_record: Mapping[str, Path],
+    seed: int,
+    min_cells: int,
+    hypersca_config_path: Path | None,
+) -> Any:
+    """Run the registered scientific rule on one materialized null input."""
+
+    from src.evaluation.task_c_predictions import normalize_task_c_predictions
+
+    expression, labels, genes, environments = _read_profile_arrays_with_environments(
+        profile_record
+    )
+    if method_id == "mean_difference":
+        from src.evaluation.task_c_benchmark import score_mean_difference_network
+
+        raw = score_mean_difference_network(
+            expression,
+            labels,
+            genes,
+            control_label=CONTROL_LABEL,
+            excluded_label="excluded",
+            min_cells_per_intervention=min_cells,
+        ).scores[["source", "target", "score"]]
+    elif method_id == "hypersca_c":
+        if hypersca_config_path is None:
+            raise TaskCRehearsalError(
+                "HyperSCA-C null inference requires the selected fixed settings"
+            )
+        from src.causal.hypersca_c import HyperSCACConfig, HyperSCACContext
+        from src.causal.hypersca_c_stability import fit_stable_hypersca_c
+
+        config = HyperSCACConfig.from_mapping(
+            _strict_json_file(hypersca_config_path, "HyperSCA-C null settings")
+        )
+        manifest = _strict_json_file(
+            profile_record["manifest"], "null profile input record"
+        )
+        contexts_record = manifest.get("contexts")
+        if not isinstance(contexts_record, list) or not contexts_record:
+            raise TaskCRehearsalError("null profile lacks its fixed contexts")
+        context_ids = tuple(
+            str(record.get("context_id"))
+            for record in contexts_record
+            if isinstance(record, dict)
+        )
+        if not context_ids:
+            raise TaskCRehearsalError("null profile lacks its fixed contexts")
+        contexts = []
+        for context_id in context_ids:
+            selected = (
+                np.ones(len(labels), dtype=bool)
+                if environments is None
+                else environments == context_id
+            )
+            if not np.any(selected):
+                raise TaskCRehearsalError(
+                    "HyperSCA-C null input lacks one fixed context"
+                )
+            contexts.append(
+                HyperSCACContext(
+                    context_id=context_id,
+                    expression=expression[selected],
+                    interventions=labels[selected],
+                    gene_names=genes,
+                )
+            )
+        fitted = fit_stable_hypersca_c(
+            contexts,
+            config,
+            seed=seed,
+            device="cpu",
+        )
+        raw = fitted.predictions[["source", "target", "score"]]
+    else:
+        raise TaskCRehearsalError(
+            "formal null inference is limited to HyperSCA-C and Mean Difference"
+        )
+    return normalize_task_c_predictions(raw, genes)
+
+
+def _response_average_precision(
+    predictions: Any,
+    expression: np.ndarray,
+    labels: np.ndarray,
+    genes: tuple[str, ...],
+) -> float:
+    from sklearn.metrics import average_precision_score
+
+    from src.evaluation.task_c_tuning import (
+        TaskCTuningError,
+        build_tuning_response_edges,
+    )
+
+    try:
+        positives = build_tuning_response_edges(
+            expression,
+            labels,
+            genes,
+            eligible_sources=set(labels.tolist()) - {CONTROL_LABEL, "excluded"},
+            q_value_threshold=0.1,
+        )
+    except TaskCTuningError:
+        return 0.0
+    relations = list(
+        zip(
+            predictions["source"].astype(str),
+            predictions["target"].astype(str),
+            strict=True,
+        )
+    )
+    truth = np.asarray([relation in positives for relation in relations], dtype=int)
+    if int(truth.sum()) in {0, len(truth)}:
+        return 0.0
+    return float(
+        average_precision_score(
+            truth,
+            np.asarray(predictions["score"], dtype=np.float64),
+        )
+    )
+
+
+def _contextwise_label_permutation(
+    labels: np.ndarray, environments: np.ndarray | None, seed: int
+) -> np.ndarray:
+    from src.evaluation.task_c_null_controls import permute_intervention_labels
+
+    if environments is None:
+        return permute_intervention_labels(labels, seed)
+    transformed = labels.copy()
+    for offset, context_id in enumerate(dict.fromkeys(environments.tolist())):
+        selected = environments == context_id
+        transformed[selected] = permute_intervention_labels(
+            labels[selected], seed + offset
+        )
+    return transformed
+
+
+def _contextwise_control_resampling(
+    expression: np.ndarray,
+    labels: np.ndarray,
+    environments: np.ndarray | None,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    from src.evaluation.task_c_null_controls import build_control_resampling_null
+
+    if environments is None:
+        return build_control_resampling_null(expression, labels, seed)
+    transformed = expression.copy()
+    copied_labels = labels.copy()
+    for offset, context_id in enumerate(dict.fromkeys(environments.tolist())):
+        selected = environments == context_id
+        sampled, sampled_labels = build_control_resampling_null(
+            expression[selected], labels[selected], seed + offset
+        )
+        transformed[selected] = sampled
+        copied_labels[selected] = sampled_labels
+    return transformed, copied_labels
+
+
+def _run_formal_null_controls(
+    *,
+    method_id: str,
+    predictions: Any,
+    profile_record: Mapping[str, Path],
+    seed: int,
+    min_cells: int,
+    hypersca_config_path: Path | None,
+    work_dir: Path,
+) -> dict[str, object]:
+    """Materialize and analyze all 40 formal zero-effect inputs."""
+
+    from src.evaluation.task_c_null_controls import (
+        empirical_null_check,
+        null_check_to_json_record,
+    )
+    from src.evaluation.task_c_profile_input import _deterministic_npz
+
+    expression, labels, genes, environments = _read_profile_arrays_with_environments(
+        profile_record
+    )
+    real_metric = _response_average_precision(
+        predictions, expression, labels, genes
+    )
+    root = work_dir / "null_controls"
+    root.mkdir(parents=True, mode=0o700, exist_ok=False)
+    failures: list[dict[str, object]] = []
+    result: dict[str, object] = {
+        "scope": "formal_scientific_inference_rerun",
+        "formal_null_gate_passed": False,
+    }
+    for control_name, offset in (
+        ("label_permutation", 1),
+        ("control_resampling", 101),
+    ):
+        metrics: list[float] = []
+        analyses: list[dict[str, object]] = []
+        for repeat in range(20):
+            repeat_seed = seed + offset + repeat
+            repeat_root = root / control_name / f"repeat_{repeat:02d}"
+            repeat_root.mkdir(parents=True, mode=0o700)
+            if control_name == "label_permutation":
+                transformed_expression = expression
+                transformed_labels = _contextwise_label_permutation(
+                    labels, environments, repeat_seed
+                )
+            else:
+                transformed_expression, transformed_labels = (
+                    _contextwise_control_resampling(
+                        expression, labels, environments, repeat_seed
+                    )
+                )
+            arrays: dict[str, np.ndarray] = {
+                "expression_matrix": transformed_expression,
+                "interventions": transformed_labels,
+                "var_names": np.asarray(genes),
+            }
+            if environments is not None:
+                arrays["environment_labels"] = environments
+            input_path = repeat_root / "input.npz"
+            _write_new_bytes(input_path, _deterministic_npz(arrays))
+            input_sha256 = _sha256_file(input_path)
+            identity = {
+                "schema_version": "1.0",
+                "method_id": method_id,
+                "control": control_name,
+                "repeat": repeat,
+                "seed": repeat_seed,
+                "parent_profile_input_sha256": _sha256_file(
+                    profile_record["input"]
+                ),
+                "parent_profile_manifest_sha256": _sha256_file(
+                    profile_record["manifest"]
+                ),
+                "input_sha256": input_sha256,
+                "hypersca_config_sha256": (
+                    _sha256_file(hypersca_config_path)
+                    if hypersca_config_path is not None
+                    else None
+                ),
+            }
+            _write_new_record(repeat_root / "input_identity.json", identity)
+            started = time.monotonic()
+            status = "completed"
+            reason: str | None = None
+            prediction_sha256: str | None = None
+            metric: float | None = None
+            try:
+                transformed_profile = {
+                    "input": input_path,
+                    "manifest": profile_record["manifest"],
+                }
+                null_predictions = _scientific_null_predictions(
+                    method_id=method_id,
+                    profile_record=transformed_profile,
+                    seed=repeat_seed,
+                    min_cells=min_cells,
+                    hypersca_config_path=hypersca_config_path,
+                )
+                prediction_path = repeat_root / "predictions.csv"
+                null_predictions.to_csv(prediction_path, index=False)
+                prediction_sha256 = _sha256_file(prediction_path)
+                metric = _response_average_precision(
+                    null_predictions,
+                    np.asarray(transformed_expression),
+                    np.asarray(transformed_labels),
+                    genes,
+                )
+                metrics.append(metric)
+            except (Exception,) as exc:
+                status = "failed"
+                reason = _safe_failure_reason(exc)
+            analysis = {
+                "schema_version": "1.0",
+                "component_kind": "null_analysis",
+                "method_id": method_id,
+                "stage": "null_control",
+                "control": control_name,
+                "repeat": repeat,
+                "seed": repeat_seed,
+                "status": status,
+                "input_sha256": input_sha256,
+                "prediction_sha256": prediction_sha256,
+                "metric": metric,
+                "elapsed_seconds": max(0.0, time.monotonic() - started),
+            }
+            if reason is not None:
+                analysis["reason"] = reason
+                failures.append(dict(analysis))
+            _write_new_record(repeat_root / "analysis.resource.json", analysis)
+            analyses.append(dict(analysis))
+        control_record: dict[str, object] = {
+            "seeds": [seed + offset + repeat for repeat in range(20)],
+            "metrics": metrics,
+            "analyses": analyses,
+            "completed_analysis_count": sum(
+                record["status"] == "completed" for record in analyses
+            ),
+        }
+        if len(metrics) == 20:
+            checked = empirical_null_check(real_metric, metrics, 0.05, 0.0)
+            control_record.update(null_check_to_json_record(checked))
+        result[control_name] = control_record
+    if failures:
+        _write_new_record(
+            root / "null_control_status.json",
+            {
+                "schema_version": "1.0",
+                "status": "failed_null_control",
+                "attempted_analysis_count": 40,
+                "completed_analysis_count": 40 - len(failures),
+                "failures": failures,
+            },
+        )
+        raise TaskCRehearsalError(
+            "null-control analyses did not all complete; retained failure records"
+        )
+    result["formal_null_gate_passed"] = all(
+        bool(result[name].get("passed"))  # type: ignore[union-attr]
+        for name in ("label_permutation", "control_resampling")
+    )
+    _write_new_record(
+        root / "null_control_status.json",
+        {
+            "schema_version": "1.0",
+            "status": "completed_formal_null_controls",
+            "attempted_analysis_count": 40,
+            "completed_analysis_count": 40,
+        },
+    )
+    return result
+
+
 def _hypersca_gene_list(
     *, profile_record: Mapping[str, Path], destination: Path, profile: str
 ) -> Path:
@@ -2222,6 +2708,8 @@ def _run_method_bundle(
     gene_list: Path | None = None,
     trial_candidate: Path | None = None,
     selection_arguments: Mapping[str, object] | None = None,
+    resource_record_path: Path | None = None,
+    resource_stage: str | None = None,
 ) -> dict[str, object]:
     from src.evaluation.task_c_method_run import (
         TaskCMethodRunError,
@@ -2248,12 +2736,43 @@ def _run_method_bundle(
         "trial_parameters_path": trial_candidate,
         "project_root": project_root,
     }
+    if method_id == "hypersca_c" and profile_record is not None:
+        profile_manifest = _strict_json_file(
+            profile_record["manifest"], "profile input record"
+        )
+        if profile_manifest.get("condition") == "cross_environment":
+            context_paths = materialize_hypersca_profile_contexts(
+                profile_record=profile_record,
+                output_dir=output_dir.parent / f"{output_dir.name}.profile-contexts",
+            )
+            arguments["profile_context_values"] = tuple(
+                f"{context_id}={path}"
+                for context_id, path in context_paths.items()
+            )
     if selection_arguments:
         arguments.update(selection_arguments)
+    started = time.monotonic()
+    final_status = "raised_before_status"
     try:
-        return run_task_c_method(**arguments)  # type: ignore[arg-type]
+        result = run_task_c_method(**arguments)  # type: ignore[arg-type]
+        final_status = str(result.get("status", "missing_status"))
+        return result
     except TaskCMethodRunError:
+        final_status = "raised_task_c_method_error"
         raise
+    finally:
+        if resource_record_path is not None:
+            _write_new_record(
+                resource_record_path,
+                {
+                    "schema_version": "1.0",
+                    "component_kind": "method_analysis",
+                    "method_id": method_id,
+                    "stage": resource_stage or "unspecified",
+                    "elapsed_seconds": max(0.0, time.monotonic() - started),
+                    "status": final_status,
+                },
+            )
 
 
 def _method_bundle_status(path: Path) -> tuple[str | None, str | None]:
@@ -2298,6 +2817,10 @@ def _select_connection_configuration(
     project_root: Path,
     base_hypersca_config: Path,
 ) -> tuple[Path, dict[str, object]]:
+    if method_id != "hypersca_c":
+        raise TaskCRehearsalError(
+            "connection selection is reserved for HyperSCA-C; reference methods use fixed settings"
+        )
     trial_root = work_dir / "trials"
     trial_root.mkdir(parents=True, mode=0o700)
     gene_list: Path | None = None
@@ -2345,6 +2868,8 @@ def _select_connection_configuration(
             hypersca_config=configs[trial_index],
             gene_list=gene_list,
             trial_candidate=candidate,
+            resource_record_path=work_dir / f"train_trial_{trial_index}.resource.json",
+            resource_stage="train",
         )
         inner_status, _reason = _method_bundle_status(trial_dir)
         if inner_status != "completed_standardized_output":
@@ -2413,12 +2938,24 @@ def _select_connection_configuration(
                 ("--trial-hypersca-config", f"{trial_dir}={configs[index]}")
             )
             command.extend(("--trial-gene-list", f"{trial_dir}={gene_list}"))
+    selection_started = time.monotonic()
     completed = subprocess.run(
         command,
         cwd=project_root,
         capture_output=True,
         text=True,
         check=False,
+    )
+    _write_new_record(
+        work_dir / "tune_selection.resource.json",
+        {
+            "schema_version": "1.0",
+            "component_kind": "configuration_selection",
+            "method_id": method_id,
+            "stage": "tune",
+            "elapsed_seconds": max(0.0, time.monotonic() - selection_started),
+            "status": "completed" if completed.returncode == 0 else "failed",
+        },
     )
     if completed.returncode != 0:
         raise TaskCRehearsalError(
@@ -2474,6 +3011,8 @@ def _select_connection_configuration(
         hypersca_config=refit_config,
         gene_list=gene_list,
         selection_arguments=selection_arguments,
+        resource_record_path=work_dir / "refit.resource.json",
+        resource_stage="refit",
     )
     return refit, status
 
@@ -2494,7 +3033,7 @@ def _run_formal_final_method(
     project_root: Path,
     source_kind: str,
 ) -> tuple[Path, dict[str, object]]:
-    if profile == "connection" and method_id in {"hypersca_c", "mean_difference"}:
+    if profile == "connection" and method_id == "hypersca_c":
         return _select_connection_configuration(
             method_id=method_id,
             condition=condition,
@@ -2550,6 +3089,8 @@ def _run_formal_final_method(
         project_root=project_root,
         hypersca_config=config,
         gene_list=gene_list,
+        resource_record_path=work_dir / "refit.resource.json",
+        resource_stage="refit",
     )
     return refit, status
 
@@ -2660,7 +3201,7 @@ def _formal_scoring(
             shutil.rmtree(private_root)
 
 
-def _formal_scoring_subset(
+def _formal_scoring_subset_unrecorded(
     *,
     condition: str,
     predictions: Path,
@@ -2787,6 +3328,51 @@ def _formal_scoring_subset(
     return metrics
 
 
+def _formal_scoring_subset(
+    *,
+    condition: str,
+    predictions: Path,
+    prepared_root: Path,
+    asset_root: Path,
+    work_dir: Path,
+    seed: int,
+    registry: Any,
+    project_root: Path,
+    heldout: Path,
+    private_root: Path,
+) -> dict[str, object]:
+    """Run sealed scoring and retain its elapsed-time and failure evidence."""
+
+    started = time.monotonic()
+    status = "failed"
+    try:
+        metrics = _formal_scoring_subset_unrecorded(
+            condition=condition,
+            predictions=predictions,
+            prepared_root=prepared_root,
+            asset_root=asset_root,
+            work_dir=work_dir,
+            seed=seed,
+            registry=registry,
+            project_root=project_root,
+            heldout=heldout,
+            private_root=private_root,
+        )
+        status = "completed"
+        return metrics
+    finally:
+        _write_new_record(
+            work_dir / "sealed_scoring.resource.json",
+            {
+                "schema_version": "1.0",
+                "component_kind": "sealed_scoring",
+                "stage": "scoring",
+                "elapsed_seconds": max(0.0, time.monotonic() - started),
+                "status": status,
+            },
+        )
+
+
 def _promotion_record() -> dict[str, object]:
     return {
         "schema_version": "1.0",
@@ -2826,17 +3412,63 @@ def _outer_environment_record(
     }
 
 
-def _resource_record(inner_dir: Path | None, *, null_repeat_count: int) -> dict[str, object]:
-    inner: object = None
-    if inner_dir is not None:
-        candidates = sorted(inner_dir.rglob("resource_usage.json"))
-        if candidates:
-            inner = _strict_json_file(candidates[-1], "method resource record")
+def _resource_record(
+    work_dir: Path | None, *, used_stages: Sequence[str]
+) -> dict[str, object]:
+    components: list[dict[str, object]] = []
+    if work_dir is not None and work_dir.is_dir():
+        for path in sorted(work_dir.rglob("*.resource.json")):
+            record = _strict_json_file(path, "rehearsal component resource record")
+            components.append(
+                {
+                    "relative_path": path.relative_to(work_dir).as_posix(),
+                    **record,
+                }
+            )
+        for path in sorted(work_dir.rglob("resource_usage.json")):
+            components.append(
+                {
+                    "relative_path": path.relative_to(work_dir).as_posix(),
+                    "schema_version": "1.0",
+                    "component_kind": "method_runtime_worker",
+                    "record": _strict_json_file(path, "method resource record"),
+                }
+            )
+    null_records = [
+        record for record in components if record.get("component_kind") == "null_analysis"
+    ]
+    elapsed = sum(
+        float(record.get("elapsed_seconds", 0.0))
+        for record in components
+        if isinstance(record.get("elapsed_seconds", 0.0), (int, float))
+        and not isinstance(record.get("elapsed_seconds", 0.0), bool)
+    )
+    observed_stages = {
+        str(record["stage"])
+        for record in components
+        if isinstance(record.get("stage"), str)
+    }
+    stage_order = ("train", "tune", "refit", "scoring", "null_control")
+    recorded_stages = tuple(
+        stage
+        for stage in stage_order
+        if stage in set(used_stages) | observed_stages
+    )
+    recorded_stages += tuple(
+        stage
+        for stage in used_stages
+        if stage not in recorded_stages
+    )
     return {
         "schema_version": "1.0",
         "resource_scope": "single-seed reduced-data rehearsal",
-        "method_resource_record": inner,
-        "null_control_repeat_count_per_type": null_repeat_count,
+        "used_stages": list(recorded_stages),
+        "component_records": components,
+        "recorded_elapsed_seconds": elapsed,
+        "null_control_analysis_count": len(null_records),
+        "null_control_repeat_count_per_type": (
+            len(null_records) // 2 if len(null_records) == 40 else 0
+        ),
     }
 
 
@@ -2851,6 +3483,7 @@ def _publish_outer_success(
     metrics: Mapping[str, object],
     input_summary: Mapping[str, object],
     inner_dir: Path | None,
+    work_dir: Path | None,
     synthetic_smoke: bool,
     required_artifacts: Sequence[str],
 ) -> None:
@@ -2893,7 +3526,14 @@ def _publish_outer_success(
         )
         _write_new_record(
             staging / "resource_usage.json",
-            _resource_record(inner_dir, null_repeat_count=20),
+            _resource_record(
+                work_dir,
+                used_stages=(
+                    ("synthetic_smoke",)
+                    if synthetic_smoke
+                    else tuple(input_summary.get("used_stages", ("refit",)))
+                ),
+            ),
         )
         _write_new_record(
             staging / "method_status.json",
@@ -2903,8 +3543,16 @@ def _publish_outer_success(
                 "condition": condition,
                 "seed": seed,
                 "run_identity_sha256": identity_sha256,
-                "status": "passed_real_rehearsal",
-                "controller_validation": "verified_task_c_rehearsal_bundle_v1",
+                "status": (
+                    "passed_synthetic_smoke"
+                    if synthetic_smoke
+                    else "passed_real_rehearsal"
+                ),
+                "controller_validation": (
+                    "verified_task_c_synthetic_smoke_bundle_v1"
+                    if synthetic_smoke
+                    else "verified_task_c_rehearsal_bundle_v1"
+                ),
             },
         )
         validate_required_run_artifacts(staging, required_artifacts)
@@ -2924,9 +3572,13 @@ def _publish_outer_failure(
     status: str,
     reason: str,
     inner_dir: Path | None,
+    work_dir: Path | None,
     synthetic_smoke: bool,
 ) -> None:
-    if status not in _FINAL_REHEARSAL_STATUSES - {"passed_real_rehearsal"}:
+    if status not in _FINAL_REHEARSAL_STATUSES - {
+        "passed_real_rehearsal",
+        "passed_synthetic_smoke",
+    }:
         raise TaskCRehearsalError("failure status is not recognized")
     staging = destination.parent / f".{destination.name}.staging"
     if staging.exists() or destination.exists():
@@ -2954,7 +3606,10 @@ def _publish_outer_failure(
         )
         _write_new_record(
             staging / "resource_usage.json",
-            _resource_record(inner_dir, null_repeat_count=0),
+            _resource_record(
+                work_dir,
+                used_stages=("synthetic_smoke",) if synthetic_smoke else (),
+            ),
         )
         _write_new_record(
             staging / "method_status.json",
@@ -3117,7 +3772,10 @@ def _resume_verified_rehearsal(
     run_dirs = sorted((output_root / "runs").iterdir())
     for run_dir in run_dirs:
         status = _strict_json_file(run_dir / "method_status.json", "method status")
-        if status.get("status") == "passed_real_rehearsal":
+        if status.get("status") in {
+            "passed_real_rehearsal",
+            "passed_synthetic_smoke",
+        }:
             validate_required_run_artifacts(run_dir, required_artifacts)
     expected_inventory = observed.get("file_inventory")
     actual_inventory = _tree_inventory(
@@ -3142,7 +3800,12 @@ def _outer_input_summary(
     synthetic_smoke: bool,
 ) -> dict[str, object]:
     stages: dict[str, object] = {}
-    for stage in ("train", "tune", "refit"):
+    used_stages = (
+        ("train", "tune", "refit")
+        if profile == "connection" and method_id == "hypersca_c"
+        else ("refit",)
+    )
+    for stage in used_stages:
         manifest = _strict_json_file(
             profile_records[stage]["manifest"], "profile input record"
         )
@@ -3179,7 +3842,15 @@ def _outer_input_summary(
         "condition": condition,
         "method_id": method_id,
         "stages": stages,
-        "training_tuning_and_final_fit_are_separate": True,
+        "used_stages": list(used_stages),
+        "training_tuning_and_final_fit_are_separate": len(used_stages) == 3,
+        "settings_policy": (
+            "two public training candidates, separate public tuning, selected public refit"
+            if len(used_stages) == 3
+            else "fixed no-tuning reference; registered settings used for public refit"
+            if method_id == "mean_difference"
+            else "registered default settings used for public refit"
+        ),
         "private_data_received_by_method": False,
         "data_scope": "synthetic_smoke" if synthetic_smoke else "external_benchmark",
         "interpretation": (
@@ -3230,6 +3901,7 @@ def run_task_c_rehearsal(
     prepared = Path(os.path.abspath(os.fspath(prepared_root.expanduser())))
     assets = Path(os.path.abspath(os.fspath(method_assets_root.expanduser())))
     output = Path(os.path.abspath(os.fspath(output_root.expanduser())))
+    _reject_output_symbolic_links(output)
     if _has_private_component(prepared) or _has_private_component(output):
         raise TaskCRehearsalError(
             "public rehearsal inputs and outputs must not use a private path"
@@ -3307,10 +3979,7 @@ def run_task_c_rehearsal(
                             profile_record=condition_profiles["refit"],
                             seed=config.seed,
                         )
-                        if profile == "connection" and method_id in {
-                            "hypersca_c",
-                            "mean_difference",
-                        }:
+                        if profile == "connection" and method_id == "hypersca_c":
                             _write_new_record(
                                 work / "selection_record.json",
                                 {
@@ -3346,6 +4015,11 @@ def run_task_c_rehearsal(
                                 raise TaskCRehearsalError(
                                     f"null-control workflow failed: {exc}"
                                 ) from exc
+                            metrics["null_controls"] = {
+                                **dict(metrics["null_controls"]),
+                                "scope": "synthetic_orchestration_only",
+                                "formal_null_gate_passed": False,
+                            }
                         _publish_outer_success(
                             destination=outer,
                             method_id=method_id,
@@ -3362,10 +4036,11 @@ def run_task_c_rehearsal(
                                 synthetic_smoke=True,
                             ),
                             inner_dir=None,
+                            work_dir=work,
                             synthetic_smoke=True,
                             required_artifacts=config.required_artifacts,
                         )
-                        status_name = "passed_real_rehearsal"
+                        status_name = "passed_synthetic_smoke"
                     else:
                         inner_dir, inner = _run_formal_final_method(
                             method_id=method_id,
@@ -3419,11 +4094,21 @@ def run_task_c_rehearsal(
                             )
                             if method_id in {"hypersca_c", "mean_difference"}:
                                 try:
-                                    metrics["null_controls"] = _null_control_records(
+                                    selected_hypersca_config = (
+                                        work / "selected_refit_config.json"
+                                        if (work / "selected_refit_config.json").is_file()
+                                        else root / "configs/hypersca_c_v1.json"
+                                        if method_id == "hypersca_c"
+                                        else None
+                                    )
+                                    metrics["null_controls"] = _run_formal_null_controls(
+                                        method_id=method_id,
                                         predictions=predictions,
                                         profile_record=condition_profiles["refit"],
                                         seed=config.seed,
-                                        synthetic_smoke=False,
+                                        min_cells=min_cells,
+                                        hypersca_config_path=selected_hypersca_config,
+                                        work_dir=work,
                                     )
                                 except (ValueError, TypeError, OSError) as exc:
                                     raise TaskCRehearsalError(
@@ -3445,10 +4130,14 @@ def run_task_c_rehearsal(
                                     synthetic_smoke=False,
                                 ),
                                 inner_dir=inner_dir,
+                                work_dir=work,
                                 synthetic_smoke=False,
                                 required_artifacts=config.required_artifacts,
                             )
-                    if status_name != "passed_real_rehearsal":
+                    if status_name not in {
+                        "passed_real_rehearsal",
+                        "passed_synthetic_smoke",
+                    }:
                         assert status_name is not None
                         _publish_outer_failure(
                             destination=outer,
@@ -3459,6 +4148,7 @@ def run_task_c_rehearsal(
                             status=status_name,
                             reason=reason or status_name,
                             inner_dir=inner_dir,
+                            work_dir=work,
                             synthetic_smoke=synthetic_smoke,
                         )
                 except (
@@ -3498,6 +4188,7 @@ def run_task_c_rehearsal(
                         status=status_name,
                         reason=reason,
                         inner_dir=inner_dir,
+                        work_dir=work,
                         synthetic_smoke=synthetic_smoke,
                     )
                 statuses[f"{condition}/{method_id}"] = str(status_name)
