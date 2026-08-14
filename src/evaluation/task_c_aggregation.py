@@ -1113,8 +1113,7 @@ def _snapshot_runtime_mapping_once(
                 "runtime estimates must contain each method exactly once"
             )
         if (
-            isinstance(value_seconds, bool)
-            or not isinstance(value_seconds, (int, float))
+            type(value_seconds) not in {int, float}
             or not math.isfinite(float(value_seconds))
             or float(value_seconds) < 0.0
         ):
@@ -1154,11 +1153,19 @@ def build_full_run_draft(
         label="full-run conditions",
         maximum_items=len(REHEARSAL_CONDITIONS),
     )
+    if any(type(condition) is not str for condition in conditions_snapshot):
+        raise TaskCAggregationError(
+            "full-run conditions must contain exact text values"
+        )
     if conditions_snapshot != REHEARSAL_CONDITIONS:
         raise TaskCAggregationError("full-run conditions must remain at the fixed four")
     seeds_snapshot = _snapshot_sequence_once(
         seeds, label="full-run seeds", maximum_items=len(FULL_RUN_SEEDS)
     )
+    if any(type(seed) is not int for seed in seeds_snapshot):
+        raise TaskCAggregationError(
+            "full-run seeds must contain exact integer values"
+        )
     if seeds_snapshot != FULL_RUN_SEEDS:
         raise TaskCAggregationError("full-run seeds must remain at the fixed five")
     if type(maximum_tuning_trials) is not int or (
@@ -1277,12 +1284,12 @@ def _evidence_gates(
     identity: Mapping[str, object], aggregation: Mapping[str, object]
 ) -> dict[str, bool]:
     runs = tuple(aggregation["runs"])
-    formal_comprehensive = (
+    formal_real_rehearsal = (
         identity.get("synthetic_smoke") is False
-        and identity.get("profile") == "comprehensive"
+        and identity.get("profile") in {"connection", "comprehensive"}
         and _is_sha256(identity.get("prepared_identity_sha256"))
     )
-    data_checks = formal_comprehensive and all(
+    data_checks = formal_real_rehearsal and all(
         run["environment_manifest"].get("data_scope") == "external_benchmark"
         and run["environment_manifest"].get("private_data_received_by_method") is False
         and (

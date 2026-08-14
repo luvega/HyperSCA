@@ -967,6 +967,25 @@ class _OnePassRuntime(Mapping[str, float]):
         return iter((("hypersca_c", 10.0),))
 
 
+class _EvilEqual:
+    def __init__(self, integer_value: int = 11) -> None:
+        self._integer_value = integer_value
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __int__(self) -> int:
+        return self._integer_value
+
+
+class _TextSubclass(str):
+    pass
+
+
+class _IntegerSubclass(int):
+    pass
+
+
 def test_full_run_draft_copies_each_caller_input_only_once() -> None:
     methods = _FlipSequence(["hypersca_c"])
     conditions = _FlipSequence(CONDITIONS)
@@ -997,6 +1016,32 @@ def test_full_run_draft_rejects_mapping_with_duplicate_items() -> None:
             median_runtime_seconds=_DuplicateItemsRuntime(),  # type: ignore[arg-type]
             maximum_tuning_trials=20,
         )
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"runnable_methods": [_TextSubclass("hypersca_c")]},
+        {"conditions": [_EvilEqual(), *CONDITIONS[1:]]},
+        {"seeds": [_EvilEqual(), 23, 47, 71, 97]},
+        {"median_runtime_seconds": {_TextSubclass("hypersca_c"): 10.0}},
+        {"median_runtime_seconds": {"hypersca_c": _IntegerSubclass(10)}},
+    ],
+)
+def test_full_run_draft_requires_exact_builtin_item_types(
+    changed: dict[str, object],
+) -> None:
+    arguments: dict[str, object] = {
+        "runnable_methods": ["hypersca_c"],
+        "conditions": list(CONDITIONS),
+        "seeds": [11, 23, 47, 71, 97],
+        "median_runtime_seconds": {"hypersca_c": 10.0},
+        "maximum_tuning_trials": 20,
+    }
+    arguments.update(changed)
+
+    with pytest.raises(TaskCAggregationError):
+        build_full_run_draft(**arguments)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -1195,6 +1240,9 @@ def test_summary_accepts_task5_real_profile_specific_stage_records(
         (tmp_path / f"{profile}-summary" / "rehearsal_summary.json").read_text()
     )
     assert summary["readiness"]["checks"]["tuning_boundary"] is True
+    assert summary["readiness"]["checks"]["data_checks"] is True
+    assert summary["readiness"]["checks"]["five_splits_reproduced"] is False
+    assert summary["readiness"]["checks"]["project_tests"] is False
 
 
 def test_summary_cli_requires_independently_retained_resume_token(

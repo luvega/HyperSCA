@@ -1213,6 +1213,10 @@ export TASK_C_DATA_ROOT=/home/a/Data/HyperSCA_external/task_c
 mkdir -p "$TASK_C_DATA_ROOT/raw" "$TASK_C_DATA_ROOT/prepared" "$TASK_C_DATA_ROOT/method_assets"
 conda run -n hypersca-task-c-causalbench python scripts/export_causalbench_data.py --data-dir "$TASK_C_DATA_ROOT/raw"
 export TASK_C_PREPARED_IDENTITY_RECORD="$TASK_C_DATA_ROOT/prepared_identity_summary.json"
+if [ -e "$TASK_C_PREPARED_IDENTITY_RECORD" ] || [ -L "$TASK_C_PREPARED_IDENTITY_RECORD" ]; then
+  echo "prepared identity record already exists; refusing to start" >&2
+  exit 1
+fi
 TASK_C_PREPARED_IDENTITY_TMP="$(mktemp "$TASK_C_DATA_ROOT/.prepared_identity_summary.XXXXXX")"
 if conda run --no-capture-output -n hypersca python scripts/prepare_task_c_data.py \
     --k562-npz "$TASK_C_DATA_ROOT/raw/dataset_k562.npz" \
@@ -1225,8 +1229,7 @@ if conda run --no-capture-output -n hypersca python scripts/prepare_task_c_data.
     > "$TASK_C_PREPARED_IDENTITY_TMP"; then
   chmod 0400 "$TASK_C_PREPARED_IDENTITY_TMP"
   if ! ln -T -- "$TASK_C_PREPARED_IDENTITY_TMP" "$TASK_C_PREPARED_IDENTITY_RECORD"; then
-    rm -f "$TASK_C_PREPARED_IDENTITY_TMP"
-    echo "prepared identity record already exists; refusing to replace it" >&2
+    echo "prepared identity publication raced; the only retained record is: $TASK_C_PREPARED_IDENTITY_TMP" >&2
     exit 1
   fi
   rm -f "$TASK_C_PREPARED_IDENTITY_TMP"
@@ -1238,8 +1241,9 @@ conda run -n hypersca python scripts/bootstrap_task_c_methods.py --cache-root "$
 ```
 
 `prepared_identity_summary.json` 位于 `prepared/` 之外，并且在准备命令成功后才用同目录
-硬链接排他发布；目标已存在时 `ln` 会失败，不会替换旧记录。随后删除临时文件名，
-最终记录只保留一个文件名。它是调用者独立保留的身份记录，不是数字签名。核对
+硬链接排他发布。运行前发现目标或悬空符号链接时立即停止；若发布时发生竞态，临时
+记录已设为只读，必须保留并在错误信息中报告它的精确路径。只有准备命令本身失败
+才删除不可信的临时输出；正常发布后才删除临时文件名。它是调用者独立保留的身份记录，不是数字签名。核对
 `raw/export_manifest.json` 的下载时间、来源和官方提交，以及 `prepared/provenance/` 中
 两个表达缓存、汇总生物关系和 ChIP 有向关系的许可与 SHA-256。
 
@@ -1269,6 +1273,10 @@ PY
 )"
 export TASK_C_PREPARED_IDENTITY_SHA256
 export TASK_C_CONNECTION_STDOUT_RECORD="$TASK_C_DATA_ROOT/connection_rehearsal_initial_stdout.json"
+if [ -e "$TASK_C_CONNECTION_STDOUT_RECORD" ] || [ -L "$TASK_C_CONNECTION_STDOUT_RECORD" ]; then
+  echo "connection stdout record already exists; refusing to start" >&2
+  exit 1
+fi
 TASK_C_CONNECTION_STDOUT_TMP="$(mktemp "$TASK_C_DATA_ROOT/.connection_rehearsal_stdout.XXXXXX")"
 if conda run --no-capture-output -n hypersca python scripts/run_task_c_rehearsal.py \
     --profile connection \
@@ -1280,8 +1288,7 @@ if conda run --no-capture-output -n hypersca python scripts/run_task_c_rehearsal
     > "$TASK_C_CONNECTION_STDOUT_TMP"; then
   chmod 0400 "$TASK_C_CONNECTION_STDOUT_TMP"
   if ! ln -T -- "$TASK_C_CONNECTION_STDOUT_TMP" "$TASK_C_CONNECTION_STDOUT_RECORD"; then
-    rm -f "$TASK_C_CONNECTION_STDOUT_TMP"
-    echo "connection stdout record already exists; refusing to replace it" >&2
+    echo "connection stdout publication raced; the only retained record is: $TASK_C_CONNECTION_STDOUT_TMP" >&2
     exit 1
   fi
   rm -f "$TASK_C_CONNECTION_STDOUT_TMP"
@@ -1292,7 +1299,8 @@ fi
 ```
 
 Expected: 64 个共同基因、每环境不超过 2,000 个细胞、种子 11；所有预演决定保持 `workflow_validation_only`。
-初次标准输出只在命令成功后排他发布到结果目录之外；目标已存在时停止，不能覆盖。
+初次标准输出只在命令成功后排他发布到结果目录之外；运行前已有目标或悬空链接时
+停止。若发布竞态失败，保留只读临时凭据并报告精确路径，不能删除唯一令牌记录。
 
 - [ ] **Step 4: 检查连接结果而不解读性能优劣**
 
@@ -1325,6 +1333,7 @@ conda run -n hypersca python scripts/summarize_task_c_rehearsal.py \
 
 **Files:**
 - Generate ignored results: `results/benchmarks/task_c/comprehensive/`
+- Generate ignored results: `results/benchmarks/task_c/comprehensive_ablations/`
 - Create: `docs/research/task_c_rehearsal_v1.md`
 - Modify: `docs/research/task_c_mean_difference_baseline_v1.md`
 - Modify: `docs/technical_roadmap.md`
@@ -1354,6 +1363,10 @@ PY
 )"
 export TASK_C_PREPARED_IDENTITY_SHA256
 export TASK_C_COMPREHENSIVE_STDOUT_RECORD="$TASK_C_DATA_ROOT/comprehensive_rehearsal_initial_stdout.json"
+if [ -e "$TASK_C_COMPREHENSIVE_STDOUT_RECORD" ] || [ -L "$TASK_C_COMPREHENSIVE_STDOUT_RECORD" ]; then
+  echo "comprehensive stdout record already exists; refusing to start" >&2
+  exit 1
+fi
 TASK_C_COMPREHENSIVE_STDOUT_TMP="$(mktemp "$TASK_C_DATA_ROOT/.comprehensive_rehearsal_stdout.XXXXXX")"
 if conda run --no-capture-output -n hypersca python scripts/run_task_c_rehearsal.py \
     --profile comprehensive \
@@ -1365,8 +1378,7 @@ if conda run --no-capture-output -n hypersca python scripts/run_task_c_rehearsal
     > "$TASK_C_COMPREHENSIVE_STDOUT_TMP"; then
   chmod 0400 "$TASK_C_COMPREHENSIVE_STDOUT_TMP"
   if ! ln -T -- "$TASK_C_COMPREHENSIVE_STDOUT_TMP" "$TASK_C_COMPREHENSIVE_STDOUT_RECORD"; then
-    rm -f "$TASK_C_COMPREHENSIVE_STDOUT_TMP"
-    echo "comprehensive stdout record already exists; refusing to replace it" >&2
+    echo "comprehensive stdout publication raced; the only retained record is: $TASK_C_COMPREHENSIVE_STDOUT_TMP" >&2
     exit 1
   fi
   rm -f "$TASK_C_COMPREHENSIVE_STDOUT_TMP"
@@ -1377,7 +1389,8 @@ fi
 ```
 
 Expected: 每个方法得到六种允许状态之一；BetterBoost、SparseRC 和 CATRAN 若仍无官方可执行资产，记录 `official_assets_unavailable`，不编写替代实现。
-初次标准输出必须独立留在结果目录之外，后续汇总只接受这里保存的令牌。
+初次标准输出必须独立留在结果目录之外，后续汇总只接受这里保存的令牌。运行前已有
+目标或悬空链接时立即停止；发布竞态时保留只读临时记录并报告精确路径。
 
 - [ ] **Step 2: 运行全部预先登记消融**
 
@@ -1387,7 +1400,7 @@ conda run -n hypersca python scripts/run_hypersca_c_ablations.py \
   --context "rpe1=$TASK_C_DATA_ROOT/prepared/splits/seed_11/within/rpe1/refit.npz" \
   --config configs/hypersca_c_v1.json \
   --ablation-registry configs/hypersca_c_ablations_v1.json \
-  --output-root results/benchmarks/task_c/comprehensive/ablations \
+  --output-root results/benchmarks/task_c/comprehensive_ablations \
   --seed 11 \
   --device cuda
 ```
@@ -1417,9 +1430,34 @@ conda run -n hypersca python scripts/summarize_task_c_rehearsal.py \
   --rehearsal-root results/benchmarks/task_c/comprehensive \
   --output-dir results/benchmarks/task_c/comprehensive_summary \
   --resume-token "$TASK_C_COMPREHENSIVE_RESUME_TOKEN"
+conda run --no-capture-output -n hypersca python - \
+  results/benchmarks/task_c/comprehensive_ablations/ablation_batch_manifest.json <<'PY'
+import json
+import sys
+
+expected = [
+    "primary",
+    "shared_only",
+    "separate_contexts",
+    "observational_only",
+    "no_stability_weighting",
+    "acyclicity_off",
+    "acyclicity_strong",
+    "prior_on_secondary",
+]
+with open(sys.argv[1], encoding="utf-8") as handle:
+    manifest = json.load(handle)
+if manifest.get("ablation_order") != expected:
+    raise SystemExit("independent ablation manifest does not contain the fixed eight items")
+records = manifest.get("ablations")
+if not isinstance(records, list) or [item.get("ablation_id") for item in records] != expected:
+    raise SystemExit("independent ablation records are incomplete or out of order")
+print("independent eight-item ablation manifest verified")
+PY
 ```
 
-核对 19 个方法和八项消融均进入兼容性记录，并确认作业草案为 `not_authorized_to_start`。
+只读汇总只核对已经封存的 19 方法预演，不声称包含消融。另行核对同级独立目录中的
+八项消融清单；写报告时再整合两份证据，并确认作业草案为 `not_authorized_to_start`。
 
 - [ ] **Step 4: 写面向生物医学读者的预演报告**
 
