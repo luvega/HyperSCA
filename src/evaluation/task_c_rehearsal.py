@@ -122,6 +122,7 @@ _MATERIALIZATION_IDENTITY_FIELDS = frozenset(
         "content_sha256",
         "gene_names_sha256",
         "gene_projection",
+        "sealed_holdout_semantic_content_sha256",
     }
 )
 _PRIVATE_MANIFEST_FIELDS = frozenset(
@@ -137,6 +138,7 @@ _PRIVATE_MANIFEST_FIELDS = frozenset(
         "content_sha256",
         "gene_names_sha256",
         "gene_projection",
+        "sealed_holdout_semantic_content_sha256",
         "materialization_identity",
         "files",
     }
@@ -4629,6 +4631,7 @@ def _validate_private_rehearsal_inputs(
     """Validate the fixed private split and its four sealed scoring files."""
 
     from src.evaluation.task_c_data import (
+        SealedHoldoutSemanticContentHasher,
         TaskCDataError,
         load_task_c_dataset_from_verified_bytes,
     )
@@ -4641,6 +4644,12 @@ def _validate_private_rehearsal_inputs(
     )
     private = _strict_json_payload(manifest_bytes, "sealed data record")
     if set(private) != _PRIVATE_MANIFEST_FIELDS:
+        if set(private) == _PRIVATE_MANIFEST_FIELDS - {
+            "sealed_holdout_semantic_content_sha256"
+        }:
+            raise TaskCRehearsalError(
+                "sealed data record predates its content commitment; rematerialize prepared data"
+            )
         raise TaskCRehearsalError("sealed data record fields differ from its schema")
     identity = public.get("materialization_identity")
     if not isinstance(identity, dict) or set(identity) != _MATERIALIZATION_IDENTITY_FIELDS:
@@ -4661,6 +4670,7 @@ def _validate_private_rehearsal_inputs(
         "content_sha256",
         "gene_names_sha256",
         "gene_projection",
+        "sealed_holdout_semantic_content_sha256",
     )
     if any(private.get(field) != public.get(field) for field in shared_fields):
         raise TaskCRehearsalError(
@@ -4713,6 +4723,12 @@ def _validate_private_rehearsal_inputs(
     if not _is_sha256_text(identity.get("gene_names_sha256")):
         raise TaskCRehearsalError(
             "sealed materialization gene fingerprint is malformed"
+        )
+    if not _is_sha256_text(
+        identity.get("sealed_holdout_semantic_content_sha256")
+    ):
+        raise TaskCRehearsalError(
+            "sealed holdout semantic content commitment is malformed"
         )
     projection = identity.get("gene_projection")
     if not isinstance(projection, dict) or set(projection) != {
@@ -4796,6 +4812,7 @@ def _validate_private_rehearsal_inputs(
     snapshots: list[tuple[Path, str, tuple[int, int, int, int, int]]] = []
     paths: dict[str, Path] = {}
     all_sources = train_sources + tune_sources + holdout_sources
+    semantic_hasher = SealedHoldoutSemanticContentHasher()
     for relative in sorted(_PRIVATE_HOLDOUT_PATHS):
         expected_hash = files[relative]
         if not _is_sha256_text(expected_hash):
@@ -4829,6 +4846,8 @@ def _validate_private_rehearsal_inputs(
                 context_id=context,
                 source_bytes=payload,
                 source_sha256=actual_hash,
+                sealed_holdout_hasher=semantic_hasher,
+                logical_artifact=relative,
             )
         except TaskCDataError as exc:
             raise TaskCRehearsalError(
@@ -4850,6 +4869,13 @@ def _validate_private_rehearsal_inputs(
             )
         paths[f"private_holdout:{relative}"] = path
         snapshots.append((path, actual_hash, file_identity))
+
+    if semantic_hasher.sha256() != identity[
+        "sealed_holdout_semantic_content_sha256"
+    ]:
+        raise TaskCRehearsalError(
+            "sealed holdout semantic content commitment changed"
+        )
 
     final_manifest_bytes, final_manifest_identity = _capture_regular_bytes(
         manifest_path,

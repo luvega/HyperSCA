@@ -2184,6 +2184,7 @@ def test_formal_run_rejects_an_incomplete_public_inventory(tmp_path: Path) -> No
         "input_sha256": {"k562": input_hash, "rpe1": input_hash},
         "content_sha256": {"k562": input_hash, "rpe1": input_hash},
         "gene_names_sha256": input_hash,
+        "sealed_holdout_semantic_content_sha256": input_hash,
         "gene_projection": {
             "rule": "sorted_common_gene_intersection_v1",
             "common_gene_count": 2,

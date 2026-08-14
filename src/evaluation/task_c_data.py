@@ -126,16 +126,38 @@ _PRIVATE_ARTIFACT_PATHS = frozenset(
 ) | frozenset(
     partitions["target_holdout"] for partitions in _CROSS_ARTIFACTS.values()
 )
+SEALED_HOLDOUT_SEMANTIC_CONTENT_FIELD = (
+    "sealed_holdout_semantic_content_sha256"
+)
 
 
-def _update_array_digest(digest: Any, name: str, values: np.ndarray) -> None:
+def _update_length_prefixed_digest(digest: Any, payload: bytes) -> None:
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
+
+
+def _update_array_digest_metadata(
+    digest: Any,
+    name: str,
+    *,
+    dtype: np.dtype[Any],
+    shape: Sequence[int],
+) -> None:
     metadata = json.dumps(
-        {"name": name, "dtype": values.dtype.str, "shape": list(values.shape)},
+        {"name": name, "dtype": dtype.str, "shape": list(shape)},
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    digest.update(len(metadata).to_bytes(8, "big"))
-    digest.update(metadata)
+    _update_length_prefixed_digest(digest, metadata)
+
+
+def _update_array_digest(digest: Any, name: str, values: np.ndarray) -> None:
+    _update_array_digest_metadata(
+        digest,
+        name,
+        dtype=values.dtype,
+        shape=values.shape,
+    )
     if values.flags.c_contiguous:
         digest.update(memoryview(values).cast("B"))
         return
@@ -149,6 +171,127 @@ def _update_array_digest(digest: Any, name: str, values: np.ndarray) -> None:
     for chunk in iterator:
         contiguous = np.ascontiguousarray(chunk)
         digest.update(memoryview(contiguous).cast("B"))
+
+
+def _update_selected_matrix_digest(
+    digest: Any,
+    name: str,
+    values: np.ndarray,
+    row_indices: np.ndarray,
+    column_indices: Sequence[int],
+) -> None:
+    columns = np.asarray(tuple(column_indices), dtype=int)
+    _update_array_digest_metadata(
+        digest,
+        name,
+        dtype=values.dtype,
+        shape=(len(row_indices), len(columns)),
+    )
+    bytes_per_row = max(1, len(columns) * max(1, values.dtype.itemsize))
+    rows_per_chunk = max(1, (1024 * 1024) // bytes_per_row)
+    for start in range(0, len(row_indices), rows_per_chunk):
+        rows = row_indices[start : start + rows_per_chunk]
+        chunk = np.ascontiguousarray(values[np.ix_(rows, columns)])
+        digest.update(memoryview(chunk).cast("B"))
+
+
+def _update_selected_vector_digest(
+    digest: Any,
+    name: str,
+    values: np.ndarray,
+    row_indices: np.ndarray,
+) -> None:
+    _update_array_digest_metadata(
+        digest,
+        name,
+        dtype=values.dtype,
+        shape=(len(row_indices),),
+    )
+    items_per_chunk = max(1, (1024 * 1024) // max(1, values.dtype.itemsize))
+    for start in range(0, len(row_indices), items_per_chunk):
+        rows = row_indices[start : start + items_per_chunk]
+        chunk = np.ascontiguousarray(values[rows])
+        digest.update(memoryview(chunk).cast("B"))
+
+
+def _update_gene_order_digest(digest: Any, gene_names: Sequence[str]) -> None:
+    genes = json.dumps(
+        tuple(gene_names),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    _update_length_prefixed_digest(digest, genes)
+
+
+class SealedHoldoutSemanticContentHasher:
+    """Stream the fixed four sealed holdouts into one public-safe commitment."""
+
+    def __init__(self) -> None:
+        self._digest = hashlib.sha256()
+        self._digest.update(b"TaskC-sealed-holdout-semantic-content-v1\0")
+        self._ordered_paths = tuple(sorted(_PRIVATE_ARTIFACT_PATHS))
+        self._position = 0
+
+    def _add_logical_artifact(self, relative: str) -> None:
+        if (
+            self._position >= len(self._ordered_paths)
+            or relative != self._ordered_paths[self._position]
+        ):
+            raise TaskCDataError(
+                "sealed holdout artifacts must use the fixed complete logical order"
+            )
+        logical_artifact = json.dumps(
+            {"logical_artifact": relative},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        _update_length_prefixed_digest(self._digest, logical_artifact)
+        self._position += 1
+
+    def add_arrays(
+        self,
+        relative: str,
+        expression: np.ndarray,
+        interventions: np.ndarray,
+        gene_names: Sequence[str],
+    ) -> None:
+        """Add one validated artifact while preserving its stored array dtypes."""
+        self._add_logical_artifact(relative)
+        _update_array_digest(self._digest, "expression", expression)
+        _update_array_digest(self._digest, "interventions", interventions)
+        _update_gene_order_digest(self._digest, gene_names)
+
+    def add_projected_selection(
+        self,
+        relative: str,
+        dataset: TaskCDataset,
+        row_indices: np.ndarray,
+        column_indices: Sequence[int],
+        gene_names: Sequence[str],
+    ) -> None:
+        """Add the exact projected arrays that materialization will write."""
+        self._add_logical_artifact(relative)
+        _update_selected_matrix_digest(
+            self._digest,
+            "expression",
+            dataset.expression,
+            row_indices,
+            column_indices,
+        )
+        _update_selected_vector_digest(
+            self._digest,
+            "interventions",
+            dataset.interventions,
+            row_indices,
+        )
+        _update_gene_order_digest(self._digest, gene_names)
+
+    def sha256(self) -> str:
+        if self._position != len(self._ordered_paths):
+            raise TaskCDataError(
+                "sealed holdout commitment requires exactly four logical artifacts"
+            )
+        return f"sha256:{self._digest.hexdigest()}"
 
 
 def _dataset_content_sha256(dataset: TaskCDataset) -> str:
@@ -364,7 +507,13 @@ def _load_task_c_dataset_archive(
     source_path: Path,
     source_sha256: str,
     context_id: str,
+    sealed_holdout_hasher: SealedHoldoutSemanticContentHasher | None = None,
+    logical_artifact: str | None = None,
 ) -> TaskCDataset:
+    if (sealed_holdout_hasher is None) != (logical_artifact is None):
+        raise TaskCDataError(
+            "sealed holdout hashing requires both a hasher and logical artifact"
+        )
     if context_id not in {"k562", "rpe1"}:
         raise TaskCDataError("context_id must be exactly k562 or rpe1")
     try:
@@ -404,6 +553,13 @@ def _load_task_c_dataset_archive(
         raise TaskCDataError("intervention labels must be nonempty")
     if CONTROL_LABEL not in labels:
         raise TaskCDataError("at least one non-targeting control is required")
+    if sealed_holdout_hasher is not None and logical_artifact is not None:
+        sealed_holdout_hasher.add_arrays(
+            logical_artifact,
+            expression,
+            interventions_raw,
+            genes,
+        )
     return TaskCDataset(
         expression=expression,
         interventions=np.asarray(labels, dtype=str),
@@ -414,7 +570,13 @@ def _load_task_c_dataset_archive(
     )
 
 
-def load_task_c_dataset(path: Path | str, *, context_id: str) -> TaskCDataset:
+def load_task_c_dataset(
+    path: Path | str,
+    *,
+    context_id: str,
+    sealed_holdout_hasher: SealedHoldoutSemanticContentHasher | None = None,
+    logical_artifact: str | None = None,
+) -> TaskCDataset:
     source_path = Path(path).expanduser().resolve()
     before = _file_signature(source_path)
     dataset = _load_task_c_dataset_archive(
@@ -422,6 +584,8 @@ def load_task_c_dataset(path: Path | str, *, context_id: str) -> TaskCDataset:
         source_path=source_path,
         source_sha256=_consistent_sha256(source_path, before),
         context_id=context_id,
+        sealed_holdout_hasher=sealed_holdout_hasher,
+        logical_artifact=logical_artifact,
     )
     if _file_signature(source_path) != before:
         raise TaskCDataError(f"dataset changed while being loaded: {source_path}")
@@ -434,6 +598,8 @@ def load_task_c_dataset_from_verified_bytes(
     context_id: str,
     source_bytes: bytes,
     source_sha256: str,
+    sealed_holdout_hasher: SealedHoldoutSemanticContentHasher | None = None,
+    logical_artifact: str | None = None,
 ) -> TaskCDataset:
     """Parse bytes whose file identity and hash were verified by the caller."""
 
@@ -452,6 +618,8 @@ def load_task_c_dataset_from_verified_bytes(
         source_path=source_path,
         source_sha256=source_sha256,
         context_id=context_id,
+        sealed_holdout_hasher=sealed_holdout_hasher,
+        logical_artifact=logical_artifact,
     )
 
 
@@ -741,6 +909,55 @@ def _indices_for_sources(
     return _validated_row_indices(dataset, np.sort(selected))
 
 
+def _sealed_holdout_semantic_content_sha256_from_split(
+    k562: TaskCDataset,
+    rpe1: TaskCDataset,
+    split: TaskCSplit,
+    projection: _CommonGeneProjection,
+) -> str:
+    datasets = {"k562": k562, "rpe1": rpe1}
+    all_sources = split.train_sources + split.tune_sources + split.holdout_sources
+    selections: dict[str, tuple[TaskCDataset, np.ndarray, tuple[int, ...]]] = {}
+    for context, dataset in datasets.items():
+        relative = _WITHIN_ARTIFACTS[context]["holdout"]
+        selections[relative] = (
+            dataset,
+            _indices_for_sources(
+                dataset,
+                split.holdout_sources,
+                split.control_indices[context]["holdout"],
+            ),
+            projection.column_indices[context],
+        )
+    for source_name, target_name in (("k562", "rpe1"), ("rpe1", "k562")):
+        target = datasets[target_name]
+        direction = f"{source_name}_to_{target_name}"
+        relative = _CROSS_ARTIFACTS[direction]["target_holdout"]
+        selections[relative] = (
+            target,
+            _indices_for_sources(
+                target,
+                all_sources,
+                split.control_indices[target_name]["holdout"],
+            ),
+            projection.column_indices[target_name],
+        )
+    if set(selections) != _PRIVATE_ARTIFACT_PATHS:
+        raise TaskCDataError("sealed holdout selections are incomplete")
+
+    hasher = SealedHoldoutSemanticContentHasher()
+    for relative in sorted(selections):
+        dataset, rows, columns = selections[relative]
+        hasher.add_projected_selection(
+            relative,
+            dataset,
+            rows,
+            columns,
+            projection.gene_names,
+        )
+    return hasher.sha256()
+
+
 def _private_split_payload(split: TaskCSplit) -> dict[str, Any]:
     return {
         "schema_version": split.schema_version,
@@ -854,6 +1071,14 @@ def _materialization_identity(
         },
         "gene_names_sha256": _gene_names_sha256(projection.gene_names),
         "gene_projection": dict(projection.record),
+        SEALED_HOLDOUT_SEMANTIC_CONTENT_FIELD: (
+            _sealed_holdout_semantic_content_sha256_from_split(
+                k562,
+                rpe1,
+                split,
+                projection,
+            )
+        ),
     }
 
 
@@ -873,6 +1098,9 @@ def _public_split_payload(
         "content_sha256": identity["content_sha256"],
         "gene_names_sha256": identity["gene_names_sha256"],
         "gene_projection": identity["gene_projection"],
+        SEALED_HOLDOUT_SEMANTIC_CONTENT_FIELD: identity[
+            SEALED_HOLDOUT_SEMANTIC_CONTENT_FIELD
+        ],
     }
 
 
@@ -947,6 +1175,23 @@ def _reject_bundle_symlinks(root: Path) -> None:
         _bundle_path(root, relative)
 
 
+def _materialized_sealed_holdout_semantic_content_sha256(root: Path) -> str:
+    hasher = SealedHoldoutSemanticContentHasher()
+    for relative in sorted(_PRIVATE_ARTIFACT_PATHS):
+        context = (
+            relative.split("/")[2]
+            if relative.startswith("private/within/")
+            else relative.split("/")[2].split("_to_")[1]
+        )
+        load_task_c_dataset(
+            _bundle_path(root, relative),
+            context_id=context,
+            sealed_holdout_hasher=hasher,
+            logical_artifact=relative,
+        )
+    return hasher.sha256()
+
+
 def _reuse_existing_materialization(
     root: Path,
     identity: Mapping[str, Any],
@@ -977,9 +1222,13 @@ def _reuse_existing_materialization(
         "files",
     }
     if set(public) != expected_public_fields:
-        raise TaskCDataError("existing public manifest fields differ from its schema")
+        raise TaskCDataError(
+            "existing public manifest schema is obsolete; rematerialize in a new output directory"
+        )
     if set(private) != expected_private_fields:
-        raise TaskCDataError("existing private manifest fields differ from its schema")
+        raise TaskCDataError(
+            "existing private manifest schema is obsolete; rematerialize in a new output directory"
+        )
     if public.get("materialization_identity") != identity or private.get(
         "materialization_identity"
     ) != identity:
@@ -989,6 +1238,17 @@ def _reuse_existing_materialization(
     if any(private.get(key) != value for key, value in private_split_payload.items()):
         raise TaskCDataError("existing private manifest semantic record differs from split")
     _verify_artifact_inventory(root, public, set(_PUBLIC_ARTIFACT_PATHS))
+    _verify_artifact_inventory(root, private, set(_PRIVATE_ARTIFACT_PATHS))
+    try:
+        actual_commitment = _materialized_sealed_holdout_semantic_content_sha256(root)
+    except TaskCDataError as exc:
+        raise TaskCDataError(
+            "existing sealed holdouts are invalid; rematerialize in a new output directory"
+        ) from exc
+    if actual_commitment != identity[SEALED_HOLDOUT_SEMANTIC_CONTENT_FIELD]:
+        raise TaskCDataError(
+            "existing sealed holdout semantic content changed; rematerialize in a new output directory"
+        )
     _verify_artifact_inventory(root, private, set(_PRIVATE_ARTIFACT_PATHS))
     _reject_public_private_inode_overlap(root)
     return _materialized_result(root)
@@ -1023,6 +1283,9 @@ def _task_c_materialization_records(
     private_split_payload["content_sha256"] = identity["content_sha256"]
     private_split_payload["gene_names_sha256"] = identity["gene_names_sha256"]
     private_split_payload["gene_projection"] = identity["gene_projection"]
+    private_split_payload[SEALED_HOLDOUT_SEMANTIC_CONTENT_FIELD] = identity[
+        SEALED_HOLDOUT_SEMANTIC_CONTENT_FIELD
+    ]
     return root, identity, public_split_payload, private_split_payload, projection
 
 

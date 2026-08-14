@@ -124,6 +124,7 @@ _PUBLIC_MANIFEST_FIELDS = frozenset(
         "content_sha256",
         "gene_names_sha256",
         "gene_projection",
+        "sealed_holdout_semantic_content_sha256",
         "materialization_identity",
         "files",
     }
@@ -737,6 +738,7 @@ def _capture_public_input(
         "content_sha256",
         "gene_names_sha256",
         "gene_projection",
+        "sealed_holdout_semantic_content_sha256",
     }
     materialization_identity = payload.get("materialization_identity")
     if not isinstance(materialization_identity, dict) or set(

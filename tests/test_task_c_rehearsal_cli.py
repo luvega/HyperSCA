@@ -1131,6 +1131,30 @@ def test_formal_validation_accepts_exact_registered_private_split(
     assert public["materialization_identity"]["seed"] == 11
 
 
+def test_formal_validation_requires_rematerialization_for_old_identity(
+    prepared_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assets = _formal_validation_dependencies(prepared_root, tmp_path)
+    for relative in ("public_manifest.json", "private/private_manifest.json"):
+        path = prepared_root / relative
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest.pop("sealed_holdout_semantic_content_sha256")
+        manifest["materialization_identity"].pop(
+            "sealed_holdout_semantic_content_sha256"
+        )
+        path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    monkeypatch.setattr(rehearsal_module, "_FULL_RUN_SEEDS", (11,))
+
+    with pytest.raises(TaskCRehearsalError, match="rematerialize"):
+        rehearsal_module._validate_prepared_rehearsal_inputs(
+            prepared_root=prepared_root,
+            method_assets_root=assets,
+            synthetic_smoke=False,
+        )
+
+
 def test_formal_validation_rejects_changed_private_split_semantics(
     prepared_root: Path,
     tmp_path: Path,
@@ -1144,6 +1168,41 @@ def test_formal_validation_rejects_changed_private_split_semantics(
     monkeypatch.setattr(rehearsal_module, "_FULL_RUN_SEEDS", (11,))
 
     with pytest.raises(TaskCRehearsalError, match="sealed|private|split|semantic"):
+        rehearsal_module._validate_prepared_rehearsal_inputs(
+            prepared_root=prepared_root,
+            method_assets_root=assets,
+            synthetic_smoke=False,
+        )
+
+
+def test_formal_validation_rejects_resigned_finite_private_expression_change(
+    prepared_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assets = _formal_validation_dependencies(prepared_root, tmp_path)
+    relative = "private/within/k562/holdout.npz"
+    holdout_path = prepared_root / relative
+    with np.load(holdout_path, allow_pickle=False) as archive:
+        expression = np.asarray(archive["expression_matrix"]).copy()
+        interventions = np.asarray(archive["interventions"]).copy()
+        var_names = np.asarray(archive["var_names"]).copy()
+    expression[0, 0] += np.asarray(0.5, dtype=expression.dtype)
+    np.savez_compressed(
+        holdout_path,
+        expression_matrix=expression,
+        interventions=interventions,
+        var_names=var_names,
+    )
+    manifest_path = prepared_root / "private/private_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][relative] = (
+        "sha256:" + hashlib.sha256(holdout_path.read_bytes()).hexdigest()
+    )
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    monkeypatch.setattr(rehearsal_module, "_FULL_RUN_SEEDS", (11,))
+
+    with pytest.raises(TaskCRehearsalError, match="commitment|sealed|semantic"):
         rehearsal_module._validate_prepared_rehearsal_inputs(
             prepared_root=prepared_root,
             method_assets_root=assets,

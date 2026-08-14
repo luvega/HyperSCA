@@ -63,6 +63,7 @@ _PUBLIC_MANIFEST_FIELDS = {
     "content_sha256",
     "gene_names_sha256",
     "gene_projection",
+    "sealed_holdout_semantic_content_sha256",
     "materialization_identity",
     "files",
 }
@@ -411,6 +412,10 @@ def _validate_public_manifest_record(payload: Mapping[str, object]) -> dict[str,
         for context, value in hashes.items():
             _sha256_text(value, f"公开清单 {field}.{context}")
     _sha256_text(payload["gene_names_sha256"], "公开清单 gene_names_sha256")
+    _sha256_text(
+        payload["sealed_holdout_semantic_content_sha256"],
+        "公开清单 sealed_holdout_semantic_content_sha256",
+    )
 
     identity = payload["materialization_identity"]
     identity_fields = {
@@ -422,6 +427,7 @@ def _validate_public_manifest_record(payload: Mapping[str, object]) -> dict[str,
         "content_sha256",
         "gene_names_sha256",
         "gene_projection",
+        "sealed_holdout_semantic_content_sha256",
     }
     if not isinstance(identity, dict) or set(identity) != identity_fields:
         raise HyperSCACError("公开清单 materialization_identity 不符合固定格式")

@@ -10,6 +10,7 @@ import pytest
 
 from src.evaluation.task_c_data import (
     CAUSALBENCH_COMMIT,
+    SealedHoldoutSemanticContentHasher,
     TaskCDataError,
     TaskCDataset,
     TaskCSplit,
@@ -479,6 +480,14 @@ def test_materialized_manifests_use_relative_paths_and_verified_hashes(tmp_path:
         "rpe1": rpe1.content_sha256,
     }
     assert private["content_sha256"] == public["content_sha256"]
+    commitment = public["sealed_holdout_semantic_content_sha256"]
+    assert commitment.startswith("sha256:")
+    assert len(commitment) == 71
+    assert private["sealed_holdout_semantic_content_sha256"] == commitment
+    assert public["materialization_identity"][
+        "sealed_holdout_semantic_content_sha256"
+    ] == commitment
+    assert private["materialization_identity"] == public["materialization_identity"]
     assert public["materialization_identity"]["content_sha256"] == public[
         "content_sha256"
     ]
@@ -514,6 +523,91 @@ def test_materialized_manifests_use_relative_paths_and_verified_hashes(tmp_path:
     )
     assert set(public["files"]) == expected_public
     assert set(private["files"]) == expected_private
+
+
+def test_materialization_reuse_rejects_resigned_private_expression_change(
+    tmp_path: Path,
+) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+    root = tmp_path / "bundle"
+    result = materialize_task_c_split(k562, rpe1, split, root)
+    relative = "private/within/k562/holdout.npz"
+    holdout_path = root / relative
+    with np.load(holdout_path, allow_pickle=False) as archive:
+        expression = np.asarray(archive["expression_matrix"]).copy()
+        interventions = np.asarray(archive["interventions"]).copy()
+        var_names = np.asarray(archive["var_names"]).copy()
+    expression[0, 0] += np.asarray(0.5, dtype=expression.dtype)
+    np.savez_compressed(
+        holdout_path,
+        expression_matrix=expression,
+        interventions=interventions,
+        var_names=var_names,
+    )
+    manifest_path = Path(result["private_manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][relative] = sha256_path(holdout_path)
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(TaskCDataError, match="identity|commitment|content|rematerialize"):
+        materialize_task_c_split(k562, rpe1, split, root)
+
+
+def test_sealed_holdout_commitment_covers_array_metadata_bytes_and_gene_order() -> None:
+    paths = (
+        "private/cross/k562_to_rpe1/target_holdout.npz",
+        "private/cross/rpe1_to_k562/target_holdout.npz",
+        "private/within/k562/holdout.npz",
+        "private/within/rpe1/holdout.npz",
+    )
+
+    def commitment(
+        expression: np.ndarray,
+        interventions: np.ndarray,
+        genes: tuple[str, ...],
+    ) -> str:
+        hasher = SealedHoldoutSemanticContentHasher()
+        for relative in paths:
+            hasher.add_arrays(relative, expression, interventions, genes)
+        return hasher.sha256()
+
+    expression = np.arange(6, dtype=np.float32).reshape(3, 2)
+    interventions = np.asarray(["non-targeting", "A", "A"], dtype="U13")
+    genes = ("A", "B")
+    observed = {
+        commitment(expression, interventions, genes),
+        commitment(expression.astype(np.float64), interventions, genes),
+        commitment(expression.reshape(2, 3), interventions, genes),
+        commitment(expression + np.float32(1.0), interventions, genes),
+        commitment(expression, interventions.astype("U14"), genes),
+        commitment(expression, interventions.reshape(1, 3), genes),
+        commitment(expression, np.asarray(["non-targeting", "B", "A"]), genes),
+        commitment(expression, interventions, tuple(reversed(genes))),
+    }
+    assert len(observed) == 8
+
+
+def test_materialization_reuse_requires_rematerialization_for_old_identity(
+    tmp_path: Path,
+) -> None:
+    k562 = dataset_for_split("k562")
+    rpe1 = dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11)
+    root = tmp_path / "bundle"
+    result = materialize_task_c_split(k562, rpe1, split, root)
+    for name in ("public_manifest", "private_manifest"):
+        path = Path(result[name])
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest.pop("sealed_holdout_semantic_content_sha256")
+        manifest["materialization_identity"].pop(
+            "sealed_holdout_semantic_content_sha256"
+        )
+        write_json(path, manifest)
+
+    with pytest.raises(TaskCDataError, match="obsolete.*rematerialize"):
+        materialize_task_c_split(k562, rpe1, split, root)
 
 
 def test_materialization_projects_both_contexts_to_sorted_common_genes(

@@ -63,6 +63,7 @@ _PUBLIC_MANIFEST_FIELDS = frozenset(
         "content_sha256",
         "gene_names_sha256",
         "gene_projection",
+        "sealed_holdout_semantic_content_sha256",
         "materialization_identity",
         "files",
     }
@@ -323,6 +324,7 @@ def _load_public_manifest(
         "content_sha256",
         "gene_names_sha256",
         "gene_projection",
+        "sealed_holdout_semantic_content_sha256",
     }
     identity = payload.get("materialization_identity")
     if not isinstance(identity, dict) or set(identity) != identity_fields or any(
