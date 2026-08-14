@@ -12,6 +12,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import hashlib
+import io
 from itertools import islice
 import json
 import math
@@ -48,6 +49,11 @@ MAXIMUM_METHOD_WORKER_BYTES = 4 * 1024 * 1024
 MAXIMUM_METHOD_COMMAND_ARGUMENTS = 512
 MAXIMUM_METHOD_BOUNDARY_FILES = 64
 MAXIMUM_METHOD_ENVIRONMENT_ENTRIES = 4_096
+MAXIMUM_REHEARSAL_JSON_BYTES = 16 * 1024 * 1024
+MAXIMUM_REHEARSAL_INPUT_BYTES = 1024 * 1024 * 1024
+MAXIMUM_REHEARSAL_REFERENCE_BYTES = 512 * 1024 * 1024
+MAXIMUM_REHEARSAL_PREDICTION_BYTES = 64 * 1024 * 1024
+MAXIMUM_REHEARSAL_PREDICTION_ROWS = 256 * 255
 CONTROL_LABEL = "non-targeting"
 
 FEATURE_SELECTION = "common_expression_genes_train_control_variance_v1"
@@ -138,6 +144,36 @@ _REHEARSAL_EXTRA_ARTIFACTS = (
 
 class TaskCRehearsalError(ValueError):
     """The rehearsal rule or supplied research data are not safe to use."""
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenRehearsalPredictions:
+    """One immutable prediction byte sequence shared by scoring and publication."""
+
+    path: Path
+    payload: bytes
+    sha256: str
+    source_path: Path
+    source_identity: tuple[int, int, int, int, int]
+    frame: Any
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenRehearsalFile:
+    """One identity-bound file in the controller's whole-round closure."""
+
+    path: Path
+    payload: bytes = field(repr=False)
+    sha256: str
+    identity: tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenRehearsalClosure:
+    """Controller, model, scoring, reference, and code files fixed for one round."""
+
+    files: Mapping[str, FrozenRehearsalFile]
+    sha256: str
 
 
 def build_rehearsal_run_id(
@@ -1729,9 +1765,15 @@ def _strict_json_bytes(payload: object) -> bytes:
 
 
 def _strict_json_file(path: Path, label: str) -> dict[str, Any]:
+    payload_bytes, _identity = _capture_regular_bytes(
+        path,
+        label=label,
+        maximum_bytes=MAXIMUM_REHEARSAL_JSON_BYTES,
+    )
     try:
+        decoded = payload_bytes.decode("utf-8", errors="strict")
         payload = json.loads(
-            path.read_text(encoding="utf-8"),
+            decoded,
             object_pairs_hook=_unique_json_object,
             parse_constant=_reject_nonfinite_json,
         )
@@ -1739,6 +1781,13 @@ def _strict_json_file(path: Path, label: str) -> dict[str, Any]:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise TaskCRehearsalError(f"{label} is not valid UTF-8 JSON") from exc
+    try:
+        depth = _json_depth(payload)
+    except RecursionError as exc:
+        raise TaskCRehearsalError(f"{label} is too deeply nested") from exc
+    if depth > MAXIMUM_JSON_DEPTH:
+        raise TaskCRehearsalError(f"{label} is too deeply nested")
+    _reject_nonfinite_numbers(payload)
     if not isinstance(payload, dict):
         raise TaskCRehearsalError(f"{label} must contain one JSON object")
     return payload
@@ -1785,6 +1834,14 @@ def _sha256_file(path: Path) -> str:
     except OSError as exc:
         raise TaskCRehearsalError(f"analysis input cannot be read: {path}") from exc
     return f"sha256:{digest.hexdigest()}"
+
+
+def _bytes_sha256(payload: bytes) -> str:
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def _record_sha256(payload: object) -> str:
+    return _bytes_sha256(_strict_json_bytes(payload))
 
 
 def _canonical_sha256(payload: object) -> str:
@@ -1835,17 +1892,47 @@ def _safe_failure_reason(error: BaseException | str) -> str:
 
 def _tree_inventory(root: Path, *, exclude: frozenset[str] = frozenset()) -> dict[str, str]:
     inventory: dict[str, str] = {}
+    seen_inodes: set[tuple[int, int]] = set()
     for path in sorted(root.rglob("*")):
         if path.is_dir() and not path.is_symlink():
             continue
         relative = path.relative_to(root).as_posix()
         if relative in exclude:
             continue
-        if path.is_symlink() or not path.is_file():
+        try:
+            metadata = os.lstat(path)
+        except OSError as exc:
             raise TaskCRehearsalError(
-                f"rehearsal output contains an unsupported path: {relative}"
+                f"rehearsal evidence could not be inspected: {relative}"
+            ) from exc
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or int(metadata.st_nlink) != 1
+        ):
+            raise TaskCRehearsalError(
+                "rehearsal evidence must use unique regular files without symbolic "
+                f"or hard links: {relative}"
             )
-        inventory[relative] = _sha256_file(path)
+        inode = (int(metadata.st_dev), int(metadata.st_ino))
+        if inode in seen_inodes:
+            raise TaskCRehearsalError(
+                f"rehearsal evidence reuses one file inode: {relative}"
+            )
+        seen_inodes.add(inode)
+        maximum = (
+            MAXIMUM_REHEARSAL_PREDICTION_BYTES
+            if path.suffix.casefold() == ".csv"
+            else MAXIMUM_REHEARSAL_INPUT_BYTES
+            if path.suffix.casefold() == ".npz"
+            else MAXIMUM_REHEARSAL_JSON_BYTES
+        )
+        payload, _identity = _capture_regular_bytes(
+            path,
+            label=f"rehearsal evidence {relative}",
+            maximum_bytes=maximum,
+        )
+        inventory[relative] = _bytes_sha256(payload)
     return inventory
 
 
@@ -1912,8 +1999,13 @@ def _profile_inputs(
 
 
 def _read_profile_arrays(profile_record: Mapping[str, Path]) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
+    payload, _identity = _capture_regular_bytes(
+        profile_record["input"],
+        label="profile input NPZ",
+        maximum_bytes=MAXIMUM_REHEARSAL_INPUT_BYTES,
+    )
     try:
-        with np.load(profile_record["input"], allow_pickle=False) as archive:
+        with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
             expression = np.asarray(archive["expression_matrix"], dtype=np.float64)
             labels = np.asarray(archive["interventions"], dtype=str)
             genes = tuple(str(value) for value in archive["var_names"].tolist())
@@ -1925,8 +2017,13 @@ def _read_profile_arrays(profile_record: Mapping[str, Path]) -> tuple[np.ndarray
 def _read_profile_arrays_with_environments(
     profile_record: Mapping[str, Path],
 ) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], np.ndarray | None]:
+    payload, _identity = _capture_regular_bytes(
+        profile_record["input"],
+        label="profile input NPZ",
+        maximum_bytes=MAXIMUM_REHEARSAL_INPUT_BYTES,
+    )
     try:
-        with np.load(profile_record["input"], allow_pickle=False) as archive:
+        with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
             expression = np.asarray(archive["expression_matrix"], dtype=np.float64)
             labels = np.asarray(archive["interventions"], dtype=str)
             genes = tuple(str(value) for value in archive["var_names"].tolist())
@@ -1966,6 +2063,229 @@ def _write_new_bytes(path: Path, payload: bytes) -> None:
         raise TaskCRehearsalError(
             f"analysis output could not be written safely: {path.name}"
         ) from exc
+
+
+def _capture_regular_bytes(
+    path: Path, *, label: str, maximum_bytes: int
+) -> tuple[bytes, tuple[int, int, int, int, int]]:
+    """Read one regular single-link file through a no-follow descriptor."""
+
+    absolute = Path(os.path.abspath(os.fspath(path.expanduser())))
+    _reject_output_symbolic_links(absolute)
+    try:
+        descriptor = os.open(
+            absolute, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        )
+    except OSError as exc:
+        raise TaskCRehearsalError(f"{label} could not be opened safely") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or int(before.st_nlink) != 1
+            or int(before.st_size) < 1
+            or int(before.st_size) > maximum_bytes
+        ):
+            raise TaskCRehearsalError(
+                f"{label} must be one bounded regular file with one link"
+            )
+        chunks: list[bytes] = []
+        collected = 0
+        while collected <= maximum_bytes:
+            chunk = os.read(descriptor, min(1024 * 1024, maximum_bytes + 1 - collected))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            collected += len(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity = (
+        int(before.st_dev),
+        int(before.st_ino),
+        int(before.st_size),
+        int(before.st_mtime_ns),
+        int(before.st_ctime_ns),
+    )
+    after_identity = (
+        int(after.st_dev),
+        int(after.st_ino),
+        int(after.st_size),
+        int(after.st_mtime_ns),
+        int(after.st_ctime_ns),
+    )
+    payload = b"".join(chunks)
+    if after_identity != identity or len(payload) != before.st_size:
+        raise TaskCRehearsalError(f"{label} changed while it was being frozen")
+    try:
+        current = os.lstat(absolute)
+    except OSError as exc:
+        raise TaskCRehearsalError(f"{label} changed after it was frozen") from exc
+    current_identity = (
+        int(current.st_dev),
+        int(current.st_ino),
+        int(current.st_size),
+        int(current.st_mtime_ns),
+        int(current.st_ctime_ns),
+    )
+    if (
+        current_identity != identity
+        or not stat.S_ISREG(current.st_mode)
+        or int(current.st_nlink) != 1
+    ):
+        raise TaskCRehearsalError(f"{label} changed after it was frozen")
+    return payload, identity
+
+
+def freeze_rehearsal_predictions(
+    *, source_path: Path, destination: Path, expected_genes: Sequence[str]
+) -> FrozenRehearsalPredictions:
+    """Freeze, bound, and parse the sole prediction bytes used downstream."""
+
+    import pandas as pd
+
+    payload, identity = _capture_regular_bytes(
+        source_path,
+        label="method prediction table",
+        maximum_bytes=MAXIMUM_REHEARSAL_PREDICTION_BYTES,
+    )
+    if payload.count(b"\n") > MAXIMUM_REHEARSAL_PREDICTION_ROWS + 1:
+        raise TaskCRehearsalError("method prediction table has too many rows")
+    try:
+        frame = pd.read_csv(io.BytesIO(payload), encoding="utf-8", on_bad_lines="error")
+    except (pd.errors.ParserError, UnicodeError, ValueError) as exc:
+        raise TaskCRehearsalError("method prediction table is not a bounded CSV") from exc
+    if list(frame.columns) != [
+        "source",
+        "target",
+        "score",
+        "returned_by_method",
+    ]:
+        raise TaskCRehearsalError("method prediction table columns changed")
+    genes = tuple(str(gene) for gene in expected_genes)
+    expected_rows = len(genes) * (len(genes) - 1)
+    relations = list(
+        zip(frame["source"].astype(str), frame["target"].astype(str), strict=True)
+    )
+    if (
+        len(frame) != expected_rows
+        or len(set(relations)) != expected_rows
+        or set(relations)
+        != {(source, target) for source in genes for target in genes if source != target}
+    ):
+        raise TaskCRehearsalError("method prediction table is not the complete fixed universe")
+    try:
+        scores = np.asarray(frame["score"], dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TaskCRehearsalError("method prediction scores are invalid") from exc
+    if not np.isfinite(scores).all():
+        raise TaskCRehearsalError("method prediction scores must be finite")
+    _write_new_bytes(destination, payload)
+    frozen_payload, _ = _capture_regular_bytes(
+        destination,
+        label="frozen prediction table",
+        maximum_bytes=MAXIMUM_REHEARSAL_PREDICTION_BYTES,
+    )
+    if frozen_payload != payload:
+        raise TaskCRehearsalError("frozen prediction bytes changed during publication")
+    return FrozenRehearsalPredictions(
+        path=Path(destination),
+        payload=payload,
+        sha256=f"sha256:{hashlib.sha256(payload).hexdigest()}",
+        source_path=Path(source_path),
+        source_identity=identity,
+        frame=frame,
+    )
+
+
+def _verify_frozen_predictions(snapshot: FrozenRehearsalPredictions) -> None:
+    payload, _ = _capture_regular_bytes(
+        snapshot.path,
+        label="frozen prediction table",
+        maximum_bytes=MAXIMUM_REHEARSAL_PREDICTION_BYTES,
+    )
+    if payload != snapshot.payload:
+        raise TaskCRehearsalError("frozen prediction bytes changed")
+
+
+def _freeze_rehearsal_closure(
+    paths: Mapping[str, Path],
+) -> FrozenRehearsalClosure:
+    if not isinstance(paths, Mapping) or not paths:
+        raise TaskCRehearsalError("rehearsal closure must contain fixed files")
+    frozen: dict[str, FrozenRehearsalFile] = {}
+    seen_paths: set[Path] = set()
+    seen_inodes: set[tuple[int, int]] = set()
+    for label, raw_path in sorted(paths.items()):
+        if not isinstance(label, str) or not label:
+            raise TaskCRehearsalError("rehearsal closure labels must be non-empty")
+        path = Path(raw_path)
+        maximum = (
+            MAXIMUM_REHEARSAL_REFERENCE_BYTES
+            if path.suffix.casefold() == ".csv"
+            else MAXIMUM_REHEARSAL_INPUT_BYTES
+            if path.suffix.casefold() == ".npz"
+            else MAXIMUM_METHOD_WORKER_BYTES
+            if path.suffix.casefold() == ".py"
+            else MAXIMUM_REHEARSAL_JSON_BYTES
+        )
+        payload, identity = _capture_regular_bytes(
+            path,
+            label=f"rehearsal closure file {label}",
+            maximum_bytes=maximum,
+        )
+        absolute = Path(os.path.abspath(os.fspath(path.expanduser())))
+        inode = (identity[0], identity[1])
+        if absolute in seen_paths or inode in seen_inodes:
+            raise TaskCRehearsalError("rehearsal closure files must be unique")
+        seen_paths.add(absolute)
+        seen_inodes.add(inode)
+        frozen[label] = FrozenRehearsalFile(
+            path=absolute,
+            payload=payload,
+            sha256=_bytes_sha256(payload),
+            identity=identity,
+        )
+    closure_record = {
+        label: {
+            "path": os.fspath(snapshot.path),
+            "sha256": snapshot.sha256,
+            "identity": list(snapshot.identity),
+        }
+        for label, snapshot in frozen.items()
+    }
+    return FrozenRehearsalClosure(
+        files=MappingProxyType(frozen),
+        sha256=_canonical_sha256(closure_record),
+    )
+
+
+def _verify_rehearsal_closure(closure: FrozenRehearsalClosure) -> None:
+    if not isinstance(closure, FrozenRehearsalClosure):
+        raise TaskCRehearsalError("rehearsal closure is invalid")
+    for label, snapshot in closure.files.items():
+        maximum = (
+            MAXIMUM_REHEARSAL_REFERENCE_BYTES
+            if snapshot.path.suffix.casefold() == ".csv"
+            else MAXIMUM_REHEARSAL_INPUT_BYTES
+            if snapshot.path.suffix.casefold() == ".npz"
+            else MAXIMUM_METHOD_WORKER_BYTES
+            if snapshot.path.suffix.casefold() == ".py"
+            else MAXIMUM_REHEARSAL_JSON_BYTES
+        )
+        payload, identity = _capture_regular_bytes(
+            snapshot.path,
+            label=f"rehearsal closure file {label}",
+            maximum_bytes=maximum,
+        )
+        if (
+            payload != snapshot.payload
+            or _bytes_sha256(payload) != snapshot.sha256
+            or identity != snapshot.identity
+        ):
+            raise TaskCRehearsalError(
+                f"rehearsal closure changed after launch: {label}"
+            )
 
 
 def materialize_hypersca_profile_contexts(
@@ -2061,15 +2381,25 @@ def materialize_sealed_scoring_subset(
         or maximum_cells < 1
     ):
         raise TaskCRehearsalError("sealed scoring cell limit must be positive")
+    profile_payload, _profile_identity = _capture_regular_bytes(
+        public_profile_input,
+        label="public profile NPZ",
+        maximum_bytes=MAXIMUM_REHEARSAL_INPUT_BYTES,
+    )
+    source_payload, _source_identity = _capture_regular_bytes(
+        source_path,
+        label="sealed scoring source NPZ",
+        maximum_bytes=MAXIMUM_REHEARSAL_INPUT_BYTES,
+    )
     try:
-        with np.load(public_profile_input, allow_pickle=False) as profile_archive:
+        with np.load(io.BytesIO(profile_payload), allow_pickle=False) as profile_archive:
             profile_genes = _canonical_texts(
                 np.asarray(profile_archive["var_names"]),
                 "public profile genes",
                 require_unique=True,
                 maximum_items=MAXIMUM_PARENT_GENES,
             )
-        with np.load(source_path, allow_pickle=False) as source_archive:
+        with np.load(io.BytesIO(source_payload), allow_pickle=False) as source_archive:
             if set(source_archive.files) != {
                 "expression_matrix",
                 "interventions",
@@ -2217,7 +2547,8 @@ def _synthetic_predictions(
 
 def _null_control_records(
     *,
-    predictions: Any,
+    predictions: Any | None,
+    prediction_snapshot: FrozenRehearsalPredictions | None = None,
     profile_record: Mapping[str, Path],
     seed: int,
     synthetic_smoke: bool,
@@ -2389,16 +2720,49 @@ def _scientific_null_predictions(
             seed=seed,
             device="cpu",
         )
-        raw = fitted.predictions[["source", "target", "score"]]
+        summary = dict(fitted.summary)
+        successful = summary.get("successful_repeats")
+        coverage = summary.get("coverage")
+        if (
+            isinstance(successful, bool)
+            or not isinstance(successful, int)
+            or successful < 1
+            or isinstance(coverage, bool)
+            or not isinstance(coverage, (int, float))
+            or not math.isfinite(float(coverage))
+            or float(coverage) <= 0.0
+        ):
+            raise TaskCRehearsalError(
+                "HyperSCA-C formal null fit has no successful, usable coverage"
+            )
+        usable = fitted.predictions.loc[
+            ~fitted.predictions["abstained"].astype(bool)
+            & np.isfinite(np.asarray(fitted.predictions["score"], dtype=np.float64))
+        ]
+        if usable.empty:
+            raise TaskCRehearsalError(
+                "HyperSCA-C formal null fit returned no usable relations"
+            )
+        raw = usable[["source", "target", "score"]]
     else:
         raise TaskCRehearsalError(
             "formal null inference is limited to HyperSCA-C and Mean Difference"
         )
-    return normalize_task_c_predictions(raw, genes)
+    normalized = normalize_task_c_predictions(raw, genes)
+    normalized.attrs["formal_null_scientific_status"] = {
+        "successful_repeats": int(summary["successful_repeats"]),
+        "requested_repeats": int(summary["requested_repeats"]),
+        "coverage": float(summary["coverage"]),
+    } if method_id == "hypersca_c" else {
+        "successful_repeats": 1,
+        "requested_repeats": 1,
+        "coverage": float(normalized["returned_by_method"].mean()),
+    }
+    return normalized
 
 
 def _response_average_precision(
-    predictions: Any,
+    predictions: Any | None,
     expression: np.ndarray,
     labels: np.ndarray,
     genes: tuple[str, ...],
@@ -2438,18 +2802,61 @@ def _response_average_precision(
     )
 
 
+def _derive_formal_null_seed(
+    *,
+    base_seed: int,
+    control_index: int,
+    repeat: int,
+    context_index: int,
+    purpose: int,
+) -> int:
+    coordinates = (control_index, repeat, context_index, purpose)
+    if (
+        isinstance(base_seed, bool)
+        or not isinstance(base_seed, int)
+        or base_seed < 0
+        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in coordinates)
+    ):
+        raise TaskCRehearsalError("formal null seed coordinates are invalid")
+    sequence = np.random.SeedSequence(base_seed, spawn_key=coordinates)
+    return int(sequence.generate_state(1, dtype=np.uint32)[0])
+
+
+def _materialize_formal_null_hypersca_config(
+    *, selected_config: Path, destination: Path
+) -> Path:
+    from src.causal.hypersca_c import HyperSCACConfig
+
+    selected = _strict_json_file(
+        selected_config, "selected HyperSCA-C settings for formal null analyses"
+    )
+    lightweight = dict(selected)
+    lightweight["bootstrap_repeats"] = 1
+    lightweight["bootstrap_success_fraction"] = 1.0
+    HyperSCACConfig.from_mapping(lightweight)
+    _write_new_record(destination, lightweight)
+    return destination
+
+
 def _contextwise_label_permutation(
-    labels: np.ndarray, environments: np.ndarray | None, seed: int
+    labels: np.ndarray,
+    environments: np.ndarray | None,
+    seeds: Sequence[int],
 ) -> np.ndarray:
     from src.evaluation.task_c_null_controls import permute_intervention_labels
 
     if environments is None:
-        return permute_intervention_labels(labels, seed)
+        if len(seeds) != 1:
+            raise TaskCRehearsalError("within-context null requires one derived seed")
+        return permute_intervention_labels(labels, int(seeds[0]))
+    context_ids = tuple(dict.fromkeys(environments.tolist()))
+    if len(seeds) != len(context_ids):
+        raise TaskCRehearsalError("cross-context null seeds are incomplete")
     transformed = labels.copy()
-    for offset, context_id in enumerate(dict.fromkeys(environments.tolist())):
+    for context_index, context_id in enumerate(context_ids):
         selected = environments == context_id
         transformed[selected] = permute_intervention_labels(
-            labels[selected], seed + offset
+            labels[selected], int(seeds[context_index])
         )
     return transformed
 
@@ -2458,22 +2865,202 @@ def _contextwise_control_resampling(
     expression: np.ndarray,
     labels: np.ndarray,
     environments: np.ndarray | None,
-    seed: int,
+    seeds: Sequence[int],
 ) -> tuple[np.ndarray, np.ndarray]:
     from src.evaluation.task_c_null_controls import build_control_resampling_null
 
     if environments is None:
-        return build_control_resampling_null(expression, labels, seed)
+        if len(seeds) != 1:
+            raise TaskCRehearsalError("within-context null requires one derived seed")
+        return build_control_resampling_null(expression, labels, int(seeds[0]))
+    context_ids = tuple(dict.fromkeys(environments.tolist()))
+    if len(seeds) != len(context_ids):
+        raise TaskCRehearsalError("cross-context null seeds are incomplete")
     transformed = expression.copy()
     copied_labels = labels.copy()
-    for offset, context_id in enumerate(dict.fromkeys(environments.tolist())):
+    for context_index, context_id in enumerate(context_ids):
         selected = environments == context_id
         sampled, sampled_labels = build_control_resampling_null(
-            expression[selected], labels[selected], seed + offset
+            expression[selected], labels[selected], int(seeds[context_index])
         )
         transformed[selected] = sampled
         copied_labels[selected] = sampled_labels
     return transformed, copied_labels
+
+
+def _directory_written_bytes(root: Path) -> int:
+    total = 0
+    if not root.exists():
+        return total
+    if root.is_file() and not root.is_symlink():
+        return int(os.lstat(root).st_size)
+    for path in root.rglob("*"):
+        try:
+            metadata = os.lstat(path)
+        except OSError as exc:
+            raise TaskCRehearsalError(
+                "null-control output size could not be measured"
+            ) from exc
+        if stat.S_ISREG(metadata.st_mode):
+            total += int(metadata.st_size)
+    return total
+
+
+def _measured_stage_fields(
+    *, output_root: Path, elapsed_seconds: float
+) -> dict[str, object]:
+    peak_rss_bytes: int | None = None
+    inner_resource = output_root / "raw_runtime/resource_usage.json"
+    if inner_resource.is_file():
+        resource = _strict_json_file(inner_resource, "method resource record")
+        maximum_resident_kib = resource.get("maximum_resident_kib")
+        if (
+            isinstance(maximum_resident_kib, int)
+            and not isinstance(maximum_resident_kib, bool)
+            and maximum_resident_kib >= 0
+        ):
+            peak_rss_bytes = maximum_resident_kib * 1024
+    return {
+        "elapsed_seconds": elapsed_seconds,
+        "peak_rss_bytes": peak_rss_bytes,
+        "peak_gpu_memory_bytes": None,
+        "written_disk_bytes": _directory_written_bytes(output_root),
+        "measurement_availability": {
+            "elapsed_seconds": True,
+            "peak_rss_bytes": peak_rss_bytes is not None,
+            "peak_gpu_memory_bytes": False,
+            "written_disk_bytes": True,
+        },
+    }
+
+
+def _run_supervised_null_inference(
+    *,
+    method_id: str,
+    profile_record: Mapping[str, Path],
+    seed: int,
+    min_cells: int,
+    hypersca_config_path: Path | None,
+    repeat_root: Path,
+    expected_genes: Sequence[str],
+    timeout_seconds: float,
+) -> tuple[Any | None, dict[str, object]]:
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or float(timeout_seconds) <= 0.0
+    ):
+        raise TaskCRehearsalError("formal null timeout must be positive")
+    from src.evaluation.task_c_runtime import (
+        TaskCRuntimeError,
+        run_isolated_method,
+    )
+
+    raw_prediction_path = repeat_root / "raw_predictions.csv"
+    scientific_status_path = repeat_root / "scientific_status.json"
+    baseline_bytes = _directory_written_bytes(repeat_root)
+    worker = Path(__file__).resolve().parents[2] / (
+        "scripts/task_c_workers/rehearsal_null_worker.py"
+    )
+    command = [
+        sys.executable,
+        "-I",
+        str(worker),
+        "--method-id",
+        method_id,
+        "--input-npz",
+        str(profile_record["input"]),
+        "--profile-manifest",
+        str(profile_record["manifest"]),
+        "--seed",
+        str(seed),
+        "--min-cells",
+        str(min_cells),
+        "--output-csv",
+        str(raw_prediction_path),
+        "--scientific-status",
+        str(scientific_status_path),
+    ]
+    if hypersca_config_path is not None:
+        command.extend(("--hypersca-config", str(hypersca_config_path)))
+    try:
+        runtime = run_isolated_method(
+            command,
+            output_dir=repeat_root / "supervision",
+            timeout_seconds=timeout_seconds,
+        )
+    except TaskCRuntimeError as exc:
+        raise TaskCRehearsalError(
+            f"formal null supervisor could not start: {exc}"
+        ) from exc
+    resource = _strict_json_file(
+        repeat_root / "supervision/resource_usage.json",
+        "formal null supervisor resource record",
+    )
+    runtime_status = runtime.get("status")
+    status = (
+        "completed"
+        if runtime_status == "completed_raw_inference"
+        else "failed_timeout"
+        if runtime_status == "failed_timeout"
+        else "failed"
+    )
+    predictions: Any | None = None
+    prediction_sha256: str | None = None
+    scientific_status: object = None
+    if status == "completed":
+        child_status = _strict_json_file(
+            scientific_status_path, "formal null scientific status"
+        )
+        if child_status.get("status") != "completed" or not isinstance(
+            child_status.get("scientific_status"), dict
+        ):
+            status = "failed"
+        else:
+            scientific_status = child_status["scientific_status"]
+    if status == "completed":
+        snapshot = freeze_rehearsal_predictions(
+            source_path=raw_prediction_path,
+            destination=repeat_root / "predictions.csv",
+            expected_genes=expected_genes,
+        )
+        predictions = snapshot.frame
+        prediction_sha256 = snapshot.sha256
+    written_bytes = max(0, _directory_written_bytes(repeat_root) - baseline_bytes)
+    maximum_resident_kib = resource.get("maximum_resident_kib")
+    peak_rss = (
+        int(maximum_resident_kib) * 1024
+        if isinstance(maximum_resident_kib, int)
+        and not isinstance(maximum_resident_kib, bool)
+        and maximum_resident_kib >= 0
+        else None
+    )
+    record: dict[str, object] = {
+        "schema_version": "1.0",
+        "component_kind": "null_analysis",
+        "stage": "null_control",
+        "status": status,
+        "return_code": runtime.get("return_code"),
+        "timeout_seconds": float(timeout_seconds),
+        "elapsed_seconds": resource.get("elapsed_seconds"),
+        "peak_rss_bytes": peak_rss,
+        "peak_gpu_memory_bytes": None,
+        "written_disk_bytes": written_bytes,
+        "measurement_availability": {
+            "elapsed_seconds": True,
+            "peak_rss_bytes": peak_rss is not None,
+            "peak_gpu_memory_bytes": False,
+            "written_disk_bytes": True,
+        },
+        "resource_meter": resource.get("resource_meter"),
+        "prediction_sha256": prediction_sha256,
+        "scientific_status": scientific_status,
+    }
+    if status != "completed":
+        reason = runtime.get("stderr_tail") or runtime_status
+        record["reason"] = _safe_failure_reason(str(reason))
+    return predictions, record
 
 
 def _run_formal_null_controls(
@@ -2485,6 +3072,7 @@ def _run_formal_null_controls(
     min_cells: int,
     hypersca_config_path: Path | None,
     work_dir: Path,
+    timeout_seconds: float = 300.0,
 ) -> dict[str, object]:
     """Materialize and analyze all 40 formal zero-effect inputs."""
 
@@ -2502,30 +3090,67 @@ def _run_formal_null_controls(
     )
     root = work_dir / "null_controls"
     root.mkdir(parents=True, mode=0o700, exist_ok=False)
+    formal_hypersca_config = hypersca_config_path
+    if method_id == "hypersca_c":
+        if hypersca_config_path is None:
+            raise TaskCRehearsalError(
+                "HyperSCA-C formal null analyses require selected settings"
+            )
+        formal_hypersca_config = _materialize_formal_null_hypersca_config(
+            selected_config=hypersca_config_path,
+            destination=root / "hypersca_formal_null_config.json",
+        )
     failures: list[dict[str, object]] = []
+    used_seeds: set[int] = set()
     result: dict[str, object] = {
         "scope": "formal_scientific_inference_rerun",
         "formal_null_gate_passed": False,
     }
-    for control_name, offset in (
-        ("label_permutation", 1),
-        ("control_resampling", 101),
+    context_ids = (
+        ("within",)
+        if environments is None
+        else tuple(str(value) for value in dict.fromkeys(environments.tolist()))
+    )
+    for control_index, control_name in enumerate(
+        ("label_permutation", "control_resampling")
     ):
         metrics: list[float] = []
         analyses: list[dict[str, object]] = []
         for repeat in range(20):
-            repeat_seed = seed + offset + repeat
+            transformation_seeds = tuple(
+                _derive_formal_null_seed(
+                    base_seed=seed,
+                    control_index=control_index,
+                    repeat=repeat,
+                    context_index=context_index,
+                    purpose=0,
+                )
+                for context_index in range(len(context_ids))
+            )
+            repeat_seed = _derive_formal_null_seed(
+                base_seed=seed,
+                control_index=control_index,
+                repeat=repeat,
+                context_index=0,
+                purpose=1,
+            )
+            current_seeds = {*transformation_seeds, repeat_seed}
+            if len(current_seeds) != len(transformation_seeds) + 1 or (
+                used_seeds & current_seeds
+            ):
+                raise TaskCRehearsalError("formal null seed streams overlap")
+            used_seeds.update(current_seeds)
             repeat_root = root / control_name / f"repeat_{repeat:02d}"
             repeat_root.mkdir(parents=True, mode=0o700)
             if control_name == "label_permutation":
                 transformed_expression = expression
                 transformed_labels = _contextwise_label_permutation(
-                    labels, environments, repeat_seed
+                    labels, environments, transformation_seeds
                 )
             else:
                 transformed_expression, transformed_labels = (
                     _contextwise_control_resampling(
-                        expression, labels, environments, repeat_seed
+                        expression, labels, environments, transformation_seeds
                     )
                 )
             arrays: dict[str, np.ndarray] = {
@@ -2543,7 +3168,12 @@ def _run_formal_null_controls(
                 "method_id": method_id,
                 "control": control_name,
                 "repeat": repeat,
-                "seed": repeat_seed,
+                "model_seed": repeat_seed,
+                "transformation_seeds": {
+                    context_id: transformation_seeds[index]
+                    for index, context_id in enumerate(context_ids)
+                },
+                "seed_derivation": "numpy_seed_sequence_v1",
                 "parent_profile_input_sha256": _sha256_file(
                     profile_record["input"]
                 ),
@@ -2552,32 +3182,28 @@ def _run_formal_null_controls(
                 ),
                 "input_sha256": input_sha256,
                 "hypersca_config_sha256": (
-                    _sha256_file(hypersca_config_path)
-                    if hypersca_config_path is not None
+                    _sha256_file(formal_hypersca_config)
+                    if formal_hypersca_config is not None
                     else None
                 ),
             }
             _write_new_record(repeat_root / "input_identity.json", identity)
-            started = time.monotonic()
-            status = "completed"
-            reason: str | None = None
-            prediction_sha256: str | None = None
             metric: float | None = None
-            try:
-                transformed_profile = {
-                    "input": input_path,
-                    "manifest": profile_record["manifest"],
-                }
-                null_predictions = _scientific_null_predictions(
-                    method_id=method_id,
-                    profile_record=transformed_profile,
-                    seed=repeat_seed,
-                    min_cells=min_cells,
-                    hypersca_config_path=hypersca_config_path,
-                )
-                prediction_path = repeat_root / "predictions.csv"
-                null_predictions.to_csv(prediction_path, index=False)
-                prediction_sha256 = _sha256_file(prediction_path)
+            transformed_profile = {
+                "input": input_path,
+                "manifest": profile_record["manifest"],
+            }
+            null_predictions, analysis = _run_supervised_null_inference(
+                method_id=method_id,
+                profile_record=transformed_profile,
+                seed=repeat_seed,
+                min_cells=min_cells,
+                hypersca_config_path=formal_hypersca_config,
+                repeat_root=repeat_root,
+                expected_genes=genes,
+                timeout_seconds=timeout_seconds,
+            )
+            if null_predictions is not None:
                 metric = _response_average_precision(
                     null_predictions,
                     np.asarray(transformed_expression),
@@ -2585,30 +3211,20 @@ def _run_formal_null_controls(
                     genes,
                 )
                 metrics.append(metric)
-            except (Exception,) as exc:
-                status = "failed"
-                reason = _safe_failure_reason(exc)
-            analysis = {
-                "schema_version": "1.0",
-                "component_kind": "null_analysis",
+            analysis.update({
                 "method_id": method_id,
-                "stage": "null_control",
                 "control": control_name,
                 "repeat": repeat,
                 "seed": repeat_seed,
-                "status": status,
                 "input_sha256": input_sha256,
-                "prediction_sha256": prediction_sha256,
                 "metric": metric,
-                "elapsed_seconds": max(0.0, time.monotonic() - started),
-            }
-            if reason is not None:
-                analysis["reason"] = reason
+            })
+            if analysis["status"] != "completed":
                 failures.append(dict(analysis))
             _write_new_record(repeat_root / "analysis.resource.json", analysis)
             analyses.append(dict(analysis))
         control_record: dict[str, object] = {
-            "seeds": [seed + offset + repeat for repeat in range(20)],
+            "seeds": [record["seed"] for record in analyses],
             "metrics": metrics,
             "analyses": analyses,
             "completed_analysis_count": sum(
@@ -2637,15 +3253,24 @@ def _run_formal_null_controls(
         bool(result[name].get("passed"))  # type: ignore[union-attr]
         for name in ("label_permutation", "control_resampling")
     )
+    final_status = (
+        "completed_formal_null_controls"
+        if result["formal_null_gate_passed"]
+        else "failed_null_control"
+    )
     _write_new_record(
         root / "null_control_status.json",
         {
             "schema_version": "1.0",
-            "status": "completed_formal_null_controls",
+            "status": final_status,
             "attempted_analysis_count": 40,
             "completed_analysis_count": 40,
         },
     )
+    if not result["formal_null_gate_passed"]:
+        raise TaskCRehearsalError(
+            "formal null-control metrics did not pass the fixed empirical gate"
+        )
     return result
 
 
@@ -2736,19 +3361,6 @@ def _run_method_bundle(
         "trial_parameters_path": trial_candidate,
         "project_root": project_root,
     }
-    if method_id == "hypersca_c" and profile_record is not None:
-        profile_manifest = _strict_json_file(
-            profile_record["manifest"], "profile input record"
-        )
-        if profile_manifest.get("condition") == "cross_environment":
-            context_paths = materialize_hypersca_profile_contexts(
-                profile_record=profile_record,
-                output_dir=output_dir.parent / f"{output_dir.name}.profile-contexts",
-            )
-            arguments["profile_context_values"] = tuple(
-                f"{context_id}={path}"
-                for context_id, path in context_paths.items()
-            )
     if selection_arguments:
         arguments.update(selection_arguments)
     started = time.monotonic()
@@ -2762,6 +3374,7 @@ def _run_method_bundle(
         raise
     finally:
         if resource_record_path is not None:
+            elapsed = max(0.0, time.monotonic() - started)
             _write_new_record(
                 resource_record_path,
                 {
@@ -2769,8 +3382,11 @@ def _run_method_bundle(
                     "component_kind": "method_analysis",
                     "method_id": method_id,
                     "stage": resource_stage or "unspecified",
-                    "elapsed_seconds": max(0.0, time.monotonic() - started),
                     "status": final_status,
+                    **_measured_stage_fields(
+                        output_root=output_dir,
+                        elapsed_seconds=elapsed,
+                    ),
                 },
             )
 
@@ -2946,6 +3562,12 @@ def _select_connection_configuration(
         text=True,
         check=False,
     )
+    selection_elapsed = max(0.0, time.monotonic() - selection_started)
+    selection_written = sum(
+        int(os.lstat(path).st_size)
+        for path in (selection, selection_status)
+        if path.is_file() and not path.is_symlink()
+    )
     _write_new_record(
         work_dir / "tune_selection.resource.json",
         {
@@ -2953,8 +3575,17 @@ def _select_connection_configuration(
             "component_kind": "configuration_selection",
             "method_id": method_id,
             "stage": "tune",
-            "elapsed_seconds": max(0.0, time.monotonic() - selection_started),
             "status": "completed" if completed.returncode == 0 else "failed",
+            "elapsed_seconds": selection_elapsed,
+            "peak_rss_bytes": None,
+            "peak_gpu_memory_bytes": None,
+            "written_disk_bytes": selection_written,
+            "measurement_availability": {
+                "elapsed_seconds": True,
+                "peak_rss_bytes": False,
+                "peak_gpu_memory_bytes": False,
+                "written_disk_bytes": True,
+            },
         },
     )
     if completed.returncode != 0:
@@ -3095,6 +3726,95 @@ def _run_formal_final_method(
     return refit, status
 
 
+def _verify_formal_final_method_bundle(
+    *,
+    method_id: str,
+    condition: str,
+    profile: str,
+    profiles: Mapping[str, Mapping[str, Path]],
+    work_dir: Path,
+    seed: int,
+    registry_path: Path,
+    asset_root: Path,
+    public_manifest: Path,
+    min_cells: int,
+    timeout_seconds: int,
+    project_root: Path,
+    source_kind: str,
+) -> None:
+    """Replay the exact method boundary immediately before outer publication."""
+
+    profile_record: Mapping[str, Path] | None = profiles["refit"]
+    if source_kind == "publication_only":
+        profile_record = None
+    gene_list: Path | None = None
+    hypersca_config: Path | None = None
+    selection_arguments: dict[str, object] | None = None
+    if method_id == "hypersca_c":
+        gene_list = work_dir / "genes.json"
+        hypersca_config = (
+            work_dir / "selected_refit_config.json"
+            if profile == "connection"
+            else project_root / "configs/hypersca_c_v1.json"
+        )
+        if profile == "connection":
+            trial_dirs = tuple(
+                work_dir / "trials" / f"trial_{index}" for index in (0, 1)
+            )
+            configs = tuple(
+                work_dir / f"hypersca_config_trial_{index}.json"
+                for index in (0, 1)
+            )
+            selection = work_dir / "selection_record.json"
+            selection_arguments = {
+                "selection_record_path": selection,
+                "selection_status_path": Path(f"{selection}.status.json"),
+                "selection_tune_input_path": profiles["tune"]["input"],
+                "selection_tune_profile_manifest_path": profiles["tune"]["manifest"],
+                "selection_config_path": project_root / "configs/task_c_tuning_v1.json",
+                "selection_trial_directories": trial_dirs,
+                "selection_trial_input_bindings": {
+                    trial.resolve(): profiles["train"]["input"] for trial in trial_dirs
+                },
+                "selection_trial_profile_bindings": {
+                    trial.resolve(): profiles["train"]["manifest"] for trial in trial_dirs
+                },
+                "selection_trial_hypersca_configs": {
+                    trial.resolve(): configs[index]
+                    for index, trial in enumerate(trial_dirs)
+                },
+                "selection_trial_gene_lists": {
+                    trial.resolve(): gene_list for trial in trial_dirs
+                },
+            }
+    result = _run_method_bundle(
+        method_id=method_id,
+        profile_record=profile_record,
+        output_dir=work_dir / "refit",
+        seed=seed,
+        registry_path=registry_path,
+        asset_root=asset_root,
+        public_manifest=public_manifest,
+        context_id=(
+            condition.replace("within_", "")
+            if condition.startswith("within_")
+            else condition
+        ),
+        min_cells=min_cells,
+        timeout_seconds=timeout_seconds,
+        project_root=project_root,
+        hypersca_config=hypersca_config,
+        gene_list=gene_list,
+        selection_arguments=selection_arguments,
+        resource_record_path=None,
+        resource_stage=None,
+    )
+    if result.get("status") != "completed_standardized_output":
+        raise TaskCRehearsalError(
+            "pre-publication method bundle verification did not retain completion"
+        )
+
+
 def _causalbench_python(asset_root: Path, environment_name: str) -> Path:
     try:
         completed = subprocess.run(
@@ -3129,11 +3849,16 @@ def _causalbench_python(asset_root: Path, environment_name: str) -> Path:
 def _reference_edges(path: Path, expected_sha256: str) -> set[tuple[str, str]]:
     import csv
 
-    observed = _sha256_file(path).removeprefix("sha256:")
+    payload, _identity = _capture_regular_bytes(
+        path,
+        label="reference-relation table",
+        maximum_bytes=MAXIMUM_REHEARSAL_REFERENCE_BYTES,
+    )
+    observed = _bytes_sha256(payload).removeprefix("sha256:")
     if expected_sha256.removeprefix("sha256:") != observed:
         raise TaskCRehearsalError("reference-relation file fingerprint changed")
     try:
-        with path.open("r", encoding="utf-8", newline="") as handle:
+        with io.StringIO(payload.decode("utf-8", errors="strict"), newline="") as handle:
             rows = csv.reader(handle)
             if next(rows, None) != ["source", "target"]:
                 raise TaskCRehearsalError(
@@ -3154,7 +3879,7 @@ def _reference_edges(path: Path, expected_sha256: str) -> set[tuple[str, str]]:
 def _formal_scoring(
     *,
     condition: str,
-    predictions: Path,
+    predictions: FrozenRehearsalPredictions,
     prepared_root: Path,
     asset_root: Path,
     work_dir: Path,
@@ -3164,6 +3889,12 @@ def _formal_scoring(
     public_profile_input: Path,
     maximum_cells: int,
 ) -> dict[str, object]:
+    if not isinstance(predictions, FrozenRehearsalPredictions):
+        raise TaskCRehearsalError(
+            "formal scoring requires one frozen prediction snapshot"
+        )
+    _verify_frozen_predictions(predictions)
+    prediction_path = predictions.path
     scope = _condition_scope(condition)
     if scope["direction"] is None:
         source_heldout = prepared_root / "private" / "within" / str(scope["context_id"]) / "holdout.npz"
@@ -3180,7 +3911,7 @@ def _formal_scoring(
         )
         metrics = _formal_scoring_subset(
             condition=condition,
-            predictions=predictions,
+            predictions=prediction_path,
             prepared_root=prepared_root,
             asset_root=asset_root,
             work_dir=work_dir,
@@ -3195,6 +3926,8 @@ def _formal_scoring(
             "profile_subset_sha256": _sha256_file(heldout),
             "public_profile_input_sha256": _sha256_file(public_profile_input),
         }
+        _verify_frozen_predictions(predictions)
+        metrics["prediction_sha256"] = predictions.sha256
         return metrics
     finally:
         if private_root.exists() and not private_root.is_symlink():
@@ -3223,8 +3956,16 @@ def _formal_scoring_subset_unrecorded(
     )
 
     scope = _condition_scope(condition)
-    prediction_sha256 = _sha256_file(predictions)
-    heldout_sha256 = _sha256_file(heldout)
+    prediction_payload, prediction_identity = _capture_regular_bytes(
+        predictions,
+        label="fixed scoring prediction table",
+        maximum_bytes=MAXIMUM_REHEARSAL_PREDICTION_BYTES,
+    )
+    heldout_payload, heldout_identity = _capture_regular_bytes(
+        heldout,
+        label="sealed scoring NPZ",
+        maximum_bytes=MAXIMUM_REHEARSAL_INPUT_BYTES,
+    )
     evaluation_worker = project_root / "scripts/task_c_workers/causalbench_evaluation_worker.py"
     boundary_worker = project_root / "scripts/task_c_workers/causalbench_worker.py"
     python = _causalbench_python(
@@ -3260,9 +4001,21 @@ def _formal_scoring_subset_unrecorded(
         timeout_seconds=1_800,
     )
     official = _strict_json_file(official_output, "sealed scoring result")
+    refreshed_predictions, refreshed_prediction_identity = _capture_regular_bytes(
+        predictions,
+        label="fixed scoring prediction table",
+        maximum_bytes=MAXIMUM_REHEARSAL_PREDICTION_BYTES,
+    )
+    refreshed_heldout, refreshed_heldout_identity = _capture_regular_bytes(
+        heldout,
+        label="sealed scoring NPZ",
+        maximum_bytes=MAXIMUM_REHEARSAL_INPUT_BYTES,
+    )
     if (
-        _sha256_file(predictions) != prediction_sha256
-        or _sha256_file(heldout) != heldout_sha256
+        refreshed_predictions != prediction_payload
+        or refreshed_prediction_identity != prediction_identity
+        or refreshed_heldout != heldout_payload
+        or refreshed_heldout_identity != heldout_identity
     ):
         raise TaskCRehearsalError(
             "sealed scoring inputs changed while the approved worker was running"
@@ -3298,10 +4051,10 @@ def _formal_scoring_subset_unrecorded(
         Path(str(chip_record.get("path"))), str(chip_record.get("sha256"))
     )
     try:
-        with np.load(heldout, allow_pickle=False) as archive:
+        with np.load(io.BytesIO(heldout_payload), allow_pickle=False) as archive:
             labels = np.asarray(archive["interventions"], dtype=str)
         eligible_sources = set(labels.tolist()) - {CONTROL_LABEL, "excluded"}
-        scores = pd.read_csv(predictions)
+        scores = pd.read_csv(io.BytesIO(prediction_payload))
         biological = evaluate_declared_references(
             scores,
             pooled_reference=pooled,
@@ -3315,9 +4068,21 @@ def _formal_scoring_subset_unrecorded(
             f"sealed biological-reference scoring failed: {exc}"
         ) from exc
     metrics = task_c_aggregation_to_jsonable(biological)
+    final_predictions, final_prediction_identity = _capture_regular_bytes(
+        predictions,
+        label="fixed scoring prediction table",
+        maximum_bytes=MAXIMUM_REHEARSAL_PREDICTION_BYTES,
+    )
+    final_heldout, final_heldout_identity = _capture_regular_bytes(
+        heldout,
+        label="sealed scoring NPZ",
+        maximum_bytes=MAXIMUM_REHEARSAL_INPUT_BYTES,
+    )
     if (
-        _sha256_file(predictions) != prediction_sha256
-        or _sha256_file(heldout) != heldout_sha256
+        final_predictions != prediction_payload
+        or final_prediction_identity != prediction_identity
+        or final_heldout != heldout_payload
+        or final_heldout_identity != heldout_identity
     ):
         raise TaskCRehearsalError(
             "sealed scoring inputs changed during biological-reference scoring"
@@ -3361,14 +4126,18 @@ def _formal_scoring_subset(
         status = "completed"
         return metrics
     finally:
+        elapsed = max(0.0, time.monotonic() - started)
         _write_new_record(
             work_dir / "sealed_scoring.resource.json",
             {
                 "schema_version": "1.0",
                 "component_kind": "sealed_scoring",
                 "stage": "scoring",
-                "elapsed_seconds": max(0.0, time.monotonic() - started),
                 "status": status,
+                **_measured_stage_fields(
+                    output_root=work_dir / "sealed_scoring.json",
+                    elapsed_seconds=elapsed,
+                ),
             },
         )
 
@@ -3459,12 +4228,87 @@ def _resource_record(
         for stage in used_stages
         if stage not in recorded_stages
     )
+    phase_resources: dict[str, dict[str, object]] = {}
+    for stage in recorded_stages:
+        stage_records = [record for record in components if record.get("stage") == stage]
+        elapsed_values = [
+            float(record["elapsed_seconds"])
+            for record in stage_records
+            if isinstance(record.get("elapsed_seconds"), (int, float))
+            and not isinstance(record.get("elapsed_seconds"), bool)
+        ]
+        rss_values = [
+            int(record["peak_rss_bytes"])
+            for record in stage_records
+            if isinstance(record.get("peak_rss_bytes"), int)
+            and not isinstance(record.get("peak_rss_bytes"), bool)
+        ]
+        gpu_values = [
+            int(record["peak_gpu_memory_bytes"])
+            for record in stage_records
+            if isinstance(record.get("peak_gpu_memory_bytes"), int)
+            and not isinstance(record.get("peak_gpu_memory_bytes"), bool)
+        ]
+        disk_values = [
+            int(record["written_disk_bytes"])
+            for record in stage_records
+            if isinstance(record.get("written_disk_bytes"), int)
+            and not isinstance(record.get("written_disk_bytes"), bool)
+        ]
+        phase_resources[stage] = {
+            "elapsed_seconds": sum(elapsed_values) if elapsed_values else None,
+            "peak_rss_bytes": max(rss_values) if rss_values else None,
+            "peak_gpu_memory_bytes": max(gpu_values) if gpu_values else None,
+            "written_disk_bytes": sum(disk_values) if disk_values else None,
+            "measurement_availability": {
+                "elapsed_seconds": bool(elapsed_values),
+                "peak_rss_bytes": bool(rss_values),
+                "peak_gpu_memory_bytes": bool(gpu_values),
+                "written_disk_bytes": bool(disk_values),
+            },
+        }
+    total_elapsed = [
+        float(record["elapsed_seconds"])
+        for record in phase_resources.values()
+        if isinstance(record.get("elapsed_seconds"), (int, float))
+    ]
+    total_rss = [
+        int(record["peak_rss_bytes"])
+        for record in phase_resources.values()
+        if isinstance(record.get("peak_rss_bytes"), int)
+    ]
+    total_gpu = [
+        int(record["peak_gpu_memory_bytes"])
+        for record in phase_resources.values()
+        if isinstance(record.get("peak_gpu_memory_bytes"), int)
+    ]
+    total_disk = [
+        int(record["written_disk_bytes"])
+        for record in phase_resources.values()
+        if isinstance(record.get("written_disk_bytes"), int)
+    ]
     return {
         "schema_version": "1.0",
         "resource_scope": "single-seed reduced-data rehearsal",
         "used_stages": list(recorded_stages),
         "component_records": components,
         "recorded_elapsed_seconds": elapsed,
+        "phase_resources": phase_resources,
+        "nonduplicated_totals": {
+            "elapsed_seconds": sum(total_elapsed) if total_elapsed else None,
+            "peak_rss_bytes": max(total_rss) if total_rss else None,
+            "peak_gpu_memory_bytes": max(total_gpu) if total_gpu else None,
+            "written_disk_bytes": sum(total_disk) if total_disk else None,
+            "measurement_availability": {
+                "elapsed_seconds": bool(total_elapsed),
+                "peak_rss_bytes": bool(total_rss),
+                "peak_gpu_memory_bytes": bool(total_gpu),
+                "written_disk_bytes": bool(total_disk),
+            },
+            "aggregation_rule": (
+                "sum non-overlapping phase envelopes; take peak memory across phases"
+            ),
+        },
         "null_control_analysis_count": len(null_records),
         "null_control_repeat_count_per_type": (
             len(null_records) // 2 if len(null_records) == 40 else 0
@@ -3479,28 +4323,71 @@ def _publish_outer_success(
     condition: str,
     profile: str,
     seed: int,
-    predictions: Any,
+    predictions: Any | None,
     metrics: Mapping[str, object],
     input_summary: Mapping[str, object],
     inner_dir: Path | None,
     work_dir: Path | None,
     synthetic_smoke: bool,
     required_artifacts: Sequence[str],
+    prediction_snapshot: FrozenRehearsalPredictions | None = None,
 ) -> None:
     staging = destination.parent / f".{destination.name}.staging"
     if staging.exists() or destination.exists():
         raise TaskCRehearsalError("run result directory already exists")
     staging.mkdir(parents=True, mode=0o700)
     try:
-        predictions.to_csv(staging / "predictions.csv", index=False)
+        prediction_path = staging / "predictions.csv"
+        if prediction_snapshot is None:
+            if predictions is None:
+                raise TaskCRehearsalError("completed run lacks fixed predictions")
+            prediction_payload = predictions.to_csv(index=False).encode("utf-8")
+        else:
+            _verify_frozen_predictions(prediction_snapshot)
+            prediction_payload = prediction_snapshot.payload
+        _write_new_bytes(prediction_path, prediction_payload)
+        prediction_sha256 = _bytes_sha256(prediction_payload)
+        metrics_record = dict(metrics)
+        recorded_prediction_sha256 = metrics_record.get("prediction_sha256")
+        if recorded_prediction_sha256 not in {None, prediction_sha256}:
+            raise TaskCRehearsalError(
+                "metrics prediction fingerprint differs from the fixed prediction bytes"
+            )
+        metrics_record["prediction_sha256"] = prediction_sha256
+        input_record = dict(input_summary)
+        promotion_record = _promotion_record()
+        environment_record = _outer_environment_record(
+            method_id=method_id,
+            condition=condition,
+            profile=profile,
+            synthetic_smoke=synthetic_smoke,
+            inner_dir=inner_dir,
+        )
+        resource_record = _resource_record(
+            work_dir,
+            used_stages=(
+                ("synthetic_smoke",)
+                if synthetic_smoke
+                else tuple(input_summary.get("used_stages", ("refit",)))
+            ),
+        )
+        evidence_sha256 = {
+            "input_summary.json": _record_sha256(input_record),
+            "metrics.json": _record_sha256(metrics_record),
+            "predictions.csv": prediction_sha256,
+            "promotion_decision.json": _record_sha256(promotion_record),
+            "environment_manifest.json": _record_sha256(environment_record),
+            "resource_usage.json": _record_sha256(resource_record),
+        }
         run_identity = {
             "schema_version": "1.0",
             "profile": profile,
             "condition": condition,
             "method_id": method_id,
             "seed": seed,
-            "input_summary_sha256": _canonical_sha256(input_summary),
-            "prediction_sha256": _sha256_file(staging / "predictions.csv"),
+            "input_summary_sha256": _canonical_sha256(input_record),
+            "prediction_sha256": prediction_sha256,
+            "evidence_sha256": evidence_sha256,
         }
         identity_sha256 = _canonical_sha256(run_identity)
         _write_new_record(
@@ -3511,30 +4398,11 @@ def _publish_outer_success(
                 "claim_level": "workflow_validation_only",
             },
         )
-        _write_new_record(staging / "input_summary.json", dict(input_summary))
-        _write_new_record(staging / "metrics.json", dict(metrics))
-        _write_new_record(staging / "promotion_decision.json", _promotion_record())
-        _write_new_record(
-            staging / "environment_manifest.json",
-            _outer_environment_record(
-                method_id=method_id,
-                condition=condition,
-                profile=profile,
-                synthetic_smoke=synthetic_smoke,
-                inner_dir=inner_dir,
-            ),
-        )
-        _write_new_record(
-            staging / "resource_usage.json",
-            _resource_record(
-                work_dir,
-                used_stages=(
-                    ("synthetic_smoke",)
-                    if synthetic_smoke
-                    else tuple(input_summary.get("used_stages", ("refit",)))
-                ),
-            ),
-        )
+        _write_new_record(staging / "input_summary.json", input_record)
+        _write_new_record(staging / "metrics.json", metrics_record)
+        _write_new_record(staging / "promotion_decision.json", promotion_record)
+        _write_new_record(staging / "environment_manifest.json", environment_record)
+        _write_new_record(staging / "resource_usage.json", resource_record)
         _write_new_record(
             staging / "method_status.json",
             {
@@ -3737,6 +4605,7 @@ def _controller_identity(
     registry_path: Path,
     rehearsal_config_path: Path,
     method_assets_root: Path,
+    closure: FrozenRehearsalClosure,
 ) -> dict[str, object]:
     asset_identity = None
     if not synthetic_smoke:
@@ -3752,8 +4621,309 @@ def _controller_identity(
         "method_registry_sha256": _sha256_file(registry_path),
         "rehearsal_config_sha256": _sha256_file(rehearsal_config_path),
         "method_assets_identity_sha256": asset_identity,
+        "rehearsal_closure_sha256": closure.sha256,
+        "rehearsal_closure_files": {
+            label: snapshot.sha256
+            for label, snapshot in closure.files.items()
+        },
         "claim_level": "workflow_validation_only",
         "promotion_eligible": False,
+    }
+
+
+def _rehearsal_closure_paths(
+    *,
+    project_root: Path,
+    prepared_root: Path,
+    method_assets_root: Path,
+    synthetic_smoke: bool,
+) -> dict[str, Path]:
+    paths = {
+        "controller_config": project_root / "configs/task_c_rehearsal_v1.json",
+        "method_registry": project_root / "configs/task_c_methods_v1.json",
+        "hypersca_model_config": project_root / "configs/hypersca_c_v1.json",
+        "scoring_config": project_root / "configs/task_c_tuning_v1.json",
+        "public_manifest": prepared_root / "public_manifest.json",
+        "controller_code": project_root / "src/evaluation/task_c_rehearsal.py",
+        "method_boundary_code": project_root / "src/evaluation/task_c_method_run.py",
+        "runtime_code": project_root / "src/evaluation/task_c_runtime.py",
+        "profile_code": project_root / "src/evaluation/task_c_profile_input.py",
+        "prediction_code": project_root / "src/evaluation/task_c_predictions.py",
+        "null_code": project_root / "src/evaluation/task_c_null_controls.py",
+        "scoring_code": project_root / "src/evaluation/task_c_aggregation.py",
+        "hypersca_model_code": project_root / "src/causal/hypersca_c.py",
+        "hypersca_stability_code": project_root / "src/causal/hypersca_c_stability.py",
+        "hypersca_bundle_code": project_root / "src/causal/hypersca_c_run.py",
+        "controller_cli": project_root / "scripts/run_task_c_rehearsal.py",
+        "selection_cli": project_root / "scripts/select_task_c_configuration.py",
+        "sealed_scoring_worker": (
+            project_root / "scripts/task_c_workers/causalbench_evaluation_worker.py"
+        ),
+        "causalbench_worker": (
+            project_root / "scripts/task_c_workers/causalbench_worker.py"
+        ),
+        "formal_null_worker": (
+            project_root / "scripts/task_c_workers/rehearsal_null_worker.py"
+        ),
+    }
+    if synthetic_smoke:
+        return paths
+    paths.update(
+        {
+            "private_manifest": prepared_root / "private/private_manifest.json",
+            "method_asset_identity": method_assets_root / "bootstrap_identity.json",
+            "method_asset_manifest": method_assets_root / "bootstrap_manifest.json",
+        }
+    )
+    provenance = prepared_root.parents[1] / "provenance"
+    for context in ("k562", "rpe1"):
+        paths[f"{context}_provenance"] = provenance / f"{context}.json"
+        reference_path = provenance / f"{context}_references.json"
+        paths[f"{context}_reference_manifest"] = reference_path
+        reference = _strict_json_file(
+            reference_path, "reference-relation provenance"
+        )
+        files = reference.get("files")
+        if not isinstance(files, dict):
+            raise TaskCRehearsalError(
+                "reference-relation provenance lacks file records"
+            )
+        for kind in ("pooled", "chipseq"):
+            record = files.get(kind)
+            if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+                raise TaskCRehearsalError(
+                    "reference-relation provenance lacks one reference path"
+                )
+            paths[f"{context}_{kind}_reference"] = Path(str(record["path"]))
+    return paths
+
+
+def _validate_resumed_success_bundle(
+    *,
+    run_dir: Path,
+    status: Mapping[str, object],
+    expected_profile: str,
+    expected_condition: str,
+    expected_method: str,
+    expected_seed: int,
+    required_artifacts: Sequence[str],
+) -> None:
+    """Cross-check one published success from its actual evidence bytes."""
+
+    validate_required_run_artifacts(run_dir, required_artifacts)
+    manifest = _strict_json_file(run_dir / "run_manifest.json", "run manifest")
+    input_summary = _strict_json_file(
+        run_dir / "input_summary.json", "run input summary"
+    )
+    metrics = _strict_json_file(run_dir / "metrics.json", "run metrics")
+    environment = _strict_json_file(
+        run_dir / "environment_manifest.json", "run environment record"
+    )
+    resource = _strict_json_file(
+        run_dir / "resource_usage.json", "run resource record"
+    )
+    promotion = _strict_json_file(
+        run_dir / "promotion_decision.json", "run promotion decision"
+    )
+    prediction_payload, _prediction_identity = _capture_regular_bytes(
+        run_dir / "predictions.csv",
+        label="run prediction table",
+        maximum_bytes=MAXIMUM_REHEARSAL_PREDICTION_BYTES,
+    )
+    prediction_sha256 = _bytes_sha256(prediction_payload)
+    evidence_sha256 = {
+        "input_summary.json": _record_sha256(input_summary),
+        "metrics.json": _record_sha256(metrics),
+        "predictions.csv": prediction_sha256,
+        "promotion_decision.json": _record_sha256(promotion),
+        "environment_manifest.json": _record_sha256(environment),
+        "resource_usage.json": _record_sha256(resource),
+    }
+    expected_identity = {
+        "schema_version": "1.0",
+        "profile": expected_profile,
+        "condition": expected_condition,
+        "method_id": expected_method,
+        "seed": expected_seed,
+        "input_summary_sha256": _canonical_sha256(input_summary),
+        "prediction_sha256": prediction_sha256,
+        "evidence_sha256": evidence_sha256,
+    }
+    if any(
+        manifest.get(name) != value for name, value in expected_identity.items()
+    ) or manifest.get("run_identity_sha256") != _canonical_sha256(expected_identity):
+        raise TaskCRehearsalError(
+            "existing run evidence changed and disagrees with its manifest"
+        )
+    if status.get("run_identity_sha256") != manifest.get("run_identity_sha256"):
+        raise TaskCRehearsalError(
+            "existing method status disagrees with the run manifest"
+        )
+    if metrics.get("prediction_sha256") != prediction_sha256:
+        raise TaskCRehearsalError(
+            "existing metrics disagree with the fixed prediction bytes"
+        )
+    if (
+        input_summary.get("profile") != expected_profile
+        or input_summary.get("condition") != expected_condition
+        or input_summary.get("method_id") != expected_method
+    ):
+        raise TaskCRehearsalError(
+            "existing input summary disagrees with the requested run"
+        )
+    if (
+        environment.get("profile") != expected_profile
+        or environment.get("condition") != expected_condition
+        or environment.get("method_id") != expected_method
+    ):
+        raise TaskCRehearsalError(
+            "existing environment record disagrees with the requested run"
+        )
+    if promotion != _promotion_record():
+        raise TaskCRehearsalError("existing promotion decision changed")
+    if resource.get("schema_version") != "1.0" or not isinstance(
+        resource.get("used_stages"), list
+    ):
+        raise TaskCRehearsalError("existing resource record is incomplete")
+    try:
+        import pandas as pd
+
+        predictions = pd.read_csv(
+            io.BytesIO(prediction_payload), encoding="utf-8", on_bad_lines="error"
+        )
+    except (pd.errors.ParserError, UnicodeError, ValueError) as exc:
+        raise TaskCRehearsalError("existing prediction table is malformed") from exc
+    if list(predictions.columns) != [
+        "source",
+        "target",
+        "score",
+        "returned_by_method",
+    ]:
+        raise TaskCRehearsalError("existing prediction columns changed")
+    sources = predictions["source"].astype(str).tolist()
+    targets = predictions["target"].astype(str).tolist()
+    genes = set(sources) | set(targets)
+    relations = set(zip(sources, targets, strict=True))
+    expected_relations = {
+        (source, target)
+        for source in genes
+        for target in genes
+        if source != target
+    }
+    try:
+        scores = np.asarray(predictions["score"], dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TaskCRehearsalError("existing prediction scores are invalid") from exc
+    if (
+        len(predictions) != len(expected_relations)
+        or relations != expected_relations
+        or not np.isfinite(scores).all()
+        or bool(np.any(scores < 0.0))
+    ):
+        raise TaskCRehearsalError(
+            "existing prediction table is not the complete fixed relation universe"
+        )
+
+
+def _rebuild_resumed_summary(
+    *, output_root: Path, expected_identity: Mapping[str, object], required_artifacts: Sequence[str]
+) -> dict[str, object]:
+    methods_raw = expected_identity.get("methods")
+    conditions_raw = expected_identity.get("conditions")
+    profile = expected_identity.get("profile")
+    seed = expected_identity.get("seed")
+    if (
+        not isinstance(methods_raw, list)
+        or not isinstance(conditions_raw, list)
+        or not isinstance(profile, str)
+        or isinstance(seed, bool)
+        or not isinstance(seed, int)
+    ):
+        raise TaskCRehearsalError("existing rehearsal identity is malformed")
+    methods = tuple(str(value) for value in methods_raw)
+    conditions = tuple(str(value) for value in conditions_raw)
+    expected_names = {
+        build_rehearsal_run_id(
+            profile=profile, condition=condition, method_id=method, seed=seed
+        ): (condition, method)
+        for condition in conditions
+        for method in methods
+    }
+    runs_root = output_root / "runs"
+    try:
+        entries = tuple(os.scandir(runs_root))
+    except OSError as exc:
+        raise TaskCRehearsalError("existing rehearsal runs cannot be inspected") from exc
+    actual_names = {entry.name for entry in entries}
+    if actual_names != set(expected_names) or any(
+        not entry.is_dir(follow_symlinks=False) for entry in entries
+    ):
+        raise TaskCRehearsalError("existing rehearsal run identities are incomplete")
+    statuses: dict[str, str] = {}
+    for run_name, (condition, method) in expected_names.items():
+        run_dir = runs_root / run_name
+        status = _strict_json_file(run_dir / "method_status.json", "method status")
+        status_name = status.get("status")
+        if (
+            status.get("schema_version") != "1.0"
+            or status.get("method_id") != method
+            or status.get("condition") != condition
+            or status.get("seed") != seed
+            or status_name not in _FINAL_REHEARSAL_STATUSES
+        ):
+            raise TaskCRehearsalError(
+                "existing method status disagrees with its run identity"
+            )
+        if status_name in {"passed_real_rehearsal", "passed_synthetic_smoke"}:
+            _validate_resumed_success_bundle(
+                run_dir=run_dir,
+                status=status,
+                expected_profile=profile,
+                expected_condition=condition,
+                expected_method=method,
+                expected_seed=seed,
+                required_artifacts=required_artifacts,
+            )
+        else:
+            expected_failure_files = frozenset(_REHEARSAL_EXTRA_ARTIFACTS)
+            try:
+                failure_files = {
+                    entry.name
+                    for entry in os.scandir(run_dir)
+                    if entry.is_file(follow_symlinks=False)
+                }
+            except OSError as exc:
+                raise TaskCRehearsalError(
+                    "existing failed run cannot be inspected"
+                ) from exc
+            if failure_files != expected_failure_files:
+                raise TaskCRehearsalError("existing failed run evidence is incomplete")
+            environment = _strict_json_file(
+                run_dir / "environment_manifest.json", "failed run environment record"
+            )
+            resource = _strict_json_file(
+                run_dir / "resource_usage.json", "failed run resource record"
+            )
+            if (
+                environment.get("profile") != profile
+                or environment.get("condition") != condition
+                or environment.get("method_id") != method
+                or resource.get("schema_version") != "1.0"
+            ):
+                raise TaskCRehearsalError(
+                    "existing failed run evidence disagrees with its identity"
+                )
+        statuses[f"{condition}/{method}"] = str(status_name)
+    return {
+        "schema_version": "1.0",
+        "profile": profile,
+        "attempted_methods": list(methods),
+        "conditions": list(conditions),
+        "attempted_run_count": len(expected_names),
+        "status_counts": dict(sorted(Counter(statuses.values()).items())),
+        "claim_level": "workflow_validation_only",
+        "promotion_eligible": False,
+        "resume_status": "verified_existing_output",
     }
 
 
@@ -3769,14 +4939,13 @@ def _resume_verified_rehearsal(
         raise TaskCRehearsalError(
             "existing rehearsal identity differs from the requested inputs"
         )
-    run_dirs = sorted((output_root / "runs").iterdir())
-    for run_dir in run_dirs:
-        status = _strict_json_file(run_dir / "method_status.json", "method status")
-        if status.get("status") in {
-            "passed_real_rehearsal",
-            "passed_synthetic_smoke",
-        }:
-            validate_required_run_artifacts(run_dir, required_artifacts)
+    if observed.get("identity_sha256") != _canonical_sha256(expected_identity):
+        raise TaskCRehearsalError("existing rehearsal identity fingerprint changed")
+    summary = _rebuild_resumed_summary(
+        output_root=output_root,
+        expected_identity=expected_identity,
+        required_artifacts=required_artifacts,
+    )
     expected_inventory = observed.get("file_inventory")
     actual_inventory = _tree_inventory(
         output_root, exclude=frozenset({"controller_manifest.json"})
@@ -3785,10 +4954,15 @@ def _resume_verified_rehearsal(
         raise TaskCRehearsalError(
             "existing rehearsal output fingerprint changed"
         )
-    summary = observed.get("summary")
-    if not isinstance(summary, dict):
-        raise TaskCRehearsalError("existing rehearsal summary is missing")
-    return {**summary, "resume_status": "verified_existing_output"}
+    recorded_summary = observed.get("summary")
+    if not isinstance(recorded_summary, dict) or {
+        **recorded_summary,
+        "resume_status": "verified_existing_output",
+    } != summary:
+        raise TaskCRehearsalError(
+            "existing rehearsal summary disagrees with the actual runs"
+        )
+    return summary
 
 
 def _outer_input_summary(
@@ -3911,6 +5085,14 @@ def run_task_c_rehearsal(
         method_assets_root=assets,
         synthetic_smoke=synthetic_smoke,
     )
+    closure = _freeze_rehearsal_closure(
+        _rehearsal_closure_paths(
+            project_root=root,
+            prepared_root=prepared,
+            method_assets_root=assets,
+            synthetic_smoke=synthetic_smoke,
+        )
+    )
     identity = _controller_identity(
         profile=profile,
         methods=methods,
@@ -3919,6 +5101,7 @@ def run_task_c_rehearsal(
         registry_path=registry_path,
         rehearsal_config_path=config_path,
         method_assets_root=assets,
+        closure=closure,
     )
     if output.exists() or output.is_symlink():
         if not resume:
@@ -4020,6 +5203,7 @@ def run_task_c_rehearsal(
                                 "scope": "synthetic_orchestration_only",
                                 "formal_null_gate_passed": False,
                             }
+                        _verify_rehearsal_closure(closure)
                         _publish_outer_success(
                             destination=outer,
                             method_id=method_id,
@@ -4075,12 +5259,17 @@ def run_task_c_rehearsal(
                                 raise TaskCRehearsalError(
                                     "completed method lacks the complete relation table"
                                 )
-                            import pandas as pd
-
-                            predictions = pd.read_csv(predictions_path)
+                            _expression, _labels, expected_genes = _read_profile_arrays(
+                                condition_profiles["refit"]
+                            )
+                            prediction_snapshot = freeze_rehearsal_predictions(
+                                source_path=predictions_path,
+                                destination=work / "fixed_scoring_predictions.csv",
+                                expected_genes=expected_genes,
+                            )
                             metrics = _formal_scoring(
                                 condition=condition,
-                                predictions=predictions_path,
+                                predictions=prediction_snapshot,
                                 prepared_root=prepared,
                                 asset_root=assets,
                                 work_dir=work,
@@ -4103,24 +5292,42 @@ def run_task_c_rehearsal(
                                     )
                                     metrics["null_controls"] = _run_formal_null_controls(
                                         method_id=method_id,
-                                        predictions=predictions,
+                                        predictions=prediction_snapshot.frame,
                                         profile_record=condition_profiles["refit"],
                                         seed=config.seed,
                                         min_cells=min_cells,
                                         hypersca_config_path=selected_hypersca_config,
                                         work_dir=work,
+                                        timeout_seconds=min(float(timeout), 300.0),
                                     )
                                 except (ValueError, TypeError, OSError) as exc:
                                     raise TaskCRehearsalError(
                                         f"null-control workflow failed: {exc}"
                                     ) from exc
+                            _verify_formal_final_method_bundle(
+                                method_id=method_id,
+                                condition=condition,
+                                profile=profile,
+                                profiles=condition_profiles,
+                                work_dir=work,
+                                seed=config.seed,
+                                registry_path=registry_path,
+                                asset_root=assets,
+                                public_manifest=public_manifest,
+                                min_cells=min_cells,
+                                timeout_seconds=timeout,
+                                project_root=root,
+                                source_kind=spec.source_kind,
+                            )
+                            _verify_frozen_predictions(prediction_snapshot)
+                            _verify_rehearsal_closure(closure)
                             _publish_outer_success(
                                 destination=outer,
                                 method_id=method_id,
                                 condition=condition,
                                 profile=profile,
                                 seed=config.seed,
-                                predictions=predictions,
+                                predictions=None,
                                 metrics=metrics,
                                 input_summary=_outer_input_summary(
                                     condition=condition,
@@ -4133,12 +5340,14 @@ def run_task_c_rehearsal(
                                 work_dir=work,
                                 synthetic_smoke=False,
                                 required_artifacts=config.required_artifacts,
+                                prediction_snapshot=prediction_snapshot,
                             )
                     if status_name not in {
                         "passed_real_rehearsal",
                         "passed_synthetic_smoke",
                     }:
                         assert status_name is not None
+                        _verify_rehearsal_closure(closure)
                         _publish_outer_failure(
                             destination=outer,
                             method_id=method_id,
@@ -4179,6 +5388,7 @@ def run_task_c_rehearsal(
                             inner_reason = found_reason
                     status_name = _classify_controller_failure(exc, inner_status)
                     reason = inner_reason or _safe_failure_reason(exc)
+                    _verify_rehearsal_closure(closure)
                     _publish_outer_failure(
                         destination=outer,
                         method_id=method_id,
@@ -4191,6 +5401,7 @@ def run_task_c_rehearsal(
                         work_dir=work,
                         synthetic_smoke=synthetic_smoke,
                     )
+                _verify_rehearsal_closure(closure)
                 statuses[f"{condition}/{method_id}"] = str(status_name)
 
         summary: dict[str, object] = {
@@ -4204,6 +5415,7 @@ def run_task_c_rehearsal(
             "promotion_eligible": False,
             "resume_status": "new_run",
         }
+        _verify_rehearsal_closure(closure)
         inventory = _tree_inventory(staging)
         _write_new_record(
             staging / "controller_manifest.json",

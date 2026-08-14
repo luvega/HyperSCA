@@ -7,7 +7,6 @@ from input permission checks, trace records, and safe output reuse.
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import math
 import os
@@ -389,28 +388,6 @@ def _parse_context_values(values: Sequence[str]) -> list[tuple[str, Path]]:
             raise HyperSCACError(f"--context 不能重复提供 {name}")
         parsed[name] = Path(raw_path)
     return [(name, parsed[name]) for name in ("k562", "rpe1") if name in parsed]
-
-
-def _parse_profile_context_values(
-    values: Sequence[str],
-) -> list[tuple[str, Path]]:
-    """Parse two profile contexts while retaining source-to-target order."""
-
-    if isinstance(values, (str, bytes)) or len(values) != 2:
-        raise HyperSCACError("跨环境统一比较必须提供两个独立细胞背景")
-    parsed: list[tuple[str, Path]] = []
-    seen: set[str] = set()
-    for raw in values:
-        if not isinstance(raw, str) or "=" not in raw:
-            raise HyperSCACError("--profile-context 必须使用 name=path")
-        name, raw_path = raw.split("=", 1)
-        if name not in _ALLOWED_CONTEXTS or not raw_path or name in seen:
-            raise HyperSCACError(
-                "--profile-context 必须各提供一次 k562 和 rpe1"
-            )
-        seen.add(name)
-        parsed.append((name, Path(raw_path)))
-    return parsed
 
 
 def _validate_public_manifest_record(payload: Mapping[str, object]) -> dict[str, str]:
@@ -1524,7 +1501,6 @@ def validate_hypersca_c_output_bundle(
     output_dir: Path,
     *,
     context_values: Sequence[str] = (),
-    profile_context_values: Sequence[str] = (),
     profile_input_path: Path | None = None,
     profile_manifest_path: Path | None = None,
     config_path: Path,
@@ -1537,7 +1513,6 @@ def validate_hypersca_c_output_bundle(
 
     return run_hypersca_c(
         context_values=context_values,
-        profile_context_values=profile_context_values,
         profile_input_path=profile_input_path,
         profile_manifest_path=profile_manifest_path,
         config_path=config_path,
@@ -1553,7 +1528,6 @@ def recompute_hypersca_c_output_bundle(
     output_dir: Path,
     *,
     context_values: Sequence[str] = (),
-    profile_context_values: Sequence[str] = (),
     profile_input_path: Path | None = None,
     profile_manifest_path: Path | None = None,
     config_path: Path,
@@ -1572,7 +1546,6 @@ def recompute_hypersca_c_output_bundle(
 
     arguments = {
         "context_values": context_values,
-        "profile_context_values": profile_context_values,
         "profile_input_path": profile_input_path,
         "profile_manifest_path": profile_manifest_path,
         "config_path": config_path,
@@ -1648,7 +1621,6 @@ def _profile_context_content_sha256(
 def run_hypersca_c(
     *,
     context_values: Sequence[str] = (),
-    profile_context_values: Sequence[str] = (),
     profile_input_path: Path | None = None,
     profile_manifest_path: Path | None = None,
     config_path: Path,
@@ -1660,16 +1632,16 @@ def run_hypersca_c(
 ) -> dict[str, object]:
     """Validate one registered run, fit it, and safely materialize four artifacts."""
 
-    profile_requested = bool(profile_context_values) or (
+    profile_requested = (
         profile_input_path is not None or profile_manifest_path is not None
     )
     if profile_requested and (
-        profile_manifest_path is None
+        profile_input_path is None
+        or profile_manifest_path is None
         or bool(context_values)
-        or (profile_input_path is None) == (not profile_context_values)
     ):
         raise HyperSCACError(
-            "统一比较必须提供 manifest，并且在合并 input 与两个独立 context 之间二选一"
+            "统一比较范围文件必须同时提供 input 和 manifest，且不能再提供 --context"
         )
     parsed_contexts = [] if profile_requested else _parse_context_values(context_values)
     gene_path, gene_selection, gene_snapshot = _load_gene_selection(gene_list_path)
@@ -1690,11 +1662,10 @@ def run_hypersca_c(
     datasets: list[HyperSCACContext] = []
     context_records: list[dict[str, object]] = []
     context_snapshots: list[tuple[str, _FileSnapshot, str]] = []
-    profile_manifest_snapshot: _FileSnapshot | None = None
     selected_genes = tuple(gene_selection["genes"])
     profile_data = None
     profile_record: dict[str, object] | None = None
-    if profile_requested and profile_input_path is not None:
+    if profile_requested:
         try:
             from src.evaluation.task_c_profile_input import (
                 validate_task_c_profile_input,
@@ -1776,117 +1747,6 @@ def run_hypersca_c(
             "manifest_sha256": profile_data.manifest_sha256,
             "profile": profile_data.profile,
             "record": dict(profile_data.manifest),
-        }
-    elif profile_requested:
-        assert profile_manifest_path is not None
-        profile_manifest, profile_manifest_snapshot = _read_strict_json_snapshot(
-            profile_manifest_path, "统一比较范围记录"
-        )
-        if (
-            profile_manifest.get("condition") != "cross_environment"
-            or profile_manifest.get("direction")
-            not in {"k562_to_rpe1", "rpe1_to_k562"}
-            or profile_manifest.get("stage") not in {"train", "tune", "refit"}
-            or profile_manifest.get("profile")
-            not in {"connection", "comprehensive"}
-        ):
-            raise HyperSCACError("独立细胞背景只适用于固定的跨环境统一比较范围")
-        direction = str(profile_manifest["direction"])
-        context_order = tuple(direction.split("_to_", 1))
-        parsed_profile_contexts = _parse_profile_context_values(
-            profile_context_values
-        )
-        if tuple(name for name, _path in parsed_profile_contexts) != context_order:
-            raise HyperSCACError("独立细胞背景必须按来源和目标调节顺序提供")
-        manifest_contexts = profile_manifest.get("contexts")
-        if not isinstance(manifest_contexts, list) or len(manifest_contexts) != 2:
-            raise HyperSCACError("统一比较范围记录必须包含两个细胞背景")
-        records_by_context = {
-            str(record.get("context_id")): record
-            for record in manifest_contexts
-            if isinstance(record, Mapping)
-        }
-        if tuple(records_by_context) != context_order:
-            raise HyperSCACError("统一比较范围记录的细胞背景顺序不一致")
-        profile_gene_selection = profile_manifest.get("gene_selection")
-        if not isinstance(profile_gene_selection, Mapping) or tuple(
-            profile_gene_selection.get("ordered_genes", ())
-        ) != selected_genes:
-            raise HyperSCACError("基因清单必须精确等于统一比较范围记录的固定顺序")
-        context_hashes: list[str] = []
-        for context_id, context_path in parsed_profile_contexts:
-            snapshot, raw_bytes = _capture_file_snapshot(
-                context_path,
-                f"{context_id} 独立统一比较输入",
-                collect_bytes=True,
-            )
-            assert raw_bytes is not None
-            try:
-                with np.load(io.BytesIO(raw_bytes), allow_pickle=False) as archive:
-                    if set(archive.files) != {
-                        "expression_matrix",
-                        "interventions",
-                        "var_names",
-                    }:
-                        raise HyperSCACError("独立统一比较输入数组不符合固定格式")
-                dataset = load_task_c_dataset_from_verified_bytes(
-                    snapshot.path,
-                    context_id=context_id,
-                    source_bytes=raw_bytes,
-                    source_sha256=snapshot.sha256,
-                )
-            except HyperSCACError:
-                raise
-            except (OSError, ValueError, KeyError, TypeError) as exc:
-                raise HyperSCACError("独立统一比较输入无法读取") from exc
-            if dataset.gene_names != selected_genes:
-                raise HyperSCACError("独立统一比较输入的基因顺序不一致")
-            source_record = records_by_context[context_id]
-            public_relative = source_record.get("public_relative_path")
-            parent_sha256 = source_record.get("parent_sha256")
-            if (
-                not isinstance(public_relative, str)
-                or public_relative not in public_files
-                or parent_sha256 != public_files[public_relative]
-            ):
-                raise HyperSCACError("独立统一比较输入的公开父文件记录不一致")
-            datasets.append(
-                HyperSCACContext(
-                    context_id=context_id,
-                    expression=dataset.expression,
-                    interventions=dataset.interventions,
-                    gene_names=selected_genes,
-                )
-            )
-            context_records.append(
-                {
-                    "context_id": context_id,
-                    "input_path": "<verified-profile-context>",
-                    "input_sha256": snapshot.sha256,
-                    "content_sha256": dataset.content_sha256,
-                    "public_relative_path": public_relative,
-                }
-            )
-            context_snapshots.append(
-                (context_id, snapshot, dataset.content_sha256)
-            )
-            context_hashes.append(snapshot.sha256)
-        condition = {
-            "condition": f"cross_{profile_manifest['stage']}_{direction}",
-            "mode": "cross",
-            "direction": direction,
-            "stage": profile_manifest["stage"],
-        }
-        combined_hash = hashlib.sha256(
-            "\0".join(context_hashes).encode("utf-8")
-        ).hexdigest()
-        profile_record = {
-            "input_path": "<verified-profile-contexts>",
-            "input_sha256": f"sha256:{combined_hash}",
-            "manifest_path": str(profile_manifest_snapshot.path),
-            "manifest_sha256": profile_manifest_snapshot.sha256,
-            "profile": profile_manifest["profile"],
-            "record": profile_manifest,
         }
     else:
         matched_inputs: list[tuple[str, Path, str, _FileSnapshot, bytes]] = []
@@ -2043,8 +1903,6 @@ def run_hypersca_c(
             or refreshed_profile.manifest != profile_data.manifest
         ):
             raise HyperSCACError("统一比较范围输入在拟合期间发生变化")
-    elif profile_manifest_snapshot is not None:
-        _verify_file_snapshot(profile_manifest_snapshot, "统一比较范围记录")
     predictions, summary, method_status = _validate_run_scientific_result(
         predictions=result.predictions,
         summary=result.summary,

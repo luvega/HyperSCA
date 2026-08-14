@@ -969,7 +969,6 @@ def _build_hypersca_command(
     *,
     project_root: Path,
     context_values: Sequence[str],
-    profile_context_values: Sequence[str],
     config_path: Path,
     gene_list_path: Path,
     public_manifest_path: Path,
@@ -984,11 +983,6 @@ def _build_hypersca_command(
         for value in context_values
         for item in ("--context", value)
     )
-    profile_context_arguments = tuple(
-        item
-        for value in profile_context_values
-        for item in ("--profile-context", value)
-    )
     profile_arguments = (
         (
             "--profile-input",
@@ -999,13 +993,10 @@ def _build_hypersca_command(
         if profile_input_path is not None and profile_manifest_path is not None
         else ()
     )
-    if profile_context_values and profile_manifest_path is not None:
-        profile_arguments = ("--profile-manifest", str(profile_manifest_path))
     return (
         sys.executable,
         str(project_root / "scripts/run_hypersca_c.py"),
         *context_arguments,
-        *profile_context_arguments,
         *profile_arguments,
         "--config",
         str(config_path),
@@ -1020,68 +1011,6 @@ def _build_hypersca_command(
         "--device",
         device,
     )
-
-
-def _capture_hypersca_profile_contexts(
-    values: Sequence[str], derived: _DerivedInput
-) -> dict[str, _Snapshot]:
-    if derived.condition != "cross_environment" or derived.environment_labels is None:
-        raise TaskCMethodRunError(
-            "separate HyperSCA-C profile contexts are only valid for cross-environment runs"
-        )
-    parsed: dict[str, _Snapshot] = {}
-    for value in values:
-        if not isinstance(value, str) or "=" not in value:
-            raise TaskCMethodRunError(
-                "HyperSCA-C profile context must use k562=path or rpe1=path"
-            )
-        name, raw_path = value.split("=", 1)
-        if name not in {"k562", "rpe1"} or not raw_path or name in parsed:
-            raise TaskCMethodRunError(
-                "HyperSCA-C profile contexts must be unique k562 and rpe1 files"
-            )
-        snapshot = _capture_file(
-            Path(raw_path),
-            f"HyperSCA-C {name} profile context",
-            maximum_bytes=MAXIMUM_INPUT_BYTES,
-            reject_private=True,
-            require_single_link=True,
-        )
-        try:
-            with np.load(io.BytesIO(snapshot.payload), allow_pickle=False) as archive:
-                if set(archive.files) != {
-                    "expression_matrix",
-                    "interventions",
-                    "var_names",
-                }:
-                    raise TaskCMethodRunError(
-                        "HyperSCA-C profile context arrays changed"
-                    )
-                expression = np.asarray(archive["expression_matrix"])
-                interventions = np.asarray(archive["interventions"], dtype=str)
-                genes = tuple(str(item) for item in archive["var_names"].tolist())
-        except TaskCMethodRunError:
-            raise
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise TaskCMethodRunError(
-                "HyperSCA-C profile context is not a valid fixed NPZ"
-            ) from exc
-        selected = derived.environment_labels == name
-        if (
-            genes != derived.genes
-            or not np.array_equal(expression, derived.expression[selected])
-            or not np.array_equal(interventions, derived.interventions[selected])
-        ):
-            raise TaskCMethodRunError(
-                "HyperSCA-C profile context differs from the frozen profile rows"
-            )
-        parsed[name] = snapshot
-    expected = tuple(str(derived.direction).split("_to_", 1))
-    if tuple(parsed) != expected:
-        raise TaskCMethodRunError(
-            "HyperSCA-C profile contexts must be source then target-adapt"
-        )
-    return parsed
 
 
 def _capture_synthetic_input(path: Path) -> _Snapshot:
@@ -1213,7 +1142,6 @@ def _safe_command_record(command: Sequence[str]) -> dict[str, object]:
         "--public-manifest",
         "--profile-input",
         "--profile-manifest",
-        "--profile-context",
         "--output-dir",
     }
     template: list[str] = []
@@ -1223,7 +1151,7 @@ def _safe_command_record(command: Sequence[str]) -> dict[str, object]:
         if argument.startswith("--"):
             options.append(argument)
             hide_next = argument in path_options
-            context_next = argument in {"--context", "--profile-context"}
+            context_next = argument == "--context"
             template.append(argument)
             continue
         if argument.endswith(".py"):
@@ -1886,84 +1814,6 @@ def _hypersca_genes(snapshot: _Snapshot) -> tuple[str, ...]:
     return genes
 
 
-def _materialize_validation_profile_contexts(
-    *,
-    input_npz: Path,
-    derived_input_manifest_path: Path,
-    output_dir: Path,
-) -> tuple[str, ...]:
-    """Rebuild the two deterministic cross-context files for trial replay."""
-
-    manifest_snapshot = _capture_file(
-        derived_input_manifest_path,
-        "profile input record",
-        maximum_bytes=MAXIMUM_RECORD_BYTES,
-        reject_private=True,
-        require_single_link=True,
-    )
-    manifest = _parse_json(manifest_snapshot, "profile input record")
-    if manifest.get("condition") != "cross_environment":
-        return ()
-    contexts = manifest.get("contexts")
-    if not isinstance(contexts, list) or len(contexts) != 2:
-        raise TaskCMethodRunError("cross profile must retain two ordered contexts")
-    input_snapshot = _capture_file(
-        input_npz,
-        "profile input",
-        maximum_bytes=MAXIMUM_INPUT_BYTES,
-        reject_private=True,
-        require_single_link=True,
-    )
-    try:
-        with np.load(io.BytesIO(input_snapshot.payload), allow_pickle=False) as archive:
-            if set(archive.files) != {
-                "expression_matrix",
-                "interventions",
-                "var_names",
-                "environment_labels",
-            }:
-                raise TaskCMethodRunError("cross profile arrays changed")
-            expression = np.asarray(archive["expression_matrix"])
-            interventions = np.asarray(archive["interventions"], dtype=str)
-            genes = np.asarray(archive["var_names"])
-            environments = np.asarray(archive["environment_labels"], dtype=str)
-    except TaskCMethodRunError:
-        raise
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise TaskCMethodRunError("cross profile arrays could not be rebuilt") from exc
-    destination = _lexical_absolute(output_dir)
-    if destination.exists() or destination.is_symlink():
-        raise TaskCMethodRunError("trial reconstruction context output already exists")
-    destination.mkdir(parents=True, mode=0o700)
-    from src.evaluation.task_c_profile_input import _deterministic_npz
-
-    values: list[str] = []
-    for index, record in enumerate(contexts):
-        if not isinstance(record, dict):
-            raise TaskCMethodRunError("cross profile context record is invalid")
-        context_id = record.get("context_id")
-        if context_id not in {"k562", "rpe1"}:
-            raise TaskCMethodRunError("cross profile context identity is invalid")
-        selected = environments == context_id
-        if not np.any(selected):
-            raise TaskCMethodRunError("cross profile context rows are missing")
-        path = destination / f"context_{index}_{context_id}.npz"
-        _write_new(
-            path,
-            _deterministic_npz(
-                {
-                    "expression_matrix": expression[selected],
-                    "interventions": interventions[selected],
-                    "var_names": genes,
-                }
-            ),
-        )
-        values.append(f"{context_id}={path}")
-    _verify_snapshot(input_snapshot, "profile input")
-    _verify_snapshot(manifest_snapshot, "profile input record")
-    return tuple(values)
-
-
 def validate_task_c_method_output_bundle(
     *,
     output_dir: Path,
@@ -2039,16 +1889,6 @@ def validate_task_c_method_output_bundle(
     ) as temporary_name:
         candidate_path = Path(temporary_name) / "trial_candidate.json"
         _write_new(candidate_path, _json_bytes(candidate))
-        profile_context_values = (
-            _materialize_validation_profile_contexts(
-                input_npz=input_npz,
-                derived_input_manifest_path=derived_input_manifest_path,
-                output_dir=Path(temporary_name) / "profile_contexts",
-            )
-            if str(sealed["method_id"]) == "hypersca_c"
-            and derived_input_manifest_path is not None
-            else ()
-        )
         return run_task_c_method(
             method_id=str(sealed["method_id"]),
             input_npz=input_npz,
@@ -2061,7 +1901,6 @@ def validate_task_c_method_output_bundle(
             min_cells=min_cells,
             public_manifest_path=public_manifest_path,
             derived_input_manifest_path=derived_input_manifest_path,
-            profile_context_values=profile_context_values,
             hypersca_config_path=hypersca_config_path,
             gene_list_path=gene_list_path,
             device=(
@@ -2110,7 +1949,6 @@ def run_task_c_method(
     public_manifest_path: Path | None = None,
     derived_input_manifest_path: Path | None = None,
     context_values: Sequence[str] = (),
-    profile_context_values: Sequence[str] = (),
     hypersca_config_path: Path | None = None,
     gene_list_path: Path | None = None,
     device: str = "cpu",
@@ -2242,7 +2080,6 @@ def run_task_c_method(
     hypersca_input_hashes: dict[str, str] = {}
     command: tuple[str, ...] | None = None
     hypersca_validation_inputs: dict[str, object] | None = None
-    profile_context_snapshots: dict[str, _Snapshot] = {}
     trial_scope: dict[str, str | None]
     if external_source_sha256 is not None:
         hypersca_input_hashes["official_source_worktree_sha256"] = (
@@ -2259,7 +2096,6 @@ def run_task_c_method(
             or public_manifest_path is not None
             or derived_input_manifest_path is not None
             or context_values
-            or profile_context_values
         ):
             raise TaskCMethodRunError("publication-only methods do not inspect Task C data")
         data_status = None
@@ -2281,9 +2117,7 @@ def run_task_c_method(
             raise TaskCMethodRunError(
                 "HyperSCA-C profile runs need one input and profile manifest, without contexts"
             )
-        if not profile_mode and (
-            input_npz is not None or not context_values or profile_context_values
-        ):
+        if not profile_mode and (input_npz is not None or not context_values):
             raise TaskCMethodRunError(
                 "HyperSCA-C needs registered context files or one validated profile input"
             )
@@ -2334,15 +2168,6 @@ def run_task_c_method(
                 extra_snapshots[f"profile_parent_{index + 1}"] = parent_snapshot
             extra_snapshots["profile_manifest"] = derived.manifest_snapshot
             hypersca_input_hashes["profile_context"] = derived.run_context_id
-            if profile_context_values:
-                profile_context_snapshots = _capture_hypersca_profile_contexts(
-                    profile_context_values, derived
-                )
-                for name, snapshot in profile_context_snapshots.items():
-                    extra_snapshots[f"profile_context_{name}"] = snapshot
-                    hypersca_input_hashes[
-                        f"profile_context_{name}_sha256"
-                    ] = snapshot.sha256
             trial_scope = {
                 "condition": derived.condition,
                 "profile": derived.profile,
@@ -2392,30 +2217,20 @@ def run_task_c_method(
         command = _build_hypersca_command(
             project_root=root,
             context_values=context_values,
-            profile_context_values=profile_context_values,
             config_path=hypersca_config_path,
             gene_list_path=gene_list_path,
             public_manifest_path=public_manifest_path,
             output_dir=_lexical_absolute(output_dir) / "raw_method_output",
             seed=seed,
             device=device,
-            profile_input_path=(
-                input_npz
-                if profile_mode and not profile_context_values
-                else None
-            ),
+            profile_input_path=input_npz if profile_mode else None,
             profile_manifest_path=(
                 derived_input_manifest_path if profile_mode else None
             ),
         )
         hypersca_validation_inputs = {
             "context_values": tuple(context_values),
-            "profile_context_values": tuple(profile_context_values),
-            "profile_input_path": (
-                input_npz
-                if profile_mode and not profile_context_values
-                else None
-            ),
+            "profile_input_path": input_npz if profile_mode else None,
             "profile_manifest_path": (
                 derived_input_manifest_path if profile_mode else None
             ),
@@ -2698,7 +2513,6 @@ def run_task_c_method(
     status_origin = "local"
     try:
         fixed_input_path: Path | None = None
-        fixed_profile_context_values: tuple[str, ...] = ()
         execution_hypersca_validation_inputs = hypersca_validation_inputs
         if derived_input_manifest_snapshot is not None:
             assert input_snapshot is not None
@@ -2710,13 +2524,6 @@ def run_task_c_method(
             )
             fixed_input_path = fixed_input_root / "profile_input.npz"
             _write_new(fixed_input_path, input_snapshot.payload)
-            if profile_context_snapshots:
-                fixed_context_values: list[str] = []
-                for name, snapshot in profile_context_snapshots.items():
-                    fixed_context = fixed_input_root / f"profile_context_{name}.npz"
-                    _write_new(fixed_context, snapshot.payload)
-                    fixed_context_values.append(f"{name}={fixed_context}")
-                fixed_profile_context_values = tuple(fixed_context_values)
         if spec.source_kind in {"causalbench", "git"}:
             assert input_snapshot is not None
             command = build_task_c_method_command(
@@ -2734,18 +2541,13 @@ def run_task_c_method(
             command = _build_hypersca_command(
                 project_root=root,
                 context_values=context_values,
-                profile_context_values=fixed_profile_context_values,
                 config_path=hypersca_config_path,
                 gene_list_path=gene_list_path,
                 public_manifest_path=public_manifest_path,
                 output_dir=staging / "raw_method_output",
                 seed=seed,
                 device=device,
-                profile_input_path=(
-                    fixed_input_path
-                    if profile_mode and not fixed_profile_context_values
-                    else None
-                ),
+                profile_input_path=fixed_input_path if profile_mode else None,
                 profile_manifest_path=(
                     derived_input_manifest_path if profile_mode else None
                 ),
@@ -2754,10 +2556,7 @@ def run_task_c_method(
                 assert fixed_input_path is not None
                 execution_hypersca_validation_inputs = {
                     **(hypersca_validation_inputs or {}),
-                    "profile_context_values": fixed_profile_context_values,
-                    "profile_input_path": (
-                        fixed_input_path if not fixed_profile_context_values else None
-                    ),
+                    "profile_input_path": fixed_input_path,
                 }
         command_record = _safe_command_record(command) if command else None
         environment = _environment_manifest(

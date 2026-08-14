@@ -143,106 +143,35 @@ def _command(
     ]
 
 
-def test_profile_context_parser_preserves_source_to_target_order(tmp_path: Path) -> None:
-    import src.causal.hypersca_c_run as run_module
-
-    parsed = run_module._parse_profile_context_values(
-        (f"rpe1={tmp_path / 'source.npz'}", f"k562={tmp_path / 'target.npz'}")
-    )
-
-    assert [name for name, _path in parsed] == ["rpe1", "k562"]
-
-
-def test_cross_profile_runs_from_two_separate_context_files(
-    prepared_run: dict[str, object],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_cli_rejects_arbitrary_profile_context_paths(
+    prepared_run: dict[str, object], tmp_path: Path
 ) -> None:
-    import src.causal.hypersca_c_run as run_module
-
-    genes = ("C", "A", "B")
-    contexts: list[Path] = []
-    for name, source_key in (("k562", "cross_source"), ("rpe1", "cross_target")):
-        source = Path(prepared_run[source_key])
-        with np.load(source, allow_pickle=False) as archive:
-            parent_genes = archive["var_names"].astype(str).tolist()
-            indices = [parent_genes.index(gene) for gene in genes]
-            destination = tmp_path / f"{name}-profile.npz"
-            np.savez(
-                destination,
-                expression_matrix=archive["expression_matrix"][:, indices],
-                interventions=archive["interventions"],
-                var_names=np.asarray(genes),
-            )
-        contexts.append(destination)
-    public = json.loads(
-        Path(prepared_run["public_manifest"]).read_text(encoding="utf-8")
-    )
-    manifest = tmp_path / "cross-profile-manifest.json"
-    _write_json(
-        manifest,
-        {
-            "profile": "connection",
-            "condition": "cross_environment",
-            "direction": "k562_to_rpe1",
-            "stage": "refit",
-            "gene_selection": {"ordered_genes": list(genes)},
-            "contexts": [
-                {
-                    "context_id": "k562",
-                    "public_relative_path": "cross/k562_to_rpe1/source_refit.npz",
-                    "parent_sha256": public["files"][
-                        "cross/k562_to_rpe1/source_refit.npz"
-                    ],
-                },
-                {
-                    "context_id": "rpe1",
-                    "public_relative_path": (
-                        "cross/k562_to_rpe1/target_adapt_refit.npz"
-                    ),
-                    "parent_sha256": public["files"][
-                        "cross/k562_to_rpe1/target_adapt_refit.npz"
-                    ],
-                },
-            ],
-        },
-    )
-    monkeypatch.setattr(
-        run_module,
-        "fit_stable_hypersca_c",
-        lambda *args, **kwargs: _all_failed_stability_result(),
-    )
-    output = tmp_path / "separate-profile-output"
-
-    run_module.run_hypersca_c(
-        profile_context_values=(
-            f"k562={contexts[0]}",
-            f"rpe1={contexts[1]}",
-        ),
-        profile_manifest_path=manifest,
-        config_path=Path(prepared_run["config"]),
-        gene_list_path=Path(prepared_run["gene_list"]),
-        public_manifest_path=Path(prepared_run["public_manifest"]),
-        output_dir=output,
-        seed=11,
-        device="cpu",
+    private = tmp_path / "private"
+    private.mkdir()
+    private_context = private / "context.npz"
+    _write_context(private_context, 31)
+    completed = _run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/run_hypersca_c.py"),
+            "--profile-context",
+            f"k562={private_context}",
+            "--config",
+            str(prepared_run["config"]),
+            "--gene-list",
+            str(prepared_run["gene_list"]),
+            "--public-manifest",
+            str(prepared_run["public_manifest"]),
+            "--output-dir",
+            str(tmp_path / "rejected-output"),
+            "--seed",
+            "11",
+        ],
+        check=False,
     )
 
-    status = json.loads(
-        (output / "method_status.json").read_text(encoding="utf-8")
-    )
-    assert status["status"] == "completed_raw_inference"
-    run_manifest = json.loads(
-        (output / "run_manifest.json").read_text(encoding="utf-8")
-    )
-    assert [record["context_id"] for record in run_manifest["contexts"]] == [
-        "k562",
-        "rpe1",
-    ]
-    assert all(
-        record["input_path"] == "<verified-profile-context>"
-        for record in run_manifest["contexts"]
-    )
+    assert completed.returncode != 0
+    assert "unrecognized arguments" in completed.stderr
 
 
 def _run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -344,6 +345,58 @@ def test_resume_reuses_only_exact_verified_identity_and_detects_tampering(
     assert "missing" in missing.stderr
 
 
+def test_resume_rejects_hardlinked_evidence(
+    prepared_root: Path, tmp_path: Path
+) -> None:
+    output = tmp_path / "results"
+    first = _run_cli(prepared_root, output, methods="mean_difference")
+    assert first.returncode == 0, first.stderr
+    metrics = next((output / "runs").iterdir()) / "metrics.json"
+    outside = tmp_path / "outside-metrics.json"
+    metrics.replace(outside)
+    os.link(outside, metrics)
+
+    resumed = _run_cli(
+        prepared_root, output, "--resume", methods="mean_difference"
+    )
+
+    assert resumed.returncode != 0
+    assert "hard" in resumed.stderr or "link" in resumed.stderr
+
+
+def test_resume_rejects_changed_metrics_even_when_controller_inventory_is_resigned(
+    prepared_root: Path, tmp_path: Path
+) -> None:
+    output = tmp_path / "results"
+    first = _run_cli(prepared_root, output, methods="mean_difference")
+    assert first.returncode == 0, first.stderr
+    run_dir = next((output / "runs").iterdir())
+    metrics_path = run_dir / "metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics["average_precision"] = 0.125
+    metrics_path.write_text(
+        json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    controller_path = output / "controller_manifest.json"
+    controller = json.loads(controller_path.read_text(encoding="utf-8"))
+    relative = metrics_path.relative_to(output).as_posix()
+    controller["file_inventory"][relative] = (
+        "sha256:" + hashlib.sha256(metrics_path.read_bytes()).hexdigest()
+    )
+    controller_path.write_text(
+        json.dumps(controller, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    resumed = _run_cli(
+        prepared_root, output, "--resume", methods="mean_difference"
+    )
+
+    assert resumed.returncode != 0
+    assert "metrics" in resumed.stderr or "evidence" in resumed.stderr
+
+
 def test_existing_output_never_clobbers_without_resume(
     prepared_root: Path, tmp_path: Path
 ) -> None:
@@ -520,6 +573,35 @@ def test_sealed_scoring_subset_matches_the_publicly_fixed_gene_scope(
     assert repeated.read_bytes() == created.read_bytes()
 
 
+def test_sealed_scoring_subset_rejects_hardlinked_npz_input(tmp_path: Path) -> None:
+    source = tmp_path / "heldout.npz"
+    np.savez(
+        source,
+        expression_matrix=np.arange(12, dtype=float).reshape(4, 3),
+        interventions=np.asarray(["non-targeting", "non-targeting", "A", "A"]),
+        var_names=np.asarray(["A", "B", "C"]),
+    )
+    public_profile = tmp_path / "profile.npz"
+    np.savez(
+        public_profile,
+        expression_matrix=np.zeros((2, 2), dtype=float),
+        interventions=np.asarray(["non-targeting", "A"]),
+        var_names=np.asarray(["A", "B"]),
+    )
+    os.link(public_profile, tmp_path / "profile-second-name.npz")
+    private = tmp_path / "private-score"
+    private.mkdir()
+
+    with pytest.raises(TaskCRehearsalError, match="one link"):
+        materialize_sealed_scoring_subset(
+            source_path=source,
+            public_profile_input=public_profile,
+            destination=private / "heldout-profile.npz",
+            maximum_cells=4,
+            seed=11,
+        )
+
+
 def test_formal_scoring_is_started_only_by_the_validated_launcher(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -625,6 +707,9 @@ def test_formal_scoring_is_started_only_by_the_validated_launcher(
     assert scoring_resource["component_kind"] == "sealed_scoring"
     assert scoring_resource["stage"] == "scoring"
     assert scoring_resource["status"] == "completed"
+    assert scoring_resource["elapsed_seconds"] >= 0.0
+    assert scoring_resource["written_disk_bytes"] > 0
+    assert scoring_resource["measurement_availability"]["written_disk_bytes"] is True
 
 
 def test_connection_controller_runs_two_train_trials_then_selected_refit(
@@ -759,7 +844,7 @@ def test_cross_hypersca_profile_contexts_preserve_frozen_rows_and_gene_order(
             )
 
 
-def test_hypersca_command_boundary_uses_two_profile_contexts_not_merged_input(
+def test_hypersca_command_boundary_uses_only_the_verified_profile_record(
     tmp_path: Path,
 ) -> None:
     from src.evaluation.task_c_method_run import _build_hypersca_command
@@ -767,49 +852,23 @@ def test_hypersca_command_boundary_uses_two_profile_contexts_not_merged_input(
     command = _build_hypersca_command(
         project_root=ROOT,
         context_values=(),
-        profile_context_values=(
-            f"k562={tmp_path / 'source.npz'}",
-            f"rpe1={tmp_path / 'target-adapt.npz'}",
-        ),
         config_path=ROOT / "configs/hypersca_c_v1.json",
         gene_list_path=tmp_path / "genes.json",
         public_manifest_path=tmp_path / "public_manifest.json",
         output_dir=tmp_path / "output",
         seed=11,
         device="cpu",
+        profile_input_path=tmp_path / "verified-profile.npz",
         profile_manifest_path=tmp_path / "profile_manifest.json",
     )
 
-    assert command.count("--profile-context") == 2
     assert "--profile-manifest" in command
-    assert "--profile-input" not in command
+    assert "--profile-input" in command
+    assert "--profile-context" not in command
     assert "--context" not in command
 
 
-def test_trial_reconstruction_rebuilds_separate_cross_profile_contexts(
-    prepared_root: Path, tmp_path: Path
-) -> None:
-    from src.evaluation.task_c_method_run import (
-        _materialize_validation_profile_contexts,
-    )
-
-    profile = rehearsal_module._profile_inputs(
-        public_manifest=prepared_root / "public_manifest.json",
-        profile="connection",
-        staging=tmp_path / "profiles",
-    )["rpe1_to_k562"]["train"]
-
-    values = _materialize_validation_profile_contexts(
-        input_npz=profile["input"],
-        derived_input_manifest_path=profile["manifest"],
-        output_dir=tmp_path / "reconstruction-contexts",
-    )
-
-    assert [value.split("=", 1)[0] for value in values] == ["rpe1", "k562"]
-    assert all(Path(value.split("=", 1)[1]).is_file() for value in values)
-
-
-def test_cross_hypersca_orchestration_passes_source_and_target_adapt_separately(
+def test_cross_hypersca_orchestration_passes_no_arbitrary_context_paths(
     prepared_root: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -845,11 +904,8 @@ def test_cross_hypersca_orchestration_passes_source_and_target_adapt_separately(
         gene_list=tmp_path / "genes.json",
     )
 
-    values = tuple(captured["profile_context_values"])  # type: ignore[arg-type]
-    assert [value.split("=", 1)[0] for value in values] == ["k562", "rpe1"]
+    assert "profile_context_values" not in captured
     assert captured["input_npz"] == profile["input"]
-    for value in values:
-        assert Path(value.split("=", 1)[1]).is_file()
 
 
 def test_formal_fixed_baseline_runs_real_method_orchestration(
@@ -884,6 +940,127 @@ def test_formal_fixed_baseline_runs_real_method_orchestration(
         (tmp_path / "formal-work/refit.resource.json").read_text(encoding="utf-8")
     )
     assert resource["stage"] == "refit"
+    assert resource["elapsed_seconds"] >= 0.0
+    assert resource["peak_rss_bytes"] is None
+    assert resource["peak_gpu_memory_bytes"] is None
+    assert resource["written_disk_bytes"] > 0
+    assert resource["measurement_availability"] == {
+        "elapsed_seconds": True,
+        "peak_rss_bytes": False,
+        "peak_gpu_memory_bytes": False,
+        "written_disk_bytes": True,
+    }
+
+
+def test_prepublication_verifier_replays_the_complete_inner_bundle_boundary(
+    prepared_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profiles = rehearsal_module._profile_inputs(
+        public_manifest=prepared_root / "public_manifest.json",
+        profile="connection",
+        staging=tmp_path / "profiles",
+    )["within_k562"]
+    captured: dict[str, object] = {}
+
+    def fake_bundle(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"status": "completed_standardized_output", "reuse": "verified"}
+
+    monkeypatch.setattr(rehearsal_module, "_run_method_bundle", fake_bundle)
+    rehearsal_module._verify_formal_final_method_bundle(
+        method_id="mean_difference",
+        condition="within_k562",
+        profile="connection",
+        profiles=profiles,
+        work_dir=tmp_path / "formal-work",
+        seed=11,
+        registry_path=ROOT / "configs/task_c_methods_v1.json",
+        asset_root=tmp_path / "assets",
+        public_manifest=prepared_root / "public_manifest.json",
+        min_cells=5,
+        timeout_seconds=60,
+        project_root=ROOT,
+        source_kind="local",
+    )
+
+    assert captured["output_dir"] == tmp_path / "formal-work/refit"
+    assert captured["profile_record"] == profiles["refit"]
+    assert captured["resource_record_path"] is None
+
+
+def test_scoring_and_publication_share_one_immutable_prediction_snapshot(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "inner-predictions.csv"
+    original = (
+        b"source,target,score,returned_by_method\n"
+        b"A,B,1.0,True\nB,A,0.0,False\n"
+    )
+    source.write_bytes(original)
+    snapshot = rehearsal_module.freeze_rehearsal_predictions(
+        source_path=source,
+        destination=tmp_path / "work/frozen-predictions.csv",
+        expected_genes=("A", "B"),
+    )
+    source.write_bytes(original.replace(b"1.0", b"9.0"))
+    output = tmp_path / "runs/run"
+    metrics = {"average_precision": 1.0, "prediction_sha256": snapshot.sha256}
+
+    rehearsal_module._publish_outer_success(
+        destination=output,
+        method_id="mean_difference",
+        condition="within_k562",
+        profile="connection",
+        seed=11,
+        predictions=None,
+        prediction_snapshot=snapshot,
+        metrics=metrics,
+        input_summary={"used_stages": ["refit"]},
+        inner_dir=None,
+        work_dir=None,
+        synthetic_smoke=False,
+        required_artifacts=(
+            "run_manifest.json",
+            "input_summary.json",
+            "metrics.json",
+            "predictions.csv",
+            "promotion_decision.json",
+        ),
+    )
+
+    assert (output / "predictions.csv").read_bytes() == original
+    published_metrics = json.loads((output / "metrics.json").read_text())
+    assert published_metrics["prediction_sha256"] == snapshot.sha256
+    run_manifest = json.loads((output / "run_manifest.json").read_text())
+    assert run_manifest["prediction_sha256"] == snapshot.sha256
+
+
+def test_formal_scoring_rejects_an_unfrozen_prediction_path(tmp_path: Path) -> None:
+    with pytest.raises(TaskCRehearsalError, match="frozen prediction snapshot"):
+        rehearsal_module._formal_scoring(
+            condition="within_k562",
+            predictions=tmp_path / "mutable.csv",
+            prepared_root=tmp_path / "prepared",
+            asset_root=tmp_path / "assets",
+            work_dir=tmp_path / "work",
+            seed=11,
+            registry=object(),
+            project_root=ROOT,
+            public_profile_input=tmp_path / "profile.npz",
+            maximum_cells=10,
+        )
+
+
+def test_rehearsal_closure_detects_code_change_after_freezing(tmp_path: Path) -> None:
+    code = tmp_path / "critical.py"
+    code.write_text("VALUE = 1\n", encoding="utf-8")
+    closure = rehearsal_module._freeze_rehearsal_closure({"critical": code})
+    code.write_text("VALUE = 2\n", encoding="utf-8")
+
+    with pytest.raises(TaskCRehearsalError, match="closure.*changed"):
+        rehearsal_module._verify_rehearsal_closure(closure)
 
 
 def _small_profile_record(tmp_path: Path) -> dict[str, Path]:
@@ -916,7 +1093,7 @@ def _small_profile_record(tmp_path: Path) -> dict[str, Path]:
     return {"input": input_path, "manifest": manifest}
 
 
-def test_formal_mean_difference_nulls_rerun_all_40_transformed_inputs(
+def test_formal_mean_difference_nulls_retain_all_40_when_empirical_gate_fails(
     tmp_path: Path,
 ) -> None:
     profile = _small_profile_record(tmp_path)
@@ -928,34 +1105,70 @@ def test_formal_mean_difference_nulls_rerun_all_40_transformed_inputs(
         hypersca_config_path=None,
     )
 
-    controls = rehearsal_module._run_formal_null_controls(
-        method_id="mean_difference",
-        predictions=predictions,
-        profile_record=profile,
-        seed=11,
-        min_cells=2,
-        hypersca_config_path=None,
-        work_dir=tmp_path / "null-work",
-    )
+    with pytest.raises(TaskCRehearsalError, match="empirical gate"):
+        rehearsal_module._run_formal_null_controls(
+            method_id="mean_difference",
+            predictions=predictions,
+            profile_record=profile,
+            seed=11,
+            min_cells=2,
+            hypersca_config_path=None,
+            work_dir=tmp_path / "null-work",
+        )
 
-    assert controls["scope"] == "formal_scientific_inference_rerun"
-    assert controls["formal_null_gate_passed"] is True
-    analyses = [
-        *controls["label_permutation"]["analyses"],
-        *controls["control_resampling"]["analyses"],
-    ]
-    assert len(analyses) == 40
-    assert all(record["status"] == "completed" for record in analyses)
-    assert all(record["input_sha256"].startswith("sha256:") for record in analyses)
-    assert all(
-        record["prediction_sha256"].startswith("sha256:") for record in analyses
-    )
     resources = sorted((tmp_path / "null-work").rglob("analysis.resource.json"))
     assert len(resources) == 40
+    analyses = [json.loads(path.read_text(encoding="utf-8")) for path in resources]
+    assert all(record["status"] == "completed" for record in analyses)
+    assert all(record["stage"] == "null_control" for record in analyses)
+    assert all(record["input_sha256"].startswith("sha256:") for record in analyses)
+    assert all(record["prediction_sha256"].startswith("sha256:") for record in analyses)
+    assert all(record["timeout_seconds"] == 300.0 for record in analyses)
+    assert all(record["measurement_availability"]["elapsed_seconds"] for record in analyses)
+    assert all(record["peak_gpu_memory_bytes"] is None for record in analyses)
     assert all(
-        json.loads(path.read_text(encoding="utf-8"))["stage"] == "null_control"
-        for path in resources
+        record["measurement_availability"]["peak_gpu_memory_bytes"] is False
+        for record in analyses
     )
+    final_status = json.loads(
+        (tmp_path / "null-work/null_controls/null_control_status.json").read_text()
+    )
+    assert final_status["status"] == "failed_null_control"
+
+
+def test_formal_null_seed_sequence_has_no_overlap_across_types_and_contexts() -> None:
+    seeds = {
+        rehearsal_module._derive_formal_null_seed(
+            base_seed=11,
+            control_index=control_index,
+            repeat=repeat,
+            context_index=context_index,
+            purpose=purpose,
+        )
+        for control_index in range(2)
+        for repeat in range(20)
+        for context_index in range(2)
+        for purpose in range(2)
+    }
+
+    assert len(seeds) == 160
+    assert all(0 <= value <= 2**64 - 1 for value in seeds)
+
+
+def test_formal_null_hypersca_settings_use_one_frozen_bootstrap(tmp_path: Path) -> None:
+    selected = tmp_path / "selected.json"
+    selected.write_text(
+        (ROOT / "configs/hypersca_c_v1.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    created = rehearsal_module._materialize_formal_null_hypersca_config(
+        selected_config=selected,
+        destination=tmp_path / "formal-null.json",
+    )
+
+    payload = json.loads(created.read_text(encoding="utf-8"))
+    assert payload["bootstrap_repeats"] == 1
+    assert payload["bootstrap_success_fraction"] == 1.0
 
 
 def test_formal_null_failure_is_retained_and_prevents_gate(
@@ -969,14 +1182,40 @@ def test_formal_null_failure_is_retained_and_prevents_gate(
         min_cells=2,
         hypersca_config_path=None,
     )
-    original = rehearsal_module._scientific_null_predictions
+    calls = 0
 
-    def fail_one(**kwargs: object) -> pd.DataFrame:
-        if kwargs["seed"] == 12:
-            raise TaskCRehearsalError("deliberate repeat failure")
-        return original(**kwargs)  # type: ignore[arg-type]
+    def supervised(**_kwargs: object) -> tuple[pd.DataFrame | None, dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        status = "failed" if calls == 1 else "completed"
+        record: dict[str, object] = {
+            "schema_version": "1.0",
+            "component_kind": "null_analysis",
+            "stage": "null_control",
+            "status": status,
+            "return_code": 2 if calls == 1 else 0,
+            "timeout_seconds": 30.0,
+            "elapsed_seconds": 0.01,
+            "peak_rss_bytes": 1024,
+            "peak_gpu_memory_bytes": 0,
+            "written_disk_bytes": 1,
+            "measurement_availability": {
+                "elapsed_seconds": True,
+                "peak_rss_bytes": True,
+                "peak_gpu_memory_bytes": True,
+                "written_disk_bytes": True,
+            },
+            "prediction_sha256": None if calls == 1 else "sha256:fixed",
+            "scientific_status": None,
+        }
+        if calls == 1:
+            record["reason"] = "deliberate repeat failure"
+            return None, record
+        return predictions, record
 
-    monkeypatch.setattr(rehearsal_module, "_scientific_null_predictions", fail_one)
+    monkeypatch.setattr(
+        rehearsal_module, "_run_supervised_null_inference", supervised
+    )
     with pytest.raises(TaskCRehearsalError, match="null-control analyses"):
         rehearsal_module._run_formal_null_controls(
             method_id="mean_difference",
