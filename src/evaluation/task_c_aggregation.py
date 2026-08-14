@@ -8,11 +8,19 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
+import csv
+import ctypes
+import errno
+import hashlib
+import io
 import json
 import math
 import os
 from pathlib import Path
+import shutil
 import stat
+import statistics
+import tempfile
 from types import MappingProxyType
 from typing import Any
 import unicodedata
@@ -100,6 +108,58 @@ _KNOWN_FAILED_FILES = _FAILED_FILES | frozenset(
 )
 _REHEARSAL_CONDITIONS = frozenset(
     {"within_k562", "within_rpe1", "k562_to_rpe1", "rpe1_to_k562"}
+)
+REHEARSAL_CONDITIONS = (
+    "within_k562",
+    "within_rpe1",
+    "k562_to_rpe1",
+    "rpe1_to_k562",
+)
+FULL_RUN_SEEDS = (11, 23, 47, 71, 97)
+MAXIMUM_TUNING_TRIALS = 20
+CORE_METHODS = frozenset(
+    {
+        "hypersca_c",
+        "mean_difference",
+        "random1000",
+        "grnboost",
+        "pc",
+        "notears_linear",
+    }
+)
+REGISTERED_METHODS = frozenset(
+    {
+        "hypersca_c",
+        "mean_difference",
+        "random1000",
+        "grnboost",
+        "pc",
+        "ges",
+        "gies",
+        "gsp",
+        "igsp",
+        "notears_linear",
+        "dcdi_g",
+        "dcdi_dsf",
+        "dcdfg_linear",
+        "dcdfg_mlp",
+        "sortnregress",
+        "guanlab_psgrn",
+        "betterboost",
+        "sparse_rc",
+        "catran",
+    }
+)
+INTERVENTIONAL_METHODS = frozenset(
+    {
+        "gies",
+        "igsp",
+        "dcdi_g",
+        "dcdi_dsf",
+        "dcdfg_linear",
+        "dcdfg_mlp",
+        "guanlab_psgrn",
+    }
 )
 
 
@@ -736,6 +796,22 @@ def _validate_metrics(metrics: dict[str, Any]) -> None:
         )
 
 
+def _canonical_sha256(value: object) -> str:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TaskCAggregationError(
+            "rehearsal evidence cannot be represented as finite JSON"
+        ) from exc
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
 def _run_directory_identity(path: Path) -> tuple[int, int, tuple[int, int, int, int, int, int]]:
     absolute = Path(os.path.abspath(os.fspath(path.expanduser())))
     cursor = Path(absolute.anchor)
@@ -905,3 +981,628 @@ def aggregate_task_c_runs(
         "independent_bundle_verification": False,
     }
     return _deep_freeze(result)
+
+
+def evaluate_rehearsal_readiness(
+    method_statuses: dict[str, str],
+    *,
+    data_checks_passed: bool,
+    five_splits_reproduced: bool,
+    null_controls_passed: bool,
+    tuning_boundary_passed: bool,
+    project_tests_passed: bool,
+) -> dict[str, object]:
+    """判断是否具备设计五份正式比较作业的最低证据。
+
+    ``passed_real_rehearsal`` 只表示真实数据预演走完了固定步骤。合成数据的
+    最小运行检查不能替代这项证据，任何通过结果也不会在这里启动正式作业。
+    """
+
+    if not isinstance(method_statuses, dict):
+        raise TaskCAggregationError("method statuses must be one method-to-status table")
+    gate_values = {
+        "data_checks": data_checks_passed,
+        "five_splits_reproduced": five_splits_reproduced,
+        "null_controls": null_controls_passed,
+        "tuning_boundary": tuning_boundary_passed,
+        "project_tests": project_tests_passed,
+    }
+    if any(type(value) is not bool for value in gate_values.values()):
+        raise TaskCAggregationError("readiness checks must be true or false")
+
+    valid_classifications = {
+        _PASSED_STATUS,
+        _SYNTHETIC_STATUS,
+        *_FAILED_OR_UNAVAILABLE_STATUSES,
+        "mixed_condition_outcomes",
+    }
+    exact_registry = set(method_statuses) == set(REGISTERED_METHODS)
+    statuses_are_final = exact_registry and all(
+        type(status) is str and status in valid_classifications
+        for status in method_statuses.values()
+    )
+    passed = {
+        method_id
+        for method_id, status in method_statuses.items()
+        if status == _PASSED_STATUS
+    }
+    checks = {
+        "data_checks": data_checks_passed,
+        "five_splits_reproduced": five_splits_reproduced,
+        "core_methods": CORE_METHODS <= passed,
+        "interventional_method": bool(INTERVENTIONAL_METHODS & passed),
+        "all_methods_classified": statuses_are_final,
+        "null_controls": null_controls_passed,
+        "tuning_boundary": tuning_boundary_passed,
+        "project_tests": project_tests_passed,
+    }
+    return {
+        "ready_for_full_run": all(checks.values()),
+        "checks": checks,
+        "claim_level": "workflow_validation_only",
+        "authorization_status": "not_authorized_to_start",
+    }
+
+
+def build_full_run_draft(
+    *,
+    runnable_methods: Sequence[str],
+    conditions: Sequence[str],
+    seeds: Sequence[int],
+    median_runtime_seconds: dict[str, float],
+    maximum_tuning_trials: int,
+) -> dict[str, object]:
+    """建立不可执行的五份正式比较作业草案。"""
+
+    if isinstance(runnable_methods, (str, bytes)) or not isinstance(
+        runnable_methods, Sequence
+    ):
+        raise TaskCAggregationError("runnable methods must be an ordered list")
+    methods = tuple(runnable_methods)
+    if any(type(method) is not str for method in methods) or len(set(methods)) != len(
+        methods
+    ):
+        raise TaskCAggregationError("runnable methods must be unique registered names")
+    if not set(methods) <= REGISTERED_METHODS:
+        raise TaskCAggregationError("full-run draft contains an unregistered method")
+    if tuple(conditions) != REHEARSAL_CONDITIONS:
+        raise TaskCAggregationError("full-run conditions must remain at the fixed four")
+    if tuple(seeds) != FULL_RUN_SEEDS:
+        raise TaskCAggregationError("full-run seeds must remain at the fixed five")
+    if type(maximum_tuning_trials) is not int or (
+        maximum_tuning_trials != MAXIMUM_TUNING_TRIALS
+    ):
+        raise TaskCAggregationError(
+            "the maximum number of settings tried per method must remain 20"
+        )
+    if not isinstance(median_runtime_seconds, dict) or set(
+        median_runtime_seconds
+    ) != set(methods):
+        raise TaskCAggregationError(
+            "each runnable method needs one rehearsal-based runtime estimate"
+        )
+    runtimes: dict[str, float] = {}
+    for method in methods:
+        value = median_runtime_seconds[method]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise TaskCAggregationError(
+                "runtime estimates must be finite non-negative seconds"
+            )
+        runtimes[method] = float(value)
+
+    tuning_jobs = [
+        {
+            "phase": "tune",
+            "trial_index": trial_index,
+            "method_id": method,
+            "condition": condition,
+            "seed": int(seed),
+        }
+        for method in sorted(methods)
+        for condition in conditions
+        for seed in seeds
+        for trial_index in range(maximum_tuning_trials)
+    ]
+    final_jobs = [
+        {
+            "phase": "refit_and_private_evaluation",
+            "method_id": method,
+            "condition": condition,
+            "seed": int(seed),
+        }
+        for method in sorted(methods)
+        for condition in conditions
+        for seed in seeds
+    ]
+    jobs = tuning_jobs + final_jobs
+    estimated_seconds = sum(
+        runtimes[method] * (maximum_tuning_trials + 1)
+        for method in methods
+        for _condition in conditions
+        for _seed in seeds
+    )
+    return {
+        "schema_version": "1.0",
+        "job_count": len(jobs),
+        "tuning_job_count": len(tuning_jobs),
+        "final_fit_job_count": len(final_jobs),
+        "maximum_tuning_trials_per_method": maximum_tuning_trials,
+        "full_run_seeds": list(seeds),
+        "conditions": list(conditions),
+        "estimated_serial_runtime_seconds": estimated_seconds,
+        "jobs": jobs,
+        "authorization_status": "not_authorized_to_start",
+        "execution_commands_included": False,
+    }
+
+
+def _overall_method_status(statuses: Sequence[str]) -> str:
+    if not statuses:
+        return "not_attempted"
+    unique = set(statuses)
+    if len(unique) == 1:
+        return statuses[0]
+    return "mixed_condition_outcomes"
+
+
+def _method_rows_and_statuses(
+    aggregation: Mapping[str, object],
+) -> tuple[list[dict[str, object]], dict[str, str]]:
+    by_cluster: dict[tuple[str, str], str] = {}
+    for run in aggregation["runs"]:
+        by_cluster[(str(run["method_id"]), str(run["condition"]))] = str(
+            run["status"]
+        )
+    rows: list[dict[str, object]] = []
+    method_statuses: dict[str, str] = {}
+    for method in sorted(REGISTERED_METHODS):
+        statuses = [
+            by_cluster[(method, condition)]
+            for condition in REHEARSAL_CONDITIONS
+            if (method, condition) in by_cluster
+        ]
+        overall = (
+            _PASSED_STATUS
+            if len(statuses) == len(REHEARSAL_CONDITIONS)
+            and all(status == _PASSED_STATUS for status in statuses)
+            else _overall_method_status(statuses)
+        )
+        method_statuses[method] = overall
+        row: dict[str, object] = {
+            "method_id": method,
+            "overall_status": overall,
+            "observed_condition_count": len(statuses),
+            "passed_real_rehearsal": overall == _PASSED_STATUS,
+        }
+        for condition in REHEARSAL_CONDITIONS:
+            row[condition] = by_cluster.get((method, condition), "not_attempted")
+        rows.append(row)
+    return rows, method_statuses
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 71
+        and value.startswith("sha256:")
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
+
+
+def _evidence_gates(
+    identity: Mapping[str, object], aggregation: Mapping[str, object]
+) -> dict[str, bool]:
+    runs = tuple(aggregation["runs"])
+    formal_comprehensive = (
+        identity.get("synthetic_smoke") is False
+        and identity.get("profile") == "comprehensive"
+        and _is_sha256(identity.get("prepared_identity_sha256"))
+    )
+    data_checks = formal_comprehensive and all(
+        run["environment_manifest"].get("data_scope") == "external_benchmark"
+        and run["environment_manifest"].get("private_data_received_by_method") is False
+        and (
+            run["status"] not in {_PASSED_STATUS, _SYNTHETIC_STATUS}
+            or run["input_summary"].get("data_scope") == "external_benchmark"
+            and run["input_summary"].get("private_data_received_by_method") is False
+        )
+        for run in runs
+    )
+    required = {
+        (method, condition)
+        for method in ("hypersca_c", "mean_difference")
+        for condition in REHEARSAL_CONDITIONS
+    }
+    selected = {
+        (str(run["method_id"]), str(run["condition"])): run
+        for run in runs
+        if run["method_id"] in {"hypersca_c", "mean_difference"}
+        and run["status"] == _PASSED_STATUS
+    }
+    null_controls = set(selected) == required and all(
+        run["metrics"].get("null_controls", {}).get("formal_null_gate_passed")
+        is True
+        for run in selected.values()
+    )
+    tuning_boundary = set(selected) == required and all(
+        (
+            run["input_summary"].get("used_stages") == ["train", "tune", "refit"]
+            and run["input_summary"].get(
+                "training_tuning_and_final_fit_are_separate"
+            )
+            is True
+        )
+        if run["method_id"] == "hypersca_c"
+        else (
+            run["input_summary"].get("used_stages") == ["refit"]
+            and str(run["input_summary"].get("settings_policy", "")).startswith(
+                "fixed no-tuning reference"
+            )
+        )
+        for run in selected.values()
+    )
+    return {
+        "data_checks_passed": bool(data_checks),
+        "five_splits_reproduced": False,
+        "null_controls_passed": bool(null_controls),
+        "tuning_boundary_passed": bool(tuning_boundary),
+        "project_tests_passed": False,
+    }
+
+
+def _resource_summary(
+    aggregation: Mapping[str, object], method_statuses: Mapping[str, str]
+) -> tuple[dict[str, object], dict[str, float]]:
+    grouped: dict[str, list[Mapping[str, object]]] = {
+        method: [] for method in REGISTERED_METHODS
+    }
+    for run in aggregation["runs"]:
+        grouped[str(run["method_id"])].append(run["resource_usage"])
+    methods: dict[str, object] = {}
+    runtime_medians: dict[str, float] = {}
+    fields = (
+        "elapsed_seconds",
+        "peak_rss_bytes",
+        "peak_gpu_memory_bytes",
+        "written_disk_bytes",
+    )
+    for method in sorted(REGISTERED_METHODS):
+        values: dict[str, list[float]] = {name: [] for name in fields}
+        for resource in grouped[method]:
+            totals = resource.get("nonduplicated_totals")
+            availability = (
+                totals.get("measurement_availability")
+                if isinstance(totals, Mapping)
+                else None
+            )
+            if not isinstance(availability, Mapping) or set(availability) != set(
+                fields
+            ):
+                raise TaskCAggregationError(
+                    "resource record lacks the four measurement declarations"
+                )
+            for name in fields:
+                value = totals.get(name)
+                measured = availability[name]
+                if type(measured) is not bool or measured != (value is not None):
+                    raise TaskCAggregationError(
+                        f"resource availability disagrees with {name}"
+                    )
+                if value is not None:
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        or float(value) < 0.0
+                    ):
+                        raise TaskCAggregationError(
+                            f"resource measurement {name} must be finite and non-negative"
+                        )
+                    values[name].append(float(value))
+        elapsed_median = (
+            float(statistics.median(values["elapsed_seconds"]))
+            if values["elapsed_seconds"]
+            else None
+        )
+        if method_statuses[method] == _PASSED_STATUS:
+            if elapsed_median is None:
+                raise TaskCAggregationError(
+                    f"passed method {method} lacks a measured rehearsal runtime"
+                )
+            runtime_medians[method] = elapsed_median
+        methods[method] = {
+            "observed_run_count": len(grouped[method]),
+            "measured_elapsed_run_count": len(values["elapsed_seconds"]),
+            "median_elapsed_seconds": elapsed_median,
+            "peak_rss_bytes": (
+                max(values["peak_rss_bytes"]) if values["peak_rss_bytes"] else None
+            ),
+            "peak_gpu_memory_bytes": (
+                max(values["peak_gpu_memory_bytes"])
+                if values["peak_gpu_memory_bytes"]
+                else None
+            ),
+            "written_disk_bytes_upper_observed": (
+                max(values["written_disk_bytes"])
+                if values["written_disk_bytes"]
+                else None
+            ),
+            "measurement_availability": {
+                name: bool(values[name]) for name in fields
+            },
+        }
+    return methods, runtime_medians
+
+
+def _json_output_bytes(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _compatibility_csv_bytes(rows: Sequence[Mapping[str, object]]) -> bytes:
+    columns = (
+        "method_id",
+        "overall_status",
+        "observed_condition_count",
+        "passed_real_rehearsal",
+        *REHEARSAL_CONDITIONS,
+    )
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=columns, lineterminator="\n")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({name: row[name] for name in columns})
+    return buffer.getvalue().encode("utf-8")
+
+
+def _reject_output_overlap(rehearsal_root: Path, output_dir: Path) -> None:
+    input_text = os.path.abspath(os.fspath(rehearsal_root))
+    output_text = os.path.abspath(os.fspath(output_dir))
+    try:
+        common = os.path.commonpath((input_text, output_text))
+    except ValueError as exc:
+        raise TaskCAggregationError("input and output paths cannot be compared") from exc
+    if common in {input_text, output_text}:
+        raise TaskCAggregationError(
+            "summary output must be separate from the read-only rehearsal evidence"
+        )
+
+
+def _atomic_publish_directory(staging: Path, output: Path) -> None:
+    """Publish one sibling directory without ever replacing an existing name."""
+
+    source = Path(os.path.abspath(os.fspath(staging)))
+    destination = Path(os.path.abspath(os.fspath(output)))
+    if source.parent != destination.parent:
+        raise TaskCAggregationError(
+            "atomic summary publication requires sibling directories"
+        )
+    parent_identity = _run_directory_identity(source.parent)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        parent_fd = os.open(source.parent, flags)
+    except OSError as exc:
+        raise TaskCAggregationError(
+            "summary parent directory could not be opened safely"
+        ) from exc
+    try:
+        opened_parent = os.fstat(parent_fd)
+        if (opened_parent.st_dev, opened_parent.st_ino) != parent_identity[:2]:
+            raise TaskCAggregationError(
+                "summary parent directory changed before publication"
+            )
+        library = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(library, "renameat2", None)
+        if renameat2 is None:
+            raise TaskCAggregationError(
+                "atomic no-overwrite directory publication is unavailable"
+            )
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            parent_fd,
+            os.fsencode(source.name),
+            parent_fd,
+            os.fsencode(destination.name),
+            1,  # RENAME_NOREPLACE
+        )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            if error_number == errno.EEXIST:
+                raise TaskCAggregationError(
+                    "summary output already exists and was not replaced"
+                )
+            raise TaskCAggregationError(
+                "summary directory could not be published atomically"
+            ) from OSError(error_number, os.strerror(error_number))
+        os.fsync(parent_fd)
+        if _run_directory_identity(destination.parent)[:2] != parent_identity[:2]:
+            raise TaskCAggregationError(
+                "summary parent directory changed during publication"
+            )
+    finally:
+        os.close(parent_fd)
+
+
+def _publish_summary_files(
+    output_dir: Path, payloads: Mapping[str, bytes]
+) -> dict[str, str]:
+    output = Path(os.path.abspath(os.fspath(output_dir.expanduser())))
+    if output.exists() or output.is_symlink():
+        raise TaskCAggregationError(
+            "汇总目录已经存在；为保留既有研究记录，本次不会覆盖"
+        )
+    output.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    _run_directory_identity(output.parent)
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{output.name}.staging-", dir=output.parent)
+    )
+    published = False
+    try:
+        for name, payload in payloads.items():
+            path = staging / name
+            descriptor = os.open(
+                path,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                offset = 0
+                while offset < len(payload):
+                    offset += os.write(descriptor, payload[offset:])
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        _atomic_publish_directory(staging, output)
+        published = True
+    except OSError as exc:
+        raise TaskCAggregationError("汇总文件无法安全写入新目录") from exc
+    finally:
+        if not published and staging.exists() and not staging.is_symlink():
+            shutil.rmtree(staging)
+    return {name: str((output / name).resolve()) for name in payloads}
+
+
+def summarize_task_c_rehearsal(
+    *, rehearsal_root: str | Path, output_dir: str | Path
+) -> dict[str, object]:
+    """只读核对 Task C 预演并写出四份不可执行的研究计划文件。"""
+
+    root = Path(os.path.abspath(os.fspath(Path(rehearsal_root).expanduser())))
+    output = Path(os.path.abspath(os.fspath(Path(output_dir).expanduser())))
+    _reject_output_overlap(root, output)
+    from src.evaluation.task_c_rehearsal import (
+        TaskCRehearsalError,
+        inspect_task_c_rehearsal_evidence,
+    )
+
+    try:
+        evidence = inspect_task_c_rehearsal_evidence(root)
+    except TaskCRehearsalError as exc:
+        raise TaskCAggregationError(str(exc)) from exc
+    identity = evidence["identity"]
+    methods = identity.get("methods")
+    if (
+        not isinstance(methods, list)
+        or not methods
+        or len(set(methods)) != len(methods)
+        or not set(methods) <= REGISTERED_METHODS
+    ):
+        raise TaskCAggregationError(
+            "rehearsal methods do not match the fixed 19-method registry"
+        )
+    rows, method_statuses = _method_rows_and_statuses(evidence)
+    gates = _evidence_gates(identity, evidence)
+    readiness = evaluate_rehearsal_readiness(method_statuses, **gates)
+    resources, runtime_medians = _resource_summary(evidence, method_statuses)
+    runnable = sorted(
+        method
+        for method, status in method_statuses.items()
+        if status == _PASSED_STATUS
+    )
+    draft = build_full_run_draft(
+        runnable_methods=runnable,
+        conditions=REHEARSAL_CONDITIONS,
+        seeds=FULL_RUN_SEEDS,
+        median_runtime_seconds=runtime_medians,
+        maximum_tuning_trials=MAXIMUM_TUNING_TRIALS,
+    )
+    inventory_sha256 = _canonical_sha256(evidence["file_inventory"])
+    resource_estimate = {
+        "schema_version": "1.0",
+        "estimate_basis": (
+            "依据单随机种子、缩小数据范围预演的实测记录估算；"
+            "这些数值只用于安排资源，不是正式比较的实测结果"
+        ),
+        "rehearsal_inventory_sha256": inventory_sha256,
+        "methods": resources,
+        "estimated_serial_runtime_seconds": draft[
+            "estimated_serial_runtime_seconds"
+        ],
+        "gpu_measurement_note": (
+            "预演未测量显卡内存时保持为空，不用零值或推测值代替。"
+        ),
+    }
+    draft["resource_estimate_sha256"] = _canonical_sha256(resource_estimate)
+    draft["rehearsal_inventory_sha256"] = inventory_sha256
+    draft["planning_limit"] = (
+        "该文件只用于安排资源，不含可执行命令，也不授权启动正式比较。"
+    )
+    blockers = [name for name, passed in readiness["checks"].items() if not passed]
+    completed_run_metrics = [
+        {
+            "method_id": run["method_id"],
+            "condition": run["condition"],
+            "seed": run["seed"],
+            "status": run["status"],
+            "metrics": run["metrics"],
+        }
+        for run in evidence["runs"]
+        if run["status"] in {_PASSED_STATUS, _SYNTHETIC_STATUS}
+    ]
+    summary = {
+        "schema_version": "1.0",
+        "profile": identity["profile"],
+        "attempted_methods": list(identity["methods"]),
+        "attempted_run_count": evidence["summary"]["attempted_run_count"],
+        "status_counts": dict(evidence["summary"]["status_counts"]),
+        "method_statuses": method_statuses,
+        "completed_run_metrics": completed_run_metrics,
+        "readiness": readiness,
+        "blocking_items": blockers,
+        "evidence_limits": {
+            "controller_check": evidence["validation_scope"],
+            "five_splits_reproduced": (
+                "这份单随机种子预演目录不能证明五份数据划分已经重现"
+            ),
+            "project_tests": (
+                "这份单随机种子预演目录没有独立保存项目测试通过记录"
+            ),
+            "scientific_claim": (
+                "预演只核对分析步骤和证据边界，不能据此判断方法性能优劣，"
+                "也不授权启动正式比较。"
+            ),
+        },
+        "claim_level": "workflow_validation_only",
+        "authorization_status": "not_authorized_to_start",
+        "rehearsal_inventory_sha256": inventory_sha256,
+    }
+    payloads = {
+        "rehearsal_summary.json": _json_output_bytes(summary),
+        "method_compatibility.csv": _compatibility_csv_bytes(rows),
+        "resource_estimate.json": _json_output_bytes(resource_estimate),
+        "full_run_jobs_draft.json": _json_output_bytes(draft),
+    }
+    paths = _publish_summary_files(output, payloads)
+    return {
+        "ready_for_full_run": readiness["ready_for_full_run"],
+        "blocking_items": blockers,
+        "output_files": paths,
+    }

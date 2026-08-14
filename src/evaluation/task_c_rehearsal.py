@@ -5418,6 +5418,98 @@ def _resume_verified_rehearsal(
     return {**summary, "resume_token": resume_token}
 
 
+def inspect_task_c_rehearsal_evidence(
+    output_root: str | Path,
+) -> dict[str, object]:
+    """Return a read-only snapshot after rechecking one Task C rehearsal.
+
+    This uses the controller's recorded token to check internal consistency.  It
+    does not replace the independently retained token required to resume a run,
+    and it never authorizes or starts the five-seed comparison.
+    """
+
+    output = Path(os.path.abspath(os.fspath(Path(output_root).expanduser())))
+    manifest = _strict_json_file(
+        output / "controller_manifest.json", "rehearsal controller record"
+    )
+    identity = manifest.get("identity")
+    recorded_token = manifest.get("resume_token")
+    if not isinstance(identity, dict) or not _is_sha256_text(recorded_token):
+        raise TaskCRehearsalError(
+            "rehearsal controller record lacks a valid identity or internal token"
+        )
+    summary = _resume_verified_rehearsal(
+        output_root=output,
+        expected_identity=identity,
+        required_artifacts=_REQUIRED_ARTIFACTS,
+        expected_resume_token=str(recorded_token),
+    )
+    methods = _fixed_text_tuple(identity.get("methods"), "rehearsal methods")
+    conditions = _fixed_text_tuple(
+        identity.get("conditions"), "rehearsal conditions"
+    )
+    profile = identity.get("profile")
+    seed = identity.get("seed")
+    if (
+        conditions != REHEARSAL_CONDITIONS
+        or type(profile) is not str
+        or type(seed) is not int
+    ):
+        raise TaskCRehearsalError("rehearsal controller identity is malformed")
+    records: list[dict[str, object]] = []
+    for condition in conditions:
+        for method in methods:
+            run_dir = output / "runs" / build_rehearsal_run_id(
+                profile=profile,
+                condition=condition,
+                method_id=method,
+                seed=seed,
+            )
+            status = _strict_json_file(run_dir / "method_status.json", "method status")
+            resource = _strict_json_file(
+                run_dir / "resource_usage.json", "run resource record"
+            )
+            environment = _strict_json_file(
+                run_dir / "environment_manifest.json", "run environment record"
+            )
+            record: dict[str, object] = {
+                "method_id": method,
+                "condition": condition,
+                "seed": seed,
+                "status": status.get("status"),
+                "resource_usage": resource,
+                "environment_manifest": environment,
+            }
+            if status.get("status") in {
+                "passed_real_rehearsal",
+                "passed_synthetic_smoke",
+            }:
+                record["metrics"] = _strict_json_file(
+                    run_dir / "metrics.json", "run metrics"
+                )
+                record["input_summary"] = _strict_json_file(
+                    run_dir / "input_summary.json", "run input summary"
+                )
+            records.append(record)
+    inventory = _tree_inventory(
+        output, exclude=frozenset({"controller_manifest.json"})
+    )
+    if manifest.get("file_inventory") != inventory:
+        raise TaskCRehearsalError(
+            "rehearsal evidence changed while the summary snapshot was collected"
+        )
+    return {
+        "identity": dict(identity),
+        "summary": summary,
+        "file_inventory": inventory,
+        "runs": records,
+        "validation_scope": (
+            "已重新核对任务 C 预演目录内部记录；本次没有提供独立保存的恢复令牌，"
+            "也没有授权启动五份数据划分的正式比较"
+        ),
+    }
+
+
 def _outer_input_summary(
     *,
     condition: str,
