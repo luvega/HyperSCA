@@ -545,6 +545,44 @@ def test_resume_cli_rejects_a_missing_output_root_without_creating_it(
     assert not output.exists()
 
 
+def test_resume_never_falls_back_to_a_new_run_if_output_disappears(
+    prepared_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "results"
+    first = _run_cli(prepared_root, output, methods="mean_difference")
+    assert first.returncode == 0, first.stderr
+    token = json.loads(first.stdout)["resume_token"]
+    original_validate = rehearsal_module._validate_prepared_rehearsal_inputs
+
+    def validate_then_remove_output(*args: object, **kwargs: object) -> object:
+        validated = original_validate(*args, **kwargs)
+        shutil.rmtree(output)
+        return validated
+
+    monkeypatch.setattr(
+        rehearsal_module,
+        "_validate_prepared_rehearsal_inputs",
+        validate_then_remove_output,
+    )
+
+    with pytest.raises(TaskCRehearsalError, match="resume.*does not exist"):
+        rehearsal_module.run_task_c_rehearsal(
+            profile="connection",
+            prepared_root=prepared_root,
+            method_assets_root=prepared_root.parent / "method_assets",
+            output_root=output,
+            method_ids=("mean_difference",),
+            expected_resume_token=token,
+            resume=True,
+            synthetic_smoke=True,
+            project_root=ROOT,
+        )
+
+    assert not output.exists()
+
+
 def test_resume_external_token_rejects_fully_resigned_success_bundle(
     prepared_root: Path,
     tmp_path: Path,

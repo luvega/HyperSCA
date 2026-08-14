@@ -1204,9 +1204,8 @@ export TASK_C_DATA_ROOT=/home/a/Data/HyperSCA_external/task_c
 mkdir -p "$TASK_C_DATA_ROOT/raw" "$TASK_C_DATA_ROOT/prepared" "$TASK_C_DATA_ROOT/method_assets"
 conda run -n hypersca-task-c-causalbench python scripts/export_causalbench_data.py --data-dir "$TASK_C_DATA_ROOT/raw"
 export TASK_C_PREPARED_IDENTITY_RECORD="$TASK_C_DATA_ROOT/prepared_identity_summary.json"
-test ! -e "$TASK_C_PREPARED_IDENTITY_RECORD"
 TASK_C_PREPARED_IDENTITY_TMP="$(mktemp "$TASK_C_DATA_ROOT/.prepared_identity_summary.XXXXXX")"
-if conda run -n hypersca python scripts/prepare_task_c_data.py \
+if conda run --no-capture-output -n hypersca python scripts/prepare_task_c_data.py \
     --k562-npz "$TASK_C_DATA_ROOT/raw/dataset_k562.npz" \
     --rpe1-npz "$TASK_C_DATA_ROOT/raw/dataset_rpe1.npz" \
     --k562-pooled-reference "$TASK_C_DATA_ROOT/raw/reference_k562_pooled.csv" \
@@ -1215,8 +1214,13 @@ if conda run -n hypersca python scripts/prepare_task_c_data.py \
     --rpe1-chipseq-reference "$TASK_C_DATA_ROOT/raw/reference_rpe1_chipseq.csv" \
     --output-dir "$TASK_C_DATA_ROOT/prepared" \
     > "$TASK_C_PREPARED_IDENTITY_TMP"; then
-  mv "$TASK_C_PREPARED_IDENTITY_TMP" "$TASK_C_PREPARED_IDENTITY_RECORD"
-  chmod 0400 "$TASK_C_PREPARED_IDENTITY_RECORD"
+  chmod 0400 "$TASK_C_PREPARED_IDENTITY_TMP"
+  if ! ln "$TASK_C_PREPARED_IDENTITY_TMP" "$TASK_C_PREPARED_IDENTITY_RECORD"; then
+    rm -f "$TASK_C_PREPARED_IDENTITY_TMP"
+    echo "prepared identity record already exists; refusing to replace it" >&2
+    exit 1
+  fi
+  rm -f "$TASK_C_PREPARED_IDENTITY_TMP"
 else
   rm -f "$TASK_C_PREPARED_IDENTITY_TMP"
   exit 1
@@ -1224,8 +1228,9 @@ fi
 conda run -n hypersca python scripts/bootstrap_task_c_methods.py --cache-root "$TASK_C_DATA_ROOT/method_assets"
 ```
 
-`prepared_identity_summary.json` 位于 `prepared/` 之外，并且在准备命令成功后才以同目录
-原子重命名发布；它是调用者独立保留的身份记录，不是数字签名。核对
+`prepared_identity_summary.json` 位于 `prepared/` 之外，并且在准备命令成功后才用同目录
+硬链接排他发布；目标已存在时 `ln` 会失败，不会替换旧记录。随后删除临时文件名，
+最终记录只保留一个文件名。它是调用者独立保留的身份记录，不是数字签名。核对
 `raw/export_manifest.json` 的下载时间、来源和官方提交，以及 `prepared/provenance/` 中
 两个表达缓存、汇总生物关系和 ChIP 有向关系的许可与 SHA-256。
 
@@ -1237,7 +1242,7 @@ for TASK_C_SEED in 11 23 47 71 97; do
   test -f "$TASK_C_DATA_ROOT/prepared/splits/seed_$TASK_C_SEED/public_manifest.json"
 done
 TASK_C_PREPARED_IDENTITY_SHA256="$(
-  conda run -n hypersca python - "$TASK_C_PREPARED_IDENTITY_RECORD" <<'PY'
+  conda run --no-capture-output -n hypersca python - "$TASK_C_PREPARED_IDENTITY_RECORD" <<'PY'
 import json
 import re
 import sys
@@ -1290,7 +1295,7 @@ set -euo pipefail
 export TASK_C_DATA_ROOT=/home/a/Data/HyperSCA_external/task_c
 export TASK_C_PREPARED_IDENTITY_RECORD="$TASK_C_DATA_ROOT/prepared_identity_summary.json"
 TASK_C_PREPARED_IDENTITY_SHA256="$(
-  conda run -n hypersca python - "$TASK_C_PREPARED_IDENTITY_RECORD" <<'PY'
+  conda run --no-capture-output -n hypersca python - "$TASK_C_PREPARED_IDENTITY_RECORD" <<'PY'
 import json
 import re
 import sys

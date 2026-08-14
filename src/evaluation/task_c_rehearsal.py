@@ -5598,16 +5598,18 @@ def run_task_c_rehearsal(
         closure=closure,
         prepared_identity_sha256=prepared_identity_sha256,
     )
-    if output.exists() or output.is_symlink():
-        if not resume:
-            raise TaskCRehearsalError(
-                "output root already exists; use --resume only for an exact verified run"
-            )
+    if resume:
+        if not output.exists():
+            raise TaskCRehearsalError("resume output root does not exist")
         return _resume_verified_rehearsal(
             output_root=output,
             expected_identity=identity,
             required_artifacts=config.required_artifacts,
             expected_resume_token=str(expected_resume_token),
+        )
+    if output.exists() or output.is_symlink():
+        raise TaskCRehearsalError(
+            "output root already exists; use --resume only for an exact verified run"
         )
 
     output.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
