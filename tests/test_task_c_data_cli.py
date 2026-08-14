@@ -261,6 +261,18 @@ def test_prepare_cli_writes_five_reproducible_splits(tmp_path: Path) -> None:
     summary = json.loads(completed.stdout)
     assert summary["status"] == "prepared"
     assert [entry["seed"] for entry in summary["splits"]] == [11, 23, 47, 71, 97]
+    for entry in summary["splits"]:
+        public = json.loads(Path(entry["public_manifest"]).read_text(encoding="utf-8"))
+        encoded_identity = json.dumps(
+            public["materialization_identity"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        assert entry["materialization_identity_sha256"] == (
+            "sha256:" + hashlib.sha256(encoded_identity).hexdigest()
+        )
     for seed in (11, 23, 47, 71, 97):
         assert (output / "splits" / f"seed_{seed}" / "public_manifest.json").exists()
     assert (output / "provenance" / "k562.json").exists()

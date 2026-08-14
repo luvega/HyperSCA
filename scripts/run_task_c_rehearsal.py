@@ -49,6 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="固定版本的外部方法代码和隔离环境记录目录。",
     )
     parser.add_argument(
+        "--prepared-identity-sha256",
+        help=(
+            "正式预演必填：从 prepare_task_c_data.py 输出独立保存的 seed 11 "
+            "materialization_identity_sha256；本地重新计算值不是签名或外部信任根。"
+        ),
+    )
+    parser.add_argument(
         "--output-root",
         type=Path,
         required=True,
@@ -62,7 +69,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="只复用身份、输入指纹和结果文件均核对无误的既有预演。",
+        help=(
+            "只复用完整重验通过且与外部 resume token 一致的既有预演；"
+            "内部记录可被同步改写，不能替代该外部值。"
+        ),
+    )
+    parser.add_argument(
+        "--resume-token",
+        help="初次运行 stdout 返回并由调用者独立保存的 resume_token。",
     )
     parser.add_argument(
         "--synthetic-smoke",
@@ -90,9 +104,11 @@ def main(argv: list[str] | None = None) -> int:
         summary = run_task_c_rehearsal(
             profile=args.profile,
             prepared_root=args.prepared_root,
+            prepared_identity_sha256=args.prepared_identity_sha256,
             method_assets_root=args.method_assets_root,
             output_root=args.output_root,
             method_ids=_methods(args.methods),
+            expected_resume_token=args.resume_token,
             resume=args.resume,
             synthetic_smoke=args.synthetic_smoke,
             project_root=ROOT,

@@ -23,10 +23,170 @@ import numpy as np
 CAUSALBENCH_REPOSITORY = "https://github.com/causalbench/causalbench.git"
 CAUSALBENCH_COMMIT = "1a2143cffdc85f835b41ce8d52034be1bf903e71"
 CONTROL_LABEL = "non-targeting"
+TASK_C_NPZ_MAXIMUM_NPY_HEADER_BYTES = 64 * 1024
+TASK_C_NPZ_MAXIMUM_CELLS = 1_000_000
+TASK_C_NPZ_MAXIMUM_GENES = 1_000
+TASK_C_NPZ_MAXIMUM_EXPRESSION_ELEMENTS = (
+    TASK_C_NPZ_MAXIMUM_CELLS * TASK_C_NPZ_MAXIMUM_GENES
+)
+TASK_C_NPZ_MAXIMUM_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
 
 
 class TaskCDataError(ValueError):
     """Raised when a Task C input cannot meet the benchmark data contract."""
+
+
+def preflight_task_c_npz_bytes(
+    payload: bytes,
+    *,
+    label: str = "Task C dataset",
+    maximum_npy_header_bytes: int = TASK_C_NPZ_MAXIMUM_NPY_HEADER_BYTES,
+    maximum_cells: int = TASK_C_NPZ_MAXIMUM_CELLS,
+    maximum_genes: int = TASK_C_NPZ_MAXIMUM_GENES,
+    maximum_expression_elements: int = TASK_C_NPZ_MAXIMUM_EXPRESSION_ELEMENTS,
+    maximum_expanded_bytes: int = TASK_C_NPZ_MAXIMUM_EXPANDED_BYTES,
+) -> dict[str, tuple[tuple[int, ...], np.dtype[Any], int]]:
+    """Reject unsafe fixed-array NPZ structure before NumPy allocates arrays."""
+
+    expected_names = {
+        "expression_matrix.npy",
+        "interventions.npy",
+        "var_names.npy",
+    }
+    if not isinstance(payload, bytes) or not payload:
+        raise TaskCDataError(f"{label} ZIP bytes must be non-empty")
+    limits = (
+        maximum_npy_header_bytes,
+        maximum_cells,
+        maximum_genes,
+        maximum_expression_elements,
+        maximum_expanded_bytes,
+    )
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in limits):
+        raise TaskCDataError(f"{label} ZIP limits are invalid")
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload), mode="r") as archive:
+            members = archive.infolist()
+            names = [member.filename for member in members]
+            if len(names) != len(set(names)):
+                raise TaskCDataError(f"{label} ZIP has duplicate members")
+            if set(names) != expected_names or len(names) != len(expected_names):
+                raise TaskCDataError(f"{label} ZIP members changed")
+            if any(member.is_dir() or member.flag_bits & 0x1 for member in members):
+                raise TaskCDataError(
+                    f"{label} ZIP members must be regular and unencrypted"
+                )
+            if sum(int(member.file_size) for member in members) > maximum_expanded_bytes:
+                raise TaskCDataError(f"{label} expanded members exceed the byte limit")
+
+            total_array_bytes = 0
+            headers: dict[str, tuple[tuple[int, ...], np.dtype[Any], int]] = {}
+            for member in members:
+                with archive.open(member, mode="r") as handle:
+                    version = np.lib.format.read_magic(handle)
+                    if version == (1, 0):
+                        shape, _, dtype = np.lib.format.read_array_header_1_0(
+                            handle,
+                            max_header_size=maximum_npy_header_bytes,
+                        )
+                    elif version == (2, 0):
+                        shape, _, dtype = np.lib.format.read_array_header_2_0(
+                            handle,
+                            max_header_size=maximum_npy_header_bytes,
+                        )
+                    else:
+                        raise TaskCDataError(f"{label} NPY version is not allowed")
+                    dtype = np.dtype(dtype)
+                    if dtype.hasobject:
+                        raise TaskCDataError(f"{label} NPY object arrays are not allowed")
+                    element_count = 1
+                    for dimension in shape:
+                        if (
+                            isinstance(dimension, bool)
+                            or not isinstance(dimension, int)
+                            or dimension < 0
+                            or (
+                                dimension
+                                and element_count
+                                > maximum_expression_elements // dimension
+                            )
+                        ):
+                            raise TaskCDataError(
+                                f"{label} NPY element count exceeds the limit"
+                            )
+                        element_count *= dimension
+                    if dtype.itemsize < 1 or (
+                        element_count > maximum_expanded_bytes // int(dtype.itemsize)
+                    ):
+                        raise TaskCDataError(
+                            f"{label} NPY dtype or array bytes exceed the limit"
+                        )
+                    array_bytes = element_count * int(dtype.itemsize)
+                    if handle.tell() > maximum_npy_header_bytes + 16:
+                        raise TaskCDataError(f"{label} NPY header exceeds the limit")
+                    if handle.tell() + array_bytes != int(member.file_size):
+                        raise TaskCDataError(
+                            f"{label} NPY header disagrees with member size"
+                        )
+                    total_array_bytes += array_bytes
+                    if total_array_bytes > maximum_expanded_bytes:
+                        raise TaskCDataError(
+                            f"{label} expanded array bytes exceed the limit"
+                        )
+                    headers[member.filename] = (
+                        tuple(int(dimension) for dimension in shape),
+                        dtype,
+                        element_count,
+                    )
+
+            expression_shape, expression_dtype, expression_elements = headers[
+                "expression_matrix.npy"
+            ]
+            labels_shape, labels_dtype, labels_elements = headers[
+                "interventions.npy"
+            ]
+            genes_shape, genes_dtype, genes_elements = headers["var_names.npy"]
+            if (
+                len(expression_shape) != 2
+                or expression_dtype.kind not in {"i", "u", "f"}
+                or not 1 <= expression_shape[0] <= maximum_cells
+                or not 2 <= expression_shape[1] <= maximum_genes
+                or expression_elements > maximum_expression_elements
+            ):
+                raise TaskCDataError(
+                    f"{label} expression header has an unsafe shape or dtype"
+                )
+            if (
+                len(labels_shape) != 1
+                or labels_dtype.kind not in {"U", "S"}
+                or labels_dtype.itemsize < 1
+                or labels_shape[0] != expression_shape[0]
+                or labels_elements > maximum_cells
+            ):
+                raise TaskCDataError(
+                    f"{label} intervention text header disagrees with expression rows"
+                )
+            if (
+                len(genes_shape) != 1
+                or genes_dtype.kind not in {"U", "S"}
+                or genes_dtype.itemsize < 1
+                or genes_shape[0] != expression_shape[1]
+                or genes_elements > maximum_genes
+            ):
+                raise TaskCDataError(
+                    f"{label} gene text header disagrees with expression columns"
+                )
+            return headers
+    except TaskCDataError:
+        raise
+    except (
+        OSError,
+        ValueError,
+        EOFError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ) as exc:
+        raise TaskCDataError(f"{label} ZIP or NPY header is invalid") from exc
 
 
 @dataclass(frozen=True)
@@ -613,6 +773,7 @@ def load_task_c_dataset_from_verified_bytes(
         or any(character not in "0123456789abcdef" for character in source_sha256[7:])
     ):
         raise TaskCDataError("captured dataset source_sha256 is malformed")
+    preflight_task_c_npz_bytes(source_bytes, label="sealed Task C holdout")
     return _load_task_c_dataset_archive(
         io.BytesIO(source_bytes),
         source_path=source_path,
@@ -1009,6 +1170,16 @@ def _canonical_sha256(payload: object) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def task_c_materialization_identity_sha256(identity: Mapping[str, Any]) -> str:
+    """Fingerprint an identity for independent retention after data preparation."""
+    if not isinstance(identity, Mapping) or not identity:
+        raise TaskCDataError("materialization identity must be a non-empty mapping")
+    try:
+        return _canonical_sha256(dict(identity))
+    except (TypeError, ValueError, OverflowError, UnicodeError) as exc:
+        raise TaskCDataError("materialization identity cannot be fingerprinted") from exc
 
 
 def _common_gene_projection(

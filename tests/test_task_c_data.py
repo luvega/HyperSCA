@@ -1,6 +1,8 @@
 import errno
+import io
 import json
 import os
+import zipfile
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
@@ -19,6 +21,7 @@ from src.evaluation.task_c_data import (
     build_task_c_provenance,
     build_task_c_reference_provenance,
     load_task_c_dataset,
+    load_task_c_dataset_from_verified_bytes,
     materialize_task_c_split,
     sha256_path,
     write_json,
@@ -350,6 +353,80 @@ def test_nonfinite_expression_is_rejected(tmp_path):
              interventions=np.asarray(["non-targeting"]), var_names=np.asarray(["A", "B"]))
     with pytest.raises(TaskCDataError, match="finite"):
         load_task_c_dataset(path, context_id="k562")
+
+
+def test_verified_private_npz_rejects_duplicate_member_before_numpy_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.npz"
+    duplicate = tmp_path / "duplicate.npz"
+    np.savez_compressed(
+        source,
+        expression_matrix=np.arange(12, dtype=np.float32).reshape(6, 2),
+        interventions=np.asarray(["non-targeting"] * 3 + ["A"] * 3),
+        var_names=np.asarray(["A", "B"]),
+    )
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        with zipfile.ZipFile(source) as original, zipfile.ZipFile(duplicate, "w") as target:
+            for name in original.namelist():
+                target.writestr(name, original.read(name))
+            target.writestr(
+                "expression_matrix.npy", original.read("expression_matrix.npy")
+            )
+    payload = duplicate.read_bytes()
+
+    def forbidden_load(*args: object, **kwargs: object) -> object:
+        raise AssertionError("np.load must not see a duplicate private archive")
+
+    monkeypatch.setattr(np, "load", forbidden_load)
+    with pytest.raises(TaskCDataError, match="duplicate|members"):
+        load_task_c_dataset_from_verified_bytes(
+            duplicate,
+            context_id="k562",
+            source_bytes=payload,
+            source_sha256=sha256_path(duplicate),
+        )
+
+
+def test_verified_private_npz_rejects_expanded_array_before_numpy_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def npy_bytes(values: np.ndarray) -> bytes:
+        buffer = io.BytesIO()
+        np.lib.format.write_array(buffer, values, allow_pickle=False)
+        return buffer.getvalue()
+
+    expression_header = io.BytesIO()
+    np.lib.format.write_array_header_1_0(
+        expression_header,
+        {
+            "descr": np.dtype("<f8").str,
+            "fortran_order": False,
+            "shape": (1_000_000, 1_000),
+        },
+    )
+    path = tmp_path / "expanded.npz"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("expression_matrix.npy", expression_header.getvalue())
+        archive.writestr(
+            "interventions.npy", npy_bytes(np.asarray(["non-targeting"]))
+        )
+        archive.writestr("var_names.npy", npy_bytes(np.asarray(["A", "B"])))
+    payload = path.read_bytes()
+
+    def forbidden_load(*args: object, **kwargs: object) -> object:
+        raise AssertionError("np.load must not allocate an oversized private array")
+
+    monkeypatch.setattr(np, "load", forbidden_load)
+    with pytest.raises(TaskCDataError, match="expanded|element|bytes|limit"):
+        load_task_c_dataset_from_verified_bytes(
+            path,
+            context_id="k562",
+            source_bytes=payload,
+            source_sha256=sha256_path(path),
+        )
 
 
 def test_empty_intervention_label_is_rejected(tmp_path):

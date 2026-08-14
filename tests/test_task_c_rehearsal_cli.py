@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -12,6 +13,7 @@ import pandas as pd
 import pytest
 
 from src.evaluation.task_c_data import (
+    SealedHoldoutSemanticContentHasher,
     TaskCDataset,
     build_shared_task_c_split,
     materialize_task_c_split,
@@ -42,6 +44,64 @@ REQUIRED = {
     "resource_usage.json",
     "environment_manifest.json",
 }
+
+
+def _canonical_sha256(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _record_sha256(payload: object) -> str:
+    encoded = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _write_record(path: Path, payload: object) -> None:
+    path.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _external_resume_token(
+    identity: object,
+    inventory: object,
+    summary: dict[str, object],
+) -> str:
+    rebuilt_summary = {
+        key: value
+        for key, value in summary.items()
+        if key not in {"resume_status", "resume_token"}
+    }
+    return _canonical_sha256(
+        {
+            "controller_identity": identity,
+            "file_inventory": inventory,
+            "rebuilt_summary": rebuilt_summary,
+        }
+    )
 
 
 def _dataset(tmp_path: Path, context: str, *, seed: int) -> TaskCDataset:
@@ -105,6 +165,16 @@ def _formal_validation_dependencies(prepared_root: Path, tmp_path: Path) -> Path
     for name in ("bootstrap_identity.json", "bootstrap_manifest.json"):
         (assets / name).write_text("{}\n", encoding="utf-8")
     return assets
+
+
+def _copy_public_sibling_splits(prepared_root: Path) -> None:
+    for seed in (23, 47, 71, 97):
+        sibling = prepared_root.parent / f"seed_{seed}"
+        shutil.copytree(prepared_root, sibling)
+        manifest_path = sibling / "public_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["seed"] = seed
+        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
 
 
 def _run_cli(
@@ -334,14 +404,25 @@ def test_resume_reuses_only_exact_verified_identity_and_detects_tampering(
     output = tmp_path / "results"
     first = _run_cli(prepared_root, output, methods="mean_difference")
     assert first.returncode == 0, first.stderr
+    resume_token = json.loads(first.stdout)["resume_token"]
     resumed = _run_cli(
-        prepared_root, output, "--resume", methods="mean_difference"
+        prepared_root,
+        output,
+        "--resume",
+        "--resume-token",
+        resume_token,
+        methods="mean_difference",
     )
     assert resumed.returncode == 0, resumed.stderr
     assert json.loads(resumed.stdout)["resume_status"] == "verified_existing_output"
 
     different = _run_cli(
-        prepared_root, output, "--resume", methods="mean_difference,random1000"
+        prepared_root,
+        output,
+        "--resume",
+        "--resume-token",
+        resume_token,
+        methods="mean_difference,random1000",
     )
     assert different.returncode != 0
     assert "identity" in different.stderr
@@ -349,7 +430,12 @@ def test_resume_reuses_only_exact_verified_identity_and_detects_tampering(
     run_dir = next((output / "runs").iterdir())
     (run_dir / "metrics.json").write_text('{"average_precision":0.0}\n')
     tampered = _run_cli(
-        prepared_root, output, "--resume", methods="mean_difference"
+        prepared_root,
+        output,
+        "--resume",
+        "--resume-token",
+        resume_token,
+        methods="mean_difference",
     )
     assert tampered.returncode != 0
     assert "changed" in tampered.stderr or "fingerprint" in tampered.stderr
@@ -357,16 +443,160 @@ def test_resume_reuses_only_exact_verified_identity_and_detects_tampering(
     missing_output = tmp_path / "missing-results"
     created = _run_cli(prepared_root, missing_output, methods="random1000")
     assert created.returncode == 0, created.stderr
+    missing_resume_token = json.loads(created.stdout)["resume_token"]
     missing_run = next((missing_output / "runs").iterdir())
     (missing_run / "metrics.json").unlink()
     missing = _run_cli(
         prepared_root,
         missing_output,
         "--resume",
+        "--resume-token",
+        missing_resume_token,
         methods="random1000",
     )
     assert missing.returncode != 0
     assert "missing" in missing.stderr
+
+
+def test_resume_requires_the_token_returned_by_initial_publication(
+    prepared_root: Path,
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "results"
+    first = _run_cli(prepared_root, output, methods="mean_difference")
+    assert first.returncode == 0, first.stderr
+    summary = json.loads(first.stdout)
+    token = summary["resume_token"]
+    assert len(token) == 71 and token.startswith("sha256:")
+    controller = json.loads(
+        (output / "controller_manifest.json").read_text(encoding="utf-8")
+    )
+    assert controller["resume_token"] == token
+    assert controller["summary"]["resume_token"] == token
+
+    missing = _run_cli(
+        prepared_root,
+        output,
+        "--resume",
+        methods="mean_difference",
+    )
+    assert missing.returncode != 0
+    assert "resume" in missing.stderr and "token" in missing.stderr
+    wrong = _run_cli(
+        prepared_root,
+        output,
+        "--resume",
+        "--resume-token",
+        "sha256:" + "0" * 64,
+        methods="mean_difference",
+    )
+    assert wrong.returncode != 0
+    resumed = _run_cli(
+        prepared_root,
+        output,
+        "--resume",
+        "--resume-token",
+        token,
+        methods="mean_difference",
+    )
+    assert resumed.returncode == 0, resumed.stderr
+    assert json.loads(resumed.stdout)["resume_token"] == token
+
+
+def test_resume_external_token_rejects_fully_resigned_success_bundle(
+    prepared_root: Path,
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "results"
+    first = _run_cli(prepared_root, output, methods="mean_difference")
+    assert first.returncode == 0, first.stderr
+    original_token = json.loads(first.stdout)["resume_token"]
+    run_dir = next((output / "runs").iterdir())
+
+    predictions_path = run_dir / "predictions.csv"
+    predictions = pd.read_csv(predictions_path)
+    predictions.loc[0, "score"] = float(predictions.loc[0, "score"]) + 0.25
+    predictions.to_csv(predictions_path, index=False)
+    prediction_sha256 = (
+        "sha256:" + hashlib.sha256(predictions_path.read_bytes()).hexdigest()
+    )
+    metrics_path = run_dir / "metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics["prediction_sha256"] = prediction_sha256
+    _write_record(metrics_path, metrics)
+    evidence = {
+        "input_summary.json": _record_sha256(
+            json.loads((run_dir / "input_summary.json").read_text(encoding="utf-8"))
+        ),
+        "metrics.json": _record_sha256(metrics),
+        "predictions.csv": prediction_sha256,
+        "promotion_decision.json": _record_sha256(
+            json.loads(
+                (run_dir / "promotion_decision.json").read_text(encoding="utf-8")
+            )
+        ),
+        "environment_manifest.json": _record_sha256(
+            json.loads(
+                (run_dir / "environment_manifest.json").read_text(encoding="utf-8")
+            )
+        ),
+        "resource_usage.json": _record_sha256(
+            json.loads((run_dir / "resource_usage.json").read_text(encoding="utf-8"))
+        ),
+    }
+    input_summary = json.loads(
+        (run_dir / "input_summary.json").read_text(encoding="utf-8")
+    )
+    run_identity = {
+        "schema_version": "1.0",
+        "profile": input_summary["profile"],
+        "condition": input_summary["condition"],
+        "method_id": input_summary["method_id"],
+        "seed": 11,
+        "input_summary_sha256": _canonical_sha256(input_summary),
+        "prediction_sha256": prediction_sha256,
+        "evidence_sha256": evidence,
+    }
+    run_identity_sha256 = _canonical_sha256(run_identity)
+    manifest = json.loads(
+        (run_dir / "run_manifest.json").read_text(encoding="utf-8")
+    )
+    manifest.update(run_identity)
+    manifest["run_identity_sha256"] = run_identity_sha256
+    _write_record(run_dir / "run_manifest.json", manifest)
+    status = json.loads((run_dir / "method_status.json").read_text(encoding="utf-8"))
+    status["run_identity_sha256"] = run_identity_sha256
+    _write_record(run_dir / "method_status.json", status)
+
+    controller_path = output / "controller_manifest.json"
+    controller = json.loads(controller_path.read_text(encoding="utf-8"))
+    inventory = {
+        path.relative_to(output).as_posix(): (
+            "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+        )
+        for path in sorted(output.rglob("*"))
+        if path.is_file() and path != controller_path
+    }
+    changed_token = _external_resume_token(
+        controller["identity"], inventory, controller["summary"]
+    )
+    assert changed_token != original_token
+    controller["file_inventory"] = inventory
+    controller["resume_token"] = changed_token
+    controller["summary"]["resume_token"] = changed_token
+    _write_record(controller_path, controller)
+
+    resumed = _run_cli(
+        prepared_root,
+        output,
+        "--resume",
+        "--resume-token",
+        original_token,
+        methods="mean_difference",
+    )
+
+    assert resumed.returncode != 0
+    assert "resume" in resumed.stderr and "token" in resumed.stderr
 
 
 def test_resume_rejects_hardlinked_evidence(
@@ -375,13 +605,19 @@ def test_resume_rejects_hardlinked_evidence(
     output = tmp_path / "results"
     first = _run_cli(prepared_root, output, methods="mean_difference")
     assert first.returncode == 0, first.stderr
+    resume_token = json.loads(first.stdout)["resume_token"]
     metrics = next((output / "runs").iterdir()) / "metrics.json"
     outside = tmp_path / "outside-metrics.json"
     metrics.replace(outside)
     os.link(outside, metrics)
 
     resumed = _run_cli(
-        prepared_root, output, "--resume", methods="mean_difference"
+        prepared_root,
+        output,
+        "--resume",
+        "--resume-token",
+        resume_token,
+        methods="mean_difference",
     )
 
     assert resumed.returncode != 0
@@ -394,6 +630,7 @@ def test_resume_rejects_changed_metrics_even_when_controller_inventory_is_resign
     output = tmp_path / "results"
     first = _run_cli(prepared_root, output, methods="mean_difference")
     assert first.returncode == 0, first.stderr
+    resume_token = json.loads(first.stdout)["resume_token"]
     run_dir = next((output / "runs").iterdir())
     metrics_path = run_dir / "metrics.json"
     metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
@@ -414,7 +651,12 @@ def test_resume_rejects_changed_metrics_even_when_controller_inventory_is_resign
     )
 
     resumed = _run_cli(
-        prepared_root, output, "--resume", methods="mean_difference"
+        prepared_root,
+        output,
+        "--resume",
+        "--resume-token",
+        resume_token,
+        methods="mean_difference",
     )
 
     assert resumed.returncode != 0
@@ -466,6 +708,8 @@ def test_output_root_and_grandparent_symbolic_links_are_rejected_before_resume(
         prepared_root,
         output_alias,
         "--resume",
+        "--resume-token",
+        "sha256:" + "0" * 64,
         methods="mean_difference",
     )
     assert direct.returncode != 0
@@ -501,11 +745,15 @@ def test_help_uses_biomedical_language_and_keeps_fixed_arguments() -> None:
         "--output-root",
         "--methods",
         "--resume",
+        "--resume-token",
+        "--prepared-identity-sha256",
         "--synthetic-smoke",
     ):
         assert option in completed.stdout
     assert "流程验证" in completed.stdout
     assert "真实数据性能" in completed.stdout
+    assert "独立保存" in completed.stdout
+    assert "不是签名" in completed.stdout
 
 
 def test_scoring_boundary_allows_only_the_exact_registered_sealed_input(
@@ -1087,6 +1335,24 @@ def test_rehearsal_closure_detects_code_change_after_freezing(tmp_path: Path) ->
         rehearsal_module._verify_rehearsal_closure(closure)
 
 
+def test_rehearsal_closure_binds_external_prepared_identity(tmp_path: Path) -> None:
+    code = tmp_path / "critical.py"
+    code.write_text("VALUE = 1\n", encoding="utf-8")
+    first = rehearsal_module._freeze_rehearsal_closure(
+        {"critical": code},
+        external_identity={"prepared_identity_sha256": "sha256:" + "1" * 64},
+    )
+    second = rehearsal_module._freeze_rehearsal_closure(
+        {"critical": code},
+        external_identity={"prepared_identity_sha256": "sha256:" + "2" * 64},
+    )
+
+    assert first.external_identity == {
+        "prepared_identity_sha256": "sha256:" + "1" * 64
+    }
+    assert first.sha256 != second.sha256
+
+
 def test_formal_validation_rejects_unrelated_absolute_private_inventory(
     prepared_root: Path,
     tmp_path: Path,
@@ -1207,6 +1473,91 @@ def test_formal_validation_rejects_resigned_finite_private_expression_change(
             prepared_root=prepared_root,
             method_assets_root=assets,
             synthetic_smoke=False,
+        )
+
+
+def test_formal_rehearsal_requires_external_prepared_identity_after_coordinated_resign(
+    prepared_root: Path,
+    tmp_path: Path,
+) -> None:
+    assets = _formal_validation_dependencies(prepared_root, tmp_path)
+    _copy_public_sibling_splits(prepared_root)
+    public_path = prepared_root / "public_manifest.json"
+    private_path = prepared_root / "private/private_manifest.json"
+    public = json.loads(public_path.read_text(encoding="utf-8"))
+    encoded_identity = json.dumps(
+        public["materialization_identity"],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    prepared_identity_sha256 = (
+        "sha256:" + hashlib.sha256(encoded_identity).hexdigest()
+    )
+
+    relative = "private/within/k562/holdout.npz"
+    holdout_path = prepared_root / relative
+    with np.load(holdout_path, allow_pickle=False) as archive:
+        expression = np.asarray(archive["expression_matrix"]).copy()
+        interventions = np.asarray(archive["interventions"]).copy()
+        var_names = np.asarray(archive["var_names"]).copy()
+    expression[0, 0] += np.asarray(0.5, dtype=expression.dtype)
+    np.savez_compressed(
+        holdout_path,
+        expression_matrix=expression,
+        interventions=interventions,
+        var_names=var_names,
+    )
+    private = json.loads(private_path.read_text(encoding="utf-8"))
+    private["files"][relative] = (
+        "sha256:" + hashlib.sha256(holdout_path.read_bytes()).hexdigest()
+    )
+    hasher = SealedHoldoutSemanticContentHasher()
+    for logical_artifact in sorted(rehearsal_module._PRIVATE_HOLDOUT_PATHS):
+        with np.load(prepared_root / logical_artifact, allow_pickle=False) as archive:
+            hasher.add_arrays(
+                logical_artifact,
+                np.asarray(archive["expression_matrix"]),
+                np.asarray(archive["interventions"]),
+                tuple(str(value) for value in archive["var_names"].tolist()),
+            )
+    changed_commitment = hasher.sha256()
+    for path, manifest in ((public_path, public), (private_path, private)):
+        manifest["sealed_holdout_semantic_content_sha256"] = changed_commitment
+        manifest["materialization_identity"][
+            "sealed_holdout_semantic_content_sha256"
+        ] = changed_commitment
+        path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    with pytest.raises(TaskCRehearsalError, match="prepared.*identity|external"):
+        rehearsal_module.run_task_c_rehearsal(
+            profile="connection",
+            prepared_root=prepared_root,
+            prepared_identity_sha256=prepared_identity_sha256,
+            method_assets_root=assets,
+            output_root=tmp_path / "results",
+            method_ids=("mean_difference",),
+            synthetic_smoke=False,
+            project_root=ROOT,
+        )
+
+
+def test_formal_rehearsal_requires_independently_saved_prepared_identity(
+    prepared_root: Path,
+    tmp_path: Path,
+) -> None:
+    assets = _formal_validation_dependencies(prepared_root, tmp_path)
+    output = tmp_path / "existing-results"
+    output.mkdir()
+    with pytest.raises(TaskCRehearsalError, match="prepared.*identity|independent"):
+        rehearsal_module.run_task_c_rehearsal(
+            profile="connection",
+            prepared_root=prepared_root,
+            method_assets_root=assets,
+            output_root=output,
+            method_ids=("mean_difference",),
+            synthetic_smoke=False,
+            project_root=ROOT,
         )
 
 

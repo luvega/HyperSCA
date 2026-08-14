@@ -19,6 +19,7 @@ from src.evaluation.task_c_data import (  # noqa: E402
     check_task_c_materializations,
     load_task_c_dataset,
     materialize_task_c_splits,
+    task_c_materialization_identity_sha256,
     write_task_c_json_record,
 )
 
@@ -79,11 +80,19 @@ def main(argv: list[str] | None = None) -> int:
 
         summaries = []
         for (split, _), result in zip(requests, results):
+            public_manifest = json.loads(
+                Path(result["public_manifest"]).read_text(encoding="utf-8")
+            )
             summaries.append(
                 {
                     "seed": split.seed,
                     "split_id": split.split_id,
                     "public_manifest": result["public_manifest"],
+                    "materialization_identity_sha256": (
+                        task_c_materialization_identity_sha256(
+                            public_manifest["materialization_identity"]
+                        )
+                    ),
                 }
             )
     except TaskCDataError as exc:

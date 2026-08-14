@@ -211,6 +211,7 @@ class FrozenRehearsalClosure:
     """Controller, model, scoring, reference, and code files fixed for one round."""
 
     files: Mapping[str, FrozenRehearsalFile]
+    external_identity: Mapping[str, str]
     sha256: str
 
 
@@ -2252,6 +2253,8 @@ def _verify_frozen_predictions(snapshot: FrozenRehearsalPredictions) -> None:
 
 def _freeze_rehearsal_closure(
     paths: Mapping[str, Path],
+    *,
+    external_identity: Mapping[str, str] | None = None,
 ) -> FrozenRehearsalClosure:
     if not isinstance(paths, Mapping) or not paths:
         raise TaskCRehearsalError("rehearsal closure must contain fixed files")
@@ -2287,16 +2290,28 @@ def _freeze_rehearsal_closure(
             sha256=_bytes_sha256(payload),
             identity=identity,
         )
+    copied_external_identity = dict(external_identity or {})
+    if any(
+        not isinstance(label, str)
+        or not label
+        or not _is_sha256_text(value)
+        for label, value in copied_external_identity.items()
+    ):
+        raise TaskCRehearsalError("rehearsal external identity is malformed")
     closure_record = {
-        label: {
-            "path": os.fspath(snapshot.path),
-            "sha256": snapshot.sha256,
-            "identity": list(snapshot.identity),
-        }
-        for label, snapshot in frozen.items()
+        "files": {
+            label: {
+                "path": os.fspath(snapshot.path),
+                "sha256": snapshot.sha256,
+                "identity": list(snapshot.identity),
+            }
+            for label, snapshot in frozen.items()
+        },
+        "external_identity": dict(sorted(copied_external_identity.items())),
     }
     return FrozenRehearsalClosure(
         files=MappingProxyType(frozen),
+        external_identity=MappingProxyType(copied_external_identity),
         sha256=_canonical_sha256(closure_record),
     )
 
@@ -4989,6 +5004,7 @@ def _controller_identity(
     rehearsal_config_path: Path,
     method_assets_root: Path,
     closure: FrozenRehearsalClosure,
+    prepared_identity_sha256: str | None,
 ) -> dict[str, object]:
     asset_identity = None
     if not synthetic_smoke:
@@ -5001,6 +5017,7 @@ def _controller_identity(
         "seed": 11,
         "synthetic_smoke": synthetic_smoke,
         "public_manifest_sha256": _sha256_file(public_manifest),
+        "prepared_identity_sha256": prepared_identity_sha256,
         "method_registry_sha256": _sha256_file(registry_path),
         "rehearsal_config_sha256": _sha256_file(rehearsal_config_path),
         "method_assets_identity_sha256": asset_identity,
@@ -5316,14 +5333,48 @@ def _rebuild_resumed_summary(
     }
 
 
+def _resume_token_summary(summary: Mapping[str, object]) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in summary.items()
+        if key not in {"resume_status", "resume_token"}
+    }
+
+
+def _rehearsal_resume_token(
+    *,
+    controller_identity: Mapping[str, object],
+    file_inventory: Mapping[str, str],
+    rebuilt_summary: Mapping[str, object],
+) -> str:
+    """Bind actual evidence for a token the caller must retain independently."""
+    return _canonical_sha256(
+        {
+            "controller_identity": dict(controller_identity),
+            "file_inventory": dict(file_inventory),
+            "rebuilt_summary": _resume_token_summary(rebuilt_summary),
+        }
+    )
+
+
 def _resume_verified_rehearsal(
     *,
     output_root: Path,
     expected_identity: Mapping[str, object],
     required_artifacts: Sequence[str],
+    expected_resume_token: str,
 ) -> dict[str, object]:
     manifest_path = output_root / "controller_manifest.json"
     observed = _strict_json_file(manifest_path, "rehearsal controller record")
+    if set(observed) != {
+        "schema_version",
+        "identity",
+        "identity_sha256",
+        "file_inventory",
+        "summary",
+        "resume_token",
+    } or observed.get("schema_version") != "1.0":
+        raise TaskCRehearsalError("existing rehearsal controller record is incomplete")
     if observed.get("identity") != dict(expected_identity):
         raise TaskCRehearsalError(
             "existing rehearsal identity differs from the requested inputs"
@@ -5344,14 +5395,27 @@ def _resume_verified_rehearsal(
             "existing rehearsal output fingerprint changed"
         )
     recorded_summary = observed.get("summary")
-    if not isinstance(recorded_summary, dict) or {
-        **recorded_summary,
-        "resume_status": "verified_existing_output",
-    } != summary:
+    resume_token = _rehearsal_resume_token(
+        controller_identity=expected_identity,
+        file_inventory=actual_inventory,
+        rebuilt_summary=summary,
+    )
+    expected_recorded_summary = {
+        **summary,
+        "resume_status": "new_run",
+        "resume_token": resume_token,
+    }
+    if not isinstance(recorded_summary, dict) or recorded_summary != expected_recorded_summary:
         raise TaskCRehearsalError(
             "existing rehearsal summary disagrees with the actual runs"
         )
-    return summary
+    if observed.get("resume_token") != resume_token:
+        raise TaskCRehearsalError("existing rehearsal resume token changed")
+    if expected_resume_token != resume_token:
+        raise TaskCRehearsalError(
+            "external resume token differs from the fully revalidated rehearsal"
+        )
+    return {**summary, "resume_token": resume_token}
 
 
 def _outer_input_summary(
@@ -5430,11 +5494,18 @@ def run_task_c_rehearsal(
     method_assets_root: Path,
     output_root: Path,
     method_ids: Sequence[str],
+    prepared_identity_sha256: str | None = None,
+    expected_resume_token: str | None = None,
     resume: bool = False,
     synthetic_smoke: bool = False,
     project_root: Path | None = None,
 ) -> dict[str, object]:
-    """Run the fixed four-condition rehearsal without raising its claim level."""
+    """Run the rehearsal using a preparation identity retained outside the bundle.
+
+    Formal runs require ``prepared_identity_sha256`` copied from the preparation
+    command's stdout and stored independently; a hash recomputed from the local
+    prepared directory is not an external trust anchor or a signature.
+    """
 
     from src.evaluation.task_c_method_registry import (
         TaskCMethodRegistryError,
@@ -5444,6 +5515,20 @@ def run_task_c_rehearsal(
 
     if type(resume) is not bool or type(synthetic_smoke) is not bool:
         raise TaskCRehearsalError("resume and synthetic_smoke must be true or false")
+    if resume:
+        if not _is_sha256_text(expected_resume_token):
+            raise TaskCRehearsalError(
+                "--resume requires the externally retained resume token"
+            )
+    elif expected_resume_token is not None:
+        raise TaskCRehearsalError("resume token may be supplied only with resume")
+    if prepared_identity_sha256 is None:
+        if not synthetic_smoke:
+            raise TaskCRehearsalError(
+                "formal rehearsal requires the independently saved prepared identity fingerprint"
+            )
+    elif not _is_sha256_text(prepared_identity_sha256):
+        raise TaskCRehearsalError("prepared identity fingerprint is malformed")
     root = (project_root or Path(__file__).resolve().parents[2]).resolve(strict=True)
     config_path = root / "configs/task_c_rehearsal_v1.json"
     registry_path = root / "configs/task_c_methods_v1.json"
@@ -5474,13 +5559,28 @@ def run_task_c_rehearsal(
         method_assets_root=assets,
         synthetic_smoke=synthetic_smoke,
     )
+    current_prepared_identity_sha256 = _canonical_sha256(
+        public.get("materialization_identity")
+    )
+    if (
+        prepared_identity_sha256 is not None
+        and prepared_identity_sha256 != current_prepared_identity_sha256
+    ):
+        raise TaskCRehearsalError(
+            "external prepared identity differs from the current materialization"
+        )
     closure = _freeze_rehearsal_closure(
         _rehearsal_closure_paths(
             project_root=root,
             prepared_root=prepared,
             method_assets_root=assets,
             synthetic_smoke=synthetic_smoke,
-        )
+        ),
+        external_identity=(
+            {"prepared_identity_sha256": prepared_identity_sha256}
+            if prepared_identity_sha256 is not None
+            else None
+        ),
     )
     if not synthetic_smoke:
         _validate_private_rehearsal_inputs(prepared_root=prepared, public=public)
@@ -5494,6 +5594,7 @@ def run_task_c_rehearsal(
         rehearsal_config_path=config_path,
         method_assets_root=assets,
         closure=closure,
+        prepared_identity_sha256=prepared_identity_sha256,
     )
     if output.exists() or output.is_symlink():
         if not resume:
@@ -5504,6 +5605,7 @@ def run_task_c_rehearsal(
             output_root=output,
             expected_identity=identity,
             required_artifacts=config.required_artifacts,
+            expected_resume_token=str(expected_resume_token),
         )
 
     output.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -5810,6 +5912,21 @@ def run_task_c_rehearsal(
         }
         _verify_rehearsal_closure(closure)
         inventory = _tree_inventory(staging)
+        rebuilt_summary = _rebuild_resumed_summary(
+            output_root=staging,
+            expected_identity=identity,
+            required_artifacts=config.required_artifacts,
+        )
+        if _resume_token_summary(summary) != _resume_token_summary(rebuilt_summary):
+            raise TaskCRehearsalError(
+                "new rehearsal summary disagrees with the actual published runs"
+            )
+        resume_token = _rehearsal_resume_token(
+            controller_identity=identity,
+            file_inventory=inventory,
+            rebuilt_summary=rebuilt_summary,
+        )
+        summary["resume_token"] = resume_token
         _write_new_record(
             staging / "controller_manifest.json",
             {
@@ -5818,6 +5935,7 @@ def run_task_c_rehearsal(
                 "identity_sha256": _canonical_sha256(identity),
                 "file_inventory": inventory,
                 "summary": summary,
+                "resume_token": resume_token,
             },
         )
         if output.exists() or output.is_symlink():
