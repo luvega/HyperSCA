@@ -1215,7 +1215,7 @@ if conda run --no-capture-output -n hypersca python scripts/prepare_task_c_data.
     --output-dir "$TASK_C_DATA_ROOT/prepared" \
     > "$TASK_C_PREPARED_IDENTITY_TMP"; then
   chmod 0400 "$TASK_C_PREPARED_IDENTITY_TMP"
-  if ! ln "$TASK_C_PREPARED_IDENTITY_TMP" "$TASK_C_PREPARED_IDENTITY_RECORD"; then
+  if ! ln -T -- "$TASK_C_PREPARED_IDENTITY_TMP" "$TASK_C_PREPARED_IDENTITY_RECORD"; then
     rm -f "$TASK_C_PREPARED_IDENTITY_TMP"
     echo "prepared identity record already exists; refusing to replace it" >&2
     exit 1
