@@ -36,6 +36,15 @@ MAXIMUM_BOOTSTRAP_RECORD_BYTES = 2 * 1024 * 1024
 MAXIMUM_BOOTSTRAP_COMMAND_BYTES = 8 * 1024 * 1024
 MAXIMUM_BOOTSTRAP_INPUT_BYTES = 1024 * 1024
 BOOTSTRAP_COMMAND_TIMEOUT_SECONDS = 600
+MAXIMUM_CAUSALBENCH_SOURCE_BLOB_BYTES = 512 * 1024 * 1024
+CAUSALBENCH_EXPORT_REQUIRED_FILES = {
+    "causalscbench/__init__.py",
+    "causalscbench/data_access/__init__.py",
+    "causalscbench/data_access/create_dataset.py",
+    "causalscbench/data_access/create_evaluation_datasets.py",
+    "causalscbench/data_access/data/K562_ChipSeq.csv",
+    "causalscbench/data_access/data/Hep_G2_ChipSeq.csv",
+}
 _ALLOWED_CACHE_ENTRIES = {
     "bootstrap_identity.json",
     "bootstrap_manifest.json",
@@ -1392,6 +1401,406 @@ def _ensure_source(
         if source.exists() and not source.is_symlink():
             shutil.rmtree(source)
         raise
+
+
+def _canonical_bootstrap_json(path: Path, label: str) -> tuple[_FileSnapshot, dict[str, object]]:
+    snapshot = _snapshot_regular_file(
+        path,
+        label,
+        maximum_bytes=MAXIMUM_BOOTSTRAP_RECORD_BYTES,
+    )
+    payload = _strict_json_loads(snapshot.payload, label)
+    if not isinstance(payload, dict) or snapshot.payload != _json_bytes(payload):
+        raise TaskCRuntimeError(f"{label} is not one canonical JSON object")
+    return snapshot, payload
+
+
+def _require_sha256_hex(value: object, label: str) -> str:
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise TaskCRuntimeError(f"{label} is not a SHA-256 identity")
+    return value
+
+
+def _validate_bootstrap_file_hashes(
+    root: Path,
+    manifest: Mapping[str, object],
+) -> list[_FileSnapshot]:
+    snapshots: list[_FileSnapshot] = []
+    for field, directory in (
+        ("environment_manifests", root / "environment_manifests"),
+        ("publication_statuses", root / "status"),
+    ):
+        records = manifest.get(field)
+        if not isinstance(records, dict):
+            raise TaskCRuntimeError(f"bootstrap manifest {field} is invalid")
+        expected_paths: set[Path] = set()
+        for relative, expected_sha in records.items():
+            if (
+                type(relative) is not str
+                or not relative
+                or Path(relative).is_absolute()
+                or ".." in Path(relative).parts
+            ):
+                raise TaskCRuntimeError(
+                    f"bootstrap manifest {field} contains an unsafe path"
+                )
+            _require_sha256_hex(expected_sha, f"bootstrap manifest {field} hash")
+            candidate = directory / relative
+            expected_paths.add(candidate)
+            snapshot = _snapshot_regular_file(
+                candidate,
+                f"bootstrap asset {field}/{relative}",
+                maximum_bytes=MAXIMUM_BOOTSTRAP_RECORD_BYTES,
+            )
+            _strict_json_loads(snapshot.payload, f"bootstrap asset {field}/{relative}")
+            if snapshot.sha256 != expected_sha:
+                raise TaskCRuntimeError(
+                    f"bootstrap asset {field}/{relative} hash changed"
+                )
+            snapshots.append(snapshot)
+        actual_paths = {
+            path
+            for path in directory.rglob("*.json")
+            if path.is_file() and not path.is_symlink()
+        }
+        if actual_paths != expected_paths:
+            raise TaskCRuntimeError(
+                f"bootstrap asset {field} file inventory is incomplete"
+            )
+    return snapshots
+
+
+def _read_fixed_git_blob(source: Path, blob_id: str, object_format: str) -> bytes:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(source), "cat-file", "blob", blob_id],
+            check=True,
+            capture_output=True,
+            timeout=BOOTSTRAP_COMMAND_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise TaskCRuntimeError("fixed CausalBench Git blob could not be read") from exc
+    payload = completed.stdout
+    if (
+        not isinstance(payload, bytes)
+        or len(payload) > MAXIMUM_CAUSALBENCH_SOURCE_BLOB_BYTES
+        or _git_blob_id(payload, object_format) != blob_id
+    ):
+        raise TaskCRuntimeError("fixed CausalBench Git blob bytes are invalid")
+    if len(completed.stderr) > MAXIMUM_BOOTSTRAP_COMMAND_BYTES:
+        raise TaskCRuntimeError("fixed CausalBench Git command output is too large")
+    return payload
+
+
+def _causalbench_commit_inventory(
+    source: Path,
+    commit: str,
+) -> tuple[list[tuple[str, str, bytes]], str]:
+    tree_text = _run_checked(
+        subprocess.run,
+        ["git", "-C", str(source), "ls-tree", "-r", "-z", commit],
+        capture_output=True,
+    ).stdout
+    committed_tree = _parse_fixed_commit_tree(tree_text)
+    selected = {
+        relative: record
+        for relative, record in committed_tree.items()
+        if relative.startswith("causalscbench/")
+    }
+    if not CAUSALBENCH_EXPORT_REQUIRED_FILES <= set(selected):
+        raise TaskCRuntimeError(
+            "fixed CausalBench commit lacks required package code or data resources"
+        )
+    object_format = _run_checked(
+        subprocess.run,
+        ["git", "-C", str(source), "rev-parse", "--show-object-format"],
+        capture_output=True,
+    ).stdout.strip()
+    if object_format not in {"sha1", "sha256"}:
+        raise TaskCRuntimeError("fixed CausalBench source uses an invalid object format")
+    inventory: list[tuple[str, str, bytes]] = []
+    digest = hashlib.sha256()
+    for relative in sorted(selected):
+        mode, blob_id = selected[relative]
+        payload = _read_fixed_git_blob(source, blob_id, object_format)
+        payload_sha = _sha256_bytes(payload)
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(mode.encode("ascii"))
+        digest.update(b"\x00")
+        digest.update(payload_sha.encode("ascii"))
+        digest.update(b"\x00")
+        inventory.append((relative, mode, payload))
+    return inventory, digest.hexdigest()
+
+
+def _validated_causalbench_export_assets(
+    method_assets_root: str | Path,
+    *,
+    repository: str,
+    commit: str,
+) -> tuple[dict[str, str], list[tuple[str, str, bytes]]]:
+    root = Path(os.path.abspath(Path(method_assets_root).expanduser()))
+    _reject_symlink_components(root, "method assets root")
+    if not root.is_dir() or {entry.name for entry in root.iterdir()} != _ALLOWED_CACHE_ENTRIES:
+        raise TaskCRuntimeError("method assets root is not one complete bootstrap cache")
+    manifest_snapshot, manifest = _canonical_bootstrap_json(
+        root / "bootstrap_manifest.json", "bootstrap manifest"
+    )
+    status_snapshot, status = _canonical_bootstrap_json(
+        root / "bootstrap_status.json", "bootstrap status"
+    )
+    identity_snapshot, identity = _canonical_bootstrap_json(
+        root / "bootstrap_identity.json", "bootstrap identity"
+    )
+    if set(manifest) != {
+        "schema_version",
+        "bootstrap_identity_sha256",
+        "sources",
+        "environment_manifests",
+        "publication_statuses",
+    } or manifest.get("schema_version") != SCHEMA_VERSION:
+        raise TaskCRuntimeError("bootstrap manifest schema is invalid")
+    if status != {
+        "schema_version": SCHEMA_VERSION,
+        "status": "assets_and_environments_recorded",
+        "bootstrap_manifest_sha256": manifest_snapshot.sha256,
+    }:
+        raise TaskCRuntimeError("bootstrap status does not bind the manifest")
+    if manifest.get("bootstrap_identity_sha256") != identity_snapshot.sha256:
+        raise TaskCRuntimeError("bootstrap manifest does not bind bootstrap identity")
+    if set(identity) != {
+        "schema_version",
+        "registry_sha256",
+        "sources",
+        "environment_files",
+    } or identity.get("schema_version") != SCHEMA_VERSION:
+        raise TaskCRuntimeError("bootstrap identity schema is invalid")
+    _require_sha256_hex(identity.get("registry_sha256"), "bootstrap registry hash")
+    sources = manifest.get("sources")
+    identity_sources = identity.get("sources")
+    if not isinstance(sources, dict) or not isinstance(identity_sources, dict):
+        raise TaskCRuntimeError("bootstrap source records are invalid")
+    causalbench = sources.get("causalbench")
+    expected_source = {"repository": repository, "commit": commit}
+    if (
+        not isinstance(causalbench, dict)
+        or set(causalbench) != {"repository", "commit", "worktree_sha256"}
+        or {key: causalbench.get(key) for key in expected_source} != expected_source
+        or identity_sources.get("causalbench") != expected_source
+    ):
+        raise TaskCRuntimeError(
+            "bootstrap manifest does not bind the fixed CausalBench source"
+        )
+    expected_worktree = _require_sha256_hex(
+        causalbench.get("worktree_sha256"), "CausalBench worktree hash"
+    )
+    extra_snapshots = _validate_bootstrap_file_hashes(root, manifest)
+    source = root / "sources/causalbench"
+    observed_worktree = _validate_source_checkout(
+        source,
+        expected_source,
+        subprocess.run,
+    )
+    if observed_worktree != expected_worktree:
+        raise TaskCRuntimeError("CausalBench worktree hash differs from bootstrap manifest")
+    inventory, inventory_sha = _causalbench_commit_inventory(source, commit)
+    for snapshot, label in (
+        (manifest_snapshot, "bootstrap manifest"),
+        (status_snapshot, "bootstrap status"),
+        (identity_snapshot, "bootstrap identity"),
+    ):
+        _verify_snapshot_unchanged(snapshot, label)
+    for snapshot in extra_snapshots:
+        _verify_snapshot_unchanged(snapshot, f"bootstrap asset {snapshot.path.name}")
+    evidence = {
+        "repository": repository,
+        "commit": commit,
+        "bootstrap_manifest_sha256": f"sha256:{manifest_snapshot.sha256}",
+        "source_worktree_sha256": f"sha256:{observed_worktree}",
+        "private_source_inventory_sha256": f"sha256:{inventory_sha}",
+    }
+    return evidence, inventory
+
+
+def validate_causalbench_export_assets(
+    method_assets_root: str | Path,
+    *,
+    repository: str,
+    commit: str,
+) -> dict[str, str]:
+    """Strictly validate the bootstrapped CausalBench source for export."""
+
+    evidence, _ = _validated_causalbench_export_assets(
+        method_assets_root,
+        repository=repository,
+        commit=commit,
+    )
+    return evidence
+
+
+def _private_source_inventory_sha256(root: Path) -> str:
+    files: list[tuple[str, str, bytes]] = []
+    for current_root, directory_names, file_names in os.walk(
+        root, topdown=True, followlinks=False
+    ):
+        current = Path(current_root)
+        current_metadata = current.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(current_metadata.st_mode)
+            or stat.S_IMODE(current_metadata.st_mode) != 0o500
+        ):
+            raise TaskCRuntimeError(
+                "private CausalBench snapshot directories must remain read-only"
+            )
+        directory_names.sort()
+        file_names.sort()
+        for directory_name in directory_names:
+            if (current / directory_name).is_symlink():
+                raise TaskCRuntimeError("private CausalBench snapshot contains a symlink")
+        for file_name in file_names:
+            path = current / file_name
+            if path.is_symlink():
+                raise TaskCRuntimeError("private CausalBench snapshot contains a symlink")
+            relative = path.relative_to(root).as_posix()
+            snapshot = _snapshot_regular_file(
+                path,
+                f"private CausalBench source {relative}",
+                maximum_bytes=MAXIMUM_CAUSALBENCH_SOURCE_BLOB_BYTES,
+                allow_empty=True,
+            )
+            mode = "100755" if snapshot.mode & 0o111 else "100644"
+            required_permissions = 0o500 if mode == "100755" else 0o400
+            if stat.S_IMODE(snapshot.mode) != required_permissions:
+                raise TaskCRuntimeError(
+                    "private CausalBench snapshot files must remain read-only"
+                )
+            files.append((relative, mode, snapshot.payload))
+    if not CAUSALBENCH_EXPORT_REQUIRED_FILES <= {record[0] for record in files}:
+        raise TaskCRuntimeError("private CausalBench snapshot inventory is incomplete")
+    digest = hashlib.sha256()
+    for relative, mode, payload in sorted(files):
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(mode.encode("ascii"))
+        digest.update(b"\x00")
+        digest.update(_sha256_bytes(payload).encode("ascii"))
+        digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+def materialize_causalbench_source_snapshot(
+    method_assets_root: str | Path,
+    destination: str | Path,
+    *,
+    repository: str,
+    commit: str,
+    expected_evidence: Mapping[str, str],
+) -> dict[str, str]:
+    """Build a private read-only package tree from fixed-commit Git blobs."""
+
+    evidence, inventory = _validated_causalbench_export_assets(
+        method_assets_root,
+        repository=repository,
+        commit=commit,
+    )
+    if evidence != dict(expected_evidence):
+        raise TaskCRuntimeError("CausalBench assets changed after export preflight")
+    target = Path(destination)
+    descriptor_bound_parent = (
+        len(target.parts) >= 5
+        and target.parts[:4] == ("/", "proc", "self", "fd")
+        and target.parts[4].isdigit()
+    )
+    if not descriptor_bound_parent:
+        _reject_symlink_components(target.parent, "private CausalBench snapshot parent")
+    if target.exists() or target.is_symlink():
+        raise TaskCRuntimeError("private CausalBench snapshot destination already exists")
+    target.mkdir(mode=0o700)
+    try:
+        for relative, mode, payload in inventory:
+            path = target / relative
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            descriptor = os.open(
+                path,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o500 if mode == "100755" else 0o400,
+            )
+            try:
+                written = 0
+                while written < len(payload):
+                    written += os.write(descriptor, payload[written:])
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        for current_root, directory_names, _ in os.walk(target, topdown=False):
+            for directory_name in directory_names:
+                (Path(current_root) / directory_name).chmod(0o500)
+        target.chmod(0o500)
+        _fsync_directory(target)
+        if not descriptor_bound_parent:
+            _fsync_directory(target.parent)
+        verify_causalbench_source_snapshot(target, evidence)
+    except BaseException:
+        target.chmod(0o700)
+        for current_root, directory_names, file_names in os.walk(
+            target, topdown=False, followlinks=False
+        ):
+            current = Path(current_root)
+            current.chmod(0o700)
+            for directory_name in directory_names:
+                (current / directory_name).chmod(0o700)
+            for file_name in file_names:
+                (current / file_name).chmod(0o600)
+        shutil.rmtree(target)
+        raise
+    return evidence
+
+
+def verify_causalbench_source_snapshot(
+    source_root: str | Path,
+    evidence: Mapping[str, str],
+) -> None:
+    """Recheck the private package inventory without importing it."""
+
+    if set(evidence) != {
+        "repository",
+        "commit",
+        "bootstrap_manifest_sha256",
+        "source_worktree_sha256",
+        "private_source_inventory_sha256",
+    }:
+        raise TaskCRuntimeError("CausalBench source evidence schema is invalid")
+    expected = evidence.get("private_source_inventory_sha256")
+    if type(expected) is not str or re.fullmatch(r"sha256:[0-9a-f]{64}", expected) is None:
+        raise TaskCRuntimeError("CausalBench private source inventory hash is invalid")
+    root = Path(source_root)
+    if root.is_symlink() or not root.is_dir():
+        raise TaskCRuntimeError("private CausalBench source is not a directory")
+    observed = _private_source_inventory_sha256(root)
+    if f"sha256:{observed}" != expected:
+        raise TaskCRuntimeError("private CausalBench source snapshot changed")
+
+
+def remove_causalbench_source_snapshot(
+    source_root: str | Path,
+    evidence: Mapping[str, str],
+) -> None:
+    """Verify and remove the private read-only snapshot before publication."""
+
+    root = Path(source_root)
+    verify_causalbench_source_snapshot(root, evidence)
+    for current_root, directory_names, _ in os.walk(
+        root, topdown=False, followlinks=False
+    ):
+        current = Path(current_root)
+        current.chmod(0o700)
+        for directory_name in directory_names:
+            (current / directory_name).chmod(0o700)
+    shutil.rmtree(root)
 
 
 def _existing_environment_names(payload: object) -> set[str]:

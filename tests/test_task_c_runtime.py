@@ -3158,3 +3158,151 @@ def test_hypersca_invalid_nested_output_is_classified_as_invalid_output(
     outer = json.loads((output / "method_status.json").read_text(encoding="utf-8"))
     assert outer["status"] == "failed_invalid_output"
     assert not (output / "predictions.csv").exists()
+
+
+def _write_canonical_runtime_json(path: Path, payload: dict[str, object]) -> None:
+    path.write_bytes(runtime_module._json_bytes(payload))
+
+
+def _local_causalbench_bootstrap_assets(
+    tmp_path: Path,
+) -> tuple[Path, str, str]:
+    repository = "https://github.com/causalbench/causalbench.git"
+    root = tmp_path / "method-assets"
+    source = root / "sources/causalbench"
+    source.mkdir(parents=True)
+    (root / "environment_manifests").mkdir()
+    (root / "status").mkdir()
+    package_files = {
+        "causalscbench/__init__.py": b"",
+        "causalscbench/data_access/__init__.py": b"",
+        "causalscbench/data_access/create_dataset.py": (
+            b"class CreateDataset:\n    pass\n"
+        ),
+        "causalscbench/data_access/create_evaluation_datasets.py": (
+            b"class CreateEvaluationDatasets:\n    pass\n"
+        ),
+        "causalscbench/data_access/data/K562_ChipSeq.csv": b"source,target\nA,B\n",
+        "causalscbench/data_access/data/Hep_G2_ChipSeq.csv": b"source,target\nB,A\n",
+    }
+    for relative, payload in package_files.items():
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.name", "HyperSCA Test"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "commit", "-q", "-m", "test fixture"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(source), "remote", "add", "origin", repository],
+        check=True,
+    )
+    commit = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    expected_source = {"repository": repository, "commit": commit}
+    worktree_sha256 = runtime_module._validate_source_checkout(
+        source, expected_source, subprocess.run
+    )
+    identity = {
+        "schema_version": "1.0",
+        "registry_sha256": "0" * 64,
+        "sources": {"causalbench": expected_source},
+        "environment_files": {},
+    }
+    _write_canonical_runtime_json(root / "bootstrap_identity.json", identity)
+    manifest = {
+        "schema_version": "1.0",
+        "bootstrap_identity_sha256": hashlib.sha256(
+            runtime_module._json_bytes(identity)
+        ).hexdigest(),
+        "sources": {
+            "causalbench": {
+                **expected_source,
+                "worktree_sha256": worktree_sha256,
+            }
+        },
+        "environment_manifests": {},
+        "publication_statuses": {},
+    }
+    _write_canonical_runtime_json(root / "bootstrap_manifest.json", manifest)
+    status = {
+        "schema_version": "1.0",
+        "status": "assets_and_environments_recorded",
+        "bootstrap_manifest_sha256": hashlib.sha256(
+            runtime_module._json_bytes(manifest)
+        ).hexdigest(),
+    }
+    _write_canonical_runtime_json(root / "bootstrap_status.json", status)
+    return root, repository, commit
+
+
+def test_causalbench_export_assets_materialize_only_fixed_commit_blobs(
+    tmp_path: Path,
+) -> None:
+    root, repository, commit = _local_causalbench_bootstrap_assets(tmp_path)
+
+    evidence = runtime_module.validate_causalbench_export_assets(
+        root, repository=repository, commit=commit
+    )
+    private_source = tmp_path / "private-source"
+    assert runtime_module.materialize_causalbench_source_snapshot(
+        root,
+        private_source,
+        repository=repository,
+        commit=commit,
+        expected_evidence=evidence,
+    ) == evidence
+
+    assert set(evidence) == {
+        "repository",
+        "commit",
+        "bootstrap_manifest_sha256",
+        "source_worktree_sha256",
+        "private_source_inventory_sha256",
+    }
+    assert runtime_module.CAUSALBENCH_EXPORT_REQUIRED_FILES <= {
+        path.relative_to(private_source).as_posix()
+        for path in private_source.rglob("*")
+        if path.is_file()
+    }
+    runtime_module.verify_causalbench_source_snapshot(private_source, evidence)
+    module_path = private_source / "causalscbench/data_access/create_dataset.py"
+    module_path.chmod(0o600)
+    with pytest.raises(TaskCRuntimeError, match="read-only"):
+        runtime_module.verify_causalbench_source_snapshot(private_source, evidence)
+    module_path.write_text("class Attacker: pass\n", encoding="utf-8")
+    module_path.chmod(0o400)
+    with pytest.raises(TaskCRuntimeError, match="snapshot changed"):
+        runtime_module.verify_causalbench_source_snapshot(private_source, evidence)
+
+
+def test_causalbench_asset_validation_rejects_assume_unchanged_source_tamper(
+    tmp_path: Path,
+) -> None:
+    root, repository, commit = _local_causalbench_bootstrap_assets(tmp_path)
+    source = root / "sources/causalbench"
+    relative = "causalscbench/data_access/create_dataset.py"
+    (source / relative).write_text("class Attacker: pass\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(source), "update-index", "--assume-unchanged", relative],
+        check=True,
+    )
+
+    with pytest.raises(TaskCRuntimeError, match="fixed commit blob"):
+        runtime_module.validate_causalbench_export_assets(
+            root, repository=repository, commit=commit
+        )

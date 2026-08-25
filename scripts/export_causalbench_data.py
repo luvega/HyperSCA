@@ -53,6 +53,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--method-assets-root",
+        type=Path,
+        help=(
+            "正式导出使用 bootstrap_task_c_methods.py 固定并核对的官方源码目录。"
+        ),
+    )
+    parser.add_argument(
         "--filter",
         action="store_true",
         help="请求 CausalBench 对表达数据进行官方过滤。",
@@ -146,19 +153,10 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(
                 "正式数据导出缺少原始输入目录：请提供 --source-data-dir。"
             )
-
-        def load_causalbench() -> tuple[type, type]:
-            try:
-                from causalscbench.data_access.create_dataset import CreateDataset
-                from causalscbench.data_access.create_evaluation_datasets import (
-                    CreateEvaluationDatasets,
-                )
-            except ImportError as exc:
-                raise SystemExit(
-                    "无法导入固定版本 CausalBench；请先创建 "
-                    "envs/task_c/causalbench.yml 中的环境。"
-                ) from exc
-            return CreateDataset, CreateEvaluationDatasets
+        if args.method_assets_root is None:
+            raise SystemExit(
+                "正式数据导出缺少固定官方源码：请提供 --method-assets-root。"
+            )
 
         from src.evaluation.task_c_formal_export import (
             TaskCFormalExportError,
@@ -171,8 +169,8 @@ def main(argv: list[str] | None = None) -> int:
                 source_data_dir=args.source_data_dir,
                 output_dir=args.data_dir,
                 acquisition_manifest=args.acquisition_manifest,
+                method_assets_root=args.method_assets_root,
                 use_filter=bool(args.filter),
-                load_causalbench=load_causalbench,
             )
         except TaskCFormalExportError as exc:
             raise SystemExit(f"正式数据导出无效：{exc}") from exc

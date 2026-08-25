@@ -1215,6 +1215,8 @@ conda run -n hypersca python scripts/validate_env.py
 set -euo pipefail
 export TASK_C_DATA_ROOT=/home/a/Data/HyperSCA_external/task_c
 mkdir -p "$TASK_C_DATA_ROOT/raw" "$TASK_C_DATA_ROOT/method_assets"
+conda run -n hypersca python scripts/bootstrap_task_c_methods.py \
+    --cache-root "$TASK_C_DATA_ROOT/method_assets"
 export TASK_C_ACQUISITION_MANIFEST="$TASK_C_DATA_ROOT/acquisition_manifest.json"
 test ! -e "$TASK_C_ACQUISITION_MANIFEST" && test ! -L "$TASK_C_ACQUISITION_MANIFEST"
 conda run --no-capture-output -n hypersca python scripts/verify_task_c_acquisition.py \
@@ -1229,6 +1231,7 @@ conda run --no-capture-output -n hypersca-task-c-causalbench python \
     scripts/export_causalbench_data.py \
     --source-data-dir "$TASK_C_DATA_ROOT/raw" \
     --data-dir "$TASK_C_DATA_ROOT/raw_export_v2" \
+    --method-assets-root "$TASK_C_DATA_ROOT/method_assets" \
     --require-acquisition-manifest \
     --acquisition-manifest "$TASK_C_ACQUISITION_MANIFEST"
 export TASK_C_PREPARED_IDENTITY_RECORD="$TASK_C_DATA_ROOT/prepared_v2_identity_summary.json"
@@ -1256,15 +1259,17 @@ else
   rm -f "$TASK_C_PREPARED_IDENTITY_TMP"
   exit 1
 fi
-conda run -n hypersca python scripts/bootstrap_task_c_methods.py --cache-root "$TASK_C_DATA_ROOT/method_assets"
 ```
 
 `verify_task_c_acquisition.py` 不联网下载；它先以 Zenodo 记录 7041849 的固定文件名、
 大小和 MD5 核对两个公开镜像，再逐块确认转换文件只把基因符号索引改为 Ensembl ID，
 并把来源、许可、SHA-256、MD5、转换规则和可选的 Figshare 403 证据写入不可覆盖的
 `acquisition_manifest.json`。其中本机修改时间只表示“核对时看到的文件系统属性”，
-不是服务器下载时间。正式导出同时传 `--require-acquisition-manifest`，因此缺少或被改写
-的来源记录会在 CausalBench 导出前停止；模拟测试仍可省略该正式闸门。
+不是服务器下载时间。方法资产必须先完成固定版本引导；正式导出同时传
+`--require-acquisition-manifest` 和 `--method-assets-root`，因此缺少、被改写或与固定提交
+不一致的来源记录和官方代码都会在 CausalBench 导出前停止。导出只从已经核对的 Git
+提交对象建立私有只读 `causalscbench` 快照，并从该快照执行数据与参考关系生成；导出
+清单记录引导清单、源码工作树和私有源码清单的 SHA-256。模拟测试仍可省略正式闸门。
 正式导出只读取 `raw/`，并把新结果一次性排他发布为 `raw_export_v2/`；随后只从
 `raw_export_v2/` 建立 `prepared_v2/`。已有的 `raw/` 导出缓存和 `prepared/` 保留为旧版
 证据，任何命令都不得在其中补写清单、覆盖文件或把部分缓存当作新版结果。

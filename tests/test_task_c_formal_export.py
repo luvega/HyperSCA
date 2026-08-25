@@ -4,6 +4,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
+import sys
+import types
 
 import anndata as ad
 import numpy as np
@@ -11,6 +14,7 @@ import pandas as pd
 import pytest
 
 from src.evaluation import task_c_acquisition as acquisition_module
+from src.evaluation import task_c_formal_export as formal_export_module
 from src.evaluation.task_c_acquisition import AcquisitionFileSpec
 from src.evaluation.task_c_formal_export import (
     TaskCFormalExportError,
@@ -27,6 +31,131 @@ SUPPORT_FILES = (
     "protein.info.txt.gz",
 )
 
+FAKE_CAUSALBENCH_EVIDENCE = {
+    "repository": "https://github.com/causalbench/causalbench.git",
+    "commit": "1a2143cffdc85f835b41ce8d52034be1bf903e71",
+    "bootstrap_manifest_sha256": "sha256:" + "1" * 64,
+    "source_worktree_sha256": "sha256:" + "2" * 64,
+    "private_source_inventory_sha256": "sha256:" + "3" * 64,
+}
+
+
+def _snapshot_tree_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _install_fake_causalbench_asset_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> types.ModuleType:
+    hook = types.ModuleType("hypersca_test_causalbench_hook")
+    hook.events = []
+    hook.tamper_module = False
+    hook.fail_load = False
+    monkeypatch.setitem(sys.modules, hook.__name__, hook)
+    inventories: dict[str, str] = {}
+
+    def validate(*args, **kwargs):
+        del args, kwargs
+        return dict(FAKE_CAUSALBENCH_EVIDENCE)
+
+    def materialize(*args, **kwargs):
+        destination = Path(args[1])
+        expected = kwargs["expected_evidence"]
+        assert dict(expected) == FAKE_CAUSALBENCH_EVIDENCE
+        package = destination / "causalscbench/data_access"
+        package.mkdir(parents=True)
+        (destination / "causalscbench/__init__.py").write_text("", encoding="utf-8")
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "create_dataset.py").write_text(
+            """from pathlib import Path
+import anndata as ad
+import numpy as np
+import hypersca_test_causalbench_hook as hook
+hook.events.append('load_causalbench')
+class CreateDataset:
+    def __init__(self, data_dir, use_filter):
+        assert use_filter is False
+        self.data_dir = Path(data_dir)
+    def load(self):
+        hook.events.append('create_datasets')
+        if hook.fail_load:
+            raise RuntimeError('simulated CausalBench failure')
+        if hook.tamper_module:
+            with open(__file__, 'a', encoding='utf-8') as handle:
+                handle.write('\\n# changed during execution\\n')
+        paths = []
+        for context in ('k562', 'rpe1'):
+            source = self.data_dir / f'{context}.h5ad'
+            assert source.is_symlink()
+            assert __import__('os').readlink(source).startswith('/proc/self/fd/')
+            dataset = ad.read_h5ad(source, backed='r')
+            try:
+                assert dataset.shape == (3, 2)
+            finally:
+                dataset.file.close()
+            path = self.data_dir / f'dataset_{context}.npz'
+            np.savez(
+                path,
+                expression_matrix=np.asarray(
+                    [[0.0, 1.0], [2.0, 0.0], [1.0, 3.0]], dtype=np.float32
+                ),
+                interventions=np.asarray(
+                    ['non-targeting', 'ENSG000001', 'ENSG000002']
+                ),
+                var_names=np.asarray(['ENSG000001', 'ENSG000002']),
+            )
+            paths.append(str(path))
+        return tuple(paths)
+""",
+            encoding="utf-8",
+        )
+        (package / "create_evaluation_datasets.py").write_text(
+            """from pathlib import Path
+import hypersca_test_causalbench_hook as hook
+class CreateEvaluationDatasets:
+    def __init__(self, data_dir, dataset_name):
+        self.data_dir = Path(data_dir)
+        self.dataset_name = dataset_name
+    def load(self):
+        hook.events.append(f'references:{self.dataset_name}')
+        return ({('ENSG000001', 'ENSG000002')}, set(), set(), set(), {('ENSG000001', 'ENSG000002')})
+""",
+            encoding="utf-8",
+        )
+        inventories[str(destination.resolve())] = _snapshot_tree_digest(destination)
+        return dict(FAKE_CAUSALBENCH_EVIDENCE)
+
+    def verify(source_root, evidence):
+        assert dict(evidence) == FAKE_CAUSALBENCH_EVIDENCE
+        root = Path(source_root)
+        if _snapshot_tree_digest(root) != inventories[str(root.resolve())]:
+            raise formal_export_module.TaskCRuntimeError(
+                "private CausalBench source snapshot changed"
+            )
+
+    def remove(source_root, evidence):
+        verify(source_root, evidence)
+        shutil.rmtree(source_root)
+
+    monkeypatch.setattr(
+        formal_export_module, "validate_causalbench_export_assets", validate
+    )
+    monkeypatch.setattr(
+        formal_export_module, "materialize_causalbench_source_snapshot", materialize
+    )
+    monkeypatch.setattr(
+        formal_export_module, "verify_causalbench_source_snapshot", verify
+    )
+    monkeypatch.setattr(
+        formal_export_module, "remove_causalbench_source_snapshot", remove
+    )
+    return hook
+
 
 def _md5(path: Path) -> str:
     return hashlib.md5(path.read_bytes()).hexdigest()  # noqa: S324
@@ -36,6 +165,7 @@ def _write_acquisition_inputs(
     root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[Path, Path]:
+    _install_fake_causalbench_asset_boundary(monkeypatch)
     source = root / "raw"
     source.mkdir()
     obs = pd.DataFrame(
@@ -89,74 +219,20 @@ def _write_acquisition_inputs(
     return source, acquisition
 
 
-def _fake_causalbench_loader(events: list[str]):
-    def load_classes():
-        events.append("load_causalbench")
-
-        class FakeDataset:
-            def __init__(self, data_dir: str, use_filter: bool):
-                assert use_filter is False
-                self.data_dir = Path(data_dir)
-
-            def load(self):
-                events.append("create_datasets")
-                for context in ("k562", "rpe1"):
-                    source = self.data_dir / f"{context}.h5ad"
-                    assert source.is_symlink()
-                    assert os.readlink(source).startswith("/proc/self/fd/")
-                    dataset = ad.read_h5ad(source, backed="r")
-                    try:
-                        assert dataset.shape == (3, 2)
-                    finally:
-                        dataset.file.close()
-                    np.savez(
-                        self.data_dir / f"dataset_{context}.npz",
-                        expression_matrix=np.asarray(
-                            [[0.0, 1.0], [2.0, 0.0], [1.0, 3.0]],
-                            dtype=np.float32,
-                        ),
-                        interventions=np.asarray(
-                            ["non-targeting", "ENSG000001", "ENSG000002"]
-                        ),
-                        var_names=np.asarray(["ENSG000001", "ENSG000002"]),
-                    )
-                return (
-                    str(self.data_dir / "dataset_k562.npz"),
-                    str(self.data_dir / "dataset_rpe1.npz"),
-                )
-
-        class FakeEvaluations:
-            def __init__(self, data_dir: str, dataset_name: str):
-                self.data_dir = Path(data_dir)
-                self.dataset_name = dataset_name
-
-            def load(self):
-                events.append(f"references:{self.dataset_name}")
-                return (
-                    {("ENSG000001", "ENSG000002")},
-                    set(),
-                    set(),
-                    set(),
-                    {("ENSG000001", "ENSG000002")},
-                )
-
-        return FakeDataset, FakeEvaluations
-
-    return load_classes
-
-
 def _run_formal_export(
     root: Path,
     source: Path,
     acquisition: Path,
     events: list[str],
 ) -> dict[str, object]:
+    hook = sys.modules["hypersca_test_causalbench_hook"]
+    hook.events = events
     return export_task_c_formal_bundle(
         source_data_dir=source,
         output_dir=root / "raw_export_v2",
         acquisition_manifest=acquisition,
+        method_assets_root=root / "method-assets",
         use_filter=False,
-        load_causalbench=_fake_causalbench_loader(events),
     )
 
 
@@ -191,6 +267,7 @@ def test_formal_export_stages_exact_files_and_ignores_old_outputs(
         "export_manifest.json"
     }
     assert set(manifest["supporting_source_files"]) == set(SUPPORT_FILES)
+    assert manifest["causalbench_source"] == FAKE_CAUSALBENCH_EVIDENCE
     assert all(not Path(value).is_absolute() for value in manifest["paths"].values())
     assert not list(tmp_path.glob(".raw_export_v2.staging-*"))
     assert events == [
@@ -255,17 +332,18 @@ def test_failed_generation_and_parent_fsync_leave_no_formal_or_staging_directory
 ) -> None:
     source, acquisition = _write_acquisition_inputs(tmp_path, monkeypatch)
 
-    def failed_loader():
-        raise RuntimeError("simulated CausalBench failure")
+    hook = sys.modules["hypersca_test_causalbench_hook"]
+    hook.fail_load = True
 
     with pytest.raises(RuntimeError, match="simulated"):
         export_task_c_formal_bundle(
             source_data_dir=source,
             output_dir=tmp_path / "raw_export_v2",
             acquisition_manifest=acquisition,
+            method_assets_root=tmp_path / "method-assets",
             use_filter=False,
-            load_causalbench=failed_loader,
         )
+    hook.fail_load = False
     assert not (tmp_path / "raw_export_v2").exists()
     assert not list(tmp_path.glob(".raw_export_v2.staging-*"))
 
@@ -313,3 +391,65 @@ def test_existing_formal_export_rejects_duplicate_manifest_fields(
 
     with pytest.raises(TaskCFormalExportError, match="manifest|schema"):
         _run_formal_export(tmp_path, source, acquisition, [])
+
+
+@pytest.mark.parametrize("change_point", ["before_rename", "after_rename"])
+def test_acquisition_change_around_publish_never_leaves_a_formal_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change_point: str,
+) -> None:
+    source, acquisition = _write_acquisition_inputs(tmp_path, monkeypatch)
+    replacement = tmp_path / "replacement-acquisition.json"
+    replacement.write_bytes(acquisition.read_bytes() + b" ")
+    changed = False
+
+    def replace_acquisition() -> None:
+        nonlocal changed
+        if not changed:
+            os.replace(replacement, acquisition)
+            changed = True
+
+    real_fsync = formal_export_module.os.fsync
+    real_rename = formal_export_module._rename_noreplace
+
+    def fsync_then_change(descriptor: int) -> None:
+        real_fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if change_point == "before_rename" and os.path.basename(
+            os.readlink(f"/proc/self/fd/{descriptor}")
+        ).startswith(".raw_export_v2.staging-") and os.path.isdir(
+            f"/proc/self/fd/{descriptor}"
+        ):
+            assert metadata.st_mode
+            replace_acquisition()
+
+    def rename_then_change(parent: int, source_name: str, target_name: str) -> None:
+        real_rename(parent, source_name, target_name)
+        if change_point == "after_rename":
+            replace_acquisition()
+
+    monkeypatch.setattr(formal_export_module.os, "fsync", fsync_then_change)
+    monkeypatch.setattr(formal_export_module, "_rename_noreplace", rename_then_change)
+
+    with pytest.raises(TaskCFormalExportError, match="acquisition|变化|替换"):
+        _run_formal_export(tmp_path, source, acquisition, [])
+
+    assert changed is True
+    assert not (tmp_path / "raw_export_v2").exists()
+    assert not list(tmp_path.glob(".raw_export_v2.staging-*"))
+
+
+def test_private_causalbench_module_tamper_fails_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, acquisition = _write_acquisition_inputs(tmp_path, monkeypatch)
+    hook = sys.modules["hypersca_test_causalbench_hook"]
+    hook.tamper_module = True
+
+    with pytest.raises(TaskCFormalExportError, match="source|源码|快照|changed"):
+        _run_formal_export(tmp_path, source, acquisition, [])
+
+    assert not (tmp_path / "raw_export_v2").exists()
+    assert not list(tmp_path.glob(".raw_export_v2.staging-*"))

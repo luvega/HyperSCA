@@ -87,6 +87,7 @@ def test_export_help_exposes_separate_source_and_versioned_output_directories():
     )
 
     assert "--source-data-dir" in completed.stdout
+    assert "--method-assets-root" in completed.stdout
     assert "原始" in completed.stdout
 
 
@@ -102,6 +103,11 @@ def test_task7_and_task8_use_only_versioned_export_and_prepared_directories():
     assert '"$TASK_C_DATA_ROOT/prepared/' not in task7_and_later
     assert '"$TASK_C_DATA_ROOT/raw/dataset_' not in task7_and_later
     assert '"$TASK_C_DATA_ROOT/raw/reference_' not in task7_and_later
+    assert (
+        task7_and_later.index("scripts/bootstrap_task_c_methods.py")
+        < task7_and_later.index("scripts/export_causalbench_data.py")
+    )
+    assert '--method-assets-root "$TASK_C_DATA_ROOT/method_assets"' in task7_and_later
 
 
 def test_formal_export_requires_an_independent_acquisition_manifest(tmp_path):
@@ -134,7 +140,7 @@ def test_formal_export_finds_project_modules_from_a_clean_subprocess(tmp_path):
             "import runpy, sys",
             "sys.meta_path = [finder for finder in sys.meta_path "
             "if 'editable' not in repr(finder).casefold()]",
-            f"sys.argv = {[str(script), '--source-data-dir', str(source_dir), '--data-dir', str(data_dir), '--acquisition-manifest', str(missing)]!r}",
+            f"sys.argv = {[str(script), '--source-data-dir', str(source_dir), '--data-dir', str(data_dir), '--acquisition-manifest', str(missing), '--method-assets-root', str(tmp_path / 'method-assets')]!r}",
             f"runpy.run_path({str(script)!r}, run_name='__main__')",
         ]
     )
@@ -200,6 +206,17 @@ def test_formal_export_rechecks_sources_before_import_call_or_directory_creation
         "bind_export_sources_against_acquisition",
         lambda *args, **kwargs: RejectingBinding(),
     )
+    monkeypatch.setattr(
+        formal_export_module,
+        "validate_causalbench_export_assets",
+        lambda *args, **kwargs: {
+            "repository": formal_export_module.REPOSITORY,
+            "commit": formal_export_module.COMMIT,
+            "bootstrap_manifest_sha256": "sha256:" + "1" * 64,
+            "source_worktree_sha256": "sha256:" + "2" * 64,
+            "private_source_inventory_sha256": "sha256:" + "3" * 64,
+        },
+    )
 
     class FakeAcquisitionBound:
         sha256 = "sha256:" + "0" * 64
@@ -254,6 +271,8 @@ def test_formal_export_rechecks_sources_before_import_call_or_directory_creation
                 "--require-acquisition-manifest",
                 "--acquisition-manifest",
                 str(tmp_path / "acquisition.json"),
+                "--method-assets-root",
+                str(tmp_path / "method-assets"),
             ]
         )
 
@@ -261,120 +280,52 @@ def test_formal_export_rechecks_sources_before_import_call_or_directory_creation
     assert not data_dir.exists()
 
 
-def test_formal_export_records_and_rechecks_the_acquisition_manifest(
-    tmp_path, monkeypatch
+def test_formal_export_forwards_acquisition_and_fixed_method_assets(
+    tmp_path, monkeypatch, capsys
 ):
-    data_dir = tmp_path / "raw"
-    data_dir.mkdir()
-    output_dir = tmp_path / "raw_export_v2"
-    mirrors = {}
-    converted = {}
-    specs = {}
-    obs = pd.DataFrame({"perturbation": ["control", "A"]}, index=["c1", "c2"])
-    base_var = pd.DataFrame(
-        {"ensembl_id": ["ENSG000001", "ENSG000002"], "chr": ["1", "2"]},
-        index=["GENE1", "GENE2"],
-    )
-    expression = np.asarray([[0.0, 1.0], [2.0, 0.0]], dtype=np.float32)
-    for context in ("k562", "rpe1"):
-        mirror = tmp_path / f"{context}-official.h5ad"
-        transformed = data_dir / f"{context}.h5ad"
-        ad.AnnData(X=expression, obs=obs, var=base_var).write_h5ad(mirror)
-        converted_var = base_var.copy()
-        converted_var["gene_name"] = converted_var.index.to_numpy(copy=True)
-        converted_var.index = converted_var["ensembl_id"].to_numpy(copy=True)
-        ad.AnnData(X=expression, obs=obs, var=converted_var).write_h5ad(transformed)
-        mirrors[context] = mirror
-        converted[context] = transformed
-        specs[context] = acquisition_module.AcquisitionFileSpec(
-            context_id=context,
-            file_name=mirror.name,
-            size_bytes=mirror.stat().st_size,
-            md5=hashlib.md5(mirror.read_bytes()).hexdigest(),  # noqa: S324
-            zenodo_content_url=(
-                f"https://zenodo.org/api/records/7041849/files/{mirror.name}/content"
-            ),
-            figshare_original_url=f"https://plus.figshare.com/{context}",
-        )
-    monkeypatch.setattr(acquisition_module, "OFFICIAL_ACQUISITION_FILES", specs)
-    acquisition_path = tmp_path / "acquisition_manifest.json"
-    acquisition_module.create_task_c_acquisition_manifest(
-        mirror_paths=mirrors,
-        converted_paths=converted,
-        output_path=acquisition_path,
-        authoritative_files=specs,
-        requested_chunk_rows=1,
-    )
-    for name in (
-        "corum_complexes.txt.zip",
-        "human_lr_pair.txt",
-        "protein.links.txt.gz",
-        "protein.physical.links.txt.gz",
-        "protein.info.txt.gz",
-    ):
-        (data_dir / name).write_bytes(name.encode("utf-8"))
-
-    class FakeDataset:
-        def __init__(self, data_dir, use_filter):
-            self.data_dir = Path(data_dir)
-            self.use_filter = use_filter
-
-        def load(self):
-            paths = []
-            for context in ("k562", "rpe1"):
-                path = self.data_dir / f"dataset_{context}.npz"
-                np.savez(
-                    path,
-                    expression_matrix=expression,
-                    interventions=np.asarray(["non-targeting", "ENSG000001"]),
-                    var_names=np.asarray(["ENSG000001", "ENSG000002"]),
-                )
-                paths.append(str(path))
-            return paths
-
-    class FakeEvaluations:
-        def __init__(self, data_dir, dataset_name):
-            del data_dir, dataset_name
-
-        def load(self):
-            return ({("A", "B")}, set(), set(), set(), {("A", "B")})
-
-    package = types.ModuleType("causalscbench")
-    data_access = types.ModuleType("causalscbench.data_access")
-    dataset_module = types.ModuleType("causalscbench.data_access.create_dataset")
-    evaluations_module = types.ModuleType(
-        "causalscbench.data_access.create_evaluation_datasets"
-    )
-    dataset_module.CreateDataset = FakeDataset
-    evaluations_module.CreateEvaluationDatasets = FakeEvaluations
-    monkeypatch.setitem(sys.modules, "causalscbench", package)
-    monkeypatch.setitem(sys.modules, "causalscbench.data_access", data_access)
-    monkeypatch.setitem(sys.modules, dataset_module.__name__, dataset_module)
-    monkeypatch.setitem(sys.modules, evaluations_module.__name__, evaluations_module)
     script_path = ROOT / "scripts" / "export_causalbench_data.py"
     module_spec = importlib.util.spec_from_file_location("formal_export_valid", script_path)
     exporter = importlib.util.module_from_spec(module_spec)
     assert module_spec.loader is not None
     module_spec.loader.exec_module(exporter)
+    captured = {}
+
+    def fake_formal_export(**kwargs):
+        captured.update(kwargs)
+        return {"status": "formal_export_complete"}
+
+    monkeypatch.setattr(
+        formal_export_module, "export_task_c_formal_bundle", fake_formal_export
+    )
+    source_dir = tmp_path / "raw"
+    output_dir = tmp_path / "raw_export_v2"
+    acquisition_path = tmp_path / "acquisition_manifest.json"
+    method_assets_root = tmp_path / "method-assets"
 
     assert exporter.main(
         [
             "--source-data-dir",
-            str(data_dir),
+            str(source_dir),
             "--data-dir",
             str(output_dir),
             "--require-acquisition-manifest",
             "--acquisition-manifest",
             str(acquisition_path),
+            "--method-assets-root",
+            str(method_assets_root),
         ]
     ) == 0
 
-    exported = json.loads((output_dir / "export_manifest.json").read_text())
-    assert exported["acquisition_manifest"]["sha256"] == (
-        "sha256:" + hashlib.sha256(acquisition_path.read_bytes()).hexdigest()
-    )
-    assert exported["acquisition_manifest"]["path"] == str(acquisition_path)
-    assert set(exported["verified_converted_sources"]) == {"k562", "rpe1"}
+    assert captured == {
+        "source_data_dir": source_dir,
+        "output_dir": output_dir,
+        "acquisition_manifest": acquisition_path,
+        "method_assets_root": method_assets_root,
+        "use_filter": False,
+    }
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "formal_export_complete"
+    }
 
 
 def test_operational_export_uses_stubs_and_records_reproducible_artifacts(

@@ -7,13 +7,15 @@ import ctypes
 from datetime import datetime, timezone
 import errno
 import hashlib
+import importlib
 import io
 import json
 import os
 from pathlib import Path
 import re
 import stat
-from typing import Callable, Mapping
+import sys
+from typing import Mapping
 import uuid
 import zipfile
 
@@ -23,6 +25,13 @@ from src.evaluation.task_c_acquisition import (
     TaskCAcquisitionError,
     bind_export_sources_against_acquisition,
     load_task_c_acquisition_manifest,
+)
+from src.evaluation.task_c_runtime import (
+    TaskCRuntimeError,
+    materialize_causalbench_source_snapshot,
+    remove_causalbench_source_snapshot,
+    validate_causalbench_export_assets,
+    verify_causalbench_source_snapshot,
 )
 
 
@@ -54,6 +63,79 @@ MAXIMUM_TOTAL_TEXT_BYTES = 512 * 1024 * 1024
 
 class TaskCFormalExportError(ValueError):
     """A formal export cannot be safely created or reused."""
+
+
+class _CausalBenchModuleBinding:
+    """Temporarily bind all CausalBench imports to one private source tree."""
+
+    def __init__(self, source_root: Path) -> None:
+        self.source_root = source_root.resolve(strict=True)
+        self._saved_modules = {
+            name: module
+            for name, module in tuple(sys.modules.items())
+            if name == "causalscbench" or name.startswith("causalscbench.")
+        }
+        for name in self._saved_modules:
+            sys.modules.pop(name, None)
+        self._saved_path = list(sys.path)
+        self._saved_dont_write_bytecode = sys.dont_write_bytecode
+        sys.path.insert(0, str(source_root))
+        sys.dont_write_bytecode = True
+        importlib.invalidate_caches()
+        self._closed = False
+        try:
+            dataset_module = importlib.import_module(
+                "causalscbench.data_access.create_dataset"
+            )
+            evaluation_module = importlib.import_module(
+                "causalscbench.data_access.create_evaluation_datasets"
+            )
+            self.CreateDataset = dataset_module.CreateDataset
+            self.CreateEvaluationDatasets = (
+                evaluation_module.CreateEvaluationDatasets
+            )
+            self.verify()
+        except BaseException:
+            self.close()
+            raise
+
+    def verify(self) -> None:
+        observed = 0
+        for name, module in tuple(sys.modules.items()):
+            if name != "causalscbench" and not name.startswith("causalscbench."):
+                continue
+            module_file = getattr(module, "__file__", None)
+            if not isinstance(module_file, str):
+                raise TaskCFormalExportError(
+                    "CausalBench imported a module without a bound source file"
+                )
+            try:
+                origin = Path(module_file).resolve(strict=True)
+            except OSError as exc:
+                raise TaskCFormalExportError(
+                    "CausalBench imported module source disappeared"
+                ) from exc
+            if not origin.is_relative_to(self.source_root):
+                raise TaskCFormalExportError(
+                    "CausalBench imported code outside the private fixed source"
+                )
+            observed += 1
+        if observed < 4:
+            raise TaskCFormalExportError(
+                "CausalBench private source did not load the required modules"
+            )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        for name in tuple(sys.modules):
+            if name == "causalscbench" or name.startswith("causalscbench."):
+                sys.modules.pop(name, None)
+        sys.modules.update(self._saved_modules)
+        sys.path[:] = self._saved_path
+        sys.dont_write_bytecode = self._saved_dont_write_bytecode
+        importlib.invalidate_caches()
+        self._closed = True
 
 
 class _BoundFile:
@@ -488,6 +570,7 @@ def _validate_existing(
     use_filter: bool,
     acquisition_reference: Mapping[str, object],
     observed_sources: Mapping[str, object],
+    causalbench_source: Mapping[str, str],
 ) -> dict[str, object]:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -550,6 +633,7 @@ def _validate_existing(
             "acquisition_time_note",
             "exported_at_utc",
             "dropped_self_edges",
+            "causalbench_source",
         }
         if (
             not isinstance(manifest, dict)
@@ -565,6 +649,7 @@ def _validate_existing(
             != "verified read-only /proc/self/fd snapshots"
             or manifest.get("downloaded_at_utc") is not None
             or manifest.get("artifact_validation") != fresh_validation
+            or manifest.get("causalbench_source") != dict(causalbench_source)
             or manifest.get("acquisition_time_note")
             != "No server download time is claimed; local files were verified snapshots."
             or not isinstance(manifest.get("exported_at_utc"), str)
@@ -687,6 +772,7 @@ def _fsync_parent_after_publish(parent_descriptor: int) -> None:
 
 
 def _clear_owned_directory(descriptor: int) -> None:
+    os.fchmod(descriptor, 0o700)
     for name in os.listdir(descriptor):
         metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
         if stat.S_ISDIR(metadata.st_mode):
@@ -722,8 +808,8 @@ def export_task_c_formal_bundle(
     source_data_dir: str | Path,
     output_dir: str | Path,
     acquisition_manifest: str | Path,
+    method_assets_root: str | Path,
     use_filter: bool,
-    load_causalbench: Callable[[], tuple[type, type]],
 ) -> dict[str, object]:
     """Build a new formal bundle privately, or fully validate an existing one."""
 
@@ -752,12 +838,23 @@ def export_task_c_formal_bundle(
     ):
         acquisition_bound.close()
         raise TaskCFormalExportError("acquisition manifest 读取快照不一致")
+    try:
+        causalbench_source = validate_causalbench_export_assets(
+            method_assets_root,
+            repository=REPOSITORY,
+            commit=COMMIT,
+        )
+    except TaskCRuntimeError as exc:
+        acquisition_bound.close()
+        raise TaskCFormalExportError(f"固定 CausalBench 资产无效：{exc}") from exc
     converted_paths = {context: source / f"{context}.h5ad" for context in CONTEXTS}
     support_names = (*SUPPORT_FILES, *(("summary_stats.xlsx",) if use_filter else ()))
     support_bound: dict[str, _BoundFile] = {}
     staging_name: str | None = None
     staging_descriptor: int | None = None
     parent_descriptor: int | None = None
+    private_source: Path | None = None
+    module_binding: _CausalBenchModuleBinding | None = None
     try:
         with bind_export_sources_against_acquisition(
             acquisition, converted_paths
@@ -769,9 +866,18 @@ def export_task_c_formal_bundle(
                     bool(use_filter),
                     acquisition_reference,
                     observed_sources,
+                    causalbench_source,
                 )
                 bound_sources.verify_unchanged()
                 acquisition_bound.verify_unchanged()
+                if validate_causalbench_export_assets(
+                    method_assets_root,
+                    repository=REPOSITORY,
+                    commit=COMMIT,
+                ) != causalbench_source:
+                    raise TaskCFormalExportError(
+                        "CausalBench 资产在正式导出复用核对期间发生变化"
+                    )
                 return result
             for name in support_names:
                 candidate = source / name
@@ -798,12 +904,32 @@ def export_task_c_formal_bundle(
                 dir_fd=parent_descriptor,
             )
             staging = Path(f"/proc/self/fd/{staging_descriptor}")
+            private_source = staging / ".causalbench-source"
+            try:
+                materialized_source = materialize_causalbench_source_snapshot(
+                    method_assets_root,
+                    private_source,
+                    repository=REPOSITORY,
+                    commit=COMMIT,
+                    expected_evidence=causalbench_source,
+                )
+            except TaskCRuntimeError as exc:
+                raise TaskCFormalExportError(
+                    f"无法建立固定 CausalBench 私有源码快照：{exc}"
+                ) from exc
+            if materialized_source != causalbench_source:
+                raise TaskCFormalExportError(
+                    "CausalBench 私有源码快照身份与预检不一致"
+                )
+            verify_causalbench_source_snapshot(private_source, causalbench_source)
             for context, descriptor_path in bound_sources.descriptor_paths.items():
                 os.symlink(descriptor_path, staging / f"{context}.h5ad")
             for name, bound in support_bound.items():
                 bound.copy_to(staging, name)
 
-            CreateDataset, CreateEvaluationDatasets = load_causalbench()
+            module_binding = _CausalBenchModuleBinding(private_source)
+            CreateDataset = module_binding.CreateDataset
+            CreateEvaluationDatasets = module_binding.CreateEvaluationDatasets
             returned = CreateDataset(str(staging), bool(use_filter)).load()
             dataset_names = _artifact_names(bool(use_filter))[:2]
             if len(returned) != 2:
@@ -865,6 +991,14 @@ def export_task_c_formal_bundle(
             acquisition_bound.verify_unchanged()
             for bound in support_bound.values():
                 bound.verify_unchanged()
+            assert module_binding is not None
+            assert private_source is not None
+            module_binding.verify()
+            verify_causalbench_source_snapshot(private_source, causalbench_source)
+            module_binding.close()
+            module_binding = None
+            remove_causalbench_source_snapshot(private_source, causalbench_source)
+            private_source = None
 
             descriptor_paths = bound_sources.descriptor_paths
             for context in CONTEXTS:
@@ -909,6 +1043,7 @@ def export_task_c_formal_bundle(
                 ),
                 "exported_at_utc": datetime.now(timezone.utc).isoformat(),
                 "dropped_self_edges": dropped_self,
+                "causalbench_source": causalbench_source,
             }
             _write_json_exclusive(staging / "export_manifest.json", manifest)
             if {entry.name for entry in os.scandir(staging)} != {
@@ -923,9 +1058,25 @@ def export_task_c_formal_bundle(
             bound_sources.verify_unchanged()
             for bound in support_bound.values():
                 bound.verify_unchanged()
+            try:
+                current_causalbench_source = validate_causalbench_export_assets(
+                    method_assets_root,
+                    repository=REPOSITORY,
+                    commit=COMMIT,
+                )
+            except TaskCRuntimeError as exc:
+                raise TaskCFormalExportError(
+                    f"CausalBench 资产在发布前核对失败：{exc}"
+                ) from exc
+            if current_causalbench_source != causalbench_source:
+                raise TaskCFormalExportError(
+                    "CausalBench 资产在正式导出期间发生变化"
+                )
             if not _same_directory_path(parent, parent_metadata):
                 raise TaskCFormalExportError("正式导出父目录在发布前被替换")
             os.fsync(staging_descriptor)
+            bound_sources.verify_unchanged()
+            acquisition_bound.verify_unchanged()
             staging_metadata = os.fstat(staging_descriptor)
             _rename_noreplace(parent_descriptor, staging_name, output.name)
             staging_name = None
@@ -950,7 +1101,17 @@ def export_task_c_formal_bundle(
                 _fsync_parent_after_publish(parent_descriptor)
                 if not _same_directory_path(parent, parent_metadata):
                     raise OSError("published parent directory path changed")
-            except OSError as exc:
+                bound_sources.verify_unchanged()
+                acquisition_bound.verify_unchanged()
+                if validate_causalbench_export_assets(
+                    method_assets_root,
+                    repository=REPOSITORY,
+                    commit=COMMIT,
+                ) != causalbench_source:
+                    raise TaskCFormalExportError(
+                        "CausalBench 资产在发布后发生变化"
+                    )
+            except BaseException as exc:
                 assert staging_descriptor is not None
                 _clear_owned_directory(staging_descriptor)
                 os.rmdir(output.name, dir_fd=parent_descriptor)
@@ -958,15 +1119,35 @@ def export_task_c_formal_bundle(
                     os.fsync(parent_descriptor)
                 except OSError:
                     pass
+                if isinstance(exc, TaskCFormalExportError):
+                    raise
+                if isinstance(exc, TaskCAcquisitionError):
+                    raise TaskCFormalExportError(
+                        "acquisition 在发布后变化；已删除正式导出目录"
+                    ) from exc
+                if isinstance(exc, TaskCRuntimeError):
+                    raise TaskCFormalExportError(
+                        "CausalBench 资产发布后核对失败；已删除正式导出目录"
+                    ) from exc
                 raise TaskCFormalExportError(
-                    "formal export publish fsync failed; published target removed"
+                    "formal export post-publish check failed; published target removed"
                 ) from exc
             result = dict(manifest)
             result["reuse_status"] = "created_new_formal_export"
             return result
-    except TaskCAcquisitionError as exc:
+    except (TaskCAcquisitionError, TaskCRuntimeError) as exc:
         raise TaskCFormalExportError(str(exc)) from exc
     finally:
+        if module_binding is not None:
+            module_binding.close()
+        if private_source is not None and private_source.exists():
+            try:
+                remove_causalbench_source_snapshot(
+                    private_source, causalbench_source
+                )
+            except (TaskCRuntimeError, OSError):
+                # The owned staging directory cleanup below remains the final fallback.
+                pass
         for bound in support_bound.values():
             bound.close()
         acquisition_bound.close()
