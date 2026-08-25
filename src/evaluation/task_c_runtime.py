@@ -38,7 +38,7 @@ MAXIMUM_BOOTSTRAP_INPUT_BYTES = 1024 * 1024
 BOOTSTRAP_COMMAND_TIMEOUT_SECONDS = 600
 MAXIMUM_CAUSALBENCH_SOURCE_BLOB_BYTES = 512 * 1024 * 1024
 CAUSALBENCH_DASK_PINS = frozenset(
-    {"dask[complete]==2024.4.1", "distributed==2024.4.1"}
+    {"dask[complete]==2023.5.0", "distributed==2023.5.0"}
 )
 CAUSALBENCH_EXPORT_REQUIRED_FILES = {
     "causalscbench/__init__.py",

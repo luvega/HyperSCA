@@ -13,8 +13,8 @@ dependencies:
       - pgmpy==1.0.0
       - umap-learn==0.5.7
       # Arboreto 0.1.6 unconditionally builds an empty metadata collection.
-      # Dask 2025+ rejects that fixed official-code path before inference.
-      - dask[complete]==2024.4.1
-      - distributed==2024.4.1
+      # The Dask expression engine rejects that fixed official-code path.
+      - dask[complete]==2023.5.0
+      - distributed==2023.5.0
       - setuptools<81
       - git+https://github.com/causalbench/causalbench.git@1a2143cffdc85f835b41ce8d52034be1bf903e71
