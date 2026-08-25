@@ -14,6 +14,7 @@ import anndata as ad
 
 from src.evaluation.task_c_data import build_task_c_reference_provenance, sha256_path
 from src.evaluation import task_c_acquisition as acquisition_module
+from src.evaluation import task_c_formal_export as formal_export_module
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,6 +77,33 @@ def test_describe_only_reports_filtered_dataset_names(tmp_path):
     assert not data_dir.exists()
 
 
+def test_export_help_exposes_separate_source_and_versioned_output_directories():
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / "scripts/export_causalbench_data.py"), "--help"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--source-data-dir" in completed.stdout
+    assert "原始" in completed.stdout
+
+
+def test_task7_and_task8_use_only_versioned_export_and_prepared_directories():
+    plan = (
+        ROOT / "docs/superpowers/plans/2026-08-13-task-c-rehearsal-and-aggregation.md"
+    ).read_text(encoding="utf-8")
+    task7_and_later = plan.split("### Task 7:", 1)[1]
+
+    assert "raw_export_v2" in task7_and_later
+    assert "prepared_v2" in task7_and_later
+    assert "prepared_v2_identity_summary.json" in task7_and_later
+    assert '"$TASK_C_DATA_ROOT/prepared/' not in task7_and_later
+    assert '"$TASK_C_DATA_ROOT/raw/dataset_' not in task7_and_later
+    assert '"$TASK_C_DATA_ROOT/raw/reference_' not in task7_and_later
+
+
 def test_formal_export_requires_an_independent_acquisition_manifest(tmp_path):
     script_path = ROOT / "scripts" / "export_causalbench_data.py"
     spec = importlib.util.spec_from_file_location("formal_export", script_path)
@@ -98,13 +126,15 @@ def test_formal_export_finds_project_modules_from_a_clean_subprocess(tmp_path):
     environment.pop("PYTHONPATH", None)
     script = ROOT / "scripts/export_causalbench_data.py"
     missing = tmp_path / "missing-acquisition.json"
-    data_dir = tmp_path / "raw"
+    source_dir = tmp_path / "raw"
+    source_dir.mkdir()
+    data_dir = tmp_path / "raw_export_v2"
     probe = "\n".join(
         [
             "import runpy, sys",
             "sys.meta_path = [finder for finder in sys.meta_path "
             "if 'editable' not in repr(finder).casefold()]",
-            f"sys.argv = {[str(script), '--data-dir', str(data_dir), '--acquisition-manifest', str(missing)]!r}",
+            f"sys.argv = {[str(script), '--source-data-dir', str(source_dir), '--data-dir', str(data_dir), '--acquisition-manifest', str(missing)]!r}",
             f"runpy.run_path({str(script)!r}, run_name='__main__')",
         ]
     )
@@ -119,7 +149,7 @@ def test_formal_export_finds_project_modules_from_a_clean_subprocess(tmp_path):
 
     assert completed.returncode != 0
     assert "ModuleNotFoundError" not in completed.stderr
-    assert "获取记录无效" in completed.stderr
+    assert "acquisition manifest" in completed.stderr
 
 
 def test_formal_export_rechecks_sources_before_import_call_or_directory_creation(
@@ -136,9 +166,10 @@ def test_formal_export_rechecks_sources_before_import_call_or_directory_creation
         "load_task_c_acquisition_manifest",
         lambda *args, **kwargs: (
             {"datasets": {"k562": {}, "rpe1": {}}},
-            {"sha256": "sha256:" + "0" * 64},
+            {"sha256": "sha256:" + "0" * 64, "size_bytes": 1},
         ),
     )
+    (tmp_path / "acquisition.json").write_bytes(b"x")
 
     def reject_changed_sources(*args, **kwargs):
         del args, kwargs
@@ -152,6 +183,38 @@ def test_formal_export_rechecks_sources_before_import_call_or_directory_creation
         "verify_export_sources_against_acquisition",
         reject_changed_sources,
     )
+    class RejectingBinding:
+        def __enter__(self):
+            reject_changed_sources()
+
+        def __exit__(self, *args):
+            del args
+
+    monkeypatch.setattr(
+        formal_export_module,
+        "load_task_c_acquisition_manifest",
+        acquisition_module.load_task_c_acquisition_manifest,
+    )
+    monkeypatch.setattr(
+        formal_export_module,
+        "bind_export_sources_against_acquisition",
+        lambda *args, **kwargs: RejectingBinding(),
+    )
+
+    class FakeAcquisitionBound:
+        sha256 = "sha256:" + "0" * 64
+        size_bytes = 1
+
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        def verify_unchanged(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(formal_export_module, "_BoundFile", FakeAcquisitionBound)
 
     class SideEffectDataset:
         def __init__(self, *args, **kwargs):
@@ -178,12 +241,16 @@ def test_formal_export_rechecks_sources_before_import_call_or_directory_creation
     monkeypatch.setitem(sys.modules, dataset_module.__name__, dataset_module)
     monkeypatch.setitem(sys.modules, evaluations_module.__name__, evaluations_module)
     data_dir = tmp_path / "must-not-be-created"
+    source_dir = tmp_path / "raw"
+    source_dir.mkdir()
 
-    with pytest.raises(SystemExit, match="获取记录|H5AD"):
+    with pytest.raises(SystemExit, match="导出无效|changed"):
         exporter.main(
             [
                 "--data-dir",
                 str(data_dir),
+                "--source-data-dir",
+                str(source_dir),
                 "--require-acquisition-manifest",
                 "--acquisition-manifest",
                 str(tmp_path / "acquisition.json"),
@@ -199,6 +266,7 @@ def test_formal_export_records_and_rechecks_the_acquisition_manifest(
 ):
     data_dir = tmp_path / "raw"
     data_dir.mkdir()
+    output_dir = tmp_path / "raw_export_v2"
     mirrors = {}
     converted = {}
     specs = {}
@@ -237,6 +305,14 @@ def test_formal_export_records_and_rechecks_the_acquisition_manifest(
         authoritative_files=specs,
         requested_chunk_rows=1,
     )
+    for name in (
+        "corum_complexes.txt.zip",
+        "human_lr_pair.txt",
+        "protein.links.txt.gz",
+        "protein.physical.links.txt.gz",
+        "protein.info.txt.gz",
+    ):
+        (data_dir / name).write_bytes(name.encode("utf-8"))
 
     class FakeDataset:
         def __init__(self, data_dir, use_filter):
@@ -247,7 +323,12 @@ def test_formal_export_records_and_rechecks_the_acquisition_manifest(
             paths = []
             for context in ("k562", "rpe1"):
                 path = self.data_dir / f"dataset_{context}.npz"
-                path.write_bytes(context.encode("utf-8"))
+                np.savez(
+                    path,
+                    expression_matrix=expression,
+                    interventions=np.asarray(["non-targeting", "ENSG000001"]),
+                    var_names=np.asarray(["ENSG000001", "ENSG000002"]),
+                )
                 paths.append(str(path))
             return paths
 
@@ -278,19 +359,21 @@ def test_formal_export_records_and_rechecks_the_acquisition_manifest(
 
     assert exporter.main(
         [
-            "--data-dir",
+            "--source-data-dir",
             str(data_dir),
+            "--data-dir",
+            str(output_dir),
             "--require-acquisition-manifest",
             "--acquisition-manifest",
             str(acquisition_path),
         ]
     ) == 0
 
-    exported = json.loads((data_dir / "export_manifest.json").read_text())
+    exported = json.loads((output_dir / "export_manifest.json").read_text())
     assert exported["acquisition_manifest"]["sha256"] == (
         "sha256:" + hashlib.sha256(acquisition_path.read_bytes()).hexdigest()
     )
-    assert exported["acquisition_manifest"]["path"] == "../acquisition_manifest.json"
+    assert exported["acquisition_manifest"]["path"] == str(acquisition_path)
     assert set(exported["verified_converted_sources"]) == {"k562", "rpe1"}
 
 

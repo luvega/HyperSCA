@@ -45,6 +45,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="保存官方数据缓存、参考关系和导出清单的目录。",
     )
     parser.add_argument(
+        "--source-data-dir",
+        type=Path,
+        help=(
+            "正式导出读取已核对原始 H5AD 和辅助缓存的目录；"
+            "必须与 --data-dir 的全新版本目录分开。"
+        ),
+    )
+    parser.add_argument(
         "--filter",
         action="store_true",
         help="请求 CausalBench 对表达数据进行官方过滤。",
@@ -132,30 +140,44 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             "正式数据导出缺少独立的获取记录：请提供 --acquisition-manifest。"
         )
-    acquisition = None
-    acquisition_reference = None
-    observed_sources = None
-    if args.acquisition_manifest is not None:
-        from src.evaluation.task_c_acquisition import (
-            TaskCAcquisitionError,
-            load_task_c_acquisition_manifest,
-            verify_export_sources_against_acquisition,
+    formal_mode = args.require_acquisition_manifest or args.acquisition_manifest is not None
+    if formal_mode:
+        if args.source_data_dir is None:
+            raise SystemExit(
+                "正式数据导出缺少原始输入目录：请提供 --source-data-dir。"
+            )
+
+        def load_causalbench() -> tuple[type, type]:
+            try:
+                from causalscbench.data_access.create_dataset import CreateDataset
+                from causalscbench.data_access.create_evaluation_datasets import (
+                    CreateEvaluationDatasets,
+                )
+            except ImportError as exc:
+                raise SystemExit(
+                    "无法导入固定版本 CausalBench；请先创建 "
+                    "envs/task_c/causalbench.yml 中的环境。"
+                ) from exc
+            return CreateDataset, CreateEvaluationDatasets
+
+        from src.evaluation.task_c_formal_export import (
+            TaskCFormalExportError,
+            export_task_c_formal_bundle,
         )
 
+        assert args.acquisition_manifest is not None
         try:
-            acquisition, acquisition_reference = load_task_c_acquisition_manifest(
-                args.acquisition_manifest,
-                require_official_metadata=True,
+            summary = export_task_c_formal_bundle(
+                source_data_dir=args.source_data_dir,
+                output_dir=args.data_dir,
+                acquisition_manifest=args.acquisition_manifest,
+                use_filter=bool(args.filter),
+                load_causalbench=load_causalbench,
             )
-            observed_sources = verify_export_sources_against_acquisition(
-                acquisition,
-                {
-                    "k562": args.data_dir / "k562.h5ad",
-                    "rpe1": args.data_dir / "rpe1.h5ad",
-                },
-            )
-        except TaskCAcquisitionError as exc:
-            raise SystemExit(f"公开数据获取记录无效：{exc}") from exc
+        except TaskCFormalExportError as exc:
+            raise SystemExit(f"正式数据导出无效：{exc}") from exc
+        print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+        return 0
 
     try:
         from causalscbench.data_access.create_dataset import CreateDataset
@@ -176,15 +198,6 @@ def main(argv: list[str] | None = None) -> int:
         "rpe1": str(Path(rpe1_path).resolve()),
     }
     description["paths"] = dataset_paths
-    if acquisition is not None:
-        assert acquisition_reference is not None
-        assert observed_sources is not None
-        description["acquisition_manifest"] = {
-            **acquisition_reference,
-            "path": _relative_path(args.acquisition_manifest, args.data_dir),
-        }
-        description["verified_converted_sources"] = observed_sources
-
     reference_paths: dict[str, str] = {}
     for context_id, dataset_name in (
         ("k562", "weissmann_k562"),

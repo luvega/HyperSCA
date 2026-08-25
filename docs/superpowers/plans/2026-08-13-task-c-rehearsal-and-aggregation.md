@@ -1214,7 +1214,7 @@ conda run -n hypersca python scripts/validate_env.py
 ```bash
 set -euo pipefail
 export TASK_C_DATA_ROOT=/home/a/Data/HyperSCA_external/task_c
-mkdir -p "$TASK_C_DATA_ROOT/raw" "$TASK_C_DATA_ROOT/prepared" "$TASK_C_DATA_ROOT/method_assets"
+mkdir -p "$TASK_C_DATA_ROOT/raw" "$TASK_C_DATA_ROOT/method_assets"
 export TASK_C_ACQUISITION_MANIFEST="$TASK_C_DATA_ROOT/acquisition_manifest.json"
 test ! -e "$TASK_C_ACQUISITION_MANIFEST" && test ! -L "$TASK_C_ACQUISITION_MANIFEST"
 conda run --no-capture-output -n hypersca python scripts/verify_task_c_acquisition.py \
@@ -1227,23 +1227,24 @@ conda run --no-capture-output -n hypersca python scripts/verify_task_c_acquisiti
     --output-manifest "$TASK_C_ACQUISITION_MANIFEST"
 conda run --no-capture-output -n hypersca-task-c-causalbench python \
     scripts/export_causalbench_data.py \
-    --data-dir "$TASK_C_DATA_ROOT/raw" \
+    --source-data-dir "$TASK_C_DATA_ROOT/raw" \
+    --data-dir "$TASK_C_DATA_ROOT/raw_export_v2" \
     --require-acquisition-manifest \
     --acquisition-manifest "$TASK_C_ACQUISITION_MANIFEST"
-export TASK_C_PREPARED_IDENTITY_RECORD="$TASK_C_DATA_ROOT/prepared_identity_summary.json"
+export TASK_C_PREPARED_IDENTITY_RECORD="$TASK_C_DATA_ROOT/prepared_v2_identity_summary.json"
 if [ -e "$TASK_C_PREPARED_IDENTITY_RECORD" ] || [ -L "$TASK_C_PREPARED_IDENTITY_RECORD" ]; then
   echo "prepared identity record already exists; refusing to start" >&2
   exit 1
 fi
-TASK_C_PREPARED_IDENTITY_TMP="$(mktemp "$TASK_C_DATA_ROOT/.prepared_identity_summary.XXXXXX")"
+TASK_C_PREPARED_IDENTITY_TMP="$(mktemp "$TASK_C_DATA_ROOT/.prepared_v2_identity_summary.XXXXXX")"
 if conda run --no-capture-output -n hypersca python scripts/prepare_task_c_data.py \
-    --k562-npz "$TASK_C_DATA_ROOT/raw/dataset_k562.npz" \
-    --rpe1-npz "$TASK_C_DATA_ROOT/raw/dataset_rpe1.npz" \
-    --k562-pooled-reference "$TASK_C_DATA_ROOT/raw/reference_k562_pooled.csv" \
-    --k562-chipseq-reference "$TASK_C_DATA_ROOT/raw/reference_k562_chipseq.csv" \
-    --rpe1-pooled-reference "$TASK_C_DATA_ROOT/raw/reference_rpe1_pooled.csv" \
-    --rpe1-chipseq-reference "$TASK_C_DATA_ROOT/raw/reference_rpe1_chipseq.csv" \
-    --output-dir "$TASK_C_DATA_ROOT/prepared" \
+    --k562-npz "$TASK_C_DATA_ROOT/raw_export_v2/dataset_k562.npz" \
+    --rpe1-npz "$TASK_C_DATA_ROOT/raw_export_v2/dataset_rpe1.npz" \
+    --k562-pooled-reference "$TASK_C_DATA_ROOT/raw_export_v2/reference_k562_pooled.csv" \
+    --k562-chipseq-reference "$TASK_C_DATA_ROOT/raw_export_v2/reference_k562_chipseq.csv" \
+    --rpe1-pooled-reference "$TASK_C_DATA_ROOT/raw_export_v2/reference_rpe1_pooled.csv" \
+    --rpe1-chipseq-reference "$TASK_C_DATA_ROOT/raw_export_v2/reference_rpe1_chipseq.csv" \
+    --output-dir "$TASK_C_DATA_ROOT/prepared_v2" \
     > "$TASK_C_PREPARED_IDENTITY_TMP"; then
   chmod 0400 "$TASK_C_PREPARED_IDENTITY_TMP"
   if ! ln -T -- "$TASK_C_PREPARED_IDENTITY_TMP" "$TASK_C_PREPARED_IDENTITY_RECORD"; then
@@ -1264,12 +1265,15 @@ conda run -n hypersca python scripts/bootstrap_task_c_methods.py --cache-root "$
 `acquisition_manifest.json`。其中本机修改时间只表示“核对时看到的文件系统属性”，
 不是服务器下载时间。正式导出同时传 `--require-acquisition-manifest`，因此缺少或被改写
 的来源记录会在 CausalBench 导出前停止；模拟测试仍可省略该正式闸门。
+正式导出只读取 `raw/`，并把新结果一次性排他发布为 `raw_export_v2/`；随后只从
+`raw_export_v2/` 建立 `prepared_v2/`。已有的 `raw/` 导出缓存和 `prepared/` 保留为旧版
+证据，任何命令都不得在其中补写清单、覆盖文件或把部分缓存当作新版结果。
 
-`prepared_identity_summary.json` 位于 `prepared/` 之外，并且在准备命令成功后才用同目录
+`prepared_v2_identity_summary.json` 位于 `prepared_v2/` 之外，并且在准备命令成功后才用同目录
 硬链接排他发布。运行前发现目标或悬空符号链接时立即停止；若发布时发生竞态，临时
 记录已设为只读，必须保留并在错误信息中报告它的精确路径。只有准备命令本身失败
 才删除不可信的临时输出；正常发布后才删除临时文件名。它是调用者独立保留的身份记录，不是数字签名。核对
-`raw/export_manifest.json` 的来源、官方提交、获取记录指纹（下载时间保持未知），以及 `prepared/provenance/` 中
+`raw_export_v2/export_manifest.json` 的来源、官方提交、获取记录指纹（下载时间保持未知），以及 `prepared_v2/provenance/` 中
 两个表达缓存、汇总生物关系和 ChIP 有向关系的许可与 SHA-256。
 
 - [ ] **Step 3: 重现五份划分并运行连接检查**
@@ -1277,7 +1281,7 @@ conda run -n hypersca python scripts/bootstrap_task_c_methods.py --cache-root "$
 ```bash
 set -euo pipefail
 for TASK_C_SEED in 11 23 47 71 97; do
-  test -f "$TASK_C_DATA_ROOT/prepared/splits/seed_$TASK_C_SEED/public_manifest.json"
+  test -f "$TASK_C_DATA_ROOT/prepared_v2/splits/seed_$TASK_C_SEED/public_manifest.json"
 done
 TASK_C_PREPARED_IDENTITY_SHA256="$(
   conda run --no-capture-output -n hypersca python - "$TASK_C_PREPARED_IDENTITY_RECORD" <<'PY'
@@ -1305,7 +1309,7 @@ fi
 TASK_C_CONNECTION_STDOUT_TMP="$(mktemp "$TASK_C_DATA_ROOT/.connection_rehearsal_stdout.XXXXXX")"
 if conda run --no-capture-output -n hypersca python scripts/run_task_c_rehearsal.py \
     --profile connection \
-    --prepared-root "$TASK_C_DATA_ROOT/prepared/splits/seed_11" \
+    --prepared-root "$TASK_C_DATA_ROOT/prepared_v2/splits/seed_11" \
     --prepared-identity-sha256 "$TASK_C_PREPARED_IDENTITY_SHA256" \
     --method-assets-root "$TASK_C_DATA_ROOT/method_assets" \
     --output-root results/benchmarks/task_c/connection \
@@ -1368,7 +1372,7 @@ conda run -n hypersca python scripts/summarize_task_c_rehearsal.py \
 ```bash
 set -euo pipefail
 export TASK_C_DATA_ROOT=/home/a/Data/HyperSCA_external/task_c
-export TASK_C_PREPARED_IDENTITY_RECORD="$TASK_C_DATA_ROOT/prepared_identity_summary.json"
+export TASK_C_PREPARED_IDENTITY_RECORD="$TASK_C_DATA_ROOT/prepared_v2_identity_summary.json"
 TASK_C_PREPARED_IDENTITY_SHA256="$(
   conda run --no-capture-output -n hypersca python - "$TASK_C_PREPARED_IDENTITY_RECORD" <<'PY'
 import json
@@ -1395,7 +1399,7 @@ fi
 TASK_C_COMPREHENSIVE_STDOUT_TMP="$(mktemp "$TASK_C_DATA_ROOT/.comprehensive_rehearsal_stdout.XXXXXX")"
 if conda run --no-capture-output -n hypersca python scripts/run_task_c_rehearsal.py \
     --profile comprehensive \
-    --prepared-root "$TASK_C_DATA_ROOT/prepared/splits/seed_11" \
+    --prepared-root "$TASK_C_DATA_ROOT/prepared_v2/splits/seed_11" \
     --prepared-identity-sha256 "$TASK_C_PREPARED_IDENTITY_SHA256" \
     --method-assets-root "$TASK_C_DATA_ROOT/method_assets" \
     --output-root results/benchmarks/task_c/comprehensive \
@@ -1421,8 +1425,8 @@ Expected: 每个方法得到六种允许状态之一；BetterBoost、SparseRC �
 
 ```bash
 conda run -n hypersca python scripts/run_hypersca_c_ablations.py \
-  --context "k562=$TASK_C_DATA_ROOT/prepared/splits/seed_11/within/k562/refit.npz" \
-  --context "rpe1=$TASK_C_DATA_ROOT/prepared/splits/seed_11/within/rpe1/refit.npz" \
+  --context "k562=$TASK_C_DATA_ROOT/prepared_v2/splits/seed_11/within/k562/refit.npz" \
+  --context "rpe1=$TASK_C_DATA_ROOT/prepared_v2/splits/seed_11/within/rpe1/refit.npz" \
   --config configs/hypersca_c_v1.json \
   --ablation-registry configs/hypersca_c_ablations_v1.json \
   --output-root results/benchmarks/task_c/comprehensive_ablations \

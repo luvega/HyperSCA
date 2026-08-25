@@ -534,43 +534,150 @@ def _write_exclusive_json(path: Path, payload: Mapping[str, object]) -> None:
     if absolute.exists() or absolute.is_symlink():
         raise TaskCAcquisitionError("acquisition manifest 已存在，拒绝 overwrite")
     absolute.parent.mkdir(parents=True, exist_ok=True)
-    _absolute_without_symlinks(absolute.parent, "acquisition manifest 输出目录")
-    temporary = absolute.parent / f".{absolute.name}.{uuid.uuid4().hex}.tmp"
+    parent = _absolute_without_symlinks(
+        absolute.parent, "acquisition manifest 输出目录"
+    )
+    temporary_name = f".{absolute.name}.{uuid.uuid4().hex}.tmp"
     content = (
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
+    parent_descriptor: int | None = None
     descriptor: int | None = None
+    published = False
+    completed = False
     try:
+        parent_descriptor = os.open(
+            parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        parent_metadata = os.fstat(parent_descriptor)
+        observed_parent = parent.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or (parent_metadata.st_dev, parent_metadata.st_ino)
+            != (observed_parent.st_dev, observed_parent.st_ino)
+        ):
+            raise TaskCAcquisitionError(
+                "acquisition manifest 输出目录在绑定时被替换"
+            )
         descriptor = os.open(
-            temporary,
+            temporary_name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
             0o400,
+            dir_fd=parent_descriptor,
         )
         written = 0
         while written < len(content):
             written += os.write(descriptor, content[written:])
         os.fsync(descriptor)
+        temporary_metadata = os.fstat(descriptor)
         os.close(descriptor)
         descriptor = None
         try:
-            os.link(temporary, absolute, follow_symlinks=False)
+            os.link(
+                temporary_name,
+                absolute.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
         except FileExistsError as exc:
             raise TaskCAcquisitionError(
                 "acquisition manifest 发布时已存在，拒绝 overwrite"
             ) from exc
-        temporary.unlink()
-        directory = os.open(
-            absolute.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        published = True
+        final_descriptor = os.open(
+            absolute.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
         )
         try:
-            os.fsync(directory)
+            final_metadata = os.fstat(final_descriptor)
         finally:
-            os.close(directory)
+            os.close(final_descriptor)
+        if (
+            not stat.S_ISREG(final_metadata.st_mode)
+            or (final_metadata.st_dev, final_metadata.st_ino)
+            != (temporary_metadata.st_dev, temporary_metadata.st_ino)
+            or final_metadata.st_nlink != 2
+        ):
+            raise TaskCAcquisitionError("acquisition manifest 发布后的 inode 无效")
+        os.unlink(temporary_name, dir_fd=parent_descriptor)
+        try:
+            os.fsync(parent_descriptor)
+        except OSError as exc:
+            try:
+                os.unlink(absolute.name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+            try:
+                os.fsync(parent_descriptor)
+            except OSError:
+                pass
+            published = False
+            raise TaskCAcquisitionError(
+                "acquisition manifest publication fsync 失败，已移除发布目标"
+            ) from exc
+        final_descriptor = os.open(
+            absolute.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        try:
+            final_metadata = os.fstat(final_descriptor)
+        finally:
+            os.close(final_descriptor)
+        if (
+            not stat.S_ISREG(final_metadata.st_mode)
+            or (final_metadata.st_dev, final_metadata.st_ino)
+            != (temporary_metadata.st_dev, temporary_metadata.st_ino)
+            or final_metadata.st_nlink != 1
+        ):
+            try:
+                os.unlink(absolute.name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+            published = False
+            raise TaskCAcquisitionError("acquisition manifest 最终 inode 核对失败")
+        try:
+            observed_parent = parent.stat(follow_symlinks=False)
+        except OSError as exc:
+            observed_parent = None
+            parent_error: OSError | None = exc
+        else:
+            parent_error = None
+        if observed_parent is None or (
+            observed_parent.st_dev,
+            observed_parent.st_ino,
+        ) != (parent_metadata.st_dev, parent_metadata.st_ino):
+            try:
+                os.unlink(absolute.name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+            published = False
+            raise TaskCAcquisitionError(
+                "acquisition manifest 输出目录在发布后被替换"
+            ) from parent_error
+        completed = True
     finally:
         if descriptor is not None:
             os.close(descriptor)
-        temporary.unlink(missing_ok=True)
+        if parent_descriptor is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                if not published:
+                    raise
+            if published and not completed:
+                try:
+                    os.unlink(absolute.name, dir_fd=parent_descriptor)
+                except FileNotFoundError:
+                    pass
+            os.close(parent_descriptor)
 
 
 def create_task_c_acquisition_manifest(
@@ -897,31 +1004,114 @@ def verify_export_sources_against_acquisition(
 ) -> dict[str, dict[str, object]]:
     """确认导出命令实际读取的两个 H5AD 仍与来源记录相同。"""
 
-    if set(converted_paths) != {"k562", "rpe1"}:
-        raise TaskCAcquisitionError("导出来源必须且只能包含 k562 与 rpe1")
-    datasets = acquisition.get("datasets")
-    if not isinstance(datasets, dict):
-        raise TaskCAcquisitionError("acquisition record 缺少数据条目")
-    observed: dict[str, dict[str, object]] = {}
-    for context in ("k562", "rpe1"):
-        entry = datasets.get(context)
-        expected = entry.get("converted") if isinstance(entry, dict) else None
-        if not isinstance(expected, dict):
-            raise TaskCAcquisitionError("acquisition record 缺少转换文件指纹")
-        snapshot = _capture_regular_file(
-            converted_paths[context],
-            f"{context} 导出来源 H5AD",
-            maximum_bytes=MAXIMUM_H5AD_BYTES,
-        )
-        if any(
-            (
-                snapshot.sha256 != expected.get("sha256"),
-                snapshot.md5 != expected.get("md5"),
-                snapshot.size_bytes != expected.get("size_bytes"),
-            )
-        ):
+    with bind_export_sources_against_acquisition(
+        acquisition, converted_paths
+    ) as bound_sources:
+        bound_sources.verify_unchanged()
+        return bound_sources.observed_records
+
+
+class BoundTaskCExportSources:
+    """Keep verified converted H5AD inodes open for one formal export."""
+
+    def __init__(
+        self,
+        acquisition: Mapping[str, object],
+        converted_paths: Mapping[str, str | Path],
+    ) -> None:
+        self._acquisition = acquisition
+        self._paths = dict(converted_paths)
+        self._snapshots: dict[str, _FileSnapshot] = {}
+        self._descriptors: dict[str, int] = {}
+
+    def __enter__(self) -> "BoundTaskCExportSources":
+        if set(self._paths) != {"k562", "rpe1"}:
             raise TaskCAcquisitionError(
-                f"{context} 导出来源与 acquisition record 不一致"
+                "导出来源必须且只能包含 k562 与 rpe1"
             )
-        observed[context] = _file_record(snapshot)
-    return observed
+        datasets = self._acquisition.get("datasets")
+        if not isinstance(datasets, dict):
+            raise TaskCAcquisitionError("acquisition record 缺少数据条目")
+        try:
+            for context in ("k562", "rpe1"):
+                entry = datasets.get(context)
+                expected = entry.get("converted") if isinstance(entry, dict) else None
+                if not isinstance(expected, dict):
+                    raise TaskCAcquisitionError(
+                        "acquisition record 缺少转换文件指纹"
+                    )
+                snapshot = _capture_regular_file(
+                    self._paths[context],
+                    f"{context} 导出来源 H5AD",
+                    maximum_bytes=MAXIMUM_H5AD_BYTES,
+                )
+                if any(
+                    (
+                        snapshot.sha256 != expected.get("sha256"),
+                        snapshot.md5 != expected.get("md5"),
+                        snapshot.size_bytes != expected.get("size_bytes"),
+                    )
+                ):
+                    raise TaskCAcquisitionError(
+                        f"{context} 导出来源与 acquisition record 不一致"
+                    )
+                self._snapshots[context] = snapshot
+                self._descriptors[context] = _open_snapshot_descriptor(
+                    snapshot, f"{context} 导出来源 H5AD"
+                )
+            return self
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def descriptor_paths(self) -> dict[str, Path]:
+        if set(self._descriptors) != {"k562", "rpe1"}:
+            raise TaskCAcquisitionError("导出来源 H5AD 尚未绑定")
+        return {
+            context: Path(f"/proc/self/fd/{descriptor}")
+            for context, descriptor in self._descriptors.items()
+        }
+
+    @property
+    def observed_records(self) -> dict[str, dict[str, object]]:
+        return {
+            context: _file_record(snapshot)
+            for context, snapshot in self._snapshots.items()
+        }
+
+    def verify_unchanged(self) -> None:
+        for context in ("k562", "rpe1"):
+            snapshot = self._snapshots[context]
+            descriptor = self._descriptors[context]
+            metadata = os.fstat(descriptor)
+            identity = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+                metadata.st_nlink,
+            )
+            if identity != snapshot.identity or not stat.S_ISREG(metadata.st_mode):
+                raise TaskCAcquisitionError(
+                    f"{context} 导出来源在生成过程中发生变化"
+                )
+            _verify_path_identity(snapshot, f"{context} 导出来源 H5AD")
+
+    def close(self) -> None:
+        while self._descriptors:
+            _, descriptor = self._descriptors.popitem()
+            os.close(descriptor)
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+
+def bind_export_sources_against_acquisition(
+    acquisition: Mapping[str, object],
+    converted_paths: Mapping[str, str | Path],
+) -> BoundTaskCExportSources:
+    """Return a context manager binding verified H5AD source inodes."""
+
+    return BoundTaskCExportSources(acquisition, converted_paths)

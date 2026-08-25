@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 
 import anndata as ad
 import numpy as np
@@ -11,6 +12,7 @@ import pandas as pd
 import pytest
 from scipy import sparse
 
+from src.evaluation import task_c_acquisition as acquisition_module
 from src.evaluation.task_c_acquisition import (
     AcquisitionFileSpec,
     OFFICIAL_ACQUISITION_FILES,
@@ -206,6 +208,46 @@ def test_acquisition_manifest_binds_fixed_metadata_and_local_files(
             authoritative_files=specs,
             requested_chunk_rows=2,
         )
+
+
+def test_acquisition_publication_uses_one_bound_parent_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, object]] = []
+    real_link = acquisition_module.os.link
+
+    def tracked_link(source, destination, **kwargs):
+        calls.append((kwargs.get("src_dir_fd"), kwargs.get("dst_dir_fd")))
+        return real_link(source, destination, **kwargs)
+
+    monkeypatch.setattr(acquisition_module.os, "link", tracked_link)
+    output = tmp_path / "acquisition.json"
+    acquisition_module._write_exclusive_json(output, {"schema_version": "test"})
+
+    assert len(calls) == 1
+    assert calls[0][0] is not None
+    assert calls[0][0] == calls[0][1]
+
+
+def test_acquisition_parent_fsync_failure_removes_published_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_fsync = acquisition_module.os.fsync
+
+    def failing_directory_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("simulated directory fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(acquisition_module.os, "fsync", failing_directory_fsync)
+    output = tmp_path / "acquisition.json"
+    with pytest.raises(TaskCAcquisitionError, match="fsync|发布|publication"):
+        acquisition_module._write_exclusive_json(output, {"schema_version": "test"})
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".acquisition.json.*.tmp"))
 
 
 def test_acquisition_rejects_symlinks_hardlinks_and_wrong_official_digest(
