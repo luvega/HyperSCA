@@ -1195,7 +1195,7 @@ Expected: tests PASS。
 
 **Files:**
 - Generate outside Git: `/home/a/Data/HyperSCA_external/task_c/`
-- Generate ignored results: `results/benchmarks/task_c/connection/`
+- Generate ignored results: `results/benchmarks/task_c/connection_v2/`
 
 - [ ] **Step 1: 建立主环境和隔离环境**
 
@@ -1214,9 +1214,9 @@ conda run -n hypersca python scripts/validate_env.py
 ```bash
 set -euo pipefail
 export TASK_C_DATA_ROOT=/home/a/Data/HyperSCA_external/task_c
-mkdir -p "$TASK_C_DATA_ROOT/raw" "$TASK_C_DATA_ROOT/method_assets"
+mkdir -p "$TASK_C_DATA_ROOT/raw" "$TASK_C_DATA_ROOT/method_assets_v2"
 conda run -n hypersca python scripts/bootstrap_task_c_methods.py \
-    --cache-root "$TASK_C_DATA_ROOT/method_assets"
+    --cache-root "$TASK_C_DATA_ROOT/method_assets_v2"
 export TASK_C_ACQUISITION_MANIFEST="$TASK_C_DATA_ROOT/acquisition_manifest.json"
 test ! -e "$TASK_C_ACQUISITION_MANIFEST" && test ! -L "$TASK_C_ACQUISITION_MANIFEST"
 conda run --no-capture-output -n hypersca python scripts/verify_task_c_acquisition.py \
@@ -1231,7 +1231,7 @@ conda run --no-capture-output -n hypersca-task-c-causalbench python \
     scripts/export_causalbench_data.py \
     --source-data-dir "$TASK_C_DATA_ROOT/raw" \
     --data-dir "$TASK_C_DATA_ROOT/raw_export_v2" \
-    --method-assets-root "$TASK_C_DATA_ROOT/method_assets" \
+    --method-assets-root "$TASK_C_DATA_ROOT/method_assets_v2" \
     --require-acquisition-manifest \
     --acquisition-manifest "$TASK_C_ACQUISITION_MANIFEST"
 export TASK_C_PREPARED_IDENTITY_RECORD="$TASK_C_DATA_ROOT/prepared_v2_identity_summary.json"
@@ -1306,7 +1306,7 @@ print(value)
 PY
 )"
 export TASK_C_PREPARED_IDENTITY_SHA256
-export TASK_C_CONNECTION_STDOUT_RECORD="$TASK_C_DATA_ROOT/connection_rehearsal_initial_stdout.json"
+export TASK_C_CONNECTION_STDOUT_RECORD="$TASK_C_DATA_ROOT/connection_v2_rehearsal_initial_stdout.json"
 if [ -e "$TASK_C_CONNECTION_STDOUT_RECORD" ] || [ -L "$TASK_C_CONNECTION_STDOUT_RECORD" ]; then
   echo "connection stdout record already exists; refusing to start" >&2
   exit 1
@@ -1316,8 +1316,8 @@ if conda run --no-capture-output -n hypersca python scripts/run_task_c_rehearsal
     --profile connection \
     --prepared-root "$TASK_C_DATA_ROOT/prepared_v2/splits/seed_11" \
     --prepared-identity-sha256 "$TASK_C_PREPARED_IDENTITY_SHA256" \
-    --method-assets-root "$TASK_C_DATA_ROOT/method_assets" \
-    --output-root results/benchmarks/task_c/connection \
+    --method-assets-root "$TASK_C_DATA_ROOT/method_assets_v2" \
+    --output-root results/benchmarks/task_c/connection_v2 \
     --methods hypersca_c,mean_difference,random1000,grnboost,pc,notears_linear,gies \
     > "$TASK_C_CONNECTION_STDOUT_TMP"; then
   chmod 0400 "$TASK_C_CONNECTION_STDOUT_TMP"
@@ -1340,7 +1340,7 @@ Expected: 64 个共同基因、每环境不超过 2,000 个细胞、种子 11；
 
 ```bash
 export TASK_C_DATA_ROOT=/home/a/Data/HyperSCA_external/task_c
-export TASK_C_CONNECTION_STDOUT_RECORD="$TASK_C_DATA_ROOT/connection_rehearsal_initial_stdout.json"
+export TASK_C_CONNECTION_STDOUT_RECORD="$TASK_C_DATA_ROOT/connection_v2_rehearsal_initial_stdout.json"
 TASK_C_CONNECTION_RESUME_TOKEN="$(
   conda run --no-capture-output -n hypersca python - "$TASK_C_CONNECTION_STDOUT_RECORD" <<'PY'
 import json
@@ -1356,8 +1356,8 @@ print(value)
 PY
 )"
 conda run -n hypersca python scripts/summarize_task_c_rehearsal.py \
-  --rehearsal-root results/benchmarks/task_c/connection \
-  --output-dir results/benchmarks/task_c/connection_summary \
+  --rehearsal-root results/benchmarks/task_c/connection_v2 \
+  --output-dir results/benchmarks/task_c/connection_v2_summary \
   --resume-token "$TASK_C_CONNECTION_RESUME_TOKEN"
 ```
 
@@ -1406,7 +1406,7 @@ if conda run --no-capture-output -n hypersca python scripts/run_task_c_rehearsal
     --profile comprehensive \
     --prepared-root "$TASK_C_DATA_ROOT/prepared_v2/splits/seed_11" \
     --prepared-identity-sha256 "$TASK_C_PREPARED_IDENTITY_SHA256" \
-    --method-assets-root "$TASK_C_DATA_ROOT/method_assets" \
+    --method-assets-root "$TASK_C_DATA_ROOT/method_assets_v2" \
     --output-root results/benchmarks/task_c/comprehensive \
     --methods hypersca_c,mean_difference,random1000,grnboost,pc,ges,gies,gsp,igsp,notears_linear,dcdi_g,dcdi_dsf,dcdfg_linear,dcdfg_mlp,sortnregress,guanlab_psgrn,betterboost,sparse_rc,catran \
     > "$TASK_C_COMPREHENSIVE_STDOUT_TMP"; then
@@ -1561,7 +1561,7 @@ Expected: 全部 PASS；空间分析、靶点发现和现有因果流程无退�
 
 ```bash
 rg -n '"status": "promoted"|benchmark_supported_candidate' \
-  results/benchmarks/task_c/connection \
+  results/benchmarks/task_c/connection_v2 \
   results/benchmarks/task_c/comprehensive
 ```
 
