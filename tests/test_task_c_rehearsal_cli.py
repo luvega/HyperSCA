@@ -1561,6 +1561,47 @@ def test_formal_validation_rejects_original_gene_count_above_source_limit(
         )
 
 
+def test_private_input_helper_rejects_adversarial_original_gene_count_subclass(
+    prepared_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class AdversarialGeneCount(int):
+        def __lt__(self, other: object) -> bool:
+            return False
+
+        def __gt__(self, other: object) -> bool:
+            return int(other) < 40  # type: ignore[arg-type]
+
+    public = json.loads(
+        (prepared_root / "public_manifest.json").read_text(encoding="utf-8")
+    )
+    private = json.loads(
+        (prepared_root / "private/private_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    oversized_count = AdversarialGeneCount(
+        TASK_C_AUTHORITATIVE_SOURCE_MAXIMUM_GENES + 1
+    )
+    for manifest in (public, private):
+        projection = manifest["gene_projection"]
+        projection["contexts"]["k562"]["original_gene_count"] = oversized_count
+        manifest["materialization_identity"]["gene_projection"] = projection
+    monkeypatch.setattr(
+        rehearsal_module,
+        "_strict_json_payload",
+        lambda *_args, **_kwargs: private,
+    )
+
+    with pytest.raises(
+        TaskCRehearsalError, match="gene-projection context semantics"
+    ):
+        rehearsal_module._validate_private_rehearsal_inputs(
+            prepared_root=prepared_root,
+            public=public,
+        )
+
+
 def test_formal_validation_requires_rematerialization_for_old_identity(
     prepared_root: Path,
     tmp_path: Path,

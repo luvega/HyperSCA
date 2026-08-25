@@ -4822,8 +4822,7 @@ def _validate_private_rehearsal_inputs(
         original_count = record.get("original_gene_count")
         indices = record.get("selected_original_indices")
         if (
-            isinstance(original_count, bool)
-            or not isinstance(original_count, int)
+            type(original_count) is not int
             or original_count < len(genes)
             or original_count > TASK_C_AUTHORITATIVE_SOURCE_MAXIMUM_GENES
             or not _is_sha256_text(record.get("original_gene_names_sha256"))
