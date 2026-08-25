@@ -26,6 +26,7 @@ from src.evaluation.task_c_acquisition import (
     bind_export_sources_against_acquisition,
     load_task_c_acquisition_manifest,
 )
+from src.evaluation.task_c_data import TASK_C_AUTHORITATIVE_SOURCE_MAXIMUM_GENES
 from src.evaluation.task_c_runtime import (
     TaskCRuntimeError,
     materialize_causalbench_source_snapshot,
@@ -56,7 +57,6 @@ MAXIMUM_SUPPORT_BYTES = 16 * 1024 * 1024 * 1024
 MAXIMUM_ARTIFACT_BYTES = 16 * 1024 * 1024 * 1024
 MAXIMUM_NPZ_EXPANDED_BYTES = 32 * 1024 * 1024 * 1024
 MAXIMUM_CELLS = 2_000_000
-MAXIMUM_GENES = 100_000
 MAXIMUM_TEXT_ITEM_BYTES = 1024 * 1024
 MAXIMUM_TOTAL_TEXT_BYTES = 512 * 1024 * 1024
 
@@ -407,7 +407,9 @@ def _validate_npz(path: Path) -> dict[str, object]:
                         if (
                             len(shape) != 2
                             or not 1 <= shape[0] <= MAXIMUM_CELLS
-                            or not 1 <= shape[1] <= MAXIMUM_GENES
+                            or shape[1] < 1
+                            or shape[1]
+                            > TASK_C_AUTHORITATIVE_SOURCE_MAXIMUM_GENES
                             or dtype.kind not in "iuf"
                             or dtype.itemsize <= 0
                         ):
@@ -424,7 +426,7 @@ def _validate_npz(path: Path) -> dict[str, object]:
                         maximum = (
                             MAXIMUM_CELLS
                             if member.filename == "interventions.npy"
-                            else MAXIMUM_GENES
+                            else TASK_C_AUTHORITATIVE_SOURCE_MAXIMUM_GENES
                         )
                         if (
                             len(shape) != 1
@@ -452,7 +454,9 @@ def _validate_npz(path: Path) -> dict[str, object]:
             if (
                 len(expression_shape) != 2
                 or not 1 <= expression_shape[0] <= MAXIMUM_CELLS
-                or not 1 <= expression_shape[1] <= MAXIMUM_GENES
+                or expression_shape[1] < 1
+                or expression_shape[1]
+                > TASK_C_AUTHORITATIVE_SOURCE_MAXIMUM_GENES
                 or interventions_shape != (expression_shape[0],)
                 or genes_shape != (expression_shape[1],)
                 or interventions_dtype.kind not in "US"

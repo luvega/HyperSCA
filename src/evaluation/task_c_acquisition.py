@@ -14,6 +14,8 @@ import uuid
 
 import numpy as np
 
+from src.evaluation.task_c_data import TASK_C_AUTHORITATIVE_SOURCE_MAXIMUM_GENES
+
 
 SCHEMA_VERSION = "1.0"
 RECORD_TYPE = "task_c_acquisition"
@@ -26,7 +28,6 @@ MAXIMUM_RECORD_BYTES = 4 * 1024 * 1024
 MAXIMUM_EVIDENCE_BYTES = 1024 * 1024
 MAXIMUM_MATRIX_CHUNK_BYTES = 128 * 1024 * 1024
 MAXIMUM_CELLS = 2_000_000
-MAXIMUM_GENES = 100_000
 MAXIMUM_METADATA_TEXT_BYTES = 512 * 1024 * 1024
 MAXIMUM_TEXT_VALUE_BYTES = 1024 * 1024
 DEFAULT_CHUNK_ROWS = 256
@@ -395,7 +396,12 @@ def _verify_h5ad_pair(
         if mirror.shape != converted.shape:
             raise TaskCAcquisitionError("镜像与转换文件的 shape 不同")
         cells, genes = mirror.shape
-        if cells <= 0 or genes <= 0 or cells > MAXIMUM_CELLS or genes > MAXIMUM_GENES:
+        if (
+            cells <= 0
+            or genes <= 0
+            or cells > MAXIMUM_CELLS
+            or genes > TASK_C_AUTHORITATIVE_SOURCE_MAXIMUM_GENES
+        ):
             raise TaskCAcquisitionError("H5AD shape 超过核对预算")
         remaining_text = [MAXIMUM_METADATA_TEXT_BYTES]
         for frame, label in (

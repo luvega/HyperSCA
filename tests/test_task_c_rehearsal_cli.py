@@ -14,6 +14,7 @@ import pytest
 
 from src.evaluation.task_c_data import (
     SealedHoldoutSemanticContentHasher,
+    TASK_C_AUTHORITATIVE_SOURCE_MAXIMUM_GENES,
     TaskCDataset,
     build_shared_task_c_split,
     materialize_task_c_split,
@@ -104,8 +105,11 @@ def _external_resume_token(
     )
 
 
-def _dataset(tmp_path: Path, context: str, *, seed: int) -> TaskCDataset:
-    genes = tuple(f"G{index:02d}" for index in range(40))
+def _dataset(
+    tmp_path: Path, context: str, *, seed: int, gene_count: int = 40
+) -> TaskCDataset:
+    gene_width = max(2, len(str(gene_count - 1)))
+    genes = tuple(f"G{index:0{gene_width}d}" for index in range(gene_count))
     sources = genes[:12]
     labels = ["non-targeting"] * 60 + [
         source for source in sources for _ in range(6)
@@ -140,6 +144,30 @@ def prepared_root(tmp_path: Path) -> Path:
     split = build_shared_task_c_split(k562, rpe1, seed=11, min_cells=5)
     root = tmp_path / "prepared" / "splits" / "seed_11"
     materialize_task_c_split(k562, rpe1, split, root)
+    return root
+
+
+def _prepared_root_with_projection_shape(
+    tmp_path: Path,
+    *,
+    common_gene_count: int,
+    original_gene_counts: dict[str, int],
+) -> Path:
+    k562 = _dataset(tmp_path, "k562", seed=11, gene_count=common_gene_count)
+    rpe1 = _dataset(tmp_path, "rpe1", seed=23, gene_count=common_gene_count)
+    split = build_shared_task_c_split(k562, rpe1, seed=11, min_cells=5)
+    root = tmp_path / "prepared" / "splits" / "seed_11"
+    result = materialize_task_c_split(k562, rpe1, split, root)
+    for key in ("public_manifest", "private_manifest"):
+        path = Path(result[key])
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        projection = manifest["gene_projection"]
+        for context, original_gene_count in original_gene_counts.items():
+            projection["contexts"][context][
+                "original_gene_count"
+            ] = original_gene_count
+        manifest["materialization_identity"]["gene_projection"] = projection
+        _write_record(path, manifest)
     return root
 
 
@@ -1482,6 +1510,55 @@ def test_formal_validation_accepts_exact_registered_private_split(
 
     assert manifest_path == prepared_root / "public_manifest.json"
     assert public["materialization_identity"]["seed"] == 11
+
+
+def test_formal_validation_accepts_real_gene_projection_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _prepared_root_with_projection_shape(
+        tmp_path,
+        common_gene_count=396,
+        original_gene_counts={"k562": 1_158, "rpe1": 651},
+    )
+    assets = _formal_validation_dependencies(prepared, tmp_path)
+    monkeypatch.setattr(rehearsal_module, "_FULL_RUN_SEEDS", (11,))
+
+    _, public = rehearsal_module._validate_prepared_rehearsal_inputs(
+        prepared_root=prepared,
+        method_assets_root=assets,
+        synthetic_smoke=False,
+    )
+
+    projection = public["materialization_identity"]["gene_projection"]
+    assert projection["common"]["count"] == 396
+    assert projection["contexts"]["k562"]["original_gene_count"] == 1_158
+    assert projection["contexts"]["rpe1"]["original_gene_count"] == 651
+
+
+def test_formal_validation_rejects_original_gene_count_above_source_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _prepared_root_with_projection_shape(
+        tmp_path,
+        common_gene_count=40,
+        original_gene_counts={
+            "k562": TASK_C_AUTHORITATIVE_SOURCE_MAXIMUM_GENES + 1,
+            "rpe1": TASK_C_AUTHORITATIVE_SOURCE_MAXIMUM_GENES,
+        },
+    )
+    assets = _formal_validation_dependencies(prepared, tmp_path)
+    monkeypatch.setattr(rehearsal_module, "_FULL_RUN_SEEDS", (11,))
+
+    with pytest.raises(
+        TaskCRehearsalError, match="gene-projection context semantics"
+    ):
+        rehearsal_module._validate_prepared_rehearsal_inputs(
+            prepared_root=prepared,
+            method_assets_root=assets,
+            synthetic_smoke=False,
+        )
 
 
 def test_formal_validation_requires_rematerialization_for_old_identity(

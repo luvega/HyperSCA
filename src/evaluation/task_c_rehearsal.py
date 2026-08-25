@@ -32,6 +32,7 @@ from urllib.parse import unquote, urlparse
 
 import numpy as np
 
+from src.evaluation.task_c_data import TASK_C_AUTHORITATIVE_SOURCE_MAXIMUM_GENES
 from src.evaluation.task_c_profile_input import (
     CROSS_TRANSFORMATION,
     MAXIMUM_DISTINCT_LABELS,
@@ -4823,7 +4824,8 @@ def _validate_private_rehearsal_inputs(
         if (
             isinstance(original_count, bool)
             or not isinstance(original_count, int)
-            or not len(genes) <= original_count <= MAXIMUM_PARENT_GENES
+            or original_count < len(genes)
+            or original_count > TASK_C_AUTHORITATIVE_SOURCE_MAXIMUM_GENES
             or not _is_sha256_text(record.get("original_gene_names_sha256"))
             or isinstance(indices, (str, bytes))
             or not isinstance(indices, Sequence)
