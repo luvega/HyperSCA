@@ -10,6 +10,12 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 REPOSITORY = "https://github.com/causalbench/causalbench.git"
@@ -128,16 +134,25 @@ def main(argv: list[str] | None = None) -> int:
         )
     acquisition = None
     acquisition_reference = None
+    observed_sources = None
     if args.acquisition_manifest is not None:
         from src.evaluation.task_c_acquisition import (
             TaskCAcquisitionError,
             load_task_c_acquisition_manifest,
+            verify_export_sources_against_acquisition,
         )
 
         try:
             acquisition, acquisition_reference = load_task_c_acquisition_manifest(
                 args.acquisition_manifest,
                 require_official_metadata=True,
+            )
+            observed_sources = verify_export_sources_against_acquisition(
+                acquisition,
+                {
+                    "k562": args.data_dir / "k562.h5ad",
+                    "rpe1": args.data_dir / "rpe1.h5ad",
+                },
             )
         except TaskCAcquisitionError as exc:
             raise SystemExit(f"公开数据获取记录无效：{exc}") from exc
@@ -162,22 +177,8 @@ def main(argv: list[str] | None = None) -> int:
     }
     description["paths"] = dataset_paths
     if acquisition is not None:
-        from src.evaluation.task_c_acquisition import (
-            TaskCAcquisitionError,
-            verify_export_sources_against_acquisition,
-        )
-
-        try:
-            observed_sources = verify_export_sources_against_acquisition(
-                acquisition,
-                {
-                    "k562": args.data_dir / "k562.h5ad",
-                    "rpe1": args.data_dir / "rpe1.h5ad",
-                },
-            )
-        except TaskCAcquisitionError as exc:
-            raise SystemExit(f"导出所用 H5AD 与获取记录不一致：{exc}") from exc
         assert acquisition_reference is not None
+        assert observed_sources is not None
         description["acquisition_manifest"] = {
             **acquisition_reference,
             "path": _relative_path(args.acquisition_manifest, args.data_dir),

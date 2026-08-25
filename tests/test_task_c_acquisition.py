@@ -107,6 +107,54 @@ def test_h5ad_conversion_rejects_changed_values_and_nonfinite_values(
         verify_h5ad_conversion(mirror, converted, requested_chunk_rows=2)
 
 
+def test_h5ad_validation_reopens_only_descriptor_bound_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mirror, converted = _write_h5ad_pair(tmp_path, "k562")
+    evil_root = tmp_path / "replacement"
+    evil_root.mkdir()
+    evil_mirror, evil_converted = _write_h5ad_pair(evil_root, "k562")
+    evil = ad.read_h5ad(evil_mirror)
+    evil.X[0, 0] = 91.0
+    evil.write_h5ad(evil_mirror)
+    evil = ad.read_h5ad(evil_converted)
+    evil.X[0, 0] = 91.0
+    evil.write_h5ad(evil_converted)
+    real_read_h5ad = ad.read_h5ad
+    originals = (mirror, converted)
+    replacements = (evil_mirror, evil_converted)
+    backups = tuple(tmp_path / f"original-{index}.h5ad" for index in range(2))
+    swapped = False
+    opened = 0
+
+    def swapping_read_h5ad(path, *args, **kwargs):
+        nonlocal swapped, opened
+        candidate = Path(path)
+        if candidate in originals and not swapped:
+            for original, replacement, backup in zip(
+                originals, replacements, backups, strict=True
+            ):
+                os.replace(original, backup)
+                os.replace(replacement, original)
+            swapped = True
+        result = real_read_h5ad(path, *args, **kwargs)
+        opened += 1
+        if swapped and opened == 2:
+            for original, replacement, backup in zip(
+                originals, replacements, backups, strict=True
+            ):
+                os.replace(original, replacement)
+                os.replace(backup, original)
+        return result
+
+    monkeypatch.setattr(ad, "read_h5ad", swapping_read_h5ad)
+
+    verify_h5ad_conversion(mirror, converted, requested_chunk_rows=2)
+
+    assert swapped is False
+
+
 def test_acquisition_manifest_binds_fixed_metadata_and_local_files(
     tmp_path: Path,
 ) -> None:

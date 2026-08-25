@@ -1,5 +1,6 @@
 import json
 import importlib.util
+import os
 import subprocess
 import sys
 import types
@@ -90,6 +91,107 @@ def test_formal_export_requires_an_independent_acquisition_manifest(tmp_path):
                 "--require-acquisition-manifest",
             ]
         )
+
+
+def test_formal_export_finds_project_modules_from_a_clean_subprocess(tmp_path):
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    script = ROOT / "scripts/export_causalbench_data.py"
+    missing = tmp_path / "missing-acquisition.json"
+    data_dir = tmp_path / "raw"
+    probe = "\n".join(
+        [
+            "import runpy, sys",
+            "sys.meta_path = [finder for finder in sys.meta_path "
+            "if 'editable' not in repr(finder).casefold()]",
+            f"sys.argv = {[str(script), '--data-dir', str(data_dir), '--acquisition-manifest', str(missing)]!r}",
+            f"runpy.run_path({str(script)!r}, run_name='__main__')",
+        ]
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", probe],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "ModuleNotFoundError" not in completed.stderr
+    assert "获取记录无效" in completed.stderr
+
+
+def test_formal_export_rechecks_sources_before_import_call_or_directory_creation(
+    tmp_path, monkeypatch
+):
+    script_path = ROOT / "scripts" / "export_causalbench_data.py"
+    spec = importlib.util.spec_from_file_location("formal_export_order", script_path)
+    exporter = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(exporter)
+    events = []
+    monkeypatch.setattr(
+        acquisition_module,
+        "load_task_c_acquisition_manifest",
+        lambda *args, **kwargs: (
+            {"datasets": {"k562": {}, "rpe1": {}}},
+            {"sha256": "sha256:" + "0" * 64},
+        ),
+    )
+
+    def reject_changed_sources(*args, **kwargs):
+        del args, kwargs
+        events.append("verify_sources")
+        raise acquisition_module.TaskCAcquisitionError(
+            "converted source changed after acquisition record"
+        )
+
+    monkeypatch.setattr(
+        acquisition_module,
+        "verify_export_sources_against_acquisition",
+        reject_changed_sources,
+    )
+
+    class SideEffectDataset:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            events.append("causalbench_called")
+
+        def load(self):
+            return ["unused-k562.npz", "unused-rpe1.npz"]
+
+    class SideEffectEvaluations:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+    package = types.ModuleType("causalscbench")
+    data_access = types.ModuleType("causalscbench.data_access")
+    dataset_module = types.ModuleType("causalscbench.data_access.create_dataset")
+    evaluations_module = types.ModuleType(
+        "causalscbench.data_access.create_evaluation_datasets"
+    )
+    dataset_module.CreateDataset = SideEffectDataset
+    evaluations_module.CreateEvaluationDatasets = SideEffectEvaluations
+    monkeypatch.setitem(sys.modules, "causalscbench", package)
+    monkeypatch.setitem(sys.modules, "causalscbench.data_access", data_access)
+    monkeypatch.setitem(sys.modules, dataset_module.__name__, dataset_module)
+    monkeypatch.setitem(sys.modules, evaluations_module.__name__, evaluations_module)
+    data_dir = tmp_path / "must-not-be-created"
+
+    with pytest.raises(SystemExit, match="获取记录|H5AD"):
+        exporter.main(
+            [
+                "--data-dir",
+                str(data_dir),
+                "--require-acquisition-manifest",
+                "--acquisition-manifest",
+                str(tmp_path / "acquisition.json"),
+            ]
+        )
+
+    assert events == ["verify_sources"]
+    assert not data_dir.exists()
 
 
 def test_formal_export_records_and_rechecks_the_acquisition_manifest(

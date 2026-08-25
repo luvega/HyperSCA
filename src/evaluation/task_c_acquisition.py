@@ -201,6 +201,37 @@ def _verify_path_identity(snapshot: _FileSnapshot, label: str) -> None:
         raise TaskCAcquisitionError(f"{label}在核对过程中发生变化")
 
 
+def _open_snapshot_descriptor(snapshot: _FileSnapshot, label: str) -> int:
+    """Reopen the verified inode once, then keep it bound during HDF5 reads."""
+
+    absolute = _absolute_without_symlinks(snapshot.path, label)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(absolute, flags)
+    except OSError as exc:
+        raise TaskCAcquisitionError(f"{label}在分块核对前缺失或被替换") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        identity = (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+            metadata.st_nlink,
+        )
+        if identity != snapshot.identity or not stat.S_ISREG(metadata.st_mode):
+            raise TaskCAcquisitionError(f"{label}在分块核对前发生变化")
+        descriptor_path = Path(f"/proc/self/fd/{descriptor}")
+        if not descriptor_path.exists():
+            raise TaskCAcquisitionError("本机缺少绑定 H5AD 文件所需的 /proc/self/fd")
+        os.set_inheritable(descriptor, False)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _safe_json_load(payload: bytes, label: str) -> object:
     try:
         text = payload.decode("utf-8")
@@ -336,15 +367,31 @@ def _verify_h5ad_pair(
     *,
     requested_chunk_rows: int,
 ) -> dict[str, object]:
-    import anndata as ad
-    import pandas as pd
+    mirror_descriptor = _open_snapshot_descriptor(
+        mirror_snapshot, "Zenodo 镜像 H5AD"
+    )
+    try:
+        converted_descriptor = _open_snapshot_descriptor(
+            converted_snapshot, "转换后 H5AD"
+        )
+    except BaseException:
+        os.close(mirror_descriptor)
+        raise
+    mirror = None
+    converted = None
+    try:
+        import anndata as ad
+        import pandas as pd
 
-    try:
-        mirror = ad.read_h5ad(mirror_snapshot.path, backed="r")
-        converted = ad.read_h5ad(converted_snapshot.path, backed="r")
-    except Exception as exc:
-        raise TaskCAcquisitionError("H5AD 文件无法以只读分块方式打开") from exc
-    try:
+        try:
+            mirror = ad.read_h5ad(
+                Path(f"/proc/self/fd/{mirror_descriptor}"), backed="r"
+            )
+            converted = ad.read_h5ad(
+                Path(f"/proc/self/fd/{converted_descriptor}"), backed="r"
+            )
+        except Exception as exc:
+            raise TaskCAcquisitionError("H5AD 文件无法以只读分块方式打开") from exc
         if mirror.shape != converted.shape:
             raise TaskCAcquisitionError("镜像与转换文件的 shape 不同")
         cells, genes = mirror.shape
@@ -424,8 +471,12 @@ def _verify_h5ad_pair(
         )
         matrix_dtype = str(np.dtype(mirror.X.dtype))
     finally:
-        mirror.file.close()
-        converted.file.close()
+        if mirror is not None:
+            mirror.file.close()
+        if converted is not None:
+            converted.file.close()
+        os.close(mirror_descriptor)
+        os.close(converted_descriptor)
     _verify_path_identity(mirror_snapshot, "Zenodo 镜像 H5AD")
     _verify_path_identity(converted_snapshot, "转换后 H5AD")
     return {

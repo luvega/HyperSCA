@@ -169,7 +169,7 @@ class _FileSnapshot:
         self,
         path: Path,
         payload: bytes,
-        identity: tuple[int, int, int, int],
+        identity: tuple[int, int, int, int, int],
     ) -> None:
         self.path = path
         self.payload = payload
@@ -178,6 +178,10 @@ class _FileSnapshot:
     @property
     def sha256(self) -> str:
         return _sha256_bytes(self.payload)
+
+    @property
+    def mode(self) -> int:
+        return self.identity[4]
 
 
 class _CommandResult:
@@ -343,12 +347,14 @@ def _snapshot_regular_file(
         before.st_ino,
         before.st_size,
         before.st_mtime_ns,
+        before.st_mode,
     )
     after_identity = (
         after.st_dev,
         after.st_ino,
         after.st_size,
         after.st_mtime_ns,
+        after.st_mode,
     )
     if before_identity != after_identity or len(payload) != before.st_size:
         raise TaskCRuntimeError(f"{label} changed while it was read")
@@ -1175,6 +1181,39 @@ def _run_checked(
         ) from exc
 
 
+def _git_blob_id(payload: bytes, object_format: str) -> str:
+    if object_format not in {"sha1", "sha256"}:
+        raise TaskCRuntimeError("official source uses an unsupported Git object format")
+    digest = hashlib.new(object_format)
+    digest.update(f"blob {len(payload)}\0".encode("ascii"))
+    digest.update(payload)
+    return digest.hexdigest()
+
+
+def _parse_fixed_commit_tree(text: str) -> dict[str, tuple[str, str]]:
+    records: dict[str, tuple[str, str]] = {}
+    for raw_record in text.split("\x00"):
+        if not raw_record:
+            continue
+        metadata, separator, relative = raw_record.partition("\t")
+        parts = metadata.split(" ")
+        if (
+            separator != "\t"
+            or len(parts) != 3
+            or parts[0] not in {"100644", "100755"}
+            or parts[1] != "blob"
+            or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", parts[2]) is None
+            or not relative
+            or relative.startswith("/")
+            or relative in records
+        ):
+            raise TaskCRuntimeError("fixed commit contains an unsupported Git tree entry")
+        records[relative] = (parts[0], parts[2])
+    if not records:
+        raise TaskCRuntimeError("fixed commit does not contain ordinary source files")
+    return records
+
+
 def _validate_source_checkout(
     source: Path,
     expected: Mapping[str, str],
@@ -1247,15 +1286,28 @@ def _validate_source_checkout(
     ).stdout
     committed_text = _run_checked(
         runner,
-        ["git", "-C", str(source), "ls-tree", "-r", "-z", "--name-only", "HEAD"],
+        ["git", "-C", str(source), "ls-tree", "-r", "-z", "HEAD"],
         capture_output=True,
     ).stdout
     tracked = {item for item in tracked_text.split("\x00") if item}
-    committed = {item for item in committed_text.split("\x00") if item}
+    committed_tree = _parse_fixed_commit_tree(committed_text)
+    committed = set(committed_tree)
     if tracked != committed or not tracked:
         raise TaskCRuntimeError(
             "official source tracked files do not match the fixed commit"
         )
+    object_format = _run_checked(
+        runner,
+        ["git", "-C", str(source), "rev-parse", "--show-object-format"],
+        capture_output=True,
+    ).stdout.strip()
+    if object_format not in {"sha1", "sha256"}:
+        raise TaskCRuntimeError("official source uses an unsupported Git object format")
+    if any(
+        len(blob_id) != (40 if object_format == "sha1" else 64)
+        for _, blob_id in committed_tree.values()
+    ):
+        raise TaskCRuntimeError("fixed commit blob identity has the wrong length")
     _run_checked(
         runner,
         ["git", "-C", str(source), "diff", "--no-ext-diff", "--quiet", "HEAD", "--"],
@@ -1289,10 +1341,27 @@ def _validate_source_checkout(
                 path,
                 f"official source file {relative}",
                 maximum_bytes=512 * 1024 * 1024,
-                allow_empty=True,
+                allow_empty=(
+                    committed_tree[relative][1]
+                    == _git_blob_id(b"", object_format)
+                ),
             )
+            expected_mode, expected_blob_id = committed_tree[relative]
+            observed_executable = bool(snapshot.mode & 0o111)
+            if observed_executable != (expected_mode == "100755"):
+                raise TaskCRuntimeError(
+                    f"official source file {relative} mode differs from the fixed commit"
+                )
+            if _git_blob_id(snapshot.payload, object_format) != expected_blob_id:
+                raise TaskCRuntimeError(
+                    f"official source file {relative} bytes differ from the fixed commit blob"
+                )
             worktree_files.add(relative)
             digest.update(relative.encode("utf-8"))
+            digest.update(b"\x00")
+            digest.update(expected_mode.encode("ascii"))
+            digest.update(b"\x00")
+            digest.update(expected_blob_id.encode("ascii"))
             digest.update(b"\x00")
             digest.update(bytes.fromhex(snapshot.sha256))
     if worktree_files != tracked:

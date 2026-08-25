@@ -1041,6 +1041,8 @@ class _FakeBootstrapRunner:
                 )
             if operation == ["rev-parse", "HEAD"]:
                 return _FakeCompleted(stdout=self.repositories[source]["commit"] + "\n")
+            if operation == ["rev-parse", "--show-object-format"]:
+                return _FakeCompleted(stdout="sha1\n")
             if operation and operation[0] == "status":
                 return _FakeCompleted(stdout="")
             if operation == ["replace", "-l"]:
@@ -1051,8 +1053,13 @@ class _FakeBootstrapRunner:
                 return _FakeCompleted(stdout=str(source / ".git/info/grafts") + "\n")
             if operation[:3] == ["ls-files", "-z", "--cached"]:
                 return _FakeCompleted(stdout="README.md\x00")
-            if operation[:4] == ["ls-tree", "-r", "-z", "--name-only"]:
-                return _FakeCompleted(stdout="README.md\x00")
+            if operation == ["ls-tree", "-r", "-z", "HEAD"]:
+                blob_id = runtime_module._git_blob_id(
+                    b"fixed official source\n", "sha1"
+                )
+                return _FakeCompleted(
+                    stdout=f"100644 blob {blob_id}\tREADME.md\x00"
+                )
             if operation[:3] == ["diff", "--no-ext-diff", "--quiet"]:
                 return _FakeCompleted(stdout="")
         if command == ["conda", "env", "list", "--json"]:
@@ -1120,9 +1127,16 @@ class _EmptyTrackedSourceRunner(_FakeBootstrapRunner):
                 return _FakeCompleted(
                     stdout="README.md\x00causalscbench/__init__.py\x00"
                 )
-            if operation[:4] == ["ls-tree", "-r", "-z", "--name-only"]:
+            if operation == ["ls-tree", "-r", "-z", "HEAD"]:
+                readme_blob = runtime_module._git_blob_id(
+                    b"fixed official source\n", "sha1"
+                )
+                empty_blob = runtime_module._git_blob_id(b"", "sha1")
                 return _FakeCompleted(
-                    stdout="README.md\x00causalscbench/__init__.py\x00"
+                    stdout=(
+                        f"100644 blob {readme_blob}\tREADME.md\x00"
+                        f"100644 blob {empty_blob}\tcausalscbench/__init__.py\x00"
+                    )
                 )
         return super().__call__(command, **kwargs)
 
@@ -1222,6 +1236,61 @@ def test_bootstrap_accepts_an_empty_file_tracked_by_the_fixed_source_commit(
     )
 
     assert summary["status"] == "assets_and_environments_recorded"
+
+
+def test_source_validation_binds_live_bytes_to_the_fixed_commit_blob(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "official-source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.name", "Task C Test"],
+        check=True,
+    )
+    repository = "https://example.invalid/fixed-source.git"
+    subprocess.run(
+        ["git", "-C", str(source), "remote", "add", "origin", repository],
+        check=True,
+    )
+    package = source / "package"
+    package.mkdir()
+    tracked = package / "__init__.py"
+    tracked.write_text("COMMITTED = True\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "commit", "-q", "-m", "fixed"],
+        check=True,
+    )
+    revision = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source),
+            "update-index",
+            "--assume-unchanged",
+            "package/__init__.py",
+        ],
+        check=True,
+    )
+    tracked.write_bytes(b"")
+
+    with pytest.raises(TaskCRuntimeError, match="empty|blob|fixed commit|bytes"):
+        runtime_module._validate_source_checkout(
+            source,
+            {"repository": repository, "commit": revision},
+            subprocess.run,
+        )
 
 
 @pytest.mark.parametrize(
