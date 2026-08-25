@@ -37,6 +37,9 @@ MAXIMUM_BOOTSTRAP_COMMAND_BYTES = 8 * 1024 * 1024
 MAXIMUM_BOOTSTRAP_INPUT_BYTES = 1024 * 1024
 BOOTSTRAP_COMMAND_TIMEOUT_SECONDS = 600
 MAXIMUM_CAUSALBENCH_SOURCE_BLOB_BYTES = 512 * 1024 * 1024
+CAUSALBENCH_DASK_PINS = frozenset(
+    {"dask[complete]==2024.4.1", "distributed==2024.4.1"}
+)
 CAUSALBENCH_EXPORT_REQUIRED_FILES = {
     "causalscbench/__init__.py",
     "causalscbench/data_access/__init__.py",
@@ -970,6 +973,8 @@ def _validate_environment_snapshot(
     snapshot: _FileSnapshot,
     expected_name: str,
     causalbench_pin: str,
+    *,
+    require_arboreto_dask: bool,
 ) -> None:
     try:
         text = snapshot.payload.decode("utf-8")
@@ -1057,6 +1062,20 @@ def _validate_environment_snapshot(
         raise TaskCRuntimeError(
             f"environment {expected_name} does not contain the fixed CausalBench source"
         )
+    if require_arboreto_dask:
+        dask_dependencies = {
+            dependency
+            for dependency in pip_strings
+            if re.fullmatch(
+                r"(?:dask(?:\[[^\]]+\])?|distributed)(?:[<>=!~@ ;].*)?",
+                dependency,
+                flags=re.IGNORECASE,
+            )
+        }
+        if dask_dependencies != CAUSALBENCH_DASK_PINS:
+            raise TaskCRuntimeError(
+                f"environment {expected_name} does not contain exactly the fixed Arboreto Dask and distributed versions"
+            )
 
 
 def _source_records(registry: TaskCMethodRegistry) -> dict[str, dict[str, str]]:
@@ -1094,7 +1113,12 @@ def _environment_records(
     snapshots: dict[str, _FileSnapshot] = {}
     for expected_name, path in records.items():
         snapshot = _snapshot_regular_file(path, f"environment file {path.name}")
-        _validate_environment_snapshot(snapshot, expected_name, causalbench_pin)
+        _validate_environment_snapshot(
+            snapshot,
+            expected_name,
+            causalbench_pin,
+            require_arboreto_dask=path.name == "causalbench.yml",
+        )
         snapshots[expected_name] = snapshot
     return snapshots
 

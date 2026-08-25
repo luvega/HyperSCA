@@ -757,6 +757,37 @@ def test_stable_fit_all_expected_failures_trigger_full_abstention(
     assert len(result.failures) == 2
 
 
+def test_cpu_stable_fit_uses_one_torch_thread_and_restores_the_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+
+    config = default_config(bootstrap_repeats=1)
+    state = {"threads": 8}
+    observed: list[int] = []
+
+    monkeypatch.setattr(torch, "get_num_threads", lambda: state["threads"])
+    monkeypatch.setattr(
+        torch, "set_num_threads", lambda value: state.__setitem__("threads", value)
+    )
+
+    def fake_fit(
+        sampled_contexts: list[HyperSCACContext], *args: object, **kwargs: object
+    ) -> SimpleNamespace:
+        observed.append(torch.get_num_threads())
+        return SimpleNamespace(
+            context_adjacencies={
+                sampled_contexts[0].context_id: np.zeros((3, 3), dtype=np.float32)
+            }
+        )
+
+    monkeypatch.setattr(stability_module, "fit_hypersca_c_once", fake_fit)
+    fit_stable_hypersca_c([make_context()], config, seed=11, device="cpu")
+
+    assert observed == [1]
+    assert state["threads"] == 8
+
+
 def test_stable_fit_propagates_unexpected_runtime_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

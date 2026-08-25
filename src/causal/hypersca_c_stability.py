@@ -848,25 +848,33 @@ def fit_stable_hypersca_c(
 
     matrices: list[Mapping[str, np.ndarray]] = []
     failures: list[str] = []
-    for repeat in range(config.bootstrap_repeats):
-        repeat_seed = normalized_seed + repeat
-        repeat_rng = np.random.default_rng(repeat_seed)
-        sampled = [
-            stratified_bootstrap_context(context, repeat_rng)
-            for context in normalized_contexts
-        ]
-        try:
-            fit = fit_hypersca_c_once(
-                sampled,
-                config,
-                seed=repeat_seed,
-                device=device,
-                prior_mask=prior_mask,
-            )
-        except HyperSCACError as exc:
-            failures.append(_compact_failure(repeat, exc))
-            continue
-        matrices.append(fit.context_adjacencies)
+    previous_torch_threads: int | None = None
+    if target_device.type == "cpu":
+        previous_torch_threads = _core.torch.get_num_threads()
+        _core.torch.set_num_threads(1)
+    try:
+        for repeat in range(config.bootstrap_repeats):
+            repeat_seed = normalized_seed + repeat
+            repeat_rng = np.random.default_rng(repeat_seed)
+            sampled = [
+                stratified_bootstrap_context(context, repeat_rng)
+                for context in normalized_contexts
+            ]
+            try:
+                fit = fit_hypersca_c_once(
+                    sampled,
+                    config,
+                    seed=repeat_seed,
+                    device=device,
+                    prior_mask=prior_mask,
+                )
+            except HyperSCACError as exc:
+                failures.append(_compact_failure(repeat, exc))
+                continue
+            matrices.append(fit.context_adjacencies)
+    finally:
+        if previous_torch_threads is not None:
+            _core.torch.set_num_threads(previous_torch_threads)
 
     predictions, summary = build_stability_table(
         matrices,

@@ -868,6 +868,19 @@ def test_hypersca_uses_the_same_capped_profile_cells(
     assert run_manifest["stage"] == "tune"
     assert run_manifest["condition"] == "within_tune_k562"
     assert run_manifest["profile_input"]["input_path"] == "<verified-profile-input>"
+    assert run_manifest["profile_input"]["manifest_path"] == (
+        "<verified-profile-manifest>"
+    )
+    assert run_manifest["config"]["path"] == "<verified-profile-config>"
+    assert run_manifest["gene_selection"]["path"] == (
+        "<verified-profile-gene-list>"
+    )
+    assert run_manifest["run_identity"]["config_path"] == (
+        "<verified-profile-config>"
+    )
+    assert run_manifest["run_identity"]["gene_list_path"] == (
+        "<verified-profile-gene-list>"
+    )
     assert run_manifest["contexts"][0]["input_path"] == "<verified-profile-input>"
     assert run_manifest["run_identity"]["contexts"][0]["input_path"] == (
         "<verified-profile-input>"

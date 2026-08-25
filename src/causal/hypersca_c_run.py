@@ -1749,7 +1749,7 @@ def run_hypersca_c(
         profile_record = {
             "input_path": "<verified-profile-input>",
             "input_sha256": profile_data.input_sha256,
-            "manifest_path": str(profile_data.manifest_path),
+            "manifest_path": "<verified-profile-manifest>",
             "manifest_sha256": profile_data.manifest_sha256,
             "profile": profile_data.profile,
             "record": dict(profile_data.manifest),
@@ -1814,10 +1814,16 @@ def run_hypersca_c(
     selected_public_bytes.clear()
 
     code = _git_state()
+    recorded_config_path = (
+        Path("<verified-profile-config>") if profile_requested else config_file
+    )
+    recorded_gene_path = (
+        Path("<verified-profile-gene-list>") if profile_requested else gene_path
+    )
     identity = _build_identity(
         context_records=context_records,
-        config_path=config_file,
-        gene_path=gene_path,
+        config_path=recorded_config_path,
+        gene_path=recorded_gene_path,
         public_manifest_path=manifest_path,
         seed=normalized_seed,
         device=normalized_device,
@@ -1829,7 +1835,7 @@ def run_hypersca_c(
         profile_input=profile_record,
     )
     gene_record: dict[str, object] = {
-        "path": str(gene_path),
+        "path": str(recorded_gene_path),
         "sha256": gene_snapshot.sha256,
         "selection_id": gene_selection["selection_id"],
         "selection_basis": gene_selection["selection_basis"],
@@ -1845,7 +1851,7 @@ def run_hypersca_c(
         "contexts": context_records,
         **condition,
         "config": {
-            "path": str(config_file),
+            "path": str(recorded_config_path),
             "sha256": config_snapshot.sha256,
             "values": config_values,
         },

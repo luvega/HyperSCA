@@ -989,8 +989,18 @@ def test_sealed_scoring_subset_rejects_hardlinked_npz_input(tmp_path: Path) -> N
         )
 
 
+@pytest.mark.parametrize(
+    ("official_status", "official_metrics"),
+    [
+        ("supplementary_official_metrics", {"official_check": 0.5}),
+        ("supplementary_official_metrics_not_applicable", None),
+    ],
+)
 def test_formal_scoring_is_started_only_by_the_validated_launcher(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    official_status: str,
+    official_metrics: object,
 ) -> None:
     prepared = tmp_path / "prepared" / "splits" / "seed_11"
     provenance = tmp_path / "prepared" / "provenance"
@@ -1048,8 +1058,8 @@ def test_formal_scoring_is_started_only_by_the_validated_launcher(
             json.dumps(
                 {
                     "schema_version": "1.0",
-                    "status": "supplementary_official_metrics",
-                    "metrics": {"official_check": 0.5},
+                    "status": official_status,
+                    "metrics": official_metrics,
                 }
             )
             + "\n",
@@ -1083,6 +1093,8 @@ def test_formal_scoring_is_started_only_by_the_validated_launcher(
     )
 
     assert metrics["average_precision"] == 1.0
+    assert metrics["sealed_scoring_status"] == official_status
+    assert metrics["supplementary_official_metrics"] == official_metrics
     assert launched["allowed_private_inputs"] == (heldout,)
     command = tuple(launched["command"])  # type: ignore[arg-type]
     assert command[:2] == (str(Path(sys.executable).resolve()), "-I")
@@ -1981,6 +1993,30 @@ def test_formal_null_seed_sequence_has_no_overlap_across_types_and_contexts() ->
 
     assert len(seeds) == 160
     assert all(0 <= value <= 2**64 - 1 for value in seeds)
+
+
+def test_cross_null_transforms_keep_a_control_only_target_context_valid() -> None:
+    expression = np.arange(24, dtype=np.float64).reshape(8, 3)
+    labels = np.asarray(
+        ["non-targeting", "non-targeting", "A", "A"]
+        + ["non-targeting"] * 4
+    )
+    environments = np.asarray(["k562"] * 4 + ["rpe1"] * 4)
+
+    permuted = rehearsal_module._contextwise_label_permutation(
+        labels, environments, (101, 102)
+    )
+    sampled, sampled_labels = rehearsal_module._contextwise_control_resampling(
+        expression, labels, environments, (201, 202)
+    )
+
+    target = environments == "rpe1"
+    assert np.all(permuted[target] == "non-targeting")
+    assert np.all(sampled_labels[target] == "non-targeting")
+    assert sampled.shape == expression.shape
+    assert {
+        tuple(row) for row in sampled[target]
+    } <= {tuple(row) for row in expression[target]}
 
 
 def test_formal_null_hypersca_settings_preserve_selected_bootstrap(

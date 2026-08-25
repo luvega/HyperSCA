@@ -1333,6 +1333,46 @@ def test_three_column_prediction_table_treats_every_relation_as_returned(
     ]
 
 
+def test_official_evaluation_records_an_empty_returned_graph_as_not_applicable(
+    tmp_path: Path,
+) -> None:
+    source, revision = _fake_evaluation_source(tmp_path)
+    heldout, predictions = _write_heldout_and_predictions(tmp_path)
+    rows = list(csv.reader(predictions.read_text(encoding="utf-8").splitlines()))
+    for row in rows[1:]:
+        row[2] = "0.0"
+        row[3] = "False"
+    with predictions.open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(handle, lineterminator="\n").writerows(rows)
+    output = tmp_path / "metrics.json"
+    record = tmp_path / "call.json"
+
+    completed = _invoke_evaluation_worker(
+        tmp_path,
+        source=source,
+        revision=revision,
+        heldout=heldout,
+        predictions=predictions,
+        output=output,
+        seed="17",
+        environment={
+            "FAKE_EVALUATION_RECORD": str(record),
+            "FAKE_METRIC_KIND": "nonfinite",
+        },
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "eligible_source_count": 2,
+        "metrics": None,
+        "reason": "no_returned_relations_for_eligible_sources",
+        "schema_version": "1.0",
+        "seed": 17,
+        "status": "supplementary_official_metrics_not_applicable",
+    }
+    assert not record.exists()
+
+
 def test_isolated_worker_ignores_pythonpath_sitecustomize_injection(
     tmp_path: Path,
 ) -> None:

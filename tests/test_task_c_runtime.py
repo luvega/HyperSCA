@@ -1452,6 +1452,39 @@ def test_bootstrap_yaml_requires_a_structural_exact_vcs_pin(tmp_path: Path) -> N
         )
 
 
+def test_causalbench_environment_pins_the_arboreto_compatible_dask_pair() -> None:
+    payload = (ROOT / "envs/task_c/causalbench.yml").read_text(encoding="utf-8")
+
+    assert "dask[complete]==2024.4.1" in payload
+    assert "distributed==2024.4.1" in payload
+
+
+@pytest.mark.parametrize("defect", ["missing", "conflicting"])
+def test_bootstrap_rejects_a_causalbench_environment_without_fixed_dask(
+    tmp_path: Path, defect: str,
+) -> None:
+    project, registry = _copy_bootstrap_inputs(tmp_path)
+    environment = project / "envs/task_c/causalbench.yml"
+    payload = environment.read_text(encoding="utf-8")
+    if defect == "missing":
+        payload = "\n".join(
+            line
+            for line in payload.splitlines()
+            if "dask[complete]==" not in line and "distributed==" not in line
+        )
+    else:
+        payload += "      - dask==2026.7.1\n"
+    environment.write_text(payload + "\n", encoding="utf-8")
+
+    with pytest.raises(TaskCRuntimeError, match="Dask|distributed|Arboreto"):
+        bootstrap_task_c_methods(
+            cache_root=tmp_path / "cache",
+            registry_path=registry,
+            project_root=project,
+            run_command=_FakeBootstrapRunner(),
+        )
+
+
 def test_bootstrap_yaml_rejects_duplicate_sections_and_extra_vcs_source(
     tmp_path: Path,
 ) -> None:

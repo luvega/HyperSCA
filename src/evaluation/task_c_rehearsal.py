@@ -2965,9 +2965,13 @@ def _contextwise_label_permutation(
     transformed = labels.copy()
     for context_index, context_id in enumerate(context_ids):
         selected = environments == context_id
-        transformed[selected] = permute_intervention_labels(
-            labels[selected], int(seeds[context_index])
-        )
+        context_labels = labels[selected]
+        if np.all(context_labels == CONTROL_LABEL):
+            transformed[selected] = context_labels
+        else:
+            transformed[selected] = permute_intervention_labels(
+                context_labels, int(seeds[context_index])
+            )
     return transformed
 
 
@@ -2990,9 +2994,21 @@ def _contextwise_control_resampling(
     copied_labels = labels.copy()
     for context_index, context_id in enumerate(context_ids):
         selected = environments == context_id
-        sampled, sampled_labels = build_control_resampling_null(
-            expression[selected], labels[selected], int(seeds[context_index])
-        )
+        context_expression = expression[selected]
+        context_labels = labels[selected]
+        if np.all(context_labels == CONTROL_LABEL):
+            rng = np.random.default_rng(int(seeds[context_index]))
+            chosen = rng.choice(
+                np.arange(len(context_labels), dtype=np.intp),
+                size=len(context_labels),
+                replace=True,
+            )
+            sampled = context_expression[chosen]
+            sampled_labels = context_labels.copy()
+        else:
+            sampled, sampled_labels = build_control_resampling_null(
+                context_expression, context_labels, int(seeds[context_index])
+            )
         transformed[selected] = sampled
         copied_labels[selected] = sampled_labels
     return transformed, copied_labels
@@ -4141,9 +4157,11 @@ def _formal_scoring_subset_unrecorded(
         raise TaskCRehearsalError(
             "sealed scoring inputs changed while the approved worker was running"
         )
-    if completed.returncode != 0 or official.get("status") != (
-        "supplementary_official_metrics"
-    ):
+    official_status = official.get("status")
+    if completed.returncode != 0 or official_status not in {
+        "supplementary_official_metrics",
+        "supplementary_official_metrics_not_applicable",
+    }:
         raise TaskCRehearsalError(
             "sealed scoring did not complete: "
             + _safe_failure_reason(official.get("error", completed.stderr))
@@ -4210,7 +4228,7 @@ def _formal_scoring_subset_unrecorded(
         )
     assert isinstance(metrics, dict)
     metrics["supplementary_official_metrics"] = official["metrics"]
-    metrics["sealed_scoring_status"] = official["status"]
+    metrics["sealed_scoring_status"] = official_status
     return metrics
 
 

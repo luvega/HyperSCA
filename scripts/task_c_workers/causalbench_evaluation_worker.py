@@ -1134,44 +1134,57 @@ def main(argv: Sequence[str] | None = None) -> int:
                     verify_loaded_causalbench_modules(
                         snapshot_source, frozen_source
                     )
-                    evaluator = evaluation_module.Evaluator(
-                        expression,
-                        interventions,
-                        list(genes),
-                    )
-                    verify_causalbench_python_source(
-                        snapshot_source, frozen_source
-                    )
-                    verify_loaded_causalbench_modules(
-                        snapshot_source, frozen_source
-                    )
-                    raw_metrics = evaluator.evaluate_network(
-                        ordered_edges,
-                        max_path_length=1,
-                        check_false_omission_rate=False,
-                        omission_estimation_size=0,
-                        seed=seed,
-                    )
-                    boundary._assert_causalbench_modules_are_verified(
-                        snapshot_source
-                    )
-                    verify_causalbench_python_source(
-                        snapshot_source, frozen_source
-                    )
-                    verify_loaded_causalbench_modules(
-                        snapshot_source, frozen_source
-                    )
-                metrics = make_json_safe(raw_metrics, np)
+                    if ordered_edges:
+                        evaluator = evaluation_module.Evaluator(
+                            expression,
+                            interventions,
+                            list(genes),
+                        )
+                        verify_causalbench_python_source(
+                            snapshot_source, frozen_source
+                        )
+                        verify_loaded_causalbench_modules(
+                            snapshot_source, frozen_source
+                        )
+                        raw_metrics = evaluator.evaluate_network(
+                            ordered_edges,
+                            max_path_length=1,
+                            check_false_omission_rate=False,
+                            omission_estimation_size=0,
+                            seed=seed,
+                        )
+                        boundary._assert_causalbench_modules_are_verified(
+                            snapshot_source
+                        )
+                        verify_causalbench_python_source(
+                            snapshot_source, frozen_source
+                        )
+                        verify_loaded_causalbench_modules(
+                            snapshot_source, frozen_source
+                        )
+                metrics = (
+                    make_json_safe(raw_metrics, np) if ordered_edges else None
+                )
                 verify_causalbench_python_source(
                     snapshot_source, frozen_source
                 )
-        payload = {
-            "schema_version": "1.0",
-            "status": "supplementary_official_metrics",
-            "seed": seed,
-            "eligible_source_count": len(eligible_sources),
-            "metrics": metrics,
-        }
+        if ordered_edges:
+            payload = {
+                "schema_version": "1.0",
+                "status": "supplementary_official_metrics",
+                "seed": seed,
+                "eligible_source_count": len(eligible_sources),
+                "metrics": metrics,
+            }
+        else:
+            payload = {
+                "schema_version": "1.0",
+                "status": "supplementary_official_metrics_not_applicable",
+                "seed": seed,
+                "eligible_source_count": len(eligible_sources),
+                "metrics": None,
+                "reason": "no_returned_relations_for_eligible_sources",
+            }
         write_json_new(args.output_json, payload)
         return 0
     except InvalidMetricOutput as exc:
