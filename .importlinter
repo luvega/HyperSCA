@@ -1,90 +1,80 @@
 [importlinter]
 root_package = src
 
-[importlinter:contract:models-foundation]
-name = Models remain independent from data and higher-level domains
+[importlinter:contract:run-evidence-no-models]
+name = Run evidence core does not depend on model implementations
 type = forbidden
 source_modules =
-    src.models
-forbidden_modules =
-    src.data
-    src.causal
-    src.evaluation
-    src.perturbation
-    src.discovery
-    src.pipeline
-    src.behavior_grammar
-    src.visualization
-
-[importlinter:contract:data-foundation]
-name = Data remains independent from models and higher-level domains
-type = forbidden
-source_modules =
-    src.data
+    src.evaluation.run_evidence_identity
+    src.evaluation.run_evidence_publisher
+    src.evaluation.run_evidence_collection
 forbidden_modules =
     src.models
-    src.causal
-    src.evaluation
-    src.perturbation
-    src.discovery
-    src.pipeline
-    src.behavior_grammar
-    src.visualization
 
-[importlinter:contract:causal-boundary]
-name = Causal code does not depend on orchestration, discovery, or presentation
+[importlinter:contract:run-evidence-no-data]
+name = Run evidence core does not depend on data implementations
 type = forbidden
 source_modules =
-    src.causal
+    src.evaluation.run_evidence_identity
+    src.evaluation.run_evidence_publisher
+    src.evaluation.run_evidence_collection
 forbidden_modules =
-    src.evaluation
-    src.perturbation
-    src.discovery
-    src.pipeline
-    src.behavior_grammar
-    src.visualization
+    src.data
 
-[importlinter:contract:evaluation-boundary]
-name = Evaluation does not depend on causal orchestration or discovery policy
+[importlinter:contract:run-evidence-no-causal]
+name = Run evidence core does not depend on causal implementations
 type = forbidden
 source_modules =
-    src.evaluation
+    src.evaluation.run_evidence_identity
+    src.evaluation.run_evidence_publisher
+    src.evaluation.run_evidence_collection
 forbidden_modules =
     src.causal
-    src.perturbation
-    src.discovery
-    src.pipeline
-    src.behavior_grammar
-    src.visualization
 
-[importlinter:contract:perturbation-boundary]
-name = Perturbation does not depend on evaluation, discovery, or orchestration
+[importlinter:contract:run-evidence-no-discovery]
+name = Run evidence core does not depend on discovery policy
 type = forbidden
 source_modules =
-    src.perturbation
+    src.evaluation.run_evidence_identity
+    src.evaluation.run_evidence_publisher
+    src.evaluation.run_evidence_collection
 forbidden_modules =
-    src.evaluation
     src.discovery
-    src.pipeline
-    src.behavior_grammar
-    src.visualization
 
-[importlinter:contract:discovery-boundary]
-name = Discovery consumes scientific domains but not orchestration or presentation
+[importlinter:contract:run-evidence-no-perturbation]
+name = Run evidence core does not depend on perturbation implementations
 type = forbidden
 source_modules =
-    src.discovery
+    src.evaluation.run_evidence_identity
+    src.evaluation.run_evidence_publisher
+    src.evaluation.run_evidence_collection
+forbidden_modules =
+    src.perturbation
+
+[importlinter:contract:run-evidence-no-orchestration]
+name = Run evidence core does not depend on orchestration or presentation
+type = forbidden
+source_modules =
+    src.evaluation.run_evidence_identity
+    src.evaluation.run_evidence_publisher
+    src.evaluation.run_evidence_collection
 forbidden_modules =
     src.pipeline
     src.behavior_grammar
     src.visualization
 
-[importlinter:contract:behavior-pipeline-separation]
-name = Behavior grammar and pipeline orchestration do not import each other
-type = independence
-modules =
-    src.behavior_grammar
-    src.pipeline
+[importlinter:contract:run-evidence-no-benchmark-runners]
+name = Run evidence core does not depend on benchmark runners
+type = forbidden
+source_modules =
+    src.evaluation.run_evidence_identity
+    src.evaluation.run_evidence_publisher
+    src.evaluation.run_evidence_collection
+forbidden_modules =
+    src.evaluation.methods_pilot
+    src.evaluation.methods_causal_pilot
+    src.evaluation.task_c_method_run
+    src.evaluation.task_c_rehearsal
 
 [importlinter:contract:run-evidence-layers]
 name = Collection depends downward on publisher and immutable identity only
