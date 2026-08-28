@@ -9,8 +9,8 @@ standalone frozen-unit digest.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
 from fractions import Fraction
 import hashlib
 import json
@@ -44,6 +44,7 @@ _PRIMARY_BANDS = ("proximal", "local")
 _MAX_TEXT = 256
 _MAX_ITEMS = 100_000
 _MAX_ROWS = 10_000_000
+_MAX_MANIFEST_ROWS = 100_000
 _MAX_BLOCK_GRAPH_NODES = 4_096
 _MAX_FROZEN_CONTEXTS = 50_000
 _SHA = re.compile(r"[0-9a-f]{64}")
@@ -279,7 +280,6 @@ class BridgeNeighbourRelation:
     source_cell_id: str
     neighbor_cell_id: str
     source_perturbation_id: str
-    matched_perturbation_id: str
     source_cell_type: str
     neighbor_cell_type: str
     rank: int
@@ -293,8 +293,7 @@ class BridgeNeighbourRelation:
             for name in (
                 "animal_id", "section_id", "spatial_block", "source_cell_id",
                 "neighbor_cell_id", "source_perturbation_id",
-                "matched_perturbation_id", "source_cell_type",
-                "neighbor_cell_type", "band",
+                "source_cell_type", "neighbor_cell_type", "band",
             )
         }
         rank = _integer(self.rank, "rank", maximum=1_000_000)
@@ -340,7 +339,6 @@ def freeze_bridge_neighbour_relation(
     source_cell_id: str,
     neighbor_cell_id: str,
     source_perturbation_id: str,
-    matched_perturbation_id: str,
     source_cell_type: str,
     neighbor_cell_type: str,
     rank: int,
@@ -355,7 +353,6 @@ def freeze_bridge_neighbour_relation(
             ("spatial_block", spatial_block), ("source_cell_id", source_cell_id),
             ("neighbor_cell_id", neighbor_cell_id),
             ("source_perturbation_id", source_perturbation_id),
-            ("matched_perturbation_id", matched_perturbation_id),
             ("source_cell_type", source_cell_type),
             ("neighbor_cell_type", neighbor_cell_type), ("band", band),
         )
@@ -374,8 +371,8 @@ def freeze_bridge_neighbour_relation(
         text_values["animal_id"], text_values["section_id"],
         text_values["spatial_block"], text_values["source_cell_id"],
         text_values["neighbor_cell_id"], text_values["source_perturbation_id"],
-        text_values["matched_perturbation_id"], text_values["source_cell_type"],
-        text_values["neighbor_cell_type"], rank, text_values["band"],
+        text_values["source_cell_type"], text_values["neighbor_cell_type"],
+        rank, text_values["band"],
         contamination, is_safe_control,
     )
 
@@ -393,18 +390,127 @@ def _relation_from(value: object, name: str) -> BridgeNeighbourRelation:
 
 def _relation_mapping(item: BridgeNeighbourRelation) -> dict[str, object]:
     snapshot = _relation_from(item, "neighbour_relation")
-    return {name: getattr(snapshot, name) for name in BridgeNeighbourRelation.__dataclass_fields__}
+    return _relation_mapping_trusted(snapshot)
 
 
-def _neighbour_table_identity(relations: tuple[BridgeNeighbourRelation, ...]) -> str:
+def _relation_mapping_trusted(
+    item: BridgeNeighbourRelation,
+) -> dict[str, object]:
+    return {
+        name: getattr(item, name)
+        for name in BridgeNeighbourRelation.__dataclass_fields__
+    }
+
+
+def _stream_neighbour_table_identity_trusted(
+    relations: tuple[BridgeNeighbourRelation, ...],
+) -> str:
     digest = hashlib.sha256()
     digest.update(b'{"relations":[')
     for index, item in enumerate(relations):
         if index:
             digest.update(b",")
-        digest.update(_canonical_bytes(_relation_mapping(item)))
+        digest.update(_canonical_bytes(_relation_mapping_trusted(item)))
     digest.update(b'],"schema":"bridge_neighbour_table_v1"}')
     return digest.hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class BridgeNeighbourTable:
+    """Canonical standalone artifact for frozen source-neighbour relations."""
+
+    relations: tuple[BridgeNeighbourRelation, ...]
+    schema: str = field(init=False)
+    relation_count: int = field(init=False)
+    identity_sha256: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        relations = tuple(
+            _relation_from(item, f"relations[{index}]")
+            for index, item in enumerate(
+                _items(self.relations, "relations", maximum=_MAX_ROWS)
+            )
+        )
+        relations = tuple(sorted(relations, key=lambda item: item.relation_id))
+        if len({item.relation_id for item in relations}) != len(relations):
+            raise SpatialPerturbationSplitError(
+                "neighbour relation identities must be unique"
+            )
+        logical_keys = {
+            (
+                item.animal_id, item.section_id,
+                item.source_perturbation_id, item.neighbor_cell_id,
+            )
+            for item in relations
+        }
+        if len(logical_keys) != len(relations):
+            raise SpatialPerturbationSplitError(
+                "neighbour relation logical keys must be unique"
+            )
+        treatment_contexts: dict[tuple[str, str, str], str] = {}
+        for relation in relations:
+            if relation.is_safe_control:
+                continue
+            key = (relation.animal_id, relation.section_id, relation.neighbor_cell_id)
+            prior = treatment_contexts.setdefault(
+                key, relation.source_perturbation_id
+            )
+            if prior != relation.source_perturbation_id:
+                raise SpatialPerturbationSplitError(
+                    "a treatment neighbor cannot cross source perturbations"
+                )
+        object.__setattr__(self, "relations", relations)
+        object.__setattr__(self, "schema", "bridge_neighbour_table_v1")
+        object.__setattr__(self, "relation_count", len(relations))
+        object.__setattr__(
+            self, "identity_sha256",
+            _stream_neighbour_table_identity_trusted(relations),
+        )
+
+
+def freeze_bridge_neighbour_table(
+    relations: tuple[BridgeNeighbourRelation, ...],
+) -> BridgeNeighbourTable:
+    """Snapshot, validate, sort, and identify one raw relation table."""
+    return BridgeNeighbourTable(relations)
+
+
+def _snapshot_neighbour_table(table: BridgeNeighbourTable) -> BridgeNeighbourTable:
+    if type(table) is not BridgeNeighbourTable:
+        raise SpatialPerturbationSplitError(
+            "relation artifact must be BridgeNeighbourTable"
+        )
+    return BridgeNeighbourTable(table.relations)
+
+
+def bridge_neighbour_table_descriptor(
+    table: BridgeNeighbourTable,
+) -> dict[str, object]:
+    snapshot = _snapshot_neighbour_table(table)
+    return {
+        "schema": snapshot.schema,
+        "relation_count": snapshot.relation_count,
+        "identity_sha256": snapshot.identity_sha256,
+    }
+
+
+def iter_bridge_neighbour_table_json(
+    table: BridgeNeighbourTable,
+) -> Iterator[bytes]:
+    """Return a bounded-chunk canonical JSON iterator for a relation artifact."""
+    snapshot = _snapshot_neighbour_table(table)
+
+    def chunks() -> Iterator[bytes]:
+        yield b'{"relations":['
+        for index, relation in enumerate(snapshot.relations):
+            if index:
+                yield b","
+            payload = _canonical_bytes(_relation_mapping_trusted(relation))
+            for offset in range(0, len(payload), 2048):
+                yield payload[offset:offset + 2048]
+        yield b'],"schema":"bridge_neighbour_table_v1"}'
+
+    return chunks()
 
 
 def _target_pairs(value: object, name: str) -> tuple[tuple[str, str], ...]:
@@ -569,38 +675,8 @@ class BridgeSplitMetadata:
             raise SpatialPerturbationSplitError(
                 "block graph must record an explicit state for every block pair"
             )
-        relations = tuple(
-            _relation_from(item, f"neighbour_relations[{index}]")
-            for index, item in enumerate(
-                _items(self.neighbour_relations, "neighbour_relations", maximum=_MAX_ROWS)
-            )
-        )
-        relations = tuple(sorted(relations, key=lambda item: item.relation_id))
-        if len({item.relation_id for item in relations}) != len(relations):
-            raise SpatialPerturbationSplitError("neighbour relation keys must be unique")
-        logical_keys = {
-            (
-                item.animal_id, item.section_id,
-                item.matched_perturbation_id, item.neighbor_cell_id,
-            )
-            for item in relations
-        }
-        if len(logical_keys) != len(relations):
-            raise SpatialPerturbationSplitError(
-                "neighbour relation logical keys must be unique"
-            )
-        treatment_neighbour_contexts: dict[tuple[str, str, str], str] = {}
-        for relation in relations:
-            if relation.is_safe_control:
-                continue
-            key = (relation.animal_id, relation.section_id, relation.neighbor_cell_id)
-            prior = treatment_neighbour_contexts.setdefault(
-                key, relation.matched_perturbation_id
-            )
-            if prior != relation.matched_perturbation_id:
-                raise SpatialPerturbationSplitError(
-                    "a treatment neighbor cannot cross matched perturbations"
-                )
+        table = freeze_bridge_neighbour_table(self.neighbour_relations)
+        relations = table.relations
         row_by_cell = {row.cell_id: row for row in rows}
         for relation in relations:
             source = row_by_cell.get(relation.source_cell_id)
@@ -610,13 +686,15 @@ class BridgeSplitMetadata:
                     "neighbour relation endpoint is absent from atomic provenance"
                 )
             expected_source_role = "safe_source" if relation.is_safe_control else "perturbation_source"
-            expected_source_perturbation = (
-                safe_label if relation.is_safe_control
-                else relation.matched_perturbation_id
-            )
             if (
-                relation.matched_perturbation_id not in perturbations
-                or relation.source_perturbation_id != expected_source_perturbation
+                (
+                    relation.is_safe_control
+                    and relation.source_perturbation_id != safe_label
+                )
+                or (
+                    not relation.is_safe_control
+                    and relation.source_perturbation_id not in perturbations
+                )
                 or source.cell_role != expected_source_role
                 or source.animal_id != relation.animal_id
                 or source.section_id != relation.section_id
@@ -635,7 +713,7 @@ class BridgeSplitMetadata:
             self.neighbour_table_identity_sha256,
             "neighbour_table_identity_sha256",
         )
-        if neighbour_identity != _neighbour_table_identity(relations):
+        if neighbour_identity != table.identity_sha256:
             raise SpatialPerturbationSplitError("neighbour-table identity mismatch")
         row_animals = tuple(sorted({row.animal_id for row in rows}))
         row_sections = tuple(
@@ -816,6 +894,7 @@ def _unit_mapping(item: FrozenPrimaryUnit) -> dict[str, object]:
 
 
 def _manifest_unsigned(manifest: "BridgeSplitManifest") -> dict[str, object]:
+    _checked_manifest_row_count(len(manifest.row_provenance))
     return {
         "split_id": manifest.split_id, "split_role": manifest.split_role,
         "split_seed": manifest.split_seed,
@@ -860,6 +939,15 @@ def _checked_cartesian_size(*factors: int) -> int:
             )
         size *= factor
     return size
+
+
+def _checked_manifest_row_count(count: object) -> int:
+    frozen = _integer(count, "manifest row count", maximum=_MAX_ROWS)
+    if frozen > _MAX_MANIFEST_ROWS:
+        raise SpatialPerturbationSplitError(
+            "manifest row count exceeds the safe serialization limit"
+        )
+    return frozen
 
 
 @dataclass(frozen=True, slots=True)
@@ -966,9 +1054,13 @@ class BridgeSplitManifest:
         )
         targets = _target_pairs(self.perturbation_targets, "perturbation_targets")
         safe_label = _safe_text(self.safe_control_label, "safe_control_label")
+        raw_rows = _items(
+            self.row_provenance, "row_provenance", maximum=_MAX_ROWS
+        )
+        _checked_manifest_row_count(len(raw_rows))
         rows = tuple(
             _row_from(item, f"row_provenance[{index}]")
-            for index, item in enumerate(_items(self.row_provenance, "row_provenance", maximum=_MAX_ROWS))
+            for index, item in enumerate(raw_rows)
         )
         rows = tuple(sorted(rows, key=lambda row: row.stable_row_id))
         metadata = BridgeSplitMetadata(
@@ -1158,9 +1250,6 @@ def _snapshot_manifest(manifest: BridgeSplitManifest) -> BridgeSplitManifest:
 def split_manifest_to_mapping(manifest: BridgeSplitManifest) -> dict[str, object]:
     snapshot = _snapshot_manifest(manifest)
     mapping = _manifest_unsigned(snapshot)
-    mapping["neighbour_relations"] = [
-        _relation_mapping(item) for item in snapshot.neighbour_relations
-    ]
     mapping["split_identity_sha256"] = snapshot.split_identity_sha256
     return mapping
 
@@ -1212,6 +1301,7 @@ def build_bridge_partition_manifest(
         len(animals), len(primary), len(snapshot.neighbour_cell_types),
         len(cast(tuple[str, str], _science()["primary_bands"])),
     )
+    _checked_manifest_row_count(len(snapshot.rows))
     parents = tuple(
         sorted(
             (_make_parent(animal, perturbation, target_map[perturbation])
@@ -1250,7 +1340,7 @@ def build_bridge_partition_manifest(
         "registered_perturbations": list(snapshot.perturbations),
         "secondary_perturbations": list(secondary),
         "development_only_perturbations": list(development_only),
-        "row_provenance": [_row_mapping(row) for row in snapshot.rows],
+        "row_provenance": snapshot.rows,
         "perturbation_parents": [_parent_mapping(item) for item in parents],
         "primary_units": [_unit_mapping(item) for item in units],
         "neighbour_cell_types": list(snapshot.neighbour_cell_types),
@@ -1465,9 +1555,9 @@ class BridgeEligibilityEvidence:
             relation_id for item in units
             for relation_id in item.safe_neighbour_relation_ids
         )
-        if len(set(treatment_ids)) != len(treatment_ids) or len(set(safe_ids)) != len(safe_ids):
+        if len(set(treatment_ids)) != len(treatment_ids):
             raise SpatialPerturbationSplitError(
-                "a neighbour relation cannot appear in two frozen units"
+                "a treatment neighbour relation cannot appear in two frozen units"
             )
         if set(treatment_ids) & set(safe_ids):
             raise SpatialPerturbationSplitError("treatment and safe neighbour evidence must be disjoint")
@@ -1671,7 +1761,7 @@ def _require_relations(
         )
     if any(
         item.animal_id != animal
-        or item.matched_perturbation_id != perturbation
+        or (not safe and item.source_perturbation_id != perturbation)
         or item.neighbor_cell_type != cell_type
         or item.band != band
         or item.is_safe_control is not safe
@@ -2107,11 +2197,13 @@ __all__ = [
     "MIN_COVERAGE", "MIN_SAFE_SOURCE_CELLS", "MIN_SOURCE_CELLS",
     "MIN_SPATIAL_BLOCKS", "BridgeBlockAdjacency", "BridgeEligibilityEvidence",
     "BridgeEligibilityResult", "BridgeParentEvidence", "BridgePrimaryUnitEvidence",
-    "BridgeNeighbourRelation", "BridgeSplitManifest", "BridgeSplitMetadata",
+    "BridgeNeighbourRelation", "BridgeNeighbourTable", "BridgeSplitManifest", "BridgeSplitMetadata",
     "BridgeSplitRow",
     "FrozenPerturbationParent", "FrozenPrimaryUnit", "SpatialPerturbationSplitError",
-    "build_bridge_eligibility_evidence", "build_pilot_fold",
+    "bridge_neighbour_table_descriptor", "build_bridge_eligibility_evidence",
+    "build_bridge_partition_manifest", "build_pilot_fold",
     "eligibility_evidence_to_mapping", "eligibility_result_to_mapping",
-    "evaluate_bridge_eligibility",
+    "evaluate_bridge_eligibility", "freeze_bridge_neighbour_relation",
+    "freeze_bridge_neighbour_table", "iter_bridge_neighbour_table_json",
     "split_manifest_to_mapping",
 ]

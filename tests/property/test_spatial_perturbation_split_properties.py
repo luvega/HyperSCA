@@ -46,18 +46,19 @@ class _HostileSequence(Sequence[object]):
         raise AssertionError("custom sequence was iterated")
 
 
-@settings(max_examples=6, deadline=None)
-@given(st.integers(min_value=0, max_value=5))
+@settings(max_examples=8, deadline=None)
+@given(st.permutations(tuple(range(6))))
 def test_three_animal_split_identity_is_invariant_to_input_permutation(
-    rotation: int,
+    chunk_order: list[int],
 ) -> None:
     metadata = _small_metadata()
-    offset = rotation % len(metadata.rows)
-    permuted = metadata.rows[offset:] + metadata.rows[:offset]
-    relation_offset = rotation % len(metadata.neighbour_relations)
-    permuted_relations = (
-        metadata.neighbour_relations[relation_offset:]
-        + metadata.neighbour_relations[:relation_offset]
+    row_chunks = tuple(metadata.rows[index::6] for index in range(6))
+    relation_chunks = tuple(
+        metadata.neighbour_relations[index::6] for index in range(6)
+    )
+    permuted = tuple(row for index in chunk_order for row in row_chunks[index])
+    permuted_relations = tuple(
+        relation for index in chunk_order for relation in relation_chunks[index]
     )
     first = build_pilot_fold(metadata, "mouse_2")
     second = build_pilot_fold(
@@ -73,6 +74,55 @@ def test_three_animal_split_identity_is_invariant_to_input_permutation(
     )
     assert split_manifest_to_mapping(first) == split_manifest_to_mapping(second)
     assert {row.animal_id for row in first.row_provenance if row.stable_row_id in first.evaluation_rows} == {"mouse_2"}
+
+
+@settings(max_examples=8, deadline=None)
+@given(
+    st.permutations((0, 1, 2)),
+    st.sampled_from(("logical_duplicate", "cross_guide_treatment")),
+)
+def test_final_review_minimal_relation_table_single_mutations_fail_closed(
+    order: list[int], mutation: str,
+) -> None:
+    module = import_module("src.evaluation.spatial_perturbation_split")
+    freeze = module.freeze_bridge_neighbour_relation
+    relations = (
+        freeze(
+            "mouse_1", "section_1", "block_1", "guide_source_0",
+            "neighbor_0", "guide_0", "source_type", "astrocyte", 1,
+            "proximal", False, False,
+        ),
+        freeze(
+            "mouse_1", "section_1", "block_1", "guide_source_1",
+            "neighbor_1", "guide_1", "source_type", "astrocyte", 2,
+            "proximal", False, False,
+        ),
+        freeze(
+            "mouse_1", "section_1", "block_1", "safe_source",
+            "safe_neighbor", "mSafe", "source_type", "astrocyte", 3,
+            "proximal", False, True,
+        ),
+    )
+    frozen = module.freeze_bridge_neighbour_table(
+        tuple(relations[index] for index in order)
+    )
+    assert frozen.relations == tuple(
+        sorted(relations, key=lambda item: item.relation_id)
+    )
+    if mutation == "logical_duplicate":
+        bad = freeze(
+            "mouse_1", "section_1", "block_1", "safe_source_2",
+            "safe_neighbor", "mSafe", "source_type", "astrocyte", 4,
+            "proximal", False, True,
+        )
+    else:
+        bad = freeze(
+            "mouse_1", "section_1", "block_1", "guide_source_1",
+            "neighbor_0", "guide_1", "source_type", "astrocyte", 2,
+            "proximal", False, False,
+        )
+    with pytest.raises(SpatialPerturbationSplitError, match="logical|treatment neighbor"):
+        module.freeze_bridge_neighbour_table(relations + (bad,))
 
 
 @settings(max_examples=4, deadline=None)
@@ -233,14 +283,15 @@ def test_holdout_only_perturbations_are_structurally_secondary(
         item for item in metadata.neighbour_relations
         if not (
             item.animal_id in {"mouse_2", "mouse_3"}
-            and item.matched_perturbation_id == holdout_only
+            and item.source_perturbation_id == holdout_only
         )
     )
     pruned = BridgeSplitMetadata(
         rows, metadata.gene_names, metadata.perturbations,
         metadata.neighbour_cell_types, metadata.perturbation_targets,
         metadata.block_adjacency, "mSafe", relations,
-        import_module("src.evaluation.spatial_perturbation_split")._neighbour_table_identity(relations),
+        import_module("src.evaluation.spatial_perturbation_split")
+        .freeze_bridge_neighbour_table(relations).identity_sha256,
         metadata.candidate, metadata.registry_summary, metadata.capability_result,
     )
     manifest = build_pilot_fold(pruned, "mouse_1")
@@ -265,7 +316,7 @@ def test_development_only_perturbations_are_not_secondary(
         item for item in metadata.neighbour_relations
         if not (
             item.animal_id == "mouse_1"
-            and item.matched_perturbation_id == development_only
+            and item.source_perturbation_id == development_only
         )
     )
     module = import_module("src.evaluation.spatial_perturbation_split")
@@ -273,7 +324,8 @@ def test_development_only_perturbations_are_not_secondary(
         rows, metadata.gene_names, metadata.perturbations,
         metadata.neighbour_cell_types, metadata.perturbation_targets,
         metadata.block_adjacency, metadata.safe_control_label, relations,
-        module._neighbour_table_identity(relations), metadata.candidate,
+        module.freeze_bridge_neighbour_table(relations).identity_sha256,
+        metadata.candidate,
         metadata.registry_summary, metadata.capability_result,
     )
     manifest = build_pilot_fold(pruned, "mouse_1")
@@ -293,7 +345,7 @@ def test_registered_perturbation_requires_at_least_one_atomic_source(
     )
     relations = tuple(
         item for item in metadata.neighbour_relations
-        if item.matched_perturbation_id != deleted
+        if item.source_perturbation_id != deleted
     )
     module = import_module("src.evaluation.spatial_perturbation_split")
     with pytest.raises(SpatialPerturbationSplitError, match="registered.*source"):
@@ -301,7 +353,8 @@ def test_registered_perturbation_requires_at_least_one_atomic_source(
             rows, metadata.gene_names, metadata.perturbations,
             metadata.neighbour_cell_types, metadata.perturbation_targets,
             metadata.block_adjacency, metadata.safe_control_label, relations,
-            module._neighbour_table_identity(relations), metadata.candidate,
+            module.freeze_bridge_neighbour_table(relations).identity_sha256,
+            metadata.candidate,
             metadata.registry_summary, metadata.capability_result,
         )
 
@@ -331,44 +384,41 @@ def test_registry_binding_cannot_be_bypassed_by_upstream_perturbation_deletion(
 
 @settings(max_examples=4, deadline=None)
 @given(st.integers(min_value=2, max_value=5))
-def test_safe_neighbour_cells_may_be_reused_by_distinct_relation_keys(
+def test_safe_raw_relation_ids_may_be_reused_across_matched_units(
     reuse_count: int,
 ) -> None:
-    metadata = _small_metadata()
-    safe_relations = tuple(
-        item for item in metadata.neighbour_relations
-        if item.is_safe_control
-        and item.animal_id == "mouse_1"
-        and item.neighbor_cell_type == metadata.neighbour_cell_types[0]
-        and item.band == "proximal"
+    manifest = build_pilot_fold(_small_metadata(), "mouse_1")
+    evidence = complete_evidence(manifest)
+    unit_by_id = {item.unit_id: item for item in manifest.primary_units}
+    selected = tuple(
+        item for item in evidence.unit_evidence
+        if unit_by_id[item.unit_id].animal_id == "mouse_1"
+        and unit_by_id[item.unit_id].neighbour_cell_type
+        == manifest.neighbour_cell_types[0]
+        and unit_by_id[item.unit_id].band == "proximal"
     )
-    reused_id = safe_relations[0].neighbor_cell_id
-    reused = tuple(item for item in safe_relations if item.neighbor_cell_id == reused_id)
-    assert len(reused[:reuse_count]) == reuse_count
-    assert len({item.relation_id for item in reused[:reuse_count]}) == reuse_count
-    assert {
-        item.matched_perturbation_id for item in reused[:reuse_count]
-    } <= set(metadata.perturbations)
-    assert {item.source_perturbation_id for item in reused[:reuse_count]} == {"mSafe"}
+    reused = selected[:reuse_count]
+    assert len(reused) == reuse_count
+    assert len({item.safe_neighbour_relation_ids for item in reused}) == 1
 
 
 @settings(max_examples=4, deadline=None)
-@given(st.integers(min_value=0, max_value=4))
-def test_generic_partition_identity_is_invariant_to_animal_order(rotation: int) -> None:
+@given(st.permutations(("mouse_1", "mouse_2", "mouse_3", "mouse_4", "mouse_5")))
+def test_generic_partition_identity_is_invariant_to_animal_order(
+    animal_order: list[str],
+) -> None:
     module = import_module("src.evaluation.spatial_perturbation_split")
     metadata = _small_metadata(animal_count=5)
-    development = ("mouse_1", "mouse_2", "mouse_3")
     evaluation = ("mouse_4", "mouse_5")
-    shifted_development = development[rotation % 3:] + development[:rotation % 3]
-    shifted_evaluation = evaluation[rotation % 2:] + evaluation[:rotation % 2]
     first = module.build_bridge_partition_manifest(
         metadata, "generic_partition:property", "generic",
         ("mouse_1", "mouse_2"), ("mouse_3",), evaluation,
     )
     second = module.build_bridge_partition_manifest(
         metadata, "generic_partition:property", "generic",
-        tuple(item for item in shifted_development if item != "mouse_3"),
-        ("mouse_3",), shifted_evaluation,
+        tuple(item for item in animal_order if item in {"mouse_1", "mouse_2"}),
+        ("mouse_3",),
+        tuple(item for item in animal_order if item in {"mouse_4", "mouse_5"}),
     )
     assert split_manifest_to_mapping(first) == split_manifest_to_mapping(second)
 
