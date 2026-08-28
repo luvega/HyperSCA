@@ -67,6 +67,8 @@ def _sha(value: object, name: str) -> str:
 def _canonical_source_uri(accession: str, value: object) -> str:
     """Accept only one spelling for each source resource identity."""
     source_uri = _safe_text(value, "source_uri")
+    if any(ord(character) < 0x21 or ord(character) > 0x7E for character in source_uri):
+        raise SpatialPerturbationRegistryError("source_uri must be canonical ASCII HTTPS text")
     try:
         parsed = urlsplit(source_uri)
         port = parsed.port
@@ -75,6 +77,7 @@ def _canonical_source_uri(accession: str, value: object) -> str:
     if (
         parsed.scheme != "https"
         or not parsed.hostname
+        or parsed.hostname.endswith(".")
         or parsed.username is not None
         or parsed.password is not None
         or port is not None

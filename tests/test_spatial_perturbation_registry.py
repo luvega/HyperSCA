@@ -357,6 +357,24 @@ def test_source_identity_rejects_noncanonical_geo_aliases(accession: str, source
         )
 
 
+@pytest.mark.parametrize(
+    "source_uri",
+    (
+        "https://example.test/source path",
+        "https://example.test/source\u00a0path",
+        "https://examplé.test/source",
+        "https://example.test./source",
+        "https://EXAMPLE.test/source",
+        "https://example.test:443/source",
+    ),
+)
+def test_source_identity_rejects_noncanonical_generic_https_spellings(source_uri: str) -> None:
+    with pytest.raises(SpatialPerturbationRegistryError):
+        BridgeCandidate(
+            "synthetic_candidate", "SYN1", "spatial", (), (), "mSafe", (), source_uri, "a" * 64,
+        )
+
+
 def test_writer_binds_result_specimen_count_to_candidate(tmp_path: Path) -> None:
     frozen = load_bridge_candidates(REGISTRY_PATH)["gse274447_msafe_bridge"]
     generic = audit_bridge_capability(candidate(5), metadata_summary(animals=5))
