@@ -546,7 +546,6 @@ class BridgeSplitMetadata:
                 source.cell_role != expected_source_role
                 or source.animal_id != relation.animal_id
                 or source.section_id != relation.section_id
-                or source.spatial_block != relation.spatial_block
                 or source.context_perturbation_id != relation.perturbation_id
                 or source.source_cell_type != relation.source_cell_type
                 or neighbor.cell_role != "neighbour"
@@ -744,7 +743,8 @@ def _unit_mapping(item: FrozenPrimaryUnit) -> dict[str, object]:
 
 def _manifest_unsigned(manifest: "BridgeSplitManifest") -> dict[str, object]:
     return {
-        "split_id": manifest.split_id, "split_seed": manifest.split_seed,
+        "split_id": manifest.split_id, "split_role": manifest.split_role,
+        "split_seed": manifest.split_seed,
         "development_animals": list(manifest.development_animals),
         "evaluation_animals": list(manifest.evaluation_animals),
         "train_rows": list(manifest.train_rows), "tune_rows": list(manifest.tune_rows),
@@ -752,6 +752,9 @@ def _manifest_unsigned(manifest: "BridgeSplitManifest") -> dict[str, object]:
         "gene_names": list(manifest.gene_names), "perturbations": list(manifest.perturbations),
         "registered_perturbations": list(manifest.registered_perturbations),
         "secondary_perturbations": list(manifest.secondary_perturbations),
+        "development_only_perturbations": list(
+            manifest.development_only_perturbations
+        ),
         "row_provenance": [_row_mapping(row) for row in manifest.row_provenance],
         "perturbation_parents": [_parent_mapping(item) for item in manifest.perturbation_parents],
         "primary_units": [_unit_mapping(item) for item in manifest.primary_units],
@@ -785,6 +788,7 @@ def _checked_cartesian_size(*factors: int) -> int:
 @dataclass(frozen=True, slots=True)
 class BridgeSplitManifest:
     split_id: str
+    split_role: str
     split_seed: int
     development_animals: tuple[str, ...]
     evaluation_animals: tuple[str, ...]
@@ -795,6 +799,7 @@ class BridgeSplitManifest:
     perturbations: tuple[str, ...]
     registered_perturbations: tuple[str, ...]
     secondary_perturbations: tuple[str, ...]
+    development_only_perturbations: tuple[str, ...]
     split_identity_sha256: str
     row_provenance: tuple[BridgeSplitRow, ...]
     perturbation_parents: tuple[FrozenPerturbationParent, ...]
@@ -814,6 +819,26 @@ class BridgeSplitManifest:
 
     def __post_init__(self) -> None:
         split_id = _safe_text(self.split_id, "split_id")
+        split_role = _safe_text(self.split_role, "split_role")
+        role_namespaces = {
+            "pilot": "pilot_leave_one_animal_out:",
+            "generic": "generic_partition:",
+            "confirmatory": "confirmatory_partition:",
+        }
+        if split_role not in role_namespaces:
+            raise SpatialPerturbationSplitError("split_role is not a frozen split role")
+        if (
+            split_id == role_namespaces[split_role]
+            or not split_id.startswith(role_namespaces[split_role])
+            or any(
+                split_id.startswith(namespace)
+                for role, namespace in role_namespaces.items()
+                if role != split_role
+            )
+        ):
+            raise SpatialPerturbationSplitError(
+                "split_id namespace does not match split_role"
+            )
         split_seed = _integer(self.split_seed, "split_seed")
         if split_seed != _science()["split_seed"]:
             raise SpatialPerturbationSplitError("split seed is frozen to 11")
@@ -822,6 +847,10 @@ class BridgeSplitManifest:
         if not development or not evaluation or set(development) & set(evaluation):
             raise SpatialPerturbationSplitError(
                 "development and evaluation animals must be nonempty and disjoint"
+            )
+        if split_role == "confirmatory" and len(development) + len(evaluation) < 5:
+            raise SpatialPerturbationSplitError(
+                "confirmatory role requires at least five animals"
             )
         train = _row_ids(self.train_rows, "train_rows")
         tune = _row_ids(self.tune_rows, "tune_rows")
@@ -838,6 +867,19 @@ class BridgeSplitManifest:
         secondary = _text_items(
             self.secondary_perturbations, "secondary_perturbations", sort=True
         )
+        development_only = _text_items(
+            self.development_only_perturbations,
+            "development_only_perturbations", sort=True,
+        )
+        if split_role == "pilot" and (
+            len(development) != 2
+            or len(evaluation) != 1
+            or tune
+            or split_id != f"pilot_leave_one_animal_out:{evaluation[0]}"
+        ):
+            raise SpatialPerturbationSplitError(
+                "pilot role requires exact three-animal leave-one-out with empty tune"
+            )
         neighbour_types = _text_items(
             self.neighbour_cell_types, "neighbour_cell_types", sort=True
         )
@@ -890,10 +932,18 @@ class BridgeSplitManifest:
             if row.animal_id in evaluation and row.cell_role == "perturbation_source"
         }
         expected_primary = tuple(sorted(development_perturbations & evaluation_perturbations))
-        expected_secondary = tuple(sorted(set(registered) - set(expected_primary)))
-        if perturbations != expected_primary or secondary != expected_secondary or not perturbations:
+        expected_secondary = tuple(sorted(evaluation_perturbations - development_perturbations))
+        expected_development_only = tuple(
+            sorted(development_perturbations - evaluation_perturbations)
+        )
+        if (
+            perturbations != expected_primary
+            or secondary != expected_secondary
+            or development_only != expected_development_only
+            or not perturbations
+        ):
             raise SpatialPerturbationSplitError(
-                "primary perturbations must be the development/evaluation intersection"
+                "primary, secondary, and development-only perturbation roles are inconsistent"
             )
         _checked_cartesian_size(len(animals), len(perturbations))
         _checked_cartesian_size(
@@ -942,12 +992,14 @@ class BridgeSplitManifest:
             raise SpatialPerturbationSplitError("upstream registry identities do not match")
         identity = _sha(self.split_identity_sha256, "split_identity_sha256")
         for name, value in (
-            ("split_id", split_id), ("split_seed", split_seed),
+            ("split_id", split_id), ("split_role", split_role),
+            ("split_seed", split_seed),
             ("development_animals", development), ("evaluation_animals", evaluation),
             ("train_rows", train), ("tune_rows", tune), ("evaluation_rows", held_out),
             ("gene_names", genes), ("perturbations", perturbations),
             ("registered_perturbations", registered),
             ("secondary_perturbations", secondary),
+            ("development_only_perturbations", development_only),
             ("row_provenance", rows), ("perturbation_parents", parents),
             ("primary_units", units), ("neighbour_cell_types", neighbour_types),
             ("perturbation_targets", targets), ("block_adjacency", adjacency),
@@ -979,10 +1031,12 @@ def _snapshot_manifest(manifest: BridgeSplitManifest) -> BridgeSplitManifest:
     if type(manifest) is not BridgeSplitManifest:
         raise SpatialPerturbationSplitError("manifest must be BridgeSplitManifest")
     return BridgeSplitManifest(
-        manifest.split_id, manifest.split_seed, manifest.development_animals,
+        manifest.split_id, manifest.split_role, manifest.split_seed,
+        manifest.development_animals,
         manifest.evaluation_animals, manifest.train_rows, manifest.tune_rows,
         manifest.evaluation_rows, manifest.gene_names, manifest.perturbations,
         manifest.registered_perturbations, manifest.secondary_perturbations,
+        manifest.development_only_perturbations,
         manifest.split_identity_sha256, manifest.row_provenance,
         manifest.perturbation_parents, manifest.primary_units,
         manifest.neighbour_cell_types, manifest.perturbation_targets,
@@ -1029,7 +1083,10 @@ def build_pilot_fold(
         if row.animal_id == evaluation and row.cell_role == "perturbation_source"
     }
     primary = tuple(sorted(development_perturbations & evaluation_perturbations))
-    secondary = tuple(sorted(set(snapshot.perturbations) - set(primary)))
+    secondary = tuple(sorted(evaluation_perturbations - development_perturbations))
+    development_only = tuple(
+        sorted(development_perturbations - evaluation_perturbations)
+    )
     if not primary:
         raise SpatialPerturbationSplitError("pilot has no shared primary perturbation")
     target_map = dict(snapshot.perturbation_targets)
@@ -1056,6 +1113,7 @@ def build_pilot_fold(
     )
     unsigned: dict[str, object] = {
         "split_id": f"pilot_leave_one_animal_out:{evaluation}",
+        "split_role": "pilot",
         "split_seed": _science()["split_seed"],
         "development_animals": list(development), "evaluation_animals": [evaluation],
         "train_rows": [row.stable_row_id for row in snapshot.rows if row.animal_id in development],
@@ -1064,6 +1122,7 @@ def build_pilot_fold(
         "gene_names": list(snapshot.gene_names), "perturbations": list(primary),
         "registered_perturbations": list(snapshot.perturbations),
         "secondary_perturbations": list(secondary),
+        "development_only_perturbations": list(development_only),
         "row_provenance": [_row_mapping(row) for row in snapshot.rows],
         "perturbation_parents": [_parent_mapping(item) for item in parents],
         "primary_units": [_unit_mapping(item) for item in units],
@@ -1139,32 +1198,44 @@ def _parent_evidence_from(value: object, name: str) -> BridgeParentEvidence:
 @dataclass(frozen=True, slots=True)
 class BridgePrimaryUnitEvidence:
     unit_id: str
-    perturbation_neighbour_cell_ids: tuple[str, ...]
-    safe_neighbour_cell_ids: tuple[str, ...]
+    perturbation_neighbour_relation_ids: tuple[str, ...]
+    safe_neighbour_relation_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "unit_id", _sha(self.unit_id, "unit_id"))
         object.__setattr__(
-            self, "perturbation_neighbour_cell_ids",
-            _text_items(self.perturbation_neighbour_cell_ids, "perturbation_neighbour_cell_ids", sort=True),
+            self, "perturbation_neighbour_relation_ids",
+            _text_items(
+                self.perturbation_neighbour_relation_ids,
+                "perturbation_neighbour_relation_ids", sort=True,
+            ),
         )
         object.__setattr__(
-            self, "safe_neighbour_cell_ids",
-            _text_items(self.safe_neighbour_cell_ids, "safe_neighbour_cell_ids", sort=True),
+            self, "safe_neighbour_relation_ids",
+            _text_items(
+                self.safe_neighbour_relation_ids,
+                "safe_neighbour_relation_ids", sort=True,
+            ),
         )
-        if set(self.perturbation_neighbour_cell_ids) & set(self.safe_neighbour_cell_ids):
-            raise SpatialPerturbationSplitError("treatment and safe neighbour IDs must be disjoint")
+        if set(self.perturbation_neighbour_relation_ids) & set(self.safe_neighbour_relation_ids):
+            raise SpatialPerturbationSplitError(
+                "treatment and safe neighbour relation IDs must be disjoint"
+            )
 
 
 def _unit_evidence_from(value: object, name: str) -> BridgePrimaryUnitEvidence:
     if type(value) is BridgePrimaryUnitEvidence:
         item = cast(BridgePrimaryUnitEvidence, value)
         return BridgePrimaryUnitEvidence(
-            item.unit_id, item.perturbation_neighbour_cell_ids, item.safe_neighbour_cell_ids
+            item.unit_id, item.perturbation_neighbour_relation_ids,
+            item.safe_neighbour_relation_ids,
         )
     if type(value) is dict:
         raw = cast(dict[object, object], value)
-        expected = {"unit_id", "perturbation_neighbour_cell_ids", "safe_neighbour_cell_ids"}
+        expected = {
+            "unit_id", "perturbation_neighbour_relation_ids",
+            "safe_neighbour_relation_ids",
+        }
         if set(raw) != expected:
             raise SpatialPerturbationSplitError(f"{name} has unexpected fields")
         return BridgePrimaryUnitEvidence(**cast(dict[str, object], raw))  # type: ignore[arg-type]
@@ -1185,8 +1256,10 @@ def _unit_evidence_mapping(item: BridgePrimaryUnitEvidence) -> dict[str, object]
     snapshot = _unit_evidence_from(item, "unit_evidence")
     return {
         "unit_id": snapshot.unit_id,
-        "perturbation_neighbour_cell_ids": list(snapshot.perturbation_neighbour_cell_ids),
-        "safe_neighbour_cell_ids": list(snapshot.safe_neighbour_cell_ids),
+        "perturbation_neighbour_relation_ids": list(
+            snapshot.perturbation_neighbour_relation_ids
+        ),
+        "safe_neighbour_relation_ids": list(snapshot.safe_neighbour_relation_ids),
     }
 
 
@@ -1229,11 +1302,18 @@ class BridgeEligibilityEvidence:
             raise SpatialPerturbationSplitError("unique unit evidence is required")
         units = tuple(sorted(units, key=lambda item: item.unit_id))
         treatment_ids = tuple(
-            cell for item in units for cell in item.perturbation_neighbour_cell_ids
+            relation_id
+            for item in units
+            for relation_id in item.perturbation_neighbour_relation_ids
         )
-        safe_ids = tuple(cell for item in units for cell in item.safe_neighbour_cell_ids)
+        safe_ids = tuple(
+            relation_id for item in units
+            for relation_id in item.safe_neighbour_relation_ids
+        )
         if len(set(treatment_ids)) != len(treatment_ids) or len(set(safe_ids)) != len(safe_ids):
-            raise SpatialPerturbationSplitError("a neighbour cell cannot appear in two frozen units")
+            raise SpatialPerturbationSplitError(
+                "a neighbour relation cannot appear in two frozen units"
+            )
         if set(treatment_ids) & set(safe_ids):
             raise SpatialPerturbationSplitError("treatment and safe neighbour evidence must be disjoint")
         identity = _sha(self.evidence_identity_sha256, "evidence_identity_sha256")
@@ -1585,10 +1665,10 @@ def _derive_eligibility(
     for unit_id, frozen_unit in frozen_unit_by_id.items():
         unit_evidence = evidence_unit_by_id[unit_id]
         treatment_relations = _resolve_relations(
-            unit_evidence.perturbation_neighbour_cell_ids, relation_by_id
+            unit_evidence.perturbation_neighbour_relation_ids, relation_by_id
         )
         safe_relations = _resolve_relations(
-            unit_evidence.safe_neighbour_cell_ids, relation_by_id
+            unit_evidence.safe_neighbour_relation_ids, relation_by_id
         )
         _require_relations(
             treatment_relations, animal=frozen_unit.animal_id,

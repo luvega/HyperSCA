@@ -246,6 +246,39 @@ def test_holdout_only_perturbations_are_structurally_secondary(
 
 
 @settings(max_examples=3, deadline=None)
+@given(st.sampled_from(("guide_0", "guide_2", "guide_4")))
+def test_development_only_perturbations_are_not_secondary(
+    development_only: str,
+) -> None:
+    metadata = _small_metadata()
+    rows = tuple(
+        row for row in metadata.rows
+        if not (
+            row.animal_id == "mouse_1"
+            and row.context_perturbation_id == development_only
+        )
+    )
+    relations = tuple(
+        item for item in metadata.neighbour_relations
+        if not (
+            item.animal_id == "mouse_1"
+            and item.perturbation_id == development_only
+        )
+    )
+    module = import_module("src.evaluation.spatial_perturbation_split")
+    pruned = BridgeSplitMetadata(
+        rows, metadata.gene_names, metadata.perturbations,
+        metadata.neighbour_cell_types, metadata.perturbation_targets,
+        metadata.block_adjacency, metadata.safe_control_label, relations,
+        module._neighbour_table_identity(relations), metadata.candidate,
+        metadata.registry_summary, metadata.capability_result,
+    )
+    manifest = build_pilot_fold(pruned, "mouse_1")
+    assert development_only in manifest.development_only_perturbations
+    assert development_only not in manifest.secondary_perturbations
+
+
+@settings(max_examples=3, deadline=None)
 @given(st.sampled_from(("guide_0", "guide_1", "guide_4")))
 def test_registry_binding_cannot_be_bypassed_by_upstream_perturbation_deletion(
     deleted: str,
