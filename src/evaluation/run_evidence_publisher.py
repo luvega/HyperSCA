@@ -73,6 +73,7 @@ class VerifiedRunEvidence:
     statistical_unit_record: Mapping[str, object]
     summary: Mapping[str, object] | None
     output_dir: Path
+    bundle_identity_sha256: str
 
 
 def _safe_text(value: object, *, allow_slash: bool = False) -> bool:
@@ -1237,6 +1238,12 @@ def verify_run_evidence_bundle(
             statistical_unit_record=_deep_freeze(unit_record),
             summary=None if summary is None else _deep_freeze(summary),
             output_dir=output,
+            bundle_identity_sha256=hashlib.sha256(
+                b"run-evidence-bundle-v1\x00"
+                + manifest_payload
+                + b"\x00"
+                + status_payload
+            ).hexdigest(),
         )
     except RunEvidenceError:
         raise
