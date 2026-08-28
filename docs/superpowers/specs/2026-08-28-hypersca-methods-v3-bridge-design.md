@@ -2,7 +2,8 @@
 
 **Date:** 2026-08-28
 
-**Status:** Approved design; implementation not started
+**Status:** Approved design, revised with predictor-adapter stop gate;
+implementation not started
 
 **Target protocol:** `hypersca-methods-v3.0`
 
@@ -103,10 +104,11 @@ The bridge enters v3 through a staged admission process.
 
 1. `candidate_registered`
 2. `capability_passed` or `capability_failed`
-3. `pilot_audit_only`
-4. `external_cohort_verified`
-5. `confirmatory_frozen`
-6. `completed_positive`, `completed_negative`, or `operational_failure`
+3. `method_adapter_executable` or `method_adapter_not_executable`
+4. `pilot_audit_only`
+5. `external_cohort_verified`
+6. `confirmatory_frozen`
+7. `completed_positive`, `completed_negative`, or `operational_failure`
 
 Capability audit is outcome-blind. It may inspect file identity, licence,
 animal and section identifiers, coordinates, barcode quality, cell types,
@@ -335,6 +337,27 @@ controls, not competitive methods.
 The three-animal pilot reports point estimates, animal-level direction, unit
 coverage, and operational failures. It never evaluates a promotion CI.
 
+### 10.1 Predictor-adapter stop gate
+
+The repository currently has no preregistered production adapter that maps a
+spatial perturbation input to the complete neighbour-expression prediction
+contract required by this benchmark. Existing HyperSCA-C output is a directed
+intracellular relation score, and `propagate_perturbation()` is an unvalidated
+generic propagation proxy; neither is silently relabelled as a bridge method.
+
+The first implementation phase therefore builds the evidence policy, bridge
+data contracts, metrics, comparator contracts, publisher boundary, synthetic
+tests, and an outcome-blind predictor-capability audit. The capability audit
+must return `method_adapter_not_executable` when the formal adapter is absent.
+That terminal capability state contains no predictions or primary metrics and
+stops the workflow before a real three-animal pilot.
+
+A possible later adapter that combines a frozen HyperSCA-C cell-autonomous
+effect with a preregistered spatial propagation rule is retained only as
+`backup_not_authorized`. It requires a separate design review, preregistration,
+protocol identity, and outcome-blind capability audit. It is not implemented
+under this specification revision.
+
 ## 11. Components and Dependency Direction
 
 The bridge is implemented as small modules around the existing evidence
@@ -344,10 +367,11 @@ infrastructure:
 BridgeCandidateRegistry
   -> BridgeCapabilityAudit
     -> BridgeSplitManifest
-      -> BridgeRunAdapter
-        -> RunEvidencePublisher
-          -> BridgePairedCollection
-            -> EvidencePolicy
+      -> BridgePredictorCapability
+        -> ValidatedBridgePredictionBundle
+          -> RunEvidencePublisher
+            -> BridgePairedCollection
+              -> EvidencePolicy
 ```
 
 Responsibilities:
@@ -355,7 +379,10 @@ Responsibilities:
 - registry: immutable asset, licence, identity, and independence metadata;
 - capability audit: outcome-blind structural and count checks;
 - split manifest: immutable animals, units, genes, bands, and abstentions;
-- run adapter: execute one frozen method without making promotion decisions;
+- predictor capability: establish that a preregistered production adapter is
+  executable without inspecting response outcomes;
+- validated prediction bundle: bind predictions to the exact method, protocol,
+  data, split, units, seed, code, and schema before scoring or publication;
 - publisher: validate and atomically publish evidence bundles;
 - paired collection: prove exact comparable units and identities;
 - policy: decide family-specific and integrated claims.
@@ -368,7 +395,8 @@ Responsibilities:
 3. BridgeCapabilityAudit cannot import models, scoring, or response metrics.
 4. BridgeSplit cannot import models or EvidencePolicy.
 5. BridgeScoring cannot import publisher or promotion policy.
-6. BridgeRunAdapter may depend on models and publisher but not CRC.
+6. The prediction contract cannot import or fit models; a future separately
+   preregistered adapter may depend on models but not CRC or promotion policy.
 7. CRC application code cannot import promotion transition interfaces.
 8. CLI scripts contain argument parsing and error translation only; scientific
    logic remains under `src/`.
@@ -382,6 +410,7 @@ The following terminal or blocking states remain distinct:
 - `insufficient_perturbation_coverage`;
 - `spatial_contamination_exceeds_limit`;
 - `external_cohort_missing`;
+- `method_adapter_not_executable`;
 - `bridge_pilot_only`;
 - `completed_negative`;
 - `operational_failure`.
@@ -449,12 +478,18 @@ collection contents.
 9. Freeze the exact v3 protocol identity. If no untouched external bridge
    cohort is already capable at this point, freeze the bridge role as
    `pilot_audit_only` and permanently disable the integrated claim for v3.
-10. Run the three-animal Spatial Perturb-Seq audit-only pilot under that frozen
-    identity. Pilot results cannot alter the protocol or admit a later cohort.
-11. After interfaces are frozen, split large benchmark runners where needed.
-12. Run eligible five-seed module releases once. A bridge confirmatory release
-    is run only if its external cohort was registered before v3 freeze. No
-    post-pilot model or protocol redesign is permitted in this study.
+10. Audit the formal bridge predictor interface without outcomes. Under the
+    current repository, record `method_adapter_not_executable` and stop without
+    running the three-animal pilot.
+11. If a future separately approved predictor-adapter protocol passes its
+    capability audit, run the three-animal Spatial Perturb-Seq audit-only pilot
+    under that new identity. Pilot results cannot alter the protocol or admit a
+    later cohort.
+12. After interfaces are frozen, split large benchmark runners where needed.
+13. Run eligible five-seed module releases once. A bridge confirmatory release
+    is run only if its external cohort was registered before the applicable
+    protocol freeze. No post-pilot model or protocol redesign is permitted in
+    that study.
 
 ## 15. Expected Scientific Outcomes
 
