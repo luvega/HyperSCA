@@ -20,9 +20,9 @@ from src.evaluation.spatial_perturbation_registry import (
 def _candidate(specimens: int = 5) -> BridgeCandidate:
     ids = tuple(f"s{index}" for index in range(1, specimens + 1))
     return BridgeCandidate(
-        "candidate", "GSE1", "spatial", ids,
+        "candidate", "SYN1", "spatial", ids,
         tuple((value, (f"{value}_sec",)) for value in ids),
-        "mSafe", ("p1",), "https://example.test/GSE1", "a" * 64,
+        "mSafe", ("p1",), "https://example.test/SYN1", "a" * 64,
     )
 
 
@@ -30,7 +30,7 @@ def _summary(specimens: int = 5, cohorts: int = 2) -> MetadataSummary:
     ids = tuple(f"s{index}" for index in range(1, specimens + 1))
     cohort_ids = tuple(f"c{index}" for index in range(cohorts))
     return MetadataSummary(
-        "candidate", "GSE1", cohort_ids, ids,
+        "candidate", "SYN1", cohort_ids, ids,
         tuple((value, (f"{value}_sec",)) for value in ids), ("b1",), True, True,
         specimens, ("G1",), 1, ("p1",), (("p1", specimens),), (("mSafe", specimens),),
         (("valid", specimens),), (("valid", specimens),),
@@ -75,13 +75,13 @@ def test_metadata_rejects_non_finite_coverage_values(value: float) -> None:
 @given(st.sampled_from(("\x00", "e\u0301", " x", "x ")))
 def test_candidate_rejects_unsafe_text(value: str) -> None:
     with pytest.raises(SpatialPerturbationRegistryError):
-        BridgeCandidate(value, "GSE1", "spatial", (), (), "mSafe", (), "https://example.test", "a" * 64)
+        BridgeCandidate(value, "SYN1", "spatial", (), (), "mSafe", (), "https://example.test/source", "a" * 64)
 
 
 def test_custom_sequences_are_rejected_without_iteration() -> None:
     hostile = _ExplodingSequence()
     with pytest.raises(SpatialPerturbationRegistryError):
-        BridgeCandidate("candidate", "GSE1", "spatial", hostile, (), "mSafe", (), "https://example.test", "a" * 64)  # type: ignore[arg-type]
+        BridgeCandidate("candidate", "SYN1", "spatial", hostile, (), "mSafe", (), "https://example.test/source", "a" * 64)  # type: ignore[arg-type]
 
 
 def test_deterministic_identity_and_role_boolean_consistency() -> None:

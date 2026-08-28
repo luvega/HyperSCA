@@ -31,13 +31,13 @@ def candidate(specimen_count: int = 3) -> BridgeCandidate:
     specimens = tuple(f"mouse_{index}" for index in range(1, specimen_count + 1))
     return BridgeCandidate(
         candidate_id="generic_bridge",
-        accession="GSETEST",
+        accession="SYNTEST",
         platform="spatial_perturbation",
         biological_specimens=specimens,
         sections_by_specimen=tuple((item, (f"{item}_section",)) for item in specimens),
         safe_control_label="mSafe",
         perturbation_labels=("guide_a",),
-        source_uri="https://example.test/GSETEST",
+        source_uri="https://example.test/SYNTEST",
         source_identity_sha256="a" * 64,
     )
 
@@ -46,7 +46,7 @@ def metadata_summary(*, animals: int = 5, cohorts: int = 2) -> MetadataSummary:
     specimens = tuple(f"mouse_{index}" for index in range(1, animals + 1))
     return MetadataSummary(
         candidate_id="generic_bridge",
-        accession="GSETEST",
+        accession="SYNTEST",
         cohort_ids=tuple(f"cohort_{index}" for index in range(cohorts)),
         biological_specimen_ids=specimens,
         sections_by_specimen=tuple((specimen, (f"{specimen}_section",)) for specimen in specimens),
@@ -99,7 +99,7 @@ def explicit_metadata_summary(
     total = len(covered)
     return MetadataSummary(
         candidate_id="generic_bridge",
-        accession="GSETEST",
+        accession="SYNTEST",
         cohort_ids=cohort_ids,
         biological_specimen_ids=specimens,
         sections_by_specimen=tuple((specimen, (f"{specimen}_section",)) for specimen in specimens),
@@ -309,6 +309,54 @@ def test_frozen_source_anchor_alias_cannot_upgrade_or_publish(tmp_path: Path) ->
     assert not output.exists()
 
 
+def test_canonical_gse_source_alias_cannot_upgrade_or_publish(tmp_path: Path) -> None:
+    frozen = load_bridge_candidates(REGISTRY_PATH)["gse274447_msafe_bridge"]
+    specimens = tuple(f"mouse_{index}" for index in range(1, 6))
+    alias = "alias_bridge"
+    for field, value in (
+        ("candidate_id", alias),
+        ("accession", "gse274447"),
+        ("source_uri", f"{frozen.source_uri}#same-http-resource"),
+        ("source_identity_sha256", "b" * 64),
+        ("biological_specimens", specimens),
+        ("sections_by_specimen", tuple((item, (f"{item}_section",)) for item in specimens)),
+        ("perturbation_labels", ("guide_a",)),
+    ):
+        object.__setattr__(frozen, field, value)
+    raw = explicit_metadata_summary(animals=5, cohorts=2).to_mapping()
+    raw.update({"candidate_id": alias, "accession": "gse274447", "source_identity_sha256": "b" * 64})
+    with pytest.raises(SpatialPerturbationRegistryError):
+        audit_bridge_capability(frozen, metadata_summary_from_mapping(raw))
+
+    unsigned = audit_bridge_capability(candidate(5), metadata_summary(animals=5)).to_mapping()
+    unsigned.pop("capability_identity_sha256")
+    unsigned["candidate_id"] = alias
+    forged = BridgeCapabilityResult(
+        **unsigned, capability_identity_sha256=_unsigned_digest(unsigned),
+    )  # type: ignore[arg-type]
+    output = tmp_path / "canonical-alias.json"
+    with pytest.raises(SpatialPerturbationRegistryError):
+        write_bridge_capability_exclusively(output, forged, candidate=frozen)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "accession,source_uri",
+    (
+        ("gse274447", "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE274447"),
+        ("GSE274447", "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE274447#fragment"),
+        ("GSE274447", "https://www.ncbi.nlm.nih.gov:443/geo/query/acc.cgi?acc=GSE274447"),
+        ("GSE274447", "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?x=1&acc=GSE274447"),
+        ("SYN1", "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE274447"),
+    ),
+)
+def test_source_identity_rejects_noncanonical_geo_aliases(accession: str, source_uri: str) -> None:
+    with pytest.raises(SpatialPerturbationRegistryError):
+        BridgeCandidate(
+            "other_candidate", accession, "spatial", (), (), "mSafe", (), source_uri, "a" * 64,
+        )
+
+
 def test_writer_binds_result_specimen_count_to_candidate(tmp_path: Path) -> None:
     frozen = load_bridge_candidates(REGISTRY_PATH)["gse274447_msafe_bridge"]
     generic = audit_bridge_capability(candidate(5), metadata_summary(animals=5))
@@ -373,12 +421,12 @@ def test_result_mapping_rejects_mutated_recomputed_impossible_state() -> None:
 
 def test_candidate_rejects_global_section_reuse_and_control_label_overlap() -> None:
     with pytest.raises(SpatialPerturbationRegistryError):
-        BridgeCandidate("candidate", "GSE1", "spatial", ("s1", "s2"),
+        BridgeCandidate("candidate", "SYN1", "spatial", ("s1", "s2"),
                         (("s1", ("same",)), ("s2", ("same",))), "mSafe", (),
-                        "https://example.test/GSE1", "a" * 64)
+                        "https://example.test/SYN1", "a" * 64)
     with pytest.raises(SpatialPerturbationRegistryError):
-        BridgeCandidate("candidate", "GSE1", "spatial", ("s1",), (("s1", ()),),
-                        "mSafe", ("mSafe",), "https://example.test/GSE1", "a" * 64)
+        BridgeCandidate("candidate", "SYN1", "spatial", ("s1",), (("s1", ()),),
+                        "mSafe", ("mSafe",), "https://example.test/SYN1", "a" * 64)
 
 
 def test_metadata_mapping_is_closed_and_outcome_blind() -> None:
@@ -401,9 +449,9 @@ def test_direct_construction_defensively_copies_and_revalidates() -> None:
     raw_specimens = ["mouse_1", "mouse_2", "mouse_3"]
     raw_sections = [("mouse_1", []), ("mouse_2", []), ("mouse_3", [])]
     value = BridgeCandidate(
-        "defensive_copy_candidate", "GSEDEF", "spatial_perturbation", raw_specimens,
+        "defensive_copy_candidate", "SYNDEF", "spatial_perturbation", raw_specimens,
         raw_sections, "mSafe", ["guide_a"],
-        "https://example.test/GSEDEF", "a" * 64,
+        "https://example.test/SYNDEF", "a" * 64,
     )
     raw_specimens.clear()
     raw_sections[0][1].append("changed")

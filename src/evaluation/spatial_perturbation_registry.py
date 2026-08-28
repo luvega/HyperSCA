@@ -18,6 +18,7 @@ import stat
 from types import MappingProxyType
 from typing import cast
 import unicodedata
+from urllib.parse import urlsplit
 
 
 MAXIMUM_REGISTRY_BYTES = 64 * 1024
@@ -28,6 +29,7 @@ MAXIMUM_BLOCK_IDS = 1024
 MAXIMUM_GENE_NAMES = 4096
 MAXIMUM_COUNT = 10_000_000
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_GEO_ACCESSION = re.compile(r"GSE[1-9][0-9]*")
 _RENAME_NOREPLACE = 1
 _AT_EMPTY_PATH = 0x1000
 _AT_FDCWD = -100
@@ -60,6 +62,47 @@ def _sha(value: object, name: str) -> str:
     if _SHA256.fullmatch(text) is None:
         raise SpatialPerturbationRegistryError(f"{name} must be a lowercase SHA-256")
     return text
+
+
+def _canonical_source_uri(accession: str, value: object) -> str:
+    """Accept only one spelling for each source resource identity."""
+    source_uri = _safe_text(value, "source_uri")
+    try:
+        parsed = urlsplit(source_uri)
+        port = parsed.port
+    except ValueError as exc:
+        raise SpatialPerturbationRegistryError("source_uri is not a canonical HTTPS URI") from exc
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.netloc != parsed.hostname
+        or parsed.fragment
+        or not parsed.path.startswith("/")
+        or parsed.path == "/"
+        or "%" in parsed.path
+        or any(piece in ("", ".", "..") for piece in parsed.path.split("/")[1:])
+    ):
+        raise SpatialPerturbationRegistryError("source_uri is not a canonical HTTPS URI")
+    begins_geo = accession[:3].casefold() == "gse"
+    is_geo = _GEO_ACCESSION.fullmatch(accession) is not None
+    if begins_geo and not is_geo:
+        raise SpatialPerturbationRegistryError("GEO accession must be uppercase canonical GSE text")
+    is_geo_endpoint = (
+        parsed.hostname == "www.ncbi.nlm.nih.gov"
+        and parsed.path == "/geo/query/acc.cgi"
+    )
+    if is_geo:
+        expected = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={accession}"
+        if source_uri != expected:
+            raise SpatialPerturbationRegistryError("GEO source_uri must exactly match accession")
+    elif is_geo_endpoint:
+        raise SpatialPerturbationRegistryError("NCBI GEO endpoint requires a matching GEO accession")
+    elif parsed.query or "?" in source_uri:
+        raise SpatialPerturbationRegistryError("non-GEO source_uri must not contain a query")
+    return source_uri
 
 
 def _count(value: object, name: str) -> int:
@@ -172,7 +215,7 @@ class BridgeCandidate:
             ("sections_by_specimen", sections),
             ("safe_control_label", safe_control_label),
             ("perturbation_labels", perturbation_labels),
-            ("source_uri", _safe_text(self.source_uri, "source_uri")),
+            ("source_uri", _canonical_source_uri(accession, self.source_uri)),
             ("source_identity_sha256", _sha(self.source_identity_sha256, "source_identity_sha256")),
         ):
             object.__setattr__(self, name, value)
@@ -194,11 +237,22 @@ def _validated_candidate_declaration(candidate: BridgeCandidate) -> BridgeCandid
     """Re-check the immutable declaration whenever it crosses an audit boundary."""
     if type(candidate) is not BridgeCandidate:
         raise SpatialPerturbationRegistryError("candidate must be BridgeCandidate")
+    canonical_accession = (
+        candidate.accession.casefold() if type(candidate.accession) is str else ""
+    )
+    canonical_resource = (
+        candidate.source_uri.split("#", 1)[0].casefold()
+        if type(candidate.source_uri) is str else ""
+    )
+    canonical_source_identity = (
+        candidate.source_identity_sha256.casefold()
+        if type(candidate.source_identity_sha256) is str else ""
+    )
     frozen_anchor = any((
         candidate.candidate_id == _FROZEN_CANDIDATE_ORDER[0],
-        candidate.accession == "GSE274447",
-        candidate.source_uri == _FROZEN_GSE274447_SOURCE,
-        candidate.source_identity_sha256 == _FROZEN_GSE274447_SOURCE_IDENTITY,
+        canonical_accession == "gse274447",
+        canonical_resource == _FROZEN_GSE274447_SOURCE.casefold(),
+        canonical_source_identity == _FROZEN_GSE274447_SOURCE_IDENTITY,
     ))
     exact_frozen_declaration = (
         candidate.candidate_id == _FROZEN_CANDIDATE_ORDER[0]
