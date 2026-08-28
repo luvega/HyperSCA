@@ -159,6 +159,59 @@ def test_real_admitted_modules_with_missing_bridge_are_separate_module_audit_onl
     assert result.allowed_use == "separate_module_claims_only"
 
 
+@pytest.mark.parametrize("failed_index", [0, 1])
+def test_missing_bridge_comparator_does_not_hide_operational_failure(
+    failed_index: int,
+) -> None:
+    policy = policy_v3()
+    required = dict(policy.required_comparators)["bridge"]
+    failed = evidence(
+        "bridge",
+        required[failed_index],
+        attempted=3,
+        completed=2,
+        identity="f" * 64,
+    )
+    bridge = evaluate_bridge_claim((failed,), policy)
+
+    assert bridge.status == "blocked"
+    assert any(
+        reason.startswith("missing comparator evidence:")
+        for reason in bridge.blocking_reasons
+    )
+    assert any(
+        reason.startswith("common paired attempted/completed units are required")
+        for reason in bridge.blocking_reasons
+    )
+    result = derive_integrated_claim(
+        (
+            evaluate_v3_claim(pair("spatial"), policy),
+            evaluate_v3_claim(pair("intracellular_causal"), policy),
+            bridge,
+        ),
+        policy,
+    )
+    assert result.status == "blocked"
+    assert result.allowed_use == "not_used"
+
+
+def test_partially_attempted_bridge_is_not_classified_as_unattempted() -> None:
+    policy = policy_v3()
+    bridge = evaluate_bridge_claim((bridge_pair(0.01, 0.01)[0],), policy)
+
+    assert bridge.status == "blocked"
+    assert "bridge evidence was attempted" in bridge.blocking_reasons
+    result = derive_integrated_claim(
+        (
+            evaluate_v3_claim(pair("spatial"), policy),
+            evaluate_v3_claim(pair("intracellular_causal"), policy),
+            bridge,
+        ),
+        policy,
+    )
+    assert result.status == "blocked"
+
+
 def test_bridge_uses_intersection_union_without_holm() -> None:
     decision = evaluate_bridge_claim(bridge_pair(0.01, 0.04), policy_v3())
     assert decision.nominal_p_value == 0.04

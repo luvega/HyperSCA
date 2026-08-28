@@ -803,42 +803,37 @@ def _evaluate_v3_family(
     multiplicity = (
         "none_intersection_union" if claim_id == "bridge" else "none_family_specific"
     )
-    if missing:
-        return _v3_decision(
-            claim_id=claim_id,
-            policy=policy,
-            status="blocked",
-            allowed_use="not_used",
-            reasons=(f"missing comparator evidence: {', '.join(missing)}",),
-            identity_payload=identity_payload,
-            nominal_p_value=None,
-            multiplicity_adjustment=multiplicity,
-            application_evidence_identities=application_identities,
-        )
-
     paired_counts = {
         (
-            by_comparator[comparator].attempted_units,
-            by_comparator[comparator].completed_units,
+            item.attempted_units,
+            item.completed_units,
         )
-        for comparator in required
+        for item in by_comparator.values()
     }
     incomplete = tuple(
         comparator
         for comparator in required
-        if by_comparator[comparator].completed_units
+        if comparator in by_comparator
+        and by_comparator[comparator].completed_units
         != by_comparator[comparator].attempted_units
     )
-    if len(paired_counts) != 1 or incomplete:
+    blocking_reasons: list[str] = []
+    if missing:
+        blocking_reasons.append(f"missing comparator evidence: {', '.join(missing)}")
+        if claim_id == "bridge" and by_comparator:
+            blocking_reasons.append("bridge evidence was attempted")
+    if incomplete or len(paired_counts) > 1:
         detail = "common paired attempted/completed units are required"
         if incomplete:
             detail = f"{detail}; incomplete evidence: {', '.join(incomplete)}"
+        blocking_reasons.append(detail)
+    if blocking_reasons:
         return _v3_decision(
             claim_id=claim_id,
             policy=policy,
             status="blocked",
             allowed_use="not_used",
-            reasons=(detail,),
+            reasons=tuple(blocking_reasons),
             identity_payload=identity_payload,
             nominal_p_value=None,
             multiplicity_adjustment=multiplicity,
@@ -966,6 +961,20 @@ def evaluate_bridge_claim(
     return _evaluate_v3_family(evidence, policy, "bridge")
 
 
+def _is_purely_missing_bridge_block(decision: V3ClaimDecision) -> bool:
+    """Classify only the closed missing-evidence reason codes as unavailable."""
+    missing_reasons = {
+        "missing comparator evidence: matched_euclidean_spatial_causal",
+        "missing comparator evidence: hypersca_own_only",
+        "missing comparator evidence: matched_euclidean_spatial_causal, hypersca_own_only",
+    }
+    return (
+        decision.status == "blocked"
+        and bool(decision.blocking_reasons)
+        and all(reason in missing_reasons for reason in decision.blocking_reasons)
+    )
+
+
 def derive_integrated_claim(
     decisions: tuple[V3ClaimDecision, ...], policy: EvidencePolicyV3
 ) -> V3ClaimDecision:
@@ -1007,11 +1016,7 @@ def derive_integrated_claim(
     bridge_unavailable = (
         by_claim["spatial"].status == "admitted"
         and by_claim["intracellular_causal"].status == "admitted"
-        and by_claim["bridge"].status == "blocked"
-        and any(
-            reason.startswith("missing comparator evidence:")
-            for reason in by_claim["bridge"].blocking_reasons
-        )
+        and _is_purely_missing_bridge_block(by_claim["bridge"])
     )
     if bridge_unavailable:
         status, allowed_use, reasons = (
