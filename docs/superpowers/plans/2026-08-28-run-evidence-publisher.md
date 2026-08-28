@@ -541,7 +541,7 @@ Run:
 conda run --no-capture-output -n hypersca \
   python -m pytest tests/test_run_evidence_*.py \
   tests/property/test_run_evidence_properties.py -q -p no:cacheprovider
-python -m importlinter
+lint-imports
 ```
 
 Expected: all publisher/property tests and Import Linter pass.
@@ -715,7 +715,7 @@ conda run --no-capture-output -n hypersca python -m pytest \
   tests/test_methods_pilot.py tests/test_methods_protocol.py \
   tests/discovery/test_evidence_policy.py tests/discovery/test_benchmark_claims.py \
   -q -p no:cacheprovider
-python -m importlinter
+lint-imports
 conda run --no-capture-output -n hypersca python -m py_compile \
   src/evaluation/run_evidence_identity.py \
   src/evaluation/run_evidence_publisher.py \

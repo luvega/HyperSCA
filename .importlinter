@@ -1,0 +1,95 @@
+[importlinter]
+root_package = src
+
+[importlinter:contract:models-foundation]
+name = Models remain independent from data and higher-level domains
+type = forbidden
+source_modules =
+    src.models
+forbidden_modules =
+    src.data
+    src.causal
+    src.evaluation
+    src.perturbation
+    src.discovery
+    src.pipeline
+    src.behavior_grammar
+    src.visualization
+
+[importlinter:contract:data-foundation]
+name = Data remains independent from models and higher-level domains
+type = forbidden
+source_modules =
+    src.data
+forbidden_modules =
+    src.models
+    src.causal
+    src.evaluation
+    src.perturbation
+    src.discovery
+    src.pipeline
+    src.behavior_grammar
+    src.visualization
+
+[importlinter:contract:causal-boundary]
+name = Causal code does not depend on orchestration, discovery, or presentation
+type = forbidden
+source_modules =
+    src.causal
+forbidden_modules =
+    src.evaluation
+    src.perturbation
+    src.discovery
+    src.pipeline
+    src.behavior_grammar
+    src.visualization
+
+[importlinter:contract:evaluation-boundary]
+name = Evaluation does not depend on causal orchestration or discovery policy
+type = forbidden
+source_modules =
+    src.evaluation
+forbidden_modules =
+    src.causal
+    src.perturbation
+    src.discovery
+    src.pipeline
+    src.behavior_grammar
+    src.visualization
+
+[importlinter:contract:perturbation-boundary]
+name = Perturbation does not depend on evaluation, discovery, or orchestration
+type = forbidden
+source_modules =
+    src.perturbation
+forbidden_modules =
+    src.evaluation
+    src.discovery
+    src.pipeline
+    src.behavior_grammar
+    src.visualization
+
+[importlinter:contract:discovery-boundary]
+name = Discovery consumes scientific domains but not orchestration or presentation
+type = forbidden
+source_modules =
+    src.discovery
+forbidden_modules =
+    src.pipeline
+    src.behavior_grammar
+    src.visualization
+
+[importlinter:contract:behavior-pipeline-separation]
+name = Behavior grammar and pipeline orchestration do not import each other
+type = independence
+modules =
+    src.behavior_grammar
+    src.pipeline
+
+[importlinter:contract:run-evidence-layers]
+name = Collection depends downward on publisher and immutable identity only
+type = layers
+layers =
+    src.evaluation.run_evidence_collection
+    src.evaluation.run_evidence_publisher
+    src.evaluation.run_evidence_identity

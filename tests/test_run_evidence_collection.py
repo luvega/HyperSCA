@@ -128,7 +128,7 @@ def test_collection_rejects_model_seed_changing_data_split(tmp_path: Path) -> No
         publish_run(
             tmp_path,
             model_seed=seed,
-            data_split_seed=seed,
+            data_split_seed=seed + 1000,
             split_sha=f"{seed:064x}",
         )
         for seed in MODEL_SEEDS
