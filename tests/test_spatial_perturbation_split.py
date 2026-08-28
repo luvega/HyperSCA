@@ -59,6 +59,7 @@ def synthetic_metadata(
     adjacency: bool = False,
     block_count: int = 3,
     neighbour_types: tuple[str, ...] = NEIGHBOUR_TYPES,
+    neighbour_count: int | None = None,
 ) -> BridgeSplitMetadata:
     rows: list[BridgeSplitRow] = []
     row_id = 0
@@ -79,15 +80,19 @@ def synthetic_metadata(
                         )
                     )
                     row_id += 1
-            neighbour_count = (
-                max(50, block_count * 13)
-                if len(neighbour_types) == 1
-                else max(30, block_count * 10)
+            frozen_neighbour_count = (
+                neighbour_count
+                if neighbour_count is not None
+                else (
+                    max(50, block_count * 13)
+                    if len(neighbour_types) == 1
+                    else max(30, block_count * 10)
+                )
             )
             for neighbour_type in neighbour_types:
                 for band in BANDS:
                     for role in ("perturbation_neighbour", "safe_neighbour"):
-                        for index in range(neighbour_count):
+                        for index in range(frozen_neighbour_count):
                             rows.append(
                                 BridgeSplitRow(
                                     row_id, f"cell_{row_id:06d}", animal, section,
@@ -652,6 +657,128 @@ def test_aggregate_fifty_does_not_rescue_band_with_all_units_abstaining() -> Non
     assert ("mouse_1", 3, 5) in result.per_animal_perturbation_coverage
     assert result.eligible is False
     assert all(unit_id in result.abstained_unit_ids for unit_id in exact_aggregate)
+
+
+def _cross_cell_type_compensation_evidence(
+    manifest: BridgeSplitManifest,
+    *,
+    matched_oligodendrocytes: int,
+) -> BridgeEligibilityEvidence:
+    parents = tuple(
+        parent for parent in manifest.perturbation_parents
+        if parent.animal_id == "mouse_1"
+    )[:2]
+    treatment_overrides: dict[str, int] = {}
+    safe_overrides: dict[str, int] = {}
+    for parent in parents:
+        units = {
+            unit.neighbour_cell_type: unit.unit_id
+            for unit in manifest.primary_units
+            if unit.animal_id == parent.animal_id
+            and unit.perturbation_id == parent.perturbation_id
+            and unit.band == "proximal"
+        }
+        treatment_overrides.update(
+            {
+                units["astrocyte"]: 29,
+                units["microglia"]: 0,
+                units["oligodendrocyte"]: matched_oligodendrocytes,
+            }
+        )
+        safe_overrides.update(
+            {
+                units["astrocyte"]: 0,
+                units["microglia"]: 29,
+                units["oligodendrocyte"]: matched_oligodendrocytes,
+            }
+        )
+    return complete_evidence(
+        manifest,
+        unit_overrides=treatment_overrides,
+        safe_unit_overrides=safe_overrides,
+    )
+
+
+def test_cross_cell_type_compensation_does_not_satisfy_matched_band_coverage() -> None:
+    manifest = build_pilot_fold(
+        synthetic_metadata(
+            neighbour_types=("astrocyte", "microglia", "oligodendrocyte")
+        ),
+        "mouse_1",
+    )
+    result = evaluate_bridge_eligibility(
+        manifest,
+        _cross_cell_type_compensation_evidence(
+            manifest, matched_oligodendrocytes=30
+        ),
+    )
+    assert ("mouse_1", 3, 5) in result.per_animal_perturbation_coverage
+    assert result.eligible is False
+    assert "insufficient_band_neighbours" not in result.reasons
+    assert "insufficient_safe_control_band_neighbours" in result.reasons
+
+
+@pytest.mark.parametrize(("matched", "eligible"), ((49, False), (50, True)))
+def test_exact_matched_band_coverage_boundary(matched: int, eligible: bool) -> None:
+    manifest = build_pilot_fold(
+        synthetic_metadata(
+            neighbour_types=("astrocyte", "microglia", "oligodendrocyte"),
+            neighbour_count=50,
+        ),
+        "mouse_1",
+    )
+    result = evaluate_bridge_eligibility(
+        manifest,
+        _cross_cell_type_compensation_evidence(
+            manifest, matched_oligodendrocytes=matched
+        ),
+    )
+    expected_scoreable = 5 if eligible else 3
+    assert ("mouse_1", expected_scoreable, 5) in result.per_animal_perturbation_coverage
+    assert result.eligible is eligible
+    assert (
+        "insufficient_safe_control_band_neighbours" in result.reasons
+    ) is (not eligible)
+
+
+def test_matched_reason_applies_only_after_both_raw_band_thresholds() -> None:
+    manifest = build_pilot_fold(
+        synthetic_metadata(
+            neighbour_types=("astrocyte", "microglia", "oligodendrocyte")
+        ),
+        "mouse_1",
+    )
+    treatment_overrides: dict[str, int] = {}
+    safe_overrides: dict[str, int] = {}
+    parents = tuple(
+        parent for parent in manifest.perturbation_parents
+        if parent.animal_id == "mouse_1"
+    )[:2]
+    for parent in parents:
+        units = {
+            unit.neighbour_cell_type: unit.unit_id
+            for unit in manifest.primary_units
+            if unit.animal_id == parent.animal_id
+            and unit.perturbation_id == parent.perturbation_id
+            and unit.band == "proximal"
+        }
+        treatment_overrides.update(
+            {units["astrocyte"]: 19, units["microglia"]: 0}
+        )
+        safe_overrides.update(
+            {units["astrocyte"]: 20, units["microglia"]: 0}
+        )
+    result = evaluate_bridge_eligibility(
+        manifest,
+        complete_evidence(
+            manifest,
+            unit_overrides=treatment_overrides,
+            safe_unit_overrides=safe_overrides,
+        ),
+    )
+    assert ("mouse_1", 3, 5) in result.per_animal_perturbation_coverage
+    assert "insufficient_band_neighbours" in result.reasons
+    assert "insufficient_safe_control_band_neighbours" not in result.reasons
 
 
 def test_below_thirty_unit_is_retained_as_abstention_not_immediate_failure() -> None:

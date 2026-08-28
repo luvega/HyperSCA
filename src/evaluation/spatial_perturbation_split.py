@@ -1186,10 +1186,26 @@ def _derive_eligibility(
             )
             treatment = tuple(row for unit_id in unit_ids for row in unit_rows[unit_id][0])
             safe = tuple(row for unit_id in unit_ids for row in unit_rows[unit_id][1])
-            if len({row.cell_id for row in treatment}) < minimum_band:
+            treatment_total = len({row.cell_id for row in treatment})
+            safe_total = len({row.cell_id for row in safe})
+            if treatment_total < minimum_band:
                 parent_failures[context].add("insufficient_band_neighbours")
-            if len({row.cell_id for row in safe}) < minimum_band:
+            if safe_total < minimum_band:
                 parent_failures[context].add("insufficient_safe_control_band_neighbours")
+            treatment_strata = _neighbour_strata(treatment)
+            safe_strata = _neighbour_strata(safe)
+            matched_neighbours = sum(
+                min(treatment_strata[key], safe_strata[key])
+                for key in treatment_strata.keys() | safe_strata.keys()
+            )
+            if (
+                treatment_total >= minimum_band
+                and safe_total >= minimum_band
+                and matched_neighbours < minimum_band
+            ):
+                parent_failures[context].add(
+                    "insufficient_safe_control_band_neighbours"
+                )
             if not any(unit_scoreable[unit_id] for unit_id in unit_ids):
                 for unit_id in unit_ids:
                     parent_failures[context].update(unit_failures[unit_id])
