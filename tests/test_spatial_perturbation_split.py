@@ -642,6 +642,48 @@ def test_final_review_task6_adapter_rejects_cross_band_ranks(
         split_module.freeze_bridge_neighbour_relation(**raw)
 
 
+def test_final_review_secondary_band_cross_source_neighbor_is_retained() -> None:
+    transition = _task6_relation_row(
+        perturbation_id="guide_0", source_cell_id="source_0",
+        neighbor_cell_id="shared_secondary_neighbor",
+    )
+    transition.update({"band": "transition", "rank": 16})
+    distal = _task6_relation_row(
+        perturbation_id="guide_1", source_cell_id="source_1",
+        neighbor_cell_id="shared_secondary_neighbor",
+    )
+    distal.update({"band": "distal", "rank": 31})
+    table = split_module.freeze_bridge_neighbour_table((transition, distal))
+    reversed_table = split_module.freeze_bridge_neighbour_table(
+        (distal, transition)
+    )
+    assert reversed_table.identity_sha256 == table.identity_sha256
+    assert reversed_table.relations == table.relations
+    assert {
+        (item.source_perturbation_id, item.band, item.rank)
+        for item in table.relations
+    } == {("guide_0", "transition", 16), ("guide_1", "distal", 31)}
+    serialized = b"".join(split_module.iter_bridge_neighbour_table_json(table))
+    assert hashlib.sha256(serialized).hexdigest() == table.identity_sha256
+
+
+def test_final_review_primary_secondary_cross_source_neighbor_is_rejected() -> None:
+    primary = _task6_relation_row(
+        perturbation_id="guide_0", source_cell_id="source_0",
+        neighbor_cell_id="shared_mixed_neighbor",
+    )
+    secondary = _task6_relation_row(
+        perturbation_id="guide_1", source_cell_id="source_1",
+        neighbor_cell_id="shared_mixed_neighbor",
+    )
+    secondary.update({"band": "transition", "rank": 16})
+    with pytest.raises(
+        SpatialPerturbationSplitError,
+        match="physical neighbor.*multiple source perturbations",
+    ):
+        split_module.freeze_bridge_neighbour_table((primary, secondary))
+
+
 def test_last_review_physical_neighbor_cannot_be_treatment_and_safe() -> None:
     treatment = _task6_relation_row()
     safe = _task6_relation_row(

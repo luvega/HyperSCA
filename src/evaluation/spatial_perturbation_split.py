@@ -471,17 +471,26 @@ class BridgeNeighbourTable:
             raise SpatialPerturbationSplitError(
                 "neighbour relation logical keys must be unique"
             )
-        source_by_physical_neighbor: dict[tuple[str, str, str], str] = {}
+        sources_by_physical_neighbor: dict[
+            tuple[str, str, str], set[str]
+        ] = {}
+        primary_physical_neighbors: set[tuple[str, str, str]] = set()
+        primary_bands = cast(tuple[str, str], _science()["primary_bands"])
         for relation in relations:
             if relation.contamination:
                 raise SpatialPerturbationSplitError(
                     "contaminated relations are excluded from the frozen artifact"
                 )
             key = (relation.animal_id, relation.section_id, relation.neighbor_cell_id)
-            prior = source_by_physical_neighbor.setdefault(
-                key, relation.source_perturbation_id
+            sources_by_physical_neighbor.setdefault(key, set()).add(
+                relation.source_perturbation_id
             )
-            if prior != relation.source_perturbation_id:
+            if relation.band in primary_bands and relation.rank <= 15:
+                primary_physical_neighbors.add(key)
+            if (
+                key in primary_physical_neighbors
+                and len(sources_by_physical_neighbor[key]) > 1
+            ):
                 raise SpatialPerturbationSplitError(
                     "a physical neighbor cannot have multiple source perturbations"
                 )
