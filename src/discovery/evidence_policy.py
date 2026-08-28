@@ -75,7 +75,14 @@ def _require_v3_text(value: object, name: str) -> str:
 
 
 def _require_v3_identity(value: object, name: str) -> str:
-    return _require_sha256(value, name)
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _require_v3_float(value: object, name: str) -> float:
+    numeric = _require_float(value, name)
+    return 0.0 if numeric == 0.0 else numeric
 
 
 def _v3_family_maps(
@@ -267,6 +274,8 @@ class V3ClaimEvidence:
 
     claim_id: str
     protocol_version: str
+    protocol_identity_sha256: str
+    capability_identity_sha256: str
     primary_metric: str
     comparator_id: str
     paired_estimate: float | None
@@ -275,6 +284,8 @@ class V3ClaimEvidence:
     nominal_p_value: float | None
     attempted_units: int
     completed_units: int
+    paired_unit_identity_sha256: str
+    run_statuses: tuple[str, ...]
     evidence_role: str
     artifact_identity: str
 
@@ -301,8 +312,13 @@ class V3ClaimEvidence:
             "audit_only",
         }:
             raise ValueError("evidence_role is not permitted by the v3 protocol")
-        if type(self.attempted_units) is not int or self.attempted_units <= 0:
-            raise ValueError("attempted_units must be a positive built-in integer")
+        if (
+            type(self.attempted_units) is not int
+            or not 0 < self.attempted_units <= 10_000
+        ):
+            raise ValueError(
+                "attempted_units must be a positive built-in integer no greater than 10000"
+            )
         if (
             type(self.completed_units) is not int
             or self.completed_units < 0
@@ -311,6 +327,32 @@ class V3ClaimEvidence:
             raise ValueError(
                 "completed_units must be a built-in integer in [0, attempted_units]"
             )
+        if (
+            type(self.run_statuses) is not tuple
+            or len(self.run_statuses) != self.attempted_units
+        ):
+            raise ValueError(
+                "run_statuses must be a bounded tuple with one terminal status per attempted unit"
+            )
+        terminal_statuses = {
+            "completed",
+            "failed_invalid_input",
+            "failed_invalid_output",
+            "failed_timeout",
+            "failed_resource",
+            "failed_runtime",
+            "not_applicable",
+        }
+        if any(
+            type(status) is not str or status not in terminal_statuses
+            for status in self.run_statuses
+        ):
+            raise ValueError("run_statuses contains an unknown or non-terminal status")
+        if (
+            sum(status == "completed" for status in self.run_statuses)
+            != self.completed_units
+        ):
+            raise ValueError("completed_units does not match run_statuses")
         statistics = (
             self.paired_estimate,
             self.ci_low,
@@ -318,16 +360,29 @@ class V3ClaimEvidence:
             self.nominal_p_value,
         )
         if self.completed_units == self.attempted_units:
-            _require_float(self.paired_estimate, "paired_estimate")
-            ci_low = _require_float(self.ci_low, "ci_low")
-            ci_high = _require_float(self.ci_high, "ci_high")
-            p_value = _require_float(self.nominal_p_value, "nominal_p_value")
+            estimate = _require_v3_float(self.paired_estimate, "paired_estimate")
+            ci_low = _require_v3_float(self.ci_low, "ci_low")
+            ci_high = _require_v3_float(self.ci_high, "ci_high")
+            p_value = _require_v3_float(self.nominal_p_value, "nominal_p_value")
             if ci_low > ci_high:
                 raise ValueError("ci_low must not exceed ci_high")
+            if not ci_low <= estimate <= ci_high:
+                raise ValueError("paired_estimate must lie within [ci_low, ci_high]")
             if not 0.0 <= p_value <= 1.0:
                 raise ValueError("nominal_p_value must lie in [0, 1]")
+            object.__setattr__(self, "paired_estimate", estimate)
+            object.__setattr__(self, "ci_low", ci_low)
+            object.__setattr__(self, "ci_high", ci_high)
+            object.__setattr__(self, "nominal_p_value", p_value)
         elif any(value is not None for value in statistics):
             raise ValueError("incomplete evidence must not contain summary statistics")
+        _require_v3_identity(self.protocol_identity_sha256, "protocol_identity_sha256")
+        _require_v3_identity(
+            self.capability_identity_sha256, "capability_identity_sha256"
+        )
+        _require_v3_identity(
+            self.paired_unit_identity_sha256, "paired_unit_identity_sha256"
+        )
         _require_v3_identity(self.artifact_identity, "artifact_identity")
 
     def to_mapping(self) -> dict[str, object]:
@@ -335,6 +390,8 @@ class V3ClaimEvidence:
         return {
             "claim_id": self.claim_id,
             "protocol_version": self.protocol_version,
+            "protocol_identity_sha256": self.protocol_identity_sha256,
+            "capability_identity_sha256": self.capability_identity_sha256,
             "primary_metric": self.primary_metric,
             "comparator_id": self.comparator_id,
             "paired_estimate": self.paired_estimate,
@@ -343,6 +400,8 @@ class V3ClaimEvidence:
             "nominal_p_value": self.nominal_p_value,
             "attempted_units": self.attempted_units,
             "completed_units": self.completed_units,
+            "paired_unit_identity_sha256": self.paired_unit_identity_sha256,
+            "run_statuses": self.run_statuses,
             "evidence_role": self.evidence_role,
             "artifact_identity": self.artifact_identity,
         }
@@ -353,6 +412,8 @@ class EvidencePolicyV3:
     """Frozen v3 promotion policy for spatial, causal, and bridge evidence."""
 
     protocol_version: str
+    protocol_identity_sha256: str
+    capability_identity_sha256: str
     family_primary_metrics: tuple[tuple[str, str], ...]
     required_comparators: tuple[tuple[str, tuple[str, ...]], ...]
     nominal_alpha: float
@@ -364,6 +425,10 @@ class EvidencePolicyV3:
         _require_v3_text(self.protocol_version, "protocol_version")
         if self.protocol_version != "hypersca-methods-v3.0":
             raise ValueError("protocol_version is frozen to hypersca-methods-v3.0")
+        _require_v3_identity(self.protocol_identity_sha256, "protocol_identity_sha256")
+        _require_v3_identity(
+            self.capability_identity_sha256, "capability_identity_sha256"
+        )
         expected_metrics = (
             ("spatial", "neighborhood_preservation_at_k"),
             ("intracellular_causal", "directed_edge_average_precision"),
@@ -422,12 +487,14 @@ class EvidencePolicyV3:
                 )
             for comparator in comparators:
                 _require_v3_text(comparator, "comparator_id")
-        alpha = _require_float(self.nominal_alpha, "nominal_alpha")
-        lower_bound = _require_float(self.minimum_lower_bound, "minimum_lower_bound")
+        alpha = _require_v3_float(self.nominal_alpha, "nominal_alpha")
+        lower_bound = _require_v3_float(self.minimum_lower_bound, "minimum_lower_bound")
         if alpha != 0.05:
             raise ValueError("nominal_alpha must equal the frozen v3 value 0.05")
         if lower_bound != 0.0:
             raise ValueError("minimum_lower_bound must equal the frozen v3 value 0.0")
+        object.__setattr__(self, "nominal_alpha", alpha)
+        object.__setattr__(self, "minimum_lower_bound", lower_bound)
         if type(self.bridge_role) is not str or self.bridge_role not in {
             "pilot_audit_only",
             "confirmatory",
@@ -437,11 +504,14 @@ class EvidencePolicyV3:
             raise ValueError("integrated_claim_enabled must be a built-in bool")
         if self.integrated_claim_enabled is not (self.bridge_role == "confirmatory"):
             raise ValueError("integrated_claim_enabled must match the bridge_role")
+        _validate_v3_policy_protocol_binding(self)
 
     def to_mapping(self) -> dict[str, object]:
         self.__post_init__()
         return {
             "protocol_version": self.protocol_version,
+            "protocol_identity_sha256": self.protocol_identity_sha256,
+            "capability_identity_sha256": self.capability_identity_sha256,
             "family_primary_metrics": self.family_primary_metrics,
             "required_comparators": self.required_comparators,
             "nominal_alpha": self.nominal_alpha,
@@ -449,6 +519,91 @@ class EvidencePolicyV3:
             "bridge_role": self.bridge_role,
             "integrated_claim_enabled": self.integrated_claim_enabled,
         }
+
+
+def _validate_v3_policy_protocol_binding(policy: EvidencePolicyV3) -> None:
+    """Bind direct policy construction to the revalidated Task 2 protocol."""
+    from src.evaluation.methods_protocol_v3 import (
+        build_methods_protocol_v3,
+        protocol_identity_v3,
+        protocol_to_mapping_v3,
+    )
+
+    protocol = build_methods_protocol_v3(
+        bridge_role=policy.bridge_role,
+        capability_identity_sha256=policy.capability_identity_sha256,
+    )
+    mapping = protocol_to_mapping_v3(protocol)
+    if policy.protocol_identity_sha256 != protocol_identity_v3(protocol):
+        raise ValueError(
+            "protocol_identity_sha256 or capability_identity_sha256 does not match the Task 2 protocol"
+        )
+    if policy.capability_identity_sha256 != mapping["capability_identity_sha256"]:
+        raise ValueError(
+            "capability_identity_sha256 does not match the Task 2 protocol"
+        )
+
+
+def build_evidence_policy_v3(protocol: object) -> EvidencePolicyV3:
+    """Build v3 policy only from a revalidated Task 2 protocol contract."""
+    from src.evaluation.methods_protocol_v3 import (
+        MethodsProtocolV3,
+        protocol_identity_v3,
+        protocol_to_mapping_v3,
+    )
+
+    if type(protocol) is not MethodsProtocolV3:
+        raise ValueError("protocol must be a MethodsProtocolV3")
+    mapping = protocol_to_mapping_v3(protocol)
+    claims = mapping["claims"]
+    if type(claims) is not dict:
+        raise ValueError("Task 2 protocol claims mapping is invalid")
+    spatial = claims["spatial"]
+    causal = claims["intracellular_causal"]
+    bridge = claims["bridge"]
+    if not all(type(value) is dict for value in (spatial, causal, bridge)):
+        raise ValueError("Task 2 protocol claim mapping is invalid")
+    spatial_comparators = spatial["comparators"]
+    causal_comparators = causal["comparators"]
+    bridge_iut = bridge["iut"]
+    if (
+        type(spatial_comparators) is not dict
+        or type(causal_comparators) is not dict
+        or type(bridge_iut) is not dict
+        or type(bridge_iut["comparators"]) is not list
+    ):
+        raise ValueError("Task 2 protocol comparators are invalid")
+    return EvidencePolicyV3(
+        protocol_version=mapping["protocol_version"],  # type: ignore[arg-type]
+        protocol_identity_sha256=protocol_identity_v3(protocol),
+        capability_identity_sha256=mapping["capability_identity_sha256"],  # type: ignore[arg-type]
+        family_primary_metrics=(
+            ("spatial", spatial["primary_metric"]),
+            ("intracellular_causal", causal["primary_metric"]),
+            ("bridge", bridge["primary_metric"]),
+        ),  # type: ignore[arg-type]
+        required_comparators=(
+            (
+                "spatial",
+                (
+                    spatial_comparators["confirmatory"],
+                    spatial_comparators["attribution"],
+                ),
+            ),
+            (
+                "intracellular_causal",
+                (
+                    causal_comparators["confirmatory"],
+                    causal_comparators["attribution"],
+                ),
+            ),
+            ("bridge", tuple(bridge_iut["comparators"])),
+        ),  # type: ignore[arg-type]
+        nominal_alpha=0.05,
+        minimum_lower_bound=0.0,
+        bridge_role=mapping["bridge_role"],  # type: ignore[arg-type]
+        integrated_claim_enabled=mapping["integration"]["integrated_claim_enabled"],  # type: ignore[index,arg-type]
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -465,8 +620,13 @@ class V3ClaimDecision:
     multiplicity_adjustment: str
     evidence_role: str
     application_evidence_identities: tuple[str, ...] = ()
+    source_evidence: tuple[V3ClaimEvidence, ...] = ()
 
     def __post_init__(self) -> None:
+        max_blocking_reasons = 16
+        max_reason_length = 256
+        max_application_identities = 8
+        max_source_evidence = 8
         if type(self.claim_id) is not str or self.claim_id not in {
             "spatial",
             "intracellular_causal",
@@ -483,15 +643,28 @@ class V3ClaimDecision:
             _require_v3_text(getattr(self, name), name)
         if type(self.status) is not str or self.status not in DECISION_STATUSES:
             raise ValueError("status is not a valid claim decision status")
-        if type(self.blocking_reasons) is not tuple or any(
-            type(reason) is not str or not reason for reason in self.blocking_reasons
+        if (
+            type(self.blocking_reasons) is not tuple
+            or len(self.blocking_reasons) > max_blocking_reasons
+            or any(
+                type(reason) is not str
+                or not reason
+                or len(reason) > max_reason_length
+                or reason != unicodedata.normalize("NFC", reason)
+                or any(
+                    unicodedata.category(character).startswith("C")
+                    for character in reason
+                )
+                for reason in self.blocking_reasons
+            )
         ):
-            raise ValueError("blocking_reasons must be a tuple of non-empty strings")
+            raise ValueError("blocking_reasons must be bounded NFC-safe strings")
         _require_v3_identity(self.evidence_identity, "evidence_identity")
         if self.nominal_p_value is not None:
-            p_value = _require_float(self.nominal_p_value, "nominal_p_value")
+            p_value = _require_v3_float(self.nominal_p_value, "nominal_p_value")
             if not 0.0 <= p_value <= 1.0:
                 raise ValueError("nominal_p_value must lie in [0, 1]")
+            object.__setattr__(self, "nominal_p_value", p_value)
         if self.multiplicity_adjustment not in {
             "none_family_specific",
             "none_intersection_union",
@@ -504,9 +677,13 @@ class V3ClaimDecision:
             "integrated",
         }:
             raise ValueError("evidence_role is not valid for a v3 decision")
-        if type(self.application_evidence_identities) is not tuple or any(
-            type(value) is not str or _SHA256_PATTERN.fullmatch(value) is None
-            for value in self.application_evidence_identities
+        if (
+            type(self.application_evidence_identities) is not tuple
+            or len(self.application_evidence_identities) > max_application_identities
+            or any(
+                type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                for value in self.application_evidence_identities
+            )
         ):
             raise ValueError(
                 "application_evidence_identities must be SHA-256 identities"
@@ -517,6 +694,31 @@ class V3ClaimDecision:
             raise ValueError(
                 "application_evidence_identities must not contain duplicates"
             )
+        if self.application_evidence_identities != tuple(
+            sorted(self.application_evidence_identities)
+        ):
+            raise ValueError("application_evidence_identities must be canonical sorted")
+        if (
+            type(self.source_evidence) is not tuple
+            or len(self.source_evidence) > max_source_evidence
+            or any(type(item) is not V3ClaimEvidence for item in self.source_evidence)
+        ):
+            raise ValueError(
+                "source_evidence must be a bounded tuple of V3ClaimEvidence"
+            )
+        for item in self.source_evidence:
+            item.__post_init__()
+        if self.source_evidence != tuple(
+            sorted(
+                self.source_evidence,
+                key=lambda item: (
+                    item.evidence_role == "application_only",
+                    item.comparator_id,
+                    item.artifact_identity,
+                ),
+            )
+        ):
+            raise ValueError("source_evidence must be canonical sorted")
 
     def to_mapping(self) -> dict[str, object]:
         self.__post_init__()
@@ -531,6 +733,9 @@ class V3ClaimDecision:
             "multiplicity_adjustment": self.multiplicity_adjustment,
             "evidence_role": self.evidence_role,
             "application_evidence_identities": self.application_evidence_identities,
+            "source_evidence": tuple(
+                item.to_mapping() for item in self.source_evidence
+            ),
         }
 
 
@@ -721,6 +926,7 @@ def _v3_decision(
     nominal_p_value: float | None,
     multiplicity_adjustment: str,
     application_evidence_identities: tuple[str, ...],
+    source_evidence: tuple[V3ClaimEvidence, ...] = (),
     evidence_role: str | None = None,
 ) -> V3ClaimDecision:
     if evidence_role is None:
@@ -736,6 +942,7 @@ def _v3_decision(
         multiplicity_adjustment=multiplicity_adjustment,
         evidence_role=evidence_role,
         application_evidence_identities=application_evidence_identities,
+        source_evidence=source_evidence,
     )
 
 
@@ -754,8 +961,9 @@ def _evaluate_v3_family(
     ):
         raise ValueError("evidence must be a tuple of V3ClaimEvidence values")
     required = comparators_by_family[claim_id]
-    if len(evidence) > len(required) + 6:
-        raise ValueError("evidence contains too many records for one v3 family")
+    max_family_evidence_records = 8
+    if len(evidence) > max_family_evidence_records:
+        raise ValueError("evidence contains more than 8 records for one v3 family")
     application: list[V3ClaimEvidence] = []
     scientific: list[V3ClaimEvidence] = []
     for item in evidence:
@@ -764,6 +972,14 @@ def _evaluate_v3_family(
             raise ValueError(f"{claim_id} evaluation received {item.claim_id} evidence")
         if item.protocol_version != policy.protocol_version:
             raise ValueError("evidence protocol_version does not match the policy")
+        if item.protocol_identity_sha256 != policy.protocol_identity_sha256:
+            raise ValueError(
+                "evidence protocol_identity_sha256 does not match the policy"
+            )
+        if item.capability_identity_sha256 != policy.capability_identity_sha256:
+            raise ValueError(
+                "evidence capability_identity_sha256 does not match the policy"
+            )
         if item.primary_metric != family_metrics[claim_id]:
             raise ValueError("evidence primary_metric does not match the policy")
         if item.evidence_role == "application_only":
@@ -784,6 +1000,16 @@ def _evaluate_v3_family(
 
     application_identities = tuple(
         sorted(item.artifact_identity for item in application)
+    )
+    source_evidence = tuple(
+        sorted(
+            evidence,
+            key=lambda item: (
+                item.evidence_role == "application_only",
+                item.comparator_id,
+                item.artifact_identity,
+            ),
+        )
     )
     identity_payload = {
         "claim_id": claim_id,
@@ -810,6 +1036,9 @@ def _evaluate_v3_family(
         )
         for item in by_comparator.values()
     }
+    paired_unit_identities = {
+        item.paired_unit_identity_sha256 for item in by_comparator.values()
+    }
     incomplete = tuple(
         comparator
         for comparator in required
@@ -827,6 +1056,8 @@ def _evaluate_v3_family(
         if incomplete:
             detail = f"{detail}; incomplete evidence: {', '.join(incomplete)}"
         blocking_reasons.append(detail)
+    if len(paired_unit_identities) > 1:
+        blocking_reasons.append("required comparators must share paired unit identity")
     if blocking_reasons:
         return _v3_decision(
             claim_id=claim_id,
@@ -838,7 +1069,15 @@ def _evaluate_v3_family(
             nominal_p_value=None,
             multiplicity_adjustment=multiplicity,
             application_evidence_identities=application_identities,
+            source_evidence=source_evidence,
         )
+
+    p_values = tuple(
+        by_comparator[comparator].nominal_p_value for comparator in required
+    )
+    if any(p_value is None for p_value in p_values):
+        raise ValueError("completed evidence must contain nominal p-values")
+    nominal_p_value = max(p_value for p_value in p_values if p_value is not None)
 
     expected_roles = (
         (policy.bridge_role, policy.bridge_role)
@@ -858,9 +1097,10 @@ def _evaluate_v3_family(
             allowed_use="audit_only",
             reasons=role_failures,
             identity_payload=identity_payload,
-            nominal_p_value=None,
+            nominal_p_value=nominal_p_value,
             multiplicity_adjustment=multiplicity,
             application_evidence_identities=application_identities,
+            source_evidence=source_evidence,
         )
 
     audit_roles = {"pilot_audit_only", "synthetic_audit_only", "audit_only"}
@@ -879,17 +1119,12 @@ def _evaluate_v3_family(
                 f"audit-only evidence cannot be promoted: {', '.join(restricted)}",
             ),
             identity_payload=identity_payload,
-            nominal_p_value=None,
+            nominal_p_value=nominal_p_value,
             multiplicity_adjustment=multiplicity,
             application_evidence_identities=application_identities,
+            source_evidence=source_evidence,
         )
 
-    p_values = tuple(
-        by_comparator[comparator].nominal_p_value for comparator in required
-    )
-    if any(p_value is None for p_value in p_values):
-        raise ValueError("completed evidence must contain nominal p-values")
-    nominal_p_value = max(p_value for p_value in p_values if p_value is not None)
     assert all(by_comparator[comparator].ci_low is not None for comparator in required)
     failures: list[str] = []
     for comparator in required:
@@ -915,6 +1150,7 @@ def _evaluate_v3_family(
             nominal_p_value=nominal_p_value,
             multiplicity_adjustment=multiplicity,
             application_evidence_identities=application_identities,
+            source_evidence=source_evidence,
         )
     allowed_uses = {
         "spatial": "spatial_representation_preservation_gain",
@@ -931,6 +1167,7 @@ def _evaluate_v3_family(
         nominal_p_value=nominal_p_value,
         multiplicity_adjustment=multiplicity,
         application_evidence_identities=application_identities,
+        source_evidence=source_evidence,
     )
 
 
@@ -961,17 +1198,25 @@ def evaluate_bridge_claim(
     return _evaluate_v3_family(evidence, policy, "bridge")
 
 
-def _is_purely_missing_bridge_block(decision: V3ClaimDecision) -> bool:
-    """Classify only the closed missing-evidence reason codes as unavailable."""
-    missing_reasons = {
-        "missing comparator evidence: matched_euclidean_spatial_causal",
-        "missing comparator evidence: hypersca_own_only",
-        "missing comparator evidence: matched_euclidean_spatial_causal, hypersca_own_only",
-    }
-    return (
-        decision.status == "blocked"
-        and bool(decision.blocking_reasons)
-        and all(reason in missing_reasons for reason in decision.blocking_reasons)
+def _replay_v3_decision(
+    decision: V3ClaimDecision, policy: EvidencePolicyV3
+) -> V3ClaimDecision:
+    """Re-evaluate the immutable provenance before trusting a public decision."""
+    if decision.claim_id == "bridge":
+        replayed = evaluate_bridge_claim(decision.source_evidence, policy)
+    elif decision.claim_id in {"spatial", "intracellular_causal"}:
+        replayed = evaluate_v3_claim(decision.source_evidence, policy)
+    else:
+        raise ValueError("only evidence-family decisions may be integrated")
+    if decision.to_mapping() != replayed.to_mapping():
+        raise ValueError("decision does not match evaluator replay")
+    return replayed
+
+
+def _is_purely_unavailable_bridge(decision: V3ClaimDecision) -> bool:
+    """A bridge is unavailable only when no scientific comparator was attempted."""
+    return decision.status == "blocked" and not any(
+        item.evidence_role != "application_only" for item in decision.source_evidence
     )
 
 
@@ -1000,7 +1245,7 @@ def derive_integrated_claim(
             )
         if decision.protocol_version != policy.protocol_version:
             raise ValueError("decision protocol_version does not match the policy")
-        by_claim[decision.claim_id] = decision
+        by_claim[decision.claim_id] = _replay_v3_decision(decision, policy)
     if set(by_claim) != expected:
         raise ValueError(
             "decisions must contain exactly one decision per required claim"
@@ -1016,7 +1261,7 @@ def derive_integrated_claim(
     bridge_unavailable = (
         by_claim["spatial"].status == "admitted"
         and by_claim["intracellular_causal"].status == "admitted"
-        and _is_purely_missing_bridge_block(by_claim["bridge"])
+        and _is_purely_unavailable_bridge(by_claim["bridge"])
     )
     if bridge_unavailable:
         status, allowed_use, reasons = (
@@ -1084,6 +1329,7 @@ __all__ = [
     "TERMINAL_RUN_STATUSES",
     "V3ClaimDecision",
     "V3ClaimEvidence",
+    "build_evidence_policy_v3",
     "derive_integrated_claim",
     "derive_joint_claim",
     "evaluate_bridge_claim",

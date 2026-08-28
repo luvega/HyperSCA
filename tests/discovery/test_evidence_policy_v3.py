@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import re
 
 import pytest
 
+import src.discovery.evidence_policy as evidence_policy_module
 from src.discovery.evidence_policy import (
     EvidencePolicyV3,
     V3ClaimDecision,
     V3ClaimEvidence,
+    build_evidence_policy_v3,
     derive_integrated_claim,
     evaluate_bridge_claim,
     evaluate_v3_claim,
 )
 from src.evaluation.methods_protocol_v3 import (
     build_methods_protocol_v3,
+    protocol_identity_v3,
     protocol_to_mapping_v3,
 )
 
@@ -21,36 +25,15 @@ from src.evaluation.methods_protocol_v3 import (
 IDENTITY = "a" * 64
 
 
+def methods_protocol(bridge_role: str = "confirmatory"):
+    return build_methods_protocol_v3(
+        bridge_role=bridge_role, capability_identity_sha256="9" * 64
+    )
+
+
 def policy_v3(**overrides: object) -> EvidencePolicyV3:
-    payload = {
-        "protocol_version": "hypersca-methods-v3.0",
-        "family_primary_metrics": (
-            ("spatial", "neighborhood_preservation_at_k"),
-            ("intracellular_causal", "directed_edge_average_precision"),
-            ("bridge", "neighbor_effect_rmse"),
-        ),
-        "required_comparators": (
-            (
-                "spatial",
-                (
-                    "matched_euclidean_autoencoder",
-                    "hypersca_without_hierarchy_loss",
-                ),
-            ),
-            (
-                "intracellular_causal",
-                ("matched_non_hyperbolic_baseline", "hypersca_c_shared_only"),
-            ),
-            (
-                "bridge",
-                ("matched_euclidean_spatial_causal", "hypersca_own_only"),
-            ),
-        ),
-        "nominal_alpha": 0.05,
-        "minimum_lower_bound": 0.0,
-        "bridge_role": "confirmatory",
-        "integrated_claim_enabled": True,
-    }
+    role = overrides.pop("bridge_role", "confirmatory")
+    payload = build_evidence_policy_v3(methods_protocol(role)).to_mapping()
     payload.update(overrides)
     return EvidencePolicyV3(**payload)  # type: ignore[arg-type]
 
@@ -65,12 +48,21 @@ def evidence(
     attempted: int = 3,
     completed: int = 3,
     identity: str = IDENTITY,
+    paired_unit_identity: str = "e" * 64,
+    run_statuses: tuple[str, ...] | None = None,
+    policy: EvidencePolicyV3 | None = None,
 ) -> V3ClaimEvidence:
     is_complete = attempted == completed
+    statuses = run_statuses or (
+        ("completed",) * completed + ("failed_resource",) * (attempted - completed)
+    )
+    policy = policy or policy_v3()
     return V3ClaimEvidence(
         claim_id=claim_id,
         protocol_version="hypersca-methods-v3.0",
-        primary_metric=dict(policy_v3().family_primary_metrics)[claim_id],
+        protocol_identity_sha256=policy.protocol_identity_sha256,
+        capability_identity_sha256=policy.capability_identity_sha256,
+        primary_metric=dict(policy.family_primary_metrics)[claim_id],
         comparator_id=comparator_id,
         paired_estimate=0.04 if is_complete else None,
         ci_low=ci_low if is_complete else None,
@@ -78,6 +70,8 @@ def evidence(
         nominal_p_value=p_value if is_complete else None,
         attempted_units=attempted,
         completed_units=completed,
+        paired_unit_identity_sha256=paired_unit_identity,
+        run_statuses=statuses,
         evidence_role=role,
         artifact_identity=identity,
     )
@@ -109,27 +103,19 @@ def bridge_pair(first_p: float, second_p: float) -> tuple[V3ClaimEvidence, ...]:
 def v3_decision(
     claim_id: str, status: str, *, role: str = "confirmatory"
 ) -> V3ClaimDecision:
-    identities = {"spatial": "a", "intracellular_causal": "b", "bridge": "c"}
-    allowed_uses = {
-        "spatial": "spatial_representation_preservation_gain",
-        "intracellular_causal": "intracellular_intervention_directed_relation_recovery",
-        "bridge": "spatial_neighbour_response_recovery",
-    }
-    return V3ClaimDecision(
-        claim_id=claim_id,
-        protocol_version="hypersca-methods-v3.0",
-        status=status,
-        allowed_use=allowed_uses[claim_id] if status == "admitted" else "audit_only",
-        blocking_reasons=(),
-        evidence_identity=identities[claim_id] * 64,
-        nominal_p_value=0.01 if status == "admitted" else None,
-        multiplicity_adjustment=(
-            "none_intersection_union"
-            if claim_id == "bridge"
-            else "none_family_specific"
-        ),
-        evidence_role=role,
-        application_evidence_identities=(),
+    policy = policy_v3()
+    if claim_id == "bridge":
+        if status == "blocked":
+            return evaluate_bridge_claim((), policy)
+        p_value = 0.01 if status == "admitted" else 0.05
+        return evaluate_bridge_claim(bridge_pair(p_value, 0.01), policy)
+    if status == "blocked":
+        required = dict(policy.required_comparators)[claim_id]
+        return evaluate_v3_claim(
+            (evidence(claim_id, required[0], attempted=3, completed=2),), policy
+        )
+    return evaluate_v3_claim(
+        pair(claim_id, ci_low=0.01 if status == "admitted" else 0.0), policy
     )
 
 
@@ -340,6 +326,17 @@ def test_crc_does_not_change_an_admitted_bridge() -> None:
     assert with_crc.application_evidence_identities == (crc.artifact_identity,)
 
 
+def test_application_evidence_identities_are_canonical_sorted() -> None:
+    first = evidence("bridge", "crc_first", role="application_only", identity="f" * 64)
+    second = evidence(
+        "bridge", "crc_second", role="application_only", identity="e" * 64
+    )
+    decision = evaluate_bridge_claim(
+        (*bridge_pair(0.01, 0.01), first, second), policy_v3()
+    )
+    assert decision.application_evidence_identities == ("e" * 64, "f" * 64)
+
+
 def test_integrated_claim_rejects_duplicate_extra_and_protocol_mismatched_decisions() -> (
     None
 ):
@@ -364,16 +361,13 @@ def test_integrated_claim_requires_exact_claim_wording_and_enabled_policy() -> N
     for field in V3ClaimDecision.__dataclass_fields__:
         object.__setattr__(wrong_wording, field, getattr(spatial, field))
     object.__setattr__(wrong_wording, "allowed_use", "some_other_claim")
+    with pytest.raises(ValueError, match="replay"):
+        derive_integrated_claim((wrong_wording, causal, bridge), policy_v3())
     assert (
-        derive_integrated_claim((wrong_wording, causal, bridge), policy_v3()).status
-        == "audit_only"
-    )
-    assert (
-        derive_integrated_claim(
-            (spatial, causal, bridge),
-            policy_v3(bridge_role="pilot_audit_only", integrated_claim_enabled=False),
-        ).status
-        == "audit_only"
+        policy_v3(
+            bridge_role="pilot_audit_only", integrated_claim_enabled=False
+        ).integrated_claim_enabled
+        is False
     )
 
 
@@ -459,3 +453,185 @@ def test_v3_public_records_are_frozen() -> None:
     item = pair("bridge")[0]
     with pytest.raises(FrozenInstanceError):
         item.comparator_id = "other"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("evidence_role", "pilot_audit_only"),
+        ("nominal_p_value", 0.99),
+        ("allowed_use", "forged_claim"),
+        ("blocking_reasons", ("forged",)),
+        ("status", "audit_only"),
+    ],
+)
+def test_derive_replays_evidence_and_rejects_mutated_admitted_decisions(
+    field: str, value: object
+) -> None:
+    policy = policy_v3()
+    spatial = evaluate_v3_claim(pair("spatial"), policy)
+    causal = evaluate_v3_claim(pair("intracellular_causal"), policy)
+    bridge = evaluate_bridge_claim(bridge_pair(0.01, 0.02), policy)
+    object.__setattr__(spatial, field, value)
+
+    with pytest.raises(ValueError, match="replay"):
+        derive_integrated_claim((spatial, causal, bridge), policy)
+
+
+def test_derive_rejects_directly_forged_admitted_decision() -> None:
+    policy = policy_v3()
+    causal = evaluate_v3_claim(pair("intracellular_causal"), policy)
+    bridge = evaluate_bridge_claim(bridge_pair(0.01, 0.02), policy)
+    forged = V3ClaimDecision(
+        claim_id="spatial",
+        protocol_version=policy.protocol_version,
+        status="admitted",
+        allowed_use="spatial_representation_preservation_gain",
+        blocking_reasons=(),
+        evidence_identity="a" * 64,
+        nominal_p_value=0.01,
+        multiplicity_adjustment="none_family_specific",
+        evidence_role="confirmatory",
+        application_evidence_identities=(),
+        source_evidence=tuple(
+            sorted(pair("spatial"), key=lambda item: item.comparator_id)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="replay"):
+        derive_integrated_claim((forged, causal, bridge), policy)
+
+
+def test_required_comparators_must_share_paired_unit_identity() -> None:
+    first, second = bridge_pair(0.01, 0.02)
+    mismatched = evidence(
+        "bridge",
+        second.comparator_id,
+        p_value=0.02,
+        paired_unit_identity="f" * 64,
+        identity=second.artifact_identity,
+    )
+
+    decision = evaluate_bridge_claim((first, mismatched), policy_v3())
+
+    assert decision.status == "blocked"
+    assert any("paired unit identity" in reason for reason in decision.blocking_reasons)
+
+
+def test_terminal_failure_cannot_be_reclassified_by_mutating_reasons() -> None:
+    policy = policy_v3()
+    required = dict(policy.required_comparators)["bridge"]
+    failed = evidence(
+        "bridge",
+        required[0],
+        attempted=3,
+        completed=2,
+        identity="f" * 64,
+        run_statuses=("completed", "failed_timeout", "completed"),
+    )
+    bridge = evaluate_bridge_claim((failed,), policy)
+    object.__setattr__(
+        bridge,
+        "blocking_reasons",
+        ("missing comparator evidence: hypersca_own_only",),
+    )
+
+    with pytest.raises(ValueError, match="replay"):
+        derive_integrated_claim(
+            (
+                evaluate_v3_claim(pair("spatial"), policy),
+                evaluate_v3_claim(pair("intracellular_causal"), policy),
+                bridge,
+            ),
+            policy,
+        )
+
+
+def test_v3_evidence_rejects_estimate_outside_confidence_interval() -> None:
+    payload = pair("spatial")[0].to_mapping()
+    payload.update({"paired_estimate": 0.09, "ci_low": 0.01, "ci_high": 0.08})
+    with pytest.raises(ValueError, match="paired_estimate"):
+        V3ClaimEvidence(**payload)  # type: ignore[arg-type]
+
+
+def test_policy_binds_revalidated_task2_protocol_and_capability_identity() -> None:
+    protocol = methods_protocol()
+    policy = build_evidence_policy_v3(protocol)
+    assert policy.protocol_identity_sha256 == protocol_identity_v3(protocol)
+    assert policy.capability_identity_sha256 == protocol.capability_identity_sha256
+    payload = policy.to_mapping()
+    payload["capability_identity_sha256"] = "a" * 64
+    with pytest.raises(ValueError, match="capability_identity"):
+        EvidencePolicyV3(**payload)  # type: ignore[arg-type]
+
+
+def test_canonical_zero_and_evidence_order_produce_same_identity() -> None:
+    policy = policy_v3()
+    first, second = pair("spatial")
+    negative_zero = evidence(
+        "spatial",
+        first.comparator_id,
+        ci_low=-0.0,
+        p_value=-0.0,
+        identity=first.artifact_identity,
+    )
+    positive_zero = evidence(
+        "spatial",
+        first.comparator_id,
+        ci_low=0.0,
+        p_value=0.0,
+        identity=first.artifact_identity,
+    )
+    assert negative_zero.to_mapping() == positive_zero.to_mapping()
+    all_zero = negative_zero.to_mapping()
+    all_zero.update({"paired_estimate": -0.0, "ci_low": -0.0, "ci_high": 0.0})
+    normalized = V3ClaimEvidence(**all_zero)  # type: ignore[arg-type]
+    assert normalized.paired_estimate == 0.0
+    assert policy_v3(minimum_lower_bound=-0.0).to_mapping() == policy.to_mapping()
+    assert (
+        evaluate_v3_claim((negative_zero, second), policy).evidence_identity
+        == evaluate_v3_claim((second, positive_zero), policy).evidence_identity
+    )
+
+
+def test_complete_pilot_bridge_retains_iut_maximum_p_value() -> None:
+    pilot = policy_v3(bridge_role="pilot_audit_only", integrated_claim_enabled=False)
+    first, second = dict(pilot.required_comparators)["bridge"]
+    decision = evaluate_bridge_claim(
+        (
+            evidence(
+                "bridge", first, role="pilot_audit_only", p_value=0.01, policy=pilot
+            ),
+            evidence(
+                "bridge", second, role="pilot_audit_only", p_value=0.04, policy=pilot
+            ),
+        ),
+        pilot,
+    )
+    assert decision.status == "audit_only"
+    assert decision.nominal_p_value == 0.04
+    assert decision.multiplicity_adjustment == "none_intersection_union"
+
+
+def test_v3_decision_bounds_reasons_and_application_identities() -> None:
+    decision = evaluate_v3_claim(pair("spatial"), policy_v3())
+    payload = decision.to_mapping()
+    payload["blocking_reasons"] = tuple("reason" for _ in range(17))
+    with pytest.raises(ValueError, match="blocking_reasons"):
+        V3ClaimDecision(**payload)  # type: ignore[arg-type]
+    payload = decision.to_mapping()
+    payload["application_evidence_identities"] = tuple(
+        f"{index:064x}" for index in range(9)
+    )
+    with pytest.raises(ValueError, match="application_evidence_identities"):
+        V3ClaimDecision(**payload)  # type: ignore[arg-type]
+
+
+def test_v3_sha_validation_does_not_trust_rebound_v2_pattern(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = pair("spatial")[0]
+    object.__setattr__(item, "artifact_identity", "not-a-sha256")
+    monkeypatch.setattr(evidence_policy_module, "_SHA256_PATTERN", re.compile(".*"))
+    with pytest.raises(ValueError, match="SHA-256"):
+        item.to_mapping()
