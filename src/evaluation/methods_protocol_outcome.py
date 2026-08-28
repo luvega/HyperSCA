@@ -8,8 +8,9 @@ import json
 import math
 import os
 from pathlib import Path
+import secrets
 import stat
-from typing import Mapping
+from typing import Mapping, Sequence, cast
 
 from src.evaluation.run_evidence_identity import canonical_json_bytes, validate_strict_json
 
@@ -225,10 +226,10 @@ def strict_json(path: Path) -> dict[str, object]:
     return _strict_json_from_bytes(_read_bounded_regular_file(path, "JSON input"), "JSON input")
 
 
-def _freeze_text_sequence(value: object, label: str) -> tuple[str, ...]:
+def _freeze_text_sequence(value: Sequence[str], label: str) -> tuple[str, ...]:
     if type(value) not in {list, tuple}:
         raise ValueError(f"{label} must be an ordered built-in sequence")
-    frozen = tuple(value)
+    frozen: tuple[str, ...] = tuple(value)
     if any(type(item) is not str or not item for item in frozen):
         raise ValueError(f"{label} must contain non-empty built-in strings")
     return frozen
@@ -244,7 +245,7 @@ def _require_sha256(value: object, label: str) -> str:
     return value
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class ProtocolOutcome:
     """The exact, no-release closure of the audited v2.1 pilot."""
 
@@ -256,6 +257,43 @@ class ProtocolOutcome:
     run_identity_sha256: tuple[str, ...]
     collection_identity_sha256: tuple[str, ...]
     blocking_reasons: tuple[str, ...]
+
+    def __init__(
+        self,
+        *,
+        protocol_version: str,
+        protocol_identity_sha256: str,
+        pilot_summary_sha256: str,
+        status: str,
+        release_authorized: bool,
+        run_identity_sha256: Sequence[str],
+        collection_identity_sha256: Sequence[str],
+        blocking_reasons: Sequence[str],
+    ) -> None:
+        object.__setattr__(self, "protocol_version", protocol_version)
+        object.__setattr__(self, "protocol_identity_sha256", protocol_identity_sha256)
+        object.__setattr__(self, "pilot_summary_sha256", pilot_summary_sha256)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "release_authorized", release_authorized)
+        object.__setattr__(
+            self,
+            "run_identity_sha256",
+            _freeze_text_sequence(run_identity_sha256, "run_identity_sha256"),
+        )
+        object.__setattr__(
+            self,
+            "collection_identity_sha256",
+            _freeze_text_sequence(
+                collection_identity_sha256,
+                "collection_identity_sha256",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "blocking_reasons",
+            _freeze_text_sequence(blocking_reasons, "blocking_reasons"),
+        )
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         if type(self.protocol_version) is not str or self.protocol_version != PROTOCOL_VERSION:
@@ -293,14 +331,16 @@ class ProtocolOutcome:
         if type(value) is not dict or set(value) != _OUTCOME_KEYS:
             raise ValueError("outcome must contain exactly the frozen closure fields")
         return cls(
-            protocol_version=value["protocol_version"],  # type: ignore[arg-type]
-            protocol_identity_sha256=value["protocol_identity_sha256"],  # type: ignore[arg-type]
-            pilot_summary_sha256=value["pilot_summary_sha256"],  # type: ignore[arg-type]
-            status=value["status"],  # type: ignore[arg-type]
-            release_authorized=value["release_authorized"],  # type: ignore[arg-type]
-            run_identity_sha256=value["run_identity_sha256"],  # type: ignore[arg-type]
-            collection_identity_sha256=value["collection_identity_sha256"],  # type: ignore[arg-type]
-            blocking_reasons=value["blocking_reasons"],  # type: ignore[arg-type]
+            protocol_version=cast(str, value["protocol_version"]),
+            protocol_identity_sha256=cast(str, value["protocol_identity_sha256"]),
+            pilot_summary_sha256=cast(str, value["pilot_summary_sha256"]),
+            status=cast(str, value["status"]),
+            release_authorized=cast(bool, value["release_authorized"]),
+            run_identity_sha256=cast(Sequence[str], value["run_identity_sha256"]),
+            collection_identity_sha256=cast(
+                Sequence[str], value["collection_identity_sha256"]
+            ),
+            blocking_reasons=cast(Sequence[str], value["blocking_reasons"]),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -367,38 +407,206 @@ def outcome_from_pilot_summary(path: Path) -> ProtocolOutcome:
     )
 
 
+def _inode_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return (metadata.st_dev, metadata.st_ino)
+
+
+def _stat_at(directory_fd: int, name: str) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _unlink_if_owned(
+    directory_fd: int,
+    name: str,
+    identity: tuple[int, int],
+) -> bool:
+    observed = _stat_at(directory_fd, name)
+    if observed is None or _inode_identity(observed) != identity:
+        return False
+    os.unlink(name, dir_fd=directory_fd)
+    return True
+
+
+def _parent_path_matches_identity(parent: Path, identity: tuple[int, int]) -> bool:
+    try:
+        observed = os.stat(parent, follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISDIR(observed.st_mode) and _inode_identity(observed) == identity
+
+
+def _open_bound_parent_directory(parent: Path) -> tuple[int, tuple[int, int]]:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(parent, flags)
+    except OSError as exc:
+        raise ValueError("protocol outcome parent is missing or unsafe") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        identity = _inode_identity(metadata)
+        if not stat.S_ISDIR(metadata.st_mode) or not _parent_path_matches_identity(
+            parent, identity
+        ):
+            raise ValueError("protocol outcome parent changed while it was bound")
+        return descriptor, identity
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short protocol outcome write")
+        view = view[written:]
+
+
 def write_protocol_outcome_exclusively(path: Path, outcome: ProtocolOutcome) -> None:
     """Publish one canonical closure record without overwriting any output."""
 
     destination = Path(path)
     _reject_symlink_components(destination.parent, "protocol outcome parent")
-    if destination.exists() or destination.is_symlink():
-        raise ValueError("refusing to overwrite existing protocol outcome")
     destination.parent.mkdir(parents=True, exist_ok=True)
     _reject_symlink_components(destination.parent, "protocol outcome parent")
     payload = canonical_json_bytes(outcome.to_mapping())
-    temporary = destination.parent / f".{destination.name}.{os.getpid()}.tmp"
-    descriptor: int | None = None
+    parent_fd: int | None = None
+    temporary_fd: int | None = None
+    parent_identity: tuple[int, int] | None = None
+    temporary_name: str | None = None
+    temporary_identity: tuple[int, int] | None = None
+    published_identity: tuple[int, int] | None = None
+    publication_completed = False
     try:
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-        view = memoryview(payload)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError("short protocol outcome write")
-            view = view[written:]
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
+        parent_fd, parent_identity = _open_bound_parent_directory(destination.parent)
+        if _stat_at(parent_fd, destination.name) is not None:
+            raise ValueError("refusing to overwrite existing protocol outcome")
+
+        for _ in range(8):
+            candidate = f".{destination.name}.{secrets.token_hex(16)}.tmp"
+            try:
+                temporary_fd = os.open(
+                    candidate,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            temporary_metadata = os.fstat(temporary_fd)
+            temporary_identity = _inode_identity(temporary_metadata)
+            observed_temporary = _stat_at(parent_fd, temporary_name)
+            if (
+                not stat.S_ISREG(temporary_metadata.st_mode)
+                or temporary_metadata.st_nlink != 1
+                or observed_temporary is None
+                or _inode_identity(observed_temporary) != temporary_identity
+            ):
+                raise ValueError("protocol outcome staging inode is invalid")
+            break
+        if temporary_fd is None or temporary_name is None or temporary_identity is None:
+            raise ValueError("unable to allocate protocol outcome staging file")
+
+        _write_all(temporary_fd, payload)
+        os.fsync(temporary_fd)
+        temporary_metadata = os.fstat(temporary_fd)
+        if (
+            not stat.S_ISREG(temporary_metadata.st_mode)
+            or temporary_metadata.st_nlink != 1
+            or _inode_identity(temporary_metadata) != temporary_identity
+        ):
+            raise ValueError("protocol outcome staging inode changed before publication")
+
         try:
-            os.link(temporary, destination, follow_symlinks=False)
+            os.link(
+                temporary_name,
+                destination.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
         except FileExistsError as exc:
             raise ValueError("refusing to overwrite existing protocol outcome") from exc
+        published_metadata = _stat_at(parent_fd, destination.name)
+        if published_metadata is None:
+            raise ValueError("published protocol outcome inode is missing")
+        published_identity = _inode_identity(published_metadata)
+        if (
+            not stat.S_ISREG(published_metadata.st_mode)
+            or published_identity != temporary_identity
+            or published_metadata.st_nlink != 2
+        ):
+            raise ValueError("published protocol outcome inode is invalid")
+
+        final_fd = os.open(
+            destination.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            final_metadata = os.fstat(final_fd)
+        finally:
+            os.close(final_fd)
+        if (
+            not stat.S_ISREG(final_metadata.st_mode)
+            or _inode_identity(final_metadata) != temporary_identity
+            or final_metadata.st_nlink != 2
+        ):
+            raise ValueError("published protocol outcome inode is invalid")
+
+        if not _unlink_if_owned(parent_fd, temporary_name, temporary_identity):
+            raise ValueError("protocol outcome staging file changed before cleanup")
+        try:
+            os.fsync(parent_fd)
+        except OSError as exc:
+            _unlink_if_owned(parent_fd, destination.name, published_identity)
+            try:
+                os.fsync(parent_fd)
+            except OSError:
+                pass
+            raise ValueError(
+                "protocol outcome publication directory fsync failed; output removed"
+            ) from exc
+
+        final_after_cleanup = _stat_at(parent_fd, destination.name)
+        if (
+            final_after_cleanup is None
+            or not stat.S_ISREG(final_after_cleanup.st_mode)
+            or _inode_identity(final_after_cleanup) != temporary_identity
+            or final_after_cleanup.st_nlink != 1
+        ):
+            raise ValueError("published protocol outcome inode is invalid")
+        if not _parent_path_matches_identity(destination.parent, parent_identity):
+            raise ValueError("protocol outcome parent changed after publication")
+        publication_completed = True
+    except OSError as exc:
+        raise ValueError("protocol outcome publication failed") from exc
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        temporary.unlink(missing_ok=True)
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        if parent_fd is not None:
+            if temporary_name is not None and temporary_identity is not None:
+                try:
+                    _unlink_if_owned(parent_fd, temporary_name, temporary_identity)
+                except OSError:
+                    pass
+            if not publication_completed and published_identity is not None:
+                try:
+                    _unlink_if_owned(parent_fd, destination.name, published_identity)
+                except OSError:
+                    pass
+            os.close(parent_fd)

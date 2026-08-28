@@ -10,6 +10,7 @@ import sys
 
 import pytest
 
+import src.evaluation.methods_protocol_outcome as protocol_outcome
 from src.evaluation.methods_protocol_outcome import (
     ProtocolOutcome,
     load_protocol_outcome,
@@ -72,6 +73,9 @@ def test_direct_construction_freezes_mutable_identity_inputs() -> None:
     assert outcome.run_identity_sha256 == loaded.run_identity_sha256
     assert outcome.collection_identity_sha256 == loaded.collection_identity_sha256
     assert outcome.blocking_reasons == loaded.blocking_reasons
+    assert type(outcome.run_identity_sha256) is tuple
+    assert type(outcome.collection_identity_sha256) is tuple
+    assert type(outcome.blocking_reasons) is tuple
     with pytest.raises((AttributeError, TypeError)):
         outcome.status = "release_authorized"  # type: ignore[misc]
 
@@ -157,3 +161,148 @@ def test_outcome_publication_refuses_to_clobber_existing_output(tmp_path: Path) 
     write_protocol_outcome_exclusively(output, outcome)
     with pytest.raises(ValueError, match="refusing to overwrite"):
         write_protocol_outcome_exclusively(output, outcome)
+
+
+def test_outcome_publication_preserves_preexisting_staging_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "protocol_outcome.json"
+    outcome = load_protocol_outcome(OUTCOME_PATH)
+    original_open = protocol_outcome.os.open
+    staging_entries: list[Path] = []
+
+    def create_staging_collision(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if flags & os.O_EXCL:
+            if dir_fd is None:
+                descriptor = original_open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            else:
+                descriptor = original_open(
+                    path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    mode,
+                    dir_fd=dir_fd,
+                )
+            try:
+                os.write(descriptor, b"preexisting staging entry")
+            finally:
+                os.close(descriptor)
+            name = os.fsdecode(path)
+            staging_entries.append(
+                Path(name) if os.path.isabs(name) else output.parent / name
+            )
+            raise FileExistsError("simulated staging collision")
+        if dir_fd is None:
+            return original_open(path, flags, mode)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(protocol_outcome.os, "open", create_staging_collision)
+
+    with pytest.raises((FileExistsError, ValueError)):
+        write_protocol_outcome_exclusively(output, outcome)
+
+    assert staging_entries
+    assert all(entry.read_bytes() == b"preexisting staging entry" for entry in staging_entries)
+
+
+def test_outcome_publication_rejects_replaced_staging_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "protocol_outcome.json"
+    outcome = load_protocol_outcome(OUTCOME_PATH)
+    original_link = protocol_outcome.os.link
+    staging: Path | None = None
+
+    def replace_staging_then_link(
+        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        destination: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal staging
+        source_name = os.fsdecode(source)
+        source_dir_fd = kwargs.get("src_dir_fd")
+        if source_dir_fd is None:
+            staging = Path(source_name)
+            os.unlink(source_name)
+            os.symlink("/etc/passwd", source_name)
+        else:
+            assert type(source_dir_fd) is int
+            staging = output.parent / source_name
+            os.unlink(source_name, dir_fd=source_dir_fd)
+            os.symlink("/etc/passwd", source_name, dir_fd=source_dir_fd)
+        original_link(source, destination, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(protocol_outcome.os, "link", replace_staging_then_link)
+
+    with pytest.raises(ValueError):
+        write_protocol_outcome_exclusively(output, outcome)
+
+    assert staging is not None and staging.is_symlink()
+    assert not os.path.lexists(output)
+
+
+def test_outcome_publication_verifies_the_final_link_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "protocol_outcome.json"
+    outcome = load_protocol_outcome(OUTCOME_PATH)
+
+    def forge_final_file(
+        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        destination: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        destination_dir_fd = kwargs.get("dst_dir_fd")
+        if destination_dir_fd is None:
+            descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        else:
+            assert type(destination_dir_fd) is int
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=destination_dir_fd,
+            )
+        try:
+            os.write(descriptor, b"forged publication")
+        finally:
+            os.close(descriptor)
+
+    monkeypatch.setattr(protocol_outcome.os, "link", forge_final_file)
+
+    with pytest.raises(ValueError, match="inode"):
+        write_protocol_outcome_exclusively(output, outcome)
+
+    assert not os.path.lexists(output)
+
+
+def test_outcome_publication_removes_output_after_directory_fsync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "protocol_outcome.json"
+    outcome = load_protocol_outcome(OUTCOME_PATH)
+    original_fsync = protocol_outcome.os.fsync
+    fsync_calls = 0
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            raise OSError("simulated directory fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(protocol_outcome.os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(ValueError, match="fsync"):
+        write_protocol_outcome_exclusively(output, outcome)
+
+    assert fsync_calls >= 2
+    assert not os.path.lexists(output)
+    assert not list(tmp_path.glob(f".{output.name}.*.tmp"))
