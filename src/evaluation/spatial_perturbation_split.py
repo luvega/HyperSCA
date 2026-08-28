@@ -1319,11 +1319,12 @@ class BridgeEligibilityResult:
             raise SpatialPerturbationSplitError("eligibility identity does not match result")
 
 
-def _trusted_eligibility_result(
-    manifest: BridgeSplitManifest,
-    evidence: BridgeEligibilityEvidence,
-    derived: _DerivedEligibility,
+def evaluate_bridge_eligibility(
+    manifest: BridgeSplitManifest, evidence: BridgeEligibilityEvidence
 ) -> BridgeEligibilityResult:
+    manifest_snapshot = _snapshot_manifest(manifest)
+    evidence_snapshot = _snapshot_evidence(evidence)
+    derived = _derive_eligibility(manifest_snapshot, evidence_snapshot)
     identity_mapping: dict[str, object] = {
         "eligible": not derived.reasons,
         "reason": derived.reasons[0] if derived.reasons else None,
@@ -1337,8 +1338,8 @@ def _trusted_eligibility_result(
         "primary_total": derived.primary_total,
         "abstained": derived.abstained,
         "attempted": derived.attempted,
-        "split_identity_sha256": manifest.split_identity_sha256,
-        "evidence_identity_sha256": evidence.evidence_identity_sha256,
+        "split_identity_sha256": manifest_snapshot.split_identity_sha256,
+        "evidence_identity_sha256": evidence_snapshot.evidence_identity_sha256,
     }
     result = object.__new__(BridgeEligibilityResult)
     for name, value in (
@@ -1352,21 +1353,12 @@ def _trusted_eligibility_result(
         ("primary_total", derived.primary_total),
         ("abstained", derived.abstained),
         ("attempted", derived.attempted),
-        ("manifest", manifest),
-        ("evidence", evidence),
+        ("manifest", manifest_snapshot),
+        ("evidence", evidence_snapshot),
         ("eligibility_identity_sha256", _identity(identity_mapping)),
     ):
         object.__setattr__(result, name, value)
     return result
-
-
-def evaluate_bridge_eligibility(
-    manifest: BridgeSplitManifest, evidence: BridgeEligibilityEvidence
-) -> BridgeEligibilityResult:
-    manifest_snapshot = _snapshot_manifest(manifest)
-    evidence_snapshot = _snapshot_evidence(evidence)
-    derived = _derive_eligibility(manifest_snapshot, evidence_snapshot)
-    return _trusted_eligibility_result(manifest_snapshot, evidence_snapshot, derived)
 
 
 __all__ = [

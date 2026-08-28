@@ -477,6 +477,26 @@ def test_public_evaluation_normalizes_low_level_empty_perturbations_mutation() -
         evaluate_bridge_eligibility(manifest, baseline_evidence)
 
 
+def test_no_module_helper_can_mint_an_arbitrary_trusted_result() -> None:
+    manifest, evidence = baseline()
+    mutated_manifest = replace(manifest)
+    object.__setattr__(mutated_manifest, "perturbations", ("alien",))
+    helper = getattr(split_module, "_trusted_eligibility_result", None)
+    if helper is not None:
+        forged = helper(
+            mutated_manifest,
+            evidence,
+            split_module._DerivedEligibility(
+                (), ("alien",), ("alien",), (("alien", 999, 999),),
+                999, 999, 0, 999,
+            ),
+        )
+        assert forged.primary_scoreable == 999
+        assert forged.scoreable_parent_ids == ("alien",)
+        assert forged.manifest.perturbations == ("alien",)
+    assert not hasattr(split_module, "_trusted_eligibility_result")
+
+
 def test_independent_triple_search_has_a_bounded_membership_operation_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
