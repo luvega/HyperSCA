@@ -194,17 +194,25 @@ def _validated_candidate_declaration(candidate: BridgeCandidate) -> BridgeCandid
     """Re-check the immutable declaration whenever it crosses an audit boundary."""
     if type(candidate) is not BridgeCandidate:
         raise SpatialPerturbationRegistryError("candidate must be BridgeCandidate")
-    if candidate.candidate_id == _FROZEN_CANDIDATE_ORDER[0] and (
-        candidate.accession != "GSE274447"
-        or candidate.platform != "spatial_perturbation"
-        or candidate.biological_specimens != ("mouse_1", "mouse_2", "mouse_3")
-        or candidate.sections_by_specimen
-        != (("mouse_1", ()), ("mouse_2", ()), ("mouse_3", ()))
-        or candidate.safe_control_label != "mSafe"
-        or candidate.perturbation_labels != ()
-        or candidate.source_uri != _FROZEN_GSE274447_SOURCE
-        or candidate.source_identity_sha256 != _FROZEN_GSE274447_SOURCE_IDENTITY
-    ):
+    frozen_anchor = any((
+        candidate.candidate_id == _FROZEN_CANDIDATE_ORDER[0],
+        candidate.accession == "GSE274447",
+        candidate.source_uri == _FROZEN_GSE274447_SOURCE,
+        candidate.source_identity_sha256 == _FROZEN_GSE274447_SOURCE_IDENTITY,
+    ))
+    exact_frozen_declaration = (
+        candidate.candidate_id == _FROZEN_CANDIDATE_ORDER[0]
+        and candidate.accession == "GSE274447"
+        and candidate.platform == "spatial_perturbation"
+        and candidate.biological_specimens == ("mouse_1", "mouse_2", "mouse_3")
+        and candidate.sections_by_specimen
+        == (("mouse_1", ()), ("mouse_2", ()), ("mouse_3", ()))
+        and candidate.safe_control_label == "mSafe"
+        and candidate.perturbation_labels == ()
+        and candidate.source_uri == _FROZEN_GSE274447_SOURCE
+        and candidate.source_identity_sha256 == _FROZEN_GSE274447_SOURCE_IDENTITY
+    )
+    if frozen_anchor and not exact_frozen_declaration:
         raise SpatialPerturbationRegistryError("GSE274447 candidate declaration must remain frozen")
     return candidate
 

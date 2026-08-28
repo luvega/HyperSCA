@@ -277,6 +277,38 @@ def test_low_level_frozen_candidate_mutation_is_rejected_by_audit_and_writer(tmp
         write_bridge_capability_exclusively(tmp_path / "no.json", generic_result, candidate=frozen)
 
 
+def test_frozen_source_anchor_alias_cannot_upgrade_or_publish(tmp_path: Path) -> None:
+    frozen = load_bridge_candidates(REGISTRY_PATH)["gse274447_msafe_bridge"]
+    specimens = tuple(f"mouse_{index}" for index in range(1, 6))
+    alias = "alias_bridge"
+    for field, value in (
+        ("candidate_id", alias),
+        ("biological_specimens", specimens),
+        ("sections_by_specimen", tuple((item, (f"{item}_section",)) for item in specimens)),
+        ("perturbation_labels", ("guide_a",)),
+    ):
+        object.__setattr__(frozen, field, value)
+    raw = explicit_metadata_summary(animals=5, cohorts=2).to_mapping()
+    raw.update({
+        "candidate_id": alias,
+        "accession": frozen.accession,
+        "source_identity_sha256": frozen.source_identity_sha256,
+    })
+    with pytest.raises(SpatialPerturbationRegistryError, match="declaration"):
+        audit_bridge_capability(frozen, metadata_summary_from_mapping(raw))
+
+    unsigned = audit_bridge_capability(candidate(5), metadata_summary(animals=5)).to_mapping()
+    unsigned.pop("capability_identity_sha256")
+    unsigned["candidate_id"] = alias
+    forged = BridgeCapabilityResult(
+        **unsigned, capability_identity_sha256=_unsigned_digest(unsigned),
+    )  # type: ignore[arg-type]
+    output = tmp_path / "alias.json"
+    with pytest.raises(SpatialPerturbationRegistryError, match="declaration"):
+        write_bridge_capability_exclusively(output, forged, candidate=frozen)
+    assert not output.exists()
+
+
 def test_writer_binds_result_specimen_count_to_candidate(tmp_path: Path) -> None:
     frozen = load_bridge_candidates(REGISTRY_PATH)["gse274447_msafe_bridge"]
     generic = audit_bridge_capability(candidate(5), metadata_summary(animals=5))
@@ -369,9 +401,9 @@ def test_direct_construction_defensively_copies_and_revalidates() -> None:
     raw_specimens = ["mouse_1", "mouse_2", "mouse_3"]
     raw_sections = [("mouse_1", []), ("mouse_2", []), ("mouse_3", [])]
     value = BridgeCandidate(
-        "defensive_copy_candidate", "GSE274447", "spatial_perturbation", raw_specimens,
+        "defensive_copy_candidate", "GSEDEF", "spatial_perturbation", raw_specimens,
         raw_sections, "mSafe", ["guide_a"],
-        "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE274447", "a" * 64,
+        "https://example.test/GSEDEF", "a" * 64,
     )
     raw_specimens.clear()
     raw_sections[0][1].append("changed")
