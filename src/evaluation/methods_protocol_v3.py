@@ -11,28 +11,12 @@ from dataclasses import dataclass
 from typing import cast
 
 
-_BRIDGE_PRIMARY_BANDS = (("proximal", 1, 5), ("local", 6, 15))
-_BRIDGE_SECONDARY_BANDS = (("transition", 16, 30), ("distal", 31, 60))
-
-# Public reference constants; canonical serialization always uses the private literals.
-BRIDGE_PRIMARY_BANDS = _BRIDGE_PRIMARY_BANDS
-BRIDGE_SECONDARY_BANDS = _BRIDGE_SECONDARY_BANDS
-
-_CLAIM_IDS = ("spatial", "intracellular_causal", "bridge")
-_PRIMARY_METRICS = (
-    "neighborhood_preservation_at_k",
-    "directed_edge_average_precision",
-    "neighbor_effect_rmse",
-)
-_PILOT_SEEDS = (11, 23, 47)
-_RELEASE_SEEDS = (11, 23, 47, 71, 101)
-_SHA256 = re.compile(r"[0-9a-f]{64}")
-_MAX_TEXT_LENGTH = 256
-
+BRIDGE_PRIMARY_BANDS = (("proximal", 1, 5), ("local", 6, 15))
+BRIDGE_SECONDARY_BANDS = (("transition", 16, 30), ("distal", 31, 60))
 
 def _safe_text(value: object, name: str) -> str:
     """Validate bounded, canonical plain text before it enters the protocol."""
-    if type(value) is not str or not value or len(value) > _MAX_TEXT_LENGTH:
+    if type(value) is not str or not value or len(value) > 256:
         raise ValueError(f"{name} must be a bounded non-empty built-in string")
     if value != value.strip() or unicodedata.normalize("NFC", value) != value:
         raise ValueError(f"{name} must be trimmed NFC text")
@@ -79,7 +63,7 @@ def _frozen_integer_tuple(
 
 def _sha256(value: object, name: str) -> str:
     text = _safe_text(value, name)
-    if _SHA256.fullmatch(text) is None:
+    if re.fullmatch(r"[0-9a-f]{64}", text) is None:
         raise ValueError(f"{name} must be a lowercase SHA-256 digest")
     return text
 
@@ -102,13 +86,25 @@ class MethodsProtocolV3:
 
     def __post_init__(self) -> None:
         protocol_version = _safe_text(self.protocol_version, "protocol_version")
-        claim_ids = _frozen_text_tuple(self.claim_ids, "claim_ids", _CLAIM_IDS)
-        primary_metrics = _frozen_text_tuple(
-            self.primary_metrics, "primary_metrics", _PRIMARY_METRICS
+        claim_ids = _frozen_text_tuple(
+            self.claim_ids,
+            "claim_ids",
+            ("spatial", "intracellular_causal", "bridge"),
         )
-        pilot_seeds = _frozen_integer_tuple(self.pilot_seeds, "pilot_seeds", _PILOT_SEEDS)
+        primary_metrics = _frozen_text_tuple(
+            self.primary_metrics,
+            "primary_metrics",
+            (
+                "neighborhood_preservation_at_k",
+                "directed_edge_average_precision",
+                "neighbor_effect_rmse",
+            ),
+        )
+        pilot_seeds = _frozen_integer_tuple(
+            self.pilot_seeds, "pilot_seeds", (11, 23, 47)
+        )
         release_seeds = _frozen_integer_tuple(
-            self.release_seeds, "release_seeds", _RELEASE_SEEDS
+            self.release_seeds, "release_seeds", (11, 23, 47, 71, 101)
         )
         multiple_testing = _safe_text(self.multiple_testing, "multiple_testing")
         integrated_gate = _safe_text(self.integrated_gate, "integrated_gate")
@@ -159,10 +155,14 @@ def build_methods_protocol_v3(
     """Build the sole permitted v3 protocol shape for a bridge asset role."""
     return MethodsProtocolV3(
         protocol_version="hypersca-methods-v3.0",
-        claim_ids=_CLAIM_IDS,
-        primary_metrics=_PRIMARY_METRICS,
-        pilot_seeds=_PILOT_SEEDS,
-        release_seeds=_RELEASE_SEEDS,
+        claim_ids=("spatial", "intracellular_causal", "bridge"),
+        primary_metrics=(
+            "neighborhood_preservation_at_k",
+            "directed_edge_average_precision",
+            "neighbor_effect_rmse",
+        ),
+        pilot_seeds=(11, 23, 47),
+        release_seeds=(11, 23, 47, 71, 101),
         bootstrap_resamples=10_000,
         confidence=0.95,
         multiple_testing="distinct_families_no_cross_adjustment",
@@ -232,8 +232,12 @@ def protocol_to_mapping_v3(protocol: MethodsProtocolV3) -> dict[str, object]:
             "bridge": {
                 "claim_id": snapshot.claim_ids[2],
                 "primary_metric": snapshot.primary_metrics[2],
-                "primary_bands": _band_mappings(_BRIDGE_PRIMARY_BANDS),
-                "secondary_bands": _band_mappings(_BRIDGE_SECONDARY_BANDS),
+                "primary_bands": _band_mappings(
+                    (("proximal", 1, 5), ("local", 6, 15))
+                ),
+                "secondary_bands": _band_mappings(
+                    (("transition", 16, 30), ("distal", 31, 60))
+                ),
                 "iut": {
                     "comparators": [
                         "matched_euclidean_spatial_causal",

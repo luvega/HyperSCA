@@ -192,6 +192,58 @@ def test_protocol_mapping_is_independent_of_rebound_exported_bands(
     assert protocol_identity_v3(protocol) == expected_identity
 
 
+@pytest.mark.parametrize(
+    ("attribute", "forged_value", "forged_field"),
+    (
+        ("BRIDGE_PRIMARY_BANDS", (("forged", 99, 100),), None),
+        ("BRIDGE_SECONDARY_BANDS", (("forged", 99, 100),), None),
+        ("_BRIDGE_PRIMARY_BANDS", (("forged", 99, 100),), None),
+        ("_BRIDGE_SECONDARY_BANDS", (("forged", 99, 100),), None),
+        (
+            "_CLAIM_IDS",
+            ("forged_spatial", "forged_causal", "forged_bridge"),
+            "claim_ids",
+        ),
+        (
+            "_PRIMARY_METRICS",
+            ("forged_spatial", "forged_causal", "forged_bridge"),
+            "primary_metrics",
+        ),
+        ("_PILOT_SEEDS", (3, 5, 7), "pilot_seeds"),
+        ("_RELEASE_SEEDS", (3, 5, 7, 11, 13), "release_seeds"),
+    ),
+)
+def test_rebinding_scientific_constants_cannot_forge_v3_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+    attribute: str,
+    forged_value: object,
+    forged_field: str | None,
+) -> None:
+    protocol = build_methods_protocol_v3(
+        bridge_role="pilot_audit_only", capability_identity_sha256="a" * 64
+    )
+    expected_mapping = protocol_to_mapping_v3(protocol)
+    expected_identity = protocol_identity_v3(protocol)
+    monkeypatch.setattr(
+        methods_protocol_v3, attribute, forged_value, raising=False
+    )
+
+    assert protocol_to_mapping_v3(protocol) == expected_mapping
+    assert protocol_identity_v3(protocol) == expected_identity
+
+    rebuilt = build_methods_protocol_v3(
+        bridge_role="pilot_audit_only", capability_identity_sha256="a" * 64
+    )
+    assert protocol_to_mapping_v3(rebuilt) == expected_mapping
+    assert protocol_identity_v3(rebuilt) == expected_identity
+
+    if forged_field is not None:
+        kwargs = _valid_kwargs()
+        kwargs[forged_field] = forged_value
+        with pytest.raises(ValueError):
+            MethodsProtocolV3(**kwargs)  # type: ignore[arg-type]
+
+
 def test_mapping_freezes_spatial_k_and_explicit_bridge_role_in_identity() -> None:
     pilot = build_methods_protocol_v3(
         bridge_role="pilot_audit_only", capability_identity_sha256="a" * 64
