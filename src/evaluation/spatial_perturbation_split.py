@@ -486,6 +486,15 @@ class BridgeSplitMetadata:
         if any(target not in genes for _, target in targets):
             raise SpatialPerturbationSplitError("target gene is not in the measurable gene set")
         _validate_rows(rows, perturbations, neighbour_types, safe_label)
+        source_perturbations = tuple(sorted({
+            row.context_perturbation_id
+            for row in rows
+            if row.cell_role == "perturbation_source"
+        }))
+        if source_perturbations != perturbations:
+            raise SpatialPerturbationSplitError(
+                "registered perturbations must exactly match atomic source evidence"
+            )
         adjacency = tuple(
             _adjacency_from(item, f"block_adjacency[{index}]")
             for index, item in enumerate(_items(self.block_adjacency, "block_adjacency"))

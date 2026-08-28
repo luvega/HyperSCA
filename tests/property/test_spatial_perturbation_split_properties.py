@@ -278,6 +278,31 @@ def test_development_only_perturbations_are_not_secondary(
     assert development_only not in manifest.secondary_perturbations
 
 
+@settings(max_examples=5, deadline=None)
+@given(st.sampled_from(("guide_0", "guide_1", "guide_2", "guide_3", "guide_4")))
+def test_registered_perturbation_requires_at_least_one_atomic_source(
+    deleted: str,
+) -> None:
+    metadata = _small_metadata()
+    rows = tuple(
+        row for row in metadata.rows
+        if row.context_perturbation_id != deleted
+    )
+    relations = tuple(
+        item for item in metadata.neighbour_relations
+        if item.perturbation_id != deleted
+    )
+    module = import_module("src.evaluation.spatial_perturbation_split")
+    with pytest.raises(SpatialPerturbationSplitError, match="registered.*source"):
+        BridgeSplitMetadata(
+            rows, metadata.gene_names, metadata.perturbations,
+            metadata.neighbour_cell_types, metadata.perturbation_targets,
+            metadata.block_adjacency, metadata.safe_control_label, relations,
+            module._neighbour_table_identity(relations), metadata.candidate,
+            metadata.registry_summary, metadata.capability_result,
+        )
+
+
 @settings(max_examples=3, deadline=None)
 @given(st.sampled_from(("guide_0", "guide_1", "guide_4")))
 def test_registry_binding_cannot_be_bypassed_by_upstream_perturbation_deletion(

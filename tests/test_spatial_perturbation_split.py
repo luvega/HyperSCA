@@ -366,6 +366,27 @@ def test_review_development_only_perturbations_are_not_secondary() -> None:
     assert manifest.development_only_perturbations == ("guide_0",)
 
 
+def test_review_registered_perturbation_cannot_have_all_sources_deleted() -> None:
+    metadata = synthetic_metadata()
+    rows = tuple(
+        row for row in metadata.rows
+        if row.context_perturbation_id != "guide_0"
+    )
+    relations = tuple(
+        item for item in metadata.neighbour_relations
+        if item.perturbation_id != "guide_0"
+    )
+    with pytest.raises(SpatialPerturbationSplitError, match="registered.*source"):
+        BridgeSplitMetadata(
+            rows, metadata.gene_names, metadata.perturbations,
+            metadata.neighbour_cell_types, metadata.perturbation_targets,
+            metadata.block_adjacency, metadata.safe_control_label, relations,
+            split_module._neighbour_table_identity(relations),
+            metadata.candidate, metadata.registry_summary,
+            metadata.capability_result,
+        )
+
+
 def test_review_unit_evidence_public_fields_are_relation_ids() -> None:
     evidence_fields = {field.name for field in fields(BridgePrimaryUnitEvidence)}
     assert {
