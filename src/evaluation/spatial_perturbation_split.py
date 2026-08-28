@@ -44,6 +44,7 @@ _PRIMARY_BANDS = ("proximal", "local")
 _MAX_TEXT = 256
 _MAX_ITEMS = 100_000
 _MAX_ROWS = 10_000_000
+_MAX_RELATIONS = 50_000
 _MAX_MANIFEST_ROWS = 100_000
 _MAX_BLOCK_GRAPH_NODES = 4_096
 _MAX_FROZEN_CONTEXTS = 50_000
@@ -52,6 +53,11 @@ _ROLES = (
     "perturbation_source",
     "safe_source",
     "neighbour",
+)
+_TASK6_NEIGHBOUR_COLUMNS = (
+    "animal_id", "section_id", "spatial_block", "source_cell_id",
+    "neighbor_cell_id", "perturbation_id", "source_cell_type",
+    "neighbor_cell_type", "rank", "band", "is_safe_control",
 )
 _REASON_ORDER = (
     "insufficient_perturbation_coverage",
@@ -338,33 +344,33 @@ def freeze_bridge_neighbour_relation(
     spatial_block: str,
     source_cell_id: str,
     neighbor_cell_id: str,
-    source_perturbation_id: str,
+    perturbation_id: str,
     source_cell_type: str,
     neighbor_cell_type: str,
     rank: int,
     band: str,
-    contamination: bool,
     is_safe_control: bool,
 ) -> BridgeNeighbourRelation:
+    """Adapt one exact Task 6 neighbour row into the derived artifact schema."""
     text_values = {
         name: _safe_text(value, name)
         for name, value in (
             ("animal_id", animal_id), ("section_id", section_id),
             ("spatial_block", spatial_block), ("source_cell_id", source_cell_id),
             ("neighbor_cell_id", neighbor_cell_id),
-            ("source_perturbation_id", source_perturbation_id),
+            ("source_perturbation_id", perturbation_id),
             ("source_cell_type", source_cell_type),
             ("neighbor_cell_type", neighbor_cell_type), ("band", band),
         )
     }
     rank = _integer(rank, "rank", maximum=1_000_000)
-    if type(contamination) is not bool or type(is_safe_control) is not bool:
+    if type(is_safe_control) is not bool:
         raise SpatialPerturbationSplitError(
             "relation control flags must be built-in booleans"
         )
     values: dict[str, object] = {
         **text_values, "rank": rank,
-        "contamination": contamination, "is_safe_control": is_safe_control,
+        "contamination": False, "is_safe_control": is_safe_control,
     }
     return BridgeNeighbourRelation(
         _context_id("bridge_neighbour_relation_v1", values),
@@ -373,7 +379,7 @@ def freeze_bridge_neighbour_relation(
         text_values["neighbor_cell_id"], text_values["source_perturbation_id"],
         text_values["source_cell_type"], text_values["neighbor_cell_type"],
         rank, text_values["band"],
-        contamination, is_safe_control,
+        False, is_safe_control,
     )
 
 
@@ -381,6 +387,11 @@ def _relation_from(value: object, name: str) -> BridgeNeighbourRelation:
     expected = tuple(BridgeNeighbourRelation.__dataclass_fields__)
     if type(value) is BridgeNeighbourRelation:
         raw = {field: getattr(value, field) for field in expected}
+    elif type(value) is dict and set(cast(dict[object, object], value)) == set(
+        _TASK6_NEIGHBOUR_COLUMNS
+    ):
+        raw_input = cast(dict[str, object], value)
+        return freeze_bridge_neighbour_relation(**raw_input)  # type: ignore[arg-type]
     elif type(value) is dict and set(cast(dict[object, object], value)) == set(expected):
         raw = cast(dict[str, object], value)
     else:
@@ -411,7 +422,7 @@ def _stream_neighbour_table_identity_trusted(
         if index:
             digest.update(b",")
         digest.update(_canonical_bytes(_relation_mapping_trusted(item)))
-    digest.update(b'],"schema":"bridge_neighbour_table_v1"}')
+    digest.update(b'],"schema":"bridge_neighbour_artifact_v1"}')
     return digest.hexdigest()
 
 
@@ -425,11 +436,17 @@ class BridgeNeighbourTable:
     identity_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
+        if type(self.relations) not in (list, tuple):
+            raise SpatialPerturbationSplitError(
+                "relations must be a built-in list or tuple"
+            )
+        if len(self.relations) > _MAX_RELATIONS:
+            raise SpatialPerturbationSplitError(
+                "relation table exceeds the safe relation limit"
+            )
         relations = tuple(
             _relation_from(item, f"relations[{index}]")
-            for index, item in enumerate(
-                _items(self.relations, "relations", maximum=_MAX_ROWS)
-            )
+            for index, item in enumerate(self.relations)
         )
         relations = tuple(sorted(relations, key=lambda item: item.relation_id))
         if len({item.relation_id for item in relations}) != len(relations):
@@ -447,20 +464,22 @@ class BridgeNeighbourTable:
             raise SpatialPerturbationSplitError(
                 "neighbour relation logical keys must be unique"
             )
-        treatment_contexts: dict[tuple[str, str, str], str] = {}
+        source_by_physical_neighbor: dict[tuple[str, str, str], str] = {}
         for relation in relations:
-            if relation.is_safe_control:
-                continue
+            if relation.contamination:
+                raise SpatialPerturbationSplitError(
+                    "contaminated relations are excluded from the frozen artifact"
+                )
             key = (relation.animal_id, relation.section_id, relation.neighbor_cell_id)
-            prior = treatment_contexts.setdefault(
+            prior = source_by_physical_neighbor.setdefault(
                 key, relation.source_perturbation_id
             )
             if prior != relation.source_perturbation_id:
                 raise SpatialPerturbationSplitError(
-                    "a treatment neighbor cannot cross source perturbations"
+                    "a physical neighbor cannot have multiple source perturbations"
                 )
         object.__setattr__(self, "relations", relations)
-        object.__setattr__(self, "schema", "bridge_neighbour_table_v1")
+        object.__setattr__(self, "schema", "bridge_neighbour_artifact_v1")
         object.__setattr__(self, "relation_count", len(relations))
         object.__setattr__(
             self, "identity_sha256",
@@ -469,10 +488,10 @@ class BridgeNeighbourTable:
 
 
 def freeze_bridge_neighbour_table(
-    relations: tuple[BridgeNeighbourRelation, ...],
+    relations: object,
 ) -> BridgeNeighbourTable:
     """Snapshot, validate, sort, and identify one raw relation table."""
-    return BridgeNeighbourTable(relations)
+    return BridgeNeighbourTable(relations)  # type: ignore[arg-type]
 
 
 def _snapshot_neighbour_table(table: BridgeNeighbourTable) -> BridgeNeighbourTable:
@@ -480,7 +499,19 @@ def _snapshot_neighbour_table(table: BridgeNeighbourTable) -> BridgeNeighbourTab
         raise SpatialPerturbationSplitError(
             "relation artifact must be BridgeNeighbourTable"
         )
-    return BridgeNeighbourTable(table.relations)
+    snapshot = BridgeNeighbourTable(table.relations)
+    if (
+        type(table.schema) is not str
+        or type(table.relation_count) is not int
+        or type(table.identity_sha256) is not str
+        or table.schema != snapshot.schema
+        or table.relation_count != snapshot.relation_count
+        or table.identity_sha256 != snapshot.identity_sha256
+    ):
+        raise SpatialPerturbationSplitError(
+            "relation artifact derived fields do not match recomputed structure"
+        )
+    return snapshot
 
 
 def bridge_neighbour_table_descriptor(
@@ -508,7 +539,7 @@ def iter_bridge_neighbour_table_json(
             payload = _canonical_bytes(_relation_mapping_trusted(relation))
             for offset in range(0, len(payload), 2048):
                 yield payload[offset:offset + 2048]
-        yield b'],"schema":"bridge_neighbour_table_v1"}'
+        yield b'],"schema":"bridge_neighbour_artifact_v1"}'
 
     return chunks()
 
@@ -916,7 +947,7 @@ def _manifest_unsigned(manifest: "BridgeSplitManifest") -> dict[str, object]:
         "block_adjacency": [_adjacency_mapping(item) for item in manifest.block_adjacency],
         "safe_control_label": manifest.safe_control_label,
         "neighbour_table": {
-            "schema": "bridge_neighbour_table_v1",
+            "schema": "bridge_neighbour_artifact_v1",
             "relation_count": len(manifest.neighbour_relations),
             "identity_sha256": manifest.neighbour_table_identity_sha256,
         },
@@ -1746,6 +1777,18 @@ def _resolve_relations(
     return result
 
 
+def _require_disjoint_neighbour_cells(
+    treatment: tuple[BridgeNeighbourRelation, ...],
+    safe: tuple[BridgeNeighbourRelation, ...],
+) -> None:
+    treatment_ids = {item.neighbor_cell_id for item in treatment}
+    safe_ids = {item.neighbor_cell_id for item in safe}
+    if treatment_ids & safe_ids:
+        raise SpatialPerturbationSplitError(
+            "treatment and safe physical neighbor cells must be disjoint"
+        )
+
+
 def _require_relations(
     relations: tuple[BridgeNeighbourRelation, ...],
     *,
@@ -1916,6 +1959,7 @@ def _derive_eligibility(
         safe_relations = _resolve_relations(
             unit_evidence.safe_neighbour_relation_ids, relation_by_id
         )
+        _require_disjoint_neighbour_cells(treatment_relations, safe_relations)
         _require_relations(
             treatment_relations, animal=frozen_unit.animal_id,
             perturbation=frozen_unit.perturbation_id,

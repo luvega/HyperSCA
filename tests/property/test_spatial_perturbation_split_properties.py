@@ -90,17 +90,17 @@ def test_final_review_minimal_relation_table_single_mutations_fail_closed(
         freeze(
             "mouse_1", "section_1", "block_1", "guide_source_0",
             "neighbor_0", "guide_0", "source_type", "astrocyte", 1,
-            "proximal", False, False,
+            "proximal", False,
         ),
         freeze(
             "mouse_1", "section_1", "block_1", "guide_source_1",
             "neighbor_1", "guide_1", "source_type", "astrocyte", 2,
-            "proximal", False, False,
+            "proximal", False,
         ),
         freeze(
             "mouse_1", "section_1", "block_1", "safe_source",
             "safe_neighbor", "mSafe", "source_type", "astrocyte", 3,
-            "proximal", False, True,
+            "proximal", True,
         ),
     )
     frozen = module.freeze_bridge_neighbour_table(
@@ -113,16 +113,53 @@ def test_final_review_minimal_relation_table_single_mutations_fail_closed(
         bad = freeze(
             "mouse_1", "section_1", "block_1", "safe_source_2",
             "safe_neighbor", "mSafe", "source_type", "astrocyte", 4,
-            "proximal", False, True,
+            "proximal", True,
         )
     else:
         bad = freeze(
             "mouse_1", "section_1", "block_1", "guide_source_1",
             "neighbor_0", "guide_1", "source_type", "astrocyte", 2,
-            "proximal", False, False,
+            "proximal", False,
         )
-    with pytest.raises(SpatialPerturbationSplitError, match="logical|treatment neighbor"):
+    with pytest.raises(SpatialPerturbationSplitError, match="logical|physical neighbor"):
         module.freeze_bridge_neighbour_table(relations + (bad,))
+
+
+@settings(max_examples=8, deadline=None)
+@given(
+    st.sampled_from(("guide_0", "guide_2", "guide_4")),
+    st.permutations((0, 1)),
+)
+def test_last_review_generated_treatment_safe_physical_overlap_is_rejected(
+    perturbation_id: str, order: list[int],
+) -> None:
+    module = import_module("src.evaluation.spatial_perturbation_split")
+    rows = (
+        {
+            "animal_id": "mouse_1", "section_id": "section_1",
+            "spatial_block": "block_1", "source_cell_id": "source_1",
+            "neighbor_cell_id": "shared_neighbor",
+            "perturbation_id": perturbation_id,
+            "source_cell_type": "source_type",
+            "neighbor_cell_type": "astrocyte", "rank": 1,
+            "band": "proximal", "is_safe_control": False,
+        },
+        {
+            "animal_id": "mouse_1", "section_id": "section_1",
+            "spatial_block": "block_1", "source_cell_id": "safe_source_1",
+            "neighbor_cell_id": "shared_neighbor", "perturbation_id": "mSafe",
+            "source_cell_type": "source_type",
+            "neighbor_cell_type": "astrocyte", "rank": 1,
+            "band": "proximal", "is_safe_control": True,
+        },
+    )
+    with pytest.raises(
+        SpatialPerturbationSplitError,
+        match="physical neighbor.*multiple source perturbations",
+    ):
+        module.freeze_bridge_neighbour_table(
+            tuple(rows[index] for index in order)
+        )
 
 
 @settings(max_examples=4, deadline=None)

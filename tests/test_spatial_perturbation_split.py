@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import random
+import tracemalloc
 from types import SimpleNamespace
 from typing import cast
 
@@ -122,7 +123,7 @@ def synthetic_metadata(
                         animal, section, block, source_id, neighbor_id, "mSafe",
                         "source_type", neighbour_type,
                         ((index % 5) + 1 if band == "proximal" else (index % 10) + 6),
-                        band, False, True,
+                        band, True,
                     ))
         for perturbation in PERTURBATIONS:
             for neighbour_type in neighbour_types:
@@ -146,7 +147,7 @@ def synthetic_metadata(
                             animal, section, block, source_id, neighbor_id,
                             perturbation, "source_type", neighbour_type,
                             ((index % 5) + 1 if band == "proximal" else (index % 10) + 6),
-                            band, False, False,
+                            band, False,
                         ))
     adjacent = tuple(
         BridgeBlockAdjacency(
@@ -267,23 +268,8 @@ def test_review_neighbour_provenance_is_a_separate_reusable_relation_table() -> 
         replace(relation, contamination=0.0)
     with pytest.raises(SpatialPerturbationSplitError, match="rank.*band"):
         replace(relation, rank=15 if relation.band == "proximal" else 1)
-    contaminated = split_module.freeze_bridge_neighbour_relation(
-        relation.animal_id, relation.section_id, relation.spatial_block,
-        relation.source_cell_id, relation.neighbor_cell_id,
-        relation.source_perturbation_id, relation.source_cell_type,
-        relation.neighbor_cell_type, relation.rank, relation.band, True,
-        relation.is_safe_control,
-    )
-    with pytest.raises(SpatialPerturbationSplitError, match="contaminated"):
-        split_module._require_relations(
-            (contaminated,), animal=relation.animal_id,
-            perturbation=(
-                "guide_0" if relation.is_safe_control
-                else relation.source_perturbation_id
-            ),
-            cell_type=relation.neighbor_cell_type, band=relation.band,
-            safe=relation.is_safe_control,
-        )
+    with pytest.raises(SpatialPerturbationSplitError):
+        replace(relation, contamination=True)
 
 
 def test_review_relations_may_cross_blocks_but_not_sections() -> None:
@@ -302,7 +288,7 @@ def test_review_relations_may_cross_blocks_but_not_sections() -> None:
         source.cell_id, relation.neighbor_cell_id,
         relation.source_perturbation_id, relation.source_cell_type,
         relation.neighbor_cell_type, relation.rank,
-        relation.band, relation.contamination, relation.is_safe_control,
+        relation.band, relation.is_safe_control,
     )
     cross_block_relations = tuple(
         cross_block if item.relation_id == relation.relation_id else item
@@ -325,7 +311,7 @@ def test_review_relations_may_cross_blocks_but_not_sections() -> None:
         relation.source_cell_id, relation.neighbor_cell_id,
         relation.source_perturbation_id, relation.source_cell_type,
         relation.neighbor_cell_type, relation.rank, relation.band,
-        relation.contamination, relation.is_safe_control,
+        relation.is_safe_control,
     )
     cross_section_relations = tuple(
         cross_section if item.relation_id == relation.relation_id else item
@@ -477,7 +463,7 @@ def test_review_public_relation_freezer_and_partition_builder_exist() -> None:
         freezer(
             "mouse_1", "section_1", "block_1", _HostileSequence(),
             "neighbor_1", "guide_0", "source_type",
-            "astrocyte", 1, "proximal", False, False,
+            "astrocyte", 1, "proximal", False,
         )
 
 
@@ -495,7 +481,7 @@ def test_review_relation_table_identity_is_streamed() -> None:
     split_identity = mapping.pop("split_identity_sha256")
     descriptor = cast(dict[str, object], mapping["neighbour_table"])
     assert descriptor == {
-        "schema": "bridge_neighbour_table_v1",
+        "schema": "bridge_neighbour_artifact_v1",
         "relation_count": len(manifest.neighbour_relations),
         "identity_sha256": manifest.neighbour_table_identity_sha256,
     }
@@ -510,11 +496,11 @@ def test_final_review_raw_relation_identity_has_no_matched_guide() -> None:
     assert "matched_perturbation_id" not in signature.parameters
     first = split_module.freeze_bridge_neighbour_relation(
         "mouse_1", "section_1", "block_1", "safe_source_1", "neighbor_1",
-        "mSafe", "source_type", "astrocyte", 1, "proximal", False, True,
+        "mSafe", "source_type", "astrocyte", 1, "proximal", True,
     )
     second = split_module.freeze_bridge_neighbour_relation(
         "mouse_1", "section_1", "block_1", "safe_source_1", "neighbor_1",
-        "mSafe", "source_type", "astrocyte", 1, "proximal", False, True,
+        "mSafe", "source_type", "astrocyte", 1, "proximal", True,
     )
     assert first.relation_id == second.relation_id
 
@@ -529,10 +515,10 @@ def test_final_review_public_table_freezer_owns_descriptor_and_identity() -> Non
     } <= set(split_module.__all__)
     relation = split_module.freeze_bridge_neighbour_relation(
         "mouse_1", "section_1", "block_1", "source_1", "neighbor_1",
-        "guide_0", "source_type", "astrocyte", 1, "proximal", False, False,
+        "guide_0", "source_type", "astrocyte", 1, "proximal", False,
     )
     table = table_freezer((relation,))
-    assert table.schema == "bridge_neighbour_table_v1"
+    assert table.schema == "bridge_neighbour_artifact_v1"
     assert table.relation_count == 1
     assert table.relations == (relation,)
     assert len(table.identity_sha256) == 64
@@ -544,7 +530,7 @@ def test_final_review_manifest_serializer_references_external_relation_artifact(
     mapping = split_manifest_to_mapping(manifest)
     assert "neighbour_relations" not in mapping
     assert mapping["neighbour_table"] == {
-        "schema": "bridge_neighbour_table_v1",
+        "schema": "bridge_neighbour_artifact_v1",
         "relation_count": len(manifest.neighbour_relations),
         "identity_sha256": manifest.neighbour_table_identity_sha256,
     }
@@ -559,7 +545,7 @@ def test_final_review_manifest_serializer_references_external_relation_artifact(
     serialized = b"".join(chunks)
     assert hashlib.sha256(serialized).hexdigest() == table.identity_sha256
     payload = json.loads(serialized)
-    assert payload["schema"] == "bridge_neighbour_table_v1"
+    assert payload["schema"] == "bridge_neighbour_artifact_v1"
     assert len(payload["relations"]) == table.relation_count
     object.__setattr__(table, "relations", _HostileSequence())
     with pytest.raises(SpatialPerturbationSplitError):
@@ -586,6 +572,122 @@ def test_final_review_manifest_row_cap_precedes_json_materialization(
         split_module._checked_manifest_row_count(
             split_module._MAX_MANIFEST_ROWS + 1
         )
+
+
+def _task6_relation_row(
+    *, perturbation_id: str = "guide_0", source_cell_id: str = "source_1",
+    neighbor_cell_id: str = "neighbor_1", is_safe_control: bool = False,
+) -> dict[str, object]:
+    return {
+        "animal_id": "mouse_1", "section_id": "section_1",
+        "spatial_block": "block_1", "source_cell_id": source_cell_id,
+        "neighbor_cell_id": neighbor_cell_id,
+        "perturbation_id": perturbation_id, "source_cell_type": "source_type",
+        "neighbor_cell_type": "astrocyte", "rank": 1,
+        "band": "proximal", "is_safe_control": is_safe_control,
+    }
+
+
+def test_last_review_task6_raw_adapter_has_exact_planned_columns() -> None:
+    expected = (
+        "animal_id", "section_id", "spatial_block", "source_cell_id",
+        "neighbor_cell_id", "perturbation_id", "source_cell_type",
+        "neighbor_cell_type", "rank", "band", "is_safe_control",
+    )
+    assert tuple(inspect.signature(
+        split_module.freeze_bridge_neighbour_relation
+    ).parameters) == expected
+    raw = _task6_relation_row()
+    relation = split_module.freeze_bridge_neighbour_relation(**raw)
+    assert relation.source_perturbation_id == raw["perturbation_id"]
+    assert relation.contamination is False
+    table = split_module.freeze_bridge_neighbour_table((raw,))
+    assert table.relations == (relation,)
+    assert table.schema == "bridge_neighbour_artifact_v1"
+
+
+def test_last_review_physical_neighbor_cannot_be_treatment_and_safe() -> None:
+    treatment = _task6_relation_row()
+    safe = _task6_relation_row(
+        perturbation_id="mSafe", source_cell_id="safe_source_1",
+        is_safe_control=True,
+    )
+    with pytest.raises(
+        SpatialPerturbationSplitError, match="physical neighbor.*multiple source perturbations"
+    ):
+        split_module.freeze_bridge_neighbour_table((treatment, safe))
+
+
+def test_last_review_fifty_by_fifty_overlap_is_defensively_rejected() -> None:
+    treatment = tuple(
+        SimpleNamespace(neighbor_cell_id=f"neighbor_{index}")
+        for index in range(50)
+    )
+    safe = tuple(
+        SimpleNamespace(neighbor_cell_id=f"neighbor_{index}")
+        for index in range(50)
+    )
+    checker = getattr(split_module, "_require_disjoint_neighbour_cells", None)
+    assert callable(checker)
+    with pytest.raises(SpatialPerturbationSplitError, match="treatment.*safe.*disjoint"):
+        checker(treatment, safe)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "forged"),
+    (
+        ("schema", "alien_schema"),
+        ("relation_count", 999),
+        ("identity_sha256", "0" * 64),
+    ),
+)
+def test_last_review_relation_artifact_derived_field_tampering_is_rejected(
+    field_name: str, forged: object,
+) -> None:
+    table = split_module.freeze_bridge_neighbour_table(
+        synthetic_metadata().neighbour_relations
+    )
+    object.__setattr__(table, field_name, forged)
+    with pytest.raises(SpatialPerturbationSplitError, match="artifact.*derived"):
+        split_module.bridge_neighbour_table_descriptor(table)
+    with pytest.raises(SpatialPerturbationSplitError, match="artifact.*derived"):
+        split_module.iter_bridge_neighbour_table_json(table)
+
+
+def test_last_review_relation_cap_rejects_before_snapshot_or_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cap = getattr(split_module, "_MAX_RELATIONS", None)
+    assert type(cap) is int and 1_000 <= cap <= 100_000
+    relation = synthetic_metadata().neighbour_relations[0]
+    oversized = (relation,) * (cap + 1)
+
+    def forbidden_snapshot(*args: object) -> object:
+        raise AssertionError("relation input was copied before the cap check")
+
+    monkeypatch.setattr(split_module, "_relation_from", forbidden_snapshot)
+    tracemalloc.start()
+    try:
+        with pytest.raises(SpatialPerturbationSplitError, match="relation.*limit"):
+            split_module.freeze_bridge_neighbour_table(oversized)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 64 * 1024
+
+
+def test_last_review_stream_iterator_creation_has_bounded_peak() -> None:
+    table = split_module.freeze_bridge_neighbour_table(
+        synthetic_metadata().neighbour_relations
+    )
+    tracemalloc.start()
+    try:
+        iterator = split_module.iter_bridge_neighbour_table_json(table)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert iter(iterator) is iterator
+    assert peak < 16 * 1024 * 1024
 
 
 def test_review_confirmatory_partition_is_bound_to_capability_and_cohorts() -> None:
@@ -650,9 +752,9 @@ def test_review_relation_logical_keys_reject_duplicates_and_cross_guide_treatmen
         guide_one_source.cell_id, treatment.neighbor_cell_id,
         "guide_1", treatment.source_cell_type,
         treatment.neighbor_cell_type, treatment.rank, treatment.band,
-        False, False,
+        False,
     )
-    with pytest.raises(SpatialPerturbationSplitError, match="treatment neighbor.*source perturbation"):
+    with pytest.raises(SpatialPerturbationSplitError, match="physical neighbor.*multiple source perturbations"):
         _metadata_with_relations(
             metadata, metadata.neighbour_relations + (cross_guide,),
         )
@@ -671,7 +773,7 @@ def test_review_relation_logical_keys_reject_duplicates_and_cross_guide_treatmen
         other_safe_source.cell_id, safe.neighbor_cell_id, "mSafe",
         safe.source_cell_type, safe.neighbor_cell_type,
         2 if safe.band == "proximal" else 7,
-        safe.band, False, True,
+        safe.band, True,
     )
     with pytest.raises(SpatialPerturbationSplitError, match="logical.*unique"):
         _metadata_with_relations(
