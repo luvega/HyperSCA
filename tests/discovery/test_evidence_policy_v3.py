@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 import re
+import subprocess
 
 import pytest
 
@@ -635,3 +636,94 @@ def test_v3_sha_validation_does_not_trust_rebound_v2_pattern(
     monkeypatch.setattr(evidence_policy_module, "_SHA256_PATTERN", re.compile(".*"))
     with pytest.raises(ValueError, match="SHA-256"):
         item.to_mapping()
+
+
+def test_integrated_decisions_require_replayable_components_on_construction_and_mapping() -> (
+    None
+):
+    policy = policy_v3()
+    forged = V3ClaimDecision(
+        claim_id="integrated",
+        protocol_version=policy.protocol_version,
+        status="admitted",
+        allowed_use="integrated_spatial_causal_gain",
+        blocking_reasons=(),
+        evidence_identity="a" * 64,
+        nominal_p_value=None,
+        multiplicity_adjustment="not_applicable",
+        evidence_role="integrated",
+    )
+    with pytest.raises(ValueError, match="integrated"):
+        forged.to_mapping()
+
+    integrated = derive_integrated_claim(
+        (
+            evaluate_v3_claim(pair("spatial"), policy),
+            evaluate_v3_claim(pair("intracellular_causal"), policy),
+            evaluate_bridge_claim(bridge_pair(0.01, 0.02), policy),
+        ),
+        policy,
+    )
+    object.__setattr__(integrated, "status", "audit_only")
+    object.__setattr__(integrated, "allowed_use", "separate_module_claims_only")
+    object.__setattr__(integrated, "evidence_role", "integrated")
+    with pytest.raises(ValueError, match="replay"):
+        integrated.to_mapping()
+
+
+def test_integrated_application_identity_bound_is_three_family_union() -> None:
+    policy = policy_v3()
+
+    def with_applications(claim_id: str) -> tuple[V3ClaimEvidence, ...]:
+        scientific = pair(claim_id) if claim_id != "bridge" else bridge_pair(0.01, 0.02)
+        offset = {"spatial": 3, "intracellular_causal": 6, "bridge": 9}[claim_id]
+        applications = tuple(
+            evidence(
+                claim_id,
+                f"crc_{claim_id}_{index}",
+                role="application_only",
+                identity=f"{index + offset:064x}",
+            )
+            for index in range(3)
+        )
+        return (*scientific, *applications)
+
+    integrated = derive_integrated_claim(
+        (
+            evaluate_v3_claim(with_applications("spatial"), policy),
+            evaluate_v3_claim(with_applications("intracellular_causal"), policy),
+            evaluate_bridge_claim(with_applications("bridge"), policy),
+        ),
+        policy,
+    )
+    assert len(integrated.application_evidence_identities) == 9
+    assert integrated.application_evidence_identities == tuple(
+        sorted(integrated.application_evidence_identities)
+    )
+    payload = integrated.to_mapping()
+    payload["application_evidence_identities"] = tuple(
+        f"{index:064x}" for index in range(25)
+    )
+    with pytest.raises(ValueError, match="application_evidence_identities"):
+        V3ClaimDecision(**payload)  # type: ignore[arg-type]
+
+
+def test_v3_policy_cold_import_does_not_load_numerical_stacks() -> None:
+    result = subprocess.run(
+        [
+            "python3.10",
+            "-c",
+            "from src.methods_protocol_v3_contract import build_methods_protocol_v3; from src.discovery.evidence_policy import build_evidence_policy_v3; import sys; build_evidence_policy_v3(build_methods_protocol_v3(bridge_role='confirmatory', capability_identity_sha256='a'*64)); assert not set(sys.modules) & {'numpy', 'pandas', 'scipy', 'torch'}",
+        ],
+        cwd=".",
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("unsafe", ["\u202e", "\u200d", "\u2066"])
+def test_v3_text_rejects_unicode_category_c(unsafe: str) -> None:
+    with pytest.raises(ValueError, match="NFC-safe"):
+        evidence("spatial", f"matched{unsafe}_baseline")

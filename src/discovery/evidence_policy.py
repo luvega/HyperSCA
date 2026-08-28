@@ -68,7 +68,7 @@ def _require_v3_text(value: object, name: str) -> str:
         or value != value.strip()
         or value != unicodedata.normalize("NFC", value)
         or len(value) > 256
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or any(unicodedata.category(character).startswith("C") for character in value)
     ):
         raise ValueError(f"{name} must be a non-empty NFC-safe built-in string")
     return value
@@ -429,10 +429,17 @@ class EvidencePolicyV3:
         _require_v3_identity(
             self.capability_identity_sha256, "capability_identity_sha256"
         )
-        expected_metrics = (
-            ("spatial", "neighborhood_preservation_at_k"),
-            ("intracellular_causal", "directed_edge_average_precision"),
-            ("bridge", "neighbor_effect_rmse"),
+        if type(self.bridge_role) is not str or self.bridge_role not in {
+            "pilot_audit_only",
+            "confirmatory",
+        }:
+            raise ValueError("bridge_role must be pilot_audit_only or confirmatory")
+        if type(self.integrated_claim_enabled) is not bool:
+            raise ValueError("integrated_claim_enabled must be a built-in bool")
+        if self.integrated_claim_enabled is not (self.bridge_role == "confirmatory"):
+            raise ValueError("integrated_claim_enabled must match the bridge_role")
+        expected_metrics, expected_comparators = _v3_contract_shape(
+            self.bridge_role, self.capability_identity_sha256
         )
         if (
             type(self.family_primary_metrics) is not tuple
@@ -444,23 +451,6 @@ class EvidencePolicyV3:
             or self.family_primary_metrics != expected_metrics
         ):
             raise ValueError("family_primary_metrics must equal the frozen v3 families")
-        expected_comparators = (
-            (
-                "spatial",
-                (
-                    "matched_euclidean_autoencoder",
-                    "hypersca_without_hierarchy_loss",
-                ),
-            ),
-            (
-                "intracellular_causal",
-                ("matched_non_hyperbolic_baseline", "hypersca_c_shared_only"),
-            ),
-            (
-                "bridge",
-                ("matched_euclidean_spatial_causal", "hypersca_own_only"),
-            ),
-        )
         if (
             type(self.required_comparators) is not tuple
             or len(self.required_comparators) != len(expected_comparators)
@@ -495,15 +485,6 @@ class EvidencePolicyV3:
             raise ValueError("minimum_lower_bound must equal the frozen v3 value 0.0")
         object.__setattr__(self, "nominal_alpha", alpha)
         object.__setattr__(self, "minimum_lower_bound", lower_bound)
-        if type(self.bridge_role) is not str or self.bridge_role not in {
-            "pilot_audit_only",
-            "confirmatory",
-        }:
-            raise ValueError("bridge_role must be pilot_audit_only or confirmatory")
-        if type(self.integrated_claim_enabled) is not bool:
-            raise ValueError("integrated_claim_enabled must be a built-in bool")
-        if self.integrated_claim_enabled is not (self.bridge_role == "confirmatory"):
-            raise ValueError("integrated_claim_enabled must match the bridge_role")
         _validate_v3_policy_protocol_binding(self)
 
     def to_mapping(self) -> dict[str, object]:
@@ -521,9 +502,62 @@ class EvidencePolicyV3:
         }
 
 
+def _v3_contract_shape(
+    bridge_role: str, capability_identity_sha256: str
+) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, tuple[str, ...]], ...]]:
+    """Read metrics and comparators from the neutral Task 2 contract only."""
+    from src.methods_protocol_v3_contract import (
+        build_methods_protocol_v3,
+        protocol_to_mapping_v3,
+    )
+
+    mapping = protocol_to_mapping_v3(
+        build_methods_protocol_v3(
+            bridge_role=bridge_role,
+            capability_identity_sha256=capability_identity_sha256,
+        )
+    )
+    claims = mapping["claims"]
+    assert type(claims) is dict
+    spatial = claims["spatial"]
+    causal = claims["intracellular_causal"]
+    bridge = claims["bridge"]
+    assert type(spatial) is dict and type(causal) is dict and type(bridge) is dict
+    spatial_comparators = spatial["comparators"]
+    causal_comparators = causal["comparators"]
+    bridge_iut = bridge["iut"]
+    assert (
+        type(spatial_comparators) is dict
+        and type(causal_comparators) is dict
+        and type(bridge_iut) is dict
+        and type(bridge_iut["comparators"]) is list
+    )
+    return (
+        (
+            ("spatial", spatial["primary_metric"]),
+            ("intracellular_causal", causal["primary_metric"]),
+            ("bridge", bridge["primary_metric"]),
+        ),
+        (
+            (
+                "spatial",
+                (
+                    spatial_comparators["confirmatory"],
+                    spatial_comparators["attribution"],
+                ),
+            ),
+            (
+                "intracellular_causal",
+                (causal_comparators["confirmatory"], causal_comparators["attribution"]),
+            ),
+            ("bridge", tuple(bridge_iut["comparators"])),
+        ),
+    )  # type: ignore[return-value]
+
+
 def _validate_v3_policy_protocol_binding(policy: EvidencePolicyV3) -> None:
     """Bind direct policy construction to the revalidated Task 2 protocol."""
-    from src.evaluation.methods_protocol_v3 import (
+    from src.methods_protocol_v3_contract import (
         build_methods_protocol_v3,
         protocol_identity_v3,
         protocol_to_mapping_v3,
@@ -546,7 +580,7 @@ def _validate_v3_policy_protocol_binding(policy: EvidencePolicyV3) -> None:
 
 def build_evidence_policy_v3(protocol: object) -> EvidencePolicyV3:
     """Build v3 policy only from a revalidated Task 2 protocol contract."""
-    from src.evaluation.methods_protocol_v3 import (
+    from src.methods_protocol_v3_contract import (
         MethodsProtocolV3,
         protocol_identity_v3,
         protocol_to_mapping_v3,
@@ -621,11 +655,13 @@ class V3ClaimDecision:
     evidence_role: str
     application_evidence_identities: tuple[str, ...] = ()
     source_evidence: tuple[V3ClaimEvidence, ...] = ()
+    source_policy: EvidencePolicyV3 | None = None
+    component_decisions: tuple[V3ClaimDecision, ...] = ()
 
     def __post_init__(self) -> None:
         max_blocking_reasons = 16
         max_reason_length = 256
-        max_application_identities = 8
+        max_application_identities = 24 if self.claim_id == "integrated" else 8
         max_source_evidence = 8
         if type(self.claim_id) is not str or self.claim_id not in {
             "spatial",
@@ -719,9 +755,23 @@ class V3ClaimDecision:
             )
         ):
             raise ValueError("source_evidence must be canonical sorted")
+        if self.source_policy is not None:
+            if type(self.source_policy) is not EvidencePolicyV3:
+                raise ValueError("source_policy must be an EvidencePolicyV3")
+            self.source_policy.__post_init__()
+        if type(self.component_decisions) is not tuple or any(
+            type(item) is not V3ClaimDecision for item in self.component_decisions
+        ):
+            raise ValueError("component_decisions must be a tuple of V3ClaimDecision")
+        if self.claim_id == "integrated" and len(self.component_decisions) not in {
+            0,
+            3,
+        }:
+            raise ValueError(
+                "integrated component_decisions must contain exactly three decisions"
+            )
 
-    def to_mapping(self) -> dict[str, object]:
-        self.__post_init__()
+    def _unchecked_mapping(self) -> dict[str, object]:
         return {
             "claim_id": self.claim_id,
             "protocol_version": self.protocol_version,
@@ -736,7 +786,25 @@ class V3ClaimDecision:
             "source_evidence": tuple(
                 item.to_mapping() for item in self.source_evidence
             ),
+            "source_policy": (
+                None if self.source_policy is None else self.source_policy.to_mapping()
+            ),
+            "component_decisions": tuple(
+                item._unchecked_mapping() for item in self.component_decisions
+            ),
         }
+
+    def to_mapping(self) -> dict[str, object]:
+        self.__post_init__()
+        if self.claim_id == "integrated":
+            replayed = _replay_integrated_decision(self)
+        else:
+            if self.source_policy is None:
+                raise ValueError("family decisions require source_policy provenance")
+            replayed = _replay_v3_decision(self, self.source_policy)
+        if self._unchecked_mapping() != replayed._unchecked_mapping():
+            raise ValueError("decision does not match evaluator replay")
+        return self._unchecked_mapping()
 
 
 def _blocked_decision(
@@ -927,6 +995,7 @@ def _v3_decision(
     multiplicity_adjustment: str,
     application_evidence_identities: tuple[str, ...],
     source_evidence: tuple[V3ClaimEvidence, ...] = (),
+    component_decisions: tuple[V3ClaimDecision, ...] = (),
     evidence_role: str | None = None,
 ) -> V3ClaimDecision:
     if evidence_role is None:
@@ -943,6 +1012,8 @@ def _v3_decision(
         evidence_role=evidence_role,
         application_evidence_identities=application_evidence_identities,
         source_evidence=source_evidence,
+        source_policy=policy,
+        component_decisions=component_decisions,
     )
 
 
@@ -1208,8 +1279,20 @@ def _replay_v3_decision(
         replayed = evaluate_v3_claim(decision.source_evidence, policy)
     else:
         raise ValueError("only evidence-family decisions may be integrated")
-    if decision.to_mapping() != replayed.to_mapping():
+    if decision._unchecked_mapping() != replayed._unchecked_mapping():
         raise ValueError("decision does not match evaluator replay")
+    return replayed
+
+
+def _replay_integrated_decision(decision: V3ClaimDecision) -> V3ClaimDecision:
+    """Replay an integrated public record from its exact component provenance."""
+    if decision.source_policy is None or len(decision.component_decisions) != 3:
+        raise ValueError("integrated decisions require policy and three components")
+    replayed = derive_integrated_claim(
+        decision.component_decisions, decision.source_policy
+    )
+    if decision._unchecked_mapping() != replayed._unchecked_mapping():
+        raise ValueError("integrated decision does not match evaluator replay")
     return replayed
 
 
@@ -1317,6 +1400,7 @@ def derive_integrated_claim(
                 }
             )
         ),
+        component_decisions=tuple(by_claim[claim] for claim in sorted(expected)),
         evidence_role="integrated",
     )
 
