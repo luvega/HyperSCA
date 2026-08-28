@@ -291,12 +291,10 @@ class MetadataSummary:
         label_quality_counts = _text_count_pairs(self.label_quality_counts, "label_quality_counts")
         if sum(count for _, count in label_counts) != sum(count for _, count in perturbation_counts):
             raise SpatialPerturbationRegistryError("perturbation totals must equal per-specimen total")
-        if sum(count for _, count in safe_control_counts) != sum(count for _, count in safe_counts):
-            raise SpatialPerturbationRegistryError("safe-control totals must equal per-specimen total")
-        if sum(count for _, count in barcode_quality_counts) != sum(count for _, count in barcode_counts):
-            raise SpatialPerturbationRegistryError("barcode totals must equal per-specimen total")
-        if sum(count for _, count in label_quality_counts) != sum(count for _, count in label_valid_counts):
-            raise SpatialPerturbationRegistryError("label totals must equal per-specimen total")
+        if dict(barcode_quality_counts).get("valid", 0) != sum(count for _, count in barcode_counts):
+            raise SpatialPerturbationRegistryError("valid barcode total must equal per-specimen total")
+        if dict(label_quality_counts).get("valid", 0) != sum(count for _, count in label_valid_counts):
+            raise SpatialPerturbationRegistryError("valid label total must equal per-specimen total")
         normalized_values: tuple[tuple[str, object], ...] = (
             ("candidate_id", candidate_id), ("accession", accession), ("cohort_ids", cohorts),
             ("biological_specimen_ids", specimens), ("sections_by_specimen", sections),
@@ -355,6 +353,7 @@ _COVERAGE_KEYS = (
     "perturbation_labels", "safe_controls", "barcode_quality", "label_quality",
     "license", "source_identity", "output_schema", "registered_specimens",
     "registered_sections", "registered_perturbation_labels", "external_cohort",
+    "development_cohort",
 )
 
 _GATE_REASONS = {
@@ -374,6 +373,7 @@ _GATE_REASONS = {
     "registered_sections": "registered_sections_mismatch",
     "registered_perturbation_labels": "registered_perturbation_labels_mismatch",
     "external_cohort": "external_cohort_missing",
+    "development_cohort": "development_cohort_missing",
 }
 
 
@@ -509,9 +509,10 @@ def _coverage(summary: MetadataSummary, candidate: BridgeCandidate) -> dict[str,
     assignments = dict(summary.specimen_cohort_assignments)
     assigned_cohorts = set(assignments.values())
     every_declared_cohort_is_assigned = bool(summary.cohort_ids) and set(summary.cohort_ids) == assigned_cohorts
-    external_is_assigned = any(
-        cohort in assigned_cohorts and cohort in summary.cohort_ids
-        for cohort in summary.external_untouched_cohort_ids
+    external_cohorts = set(summary.external_untouched_cohort_ids)
+    external_is_assigned = bool(external_cohorts) and external_cohorts <= set(summary.cohort_ids) and external_cohorts <= assigned_cohorts
+    development_is_assigned = any(
+        cohort not in external_cohorts for cohort in assigned_cohorts & set(summary.cohort_ids)
     )
     def every_specimen_has(pairs: tuple[tuple[str, int], ...]) -> bool:
         return tuple(label for label, _ in pairs) == candidate.biological_specimens and all(
@@ -528,9 +529,19 @@ def _coverage(summary: MetadataSummary, candidate: BridgeCandidate) -> dict[str,
         "coordinates": float(summary.coordinate_available and summary.coordinate_finite and every_specimen_has(summary.per_specimen_coordinate_counts)),
         "genes": float(summary.measured_gene_count > 0 and bool(summary.measured_gene_names)),
         "perturbation_labels": float(bool(summary.perturbation_labels) and all(counts.get(label, 0) > 0 for label in summary.perturbation_labels) and every_specimen_has(summary.per_specimen_perturbation_counts)),
-        "safe_controls": float(controls.get(candidate.safe_control_label, 0) > 0 and every_specimen_has(summary.per_specimen_safe_control_counts)),
-        "barcode_quality": float(barcode.get("valid", 0) > 0 and every_specimen_has(summary.per_specimen_barcode_valid_counts)),
-        "label_quality": float(labels.get("valid", 0) > 0 and every_specimen_has(summary.per_specimen_label_valid_counts)),
+        "safe_controls": float(
+            controls.get(candidate.safe_control_label, 0)
+            == sum(count for _, count in summary.per_specimen_safe_control_counts)
+            and every_specimen_has(summary.per_specimen_safe_control_counts)
+        ),
+        "barcode_quality": float(
+            barcode.get("valid", 0) == sum(count for _, count in summary.per_specimen_barcode_valid_counts)
+            and every_specimen_has(summary.per_specimen_barcode_valid_counts)
+        ),
+        "label_quality": float(
+            labels.get("valid", 0) == sum(count for _, count in summary.per_specimen_label_valid_counts)
+            and every_specimen_has(summary.per_specimen_label_valid_counts)
+        ),
         "license": float(summary.license_identity != "unavailable"),
         "source_identity": float(summary.source_identity_sha256 == candidate.source_identity_sha256),
         "output_schema": float(summary.executable_output_schema_capable),
@@ -538,6 +549,7 @@ def _coverage(summary: MetadataSummary, candidate: BridgeCandidate) -> dict[str,
         "registered_sections": float(summary.sections_by_specimen == candidate.sections_by_specimen),
         "registered_perturbation_labels": float(summary.perturbation_labels == candidate.perturbation_labels),
         "external_cohort": float(external_is_assigned),
+        "development_cohort": float(development_is_assigned),
     }
 
 
@@ -906,6 +918,8 @@ def write_bridge_capability_exclusively(
     frozen_candidate = _validated_candidate_declaration(_candidate_snapshot(candidate))
     if frozen_candidate.candidate_id != frozen_result.candidate_id:
         raise SpatialPerturbationRegistryError("candidate does not match capability result")
+    if frozen_result.biological_specimen_count != len(frozen_candidate.biological_specimens):
+        raise SpatialPerturbationRegistryError("result specimen count does not match candidate declaration")
     record = frozen_result.to_mapping()
     try:
         bound, output_name = _bound_parent(path, "output")

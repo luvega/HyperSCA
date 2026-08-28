@@ -142,6 +142,34 @@ def test_explicit_cohort_assignments_and_external_coverage_are_required() -> Non
     reasons = audit_bridge_capability(bridge, orphan_external).blocking_reasons
     assert "external_cohort_missing" in reasons
 
+    mixed_external = explicit_metadata_summary(
+        animals=5, cohorts=2, external_cohorts=("cohort_1", "invented"),
+    )
+    assert "external_cohort_missing" in audit_bridge_capability(bridge, mixed_external).blocking_reasons
+
+    all_external = explicit_metadata_summary(
+        animals=5, cohorts=2, external_cohorts=("cohort_0", "cohort_1"),
+    )
+    assert "development_cohort_missing" in audit_bridge_capability(bridge, all_external).blocking_reasons
+
+
+def test_category_specific_aggregate_evidence_cannot_be_hidden_by_other_categories() -> None:
+    raw = explicit_metadata_summary(animals=5, cohorts=2).to_mapping()
+    raw["safe_control_counts"] = [["mSafe", 1], ["other_safe", 4]]
+    result = audit_bridge_capability(candidate(5), metadata_summary_from_mapping(raw))
+    assert result.status == "pilot_audit_only"
+    assert "safe_control_coverage_missing" in result.blocking_reasons
+
+    raw = explicit_metadata_summary(animals=5, cohorts=2).to_mapping()
+    raw["barcode_quality_counts"] = [["valid", 1], ["invalid", 4]]
+    with pytest.raises(SpatialPerturbationRegistryError, match="valid barcode"):
+        metadata_summary_from_mapping(raw)
+
+    raw = explicit_metadata_summary(animals=5, cohorts=2).to_mapping()
+    raw["label_quality_counts"] = [["valid", 1], ["invalid", 4]]
+    with pytest.raises(SpatialPerturbationRegistryError, match="valid label"):
+        metadata_summary_from_mapping(raw)
+
 
 @pytest.mark.parametrize(
     "field_reason",
@@ -247,6 +275,22 @@ def test_low_level_frozen_candidate_mutation_is_rejected_by_audit_and_writer(tmp
     generic_result = audit_bridge_capability(candidate(), metadata_summary(animals=3))
     with pytest.raises(SpatialPerturbationRegistryError, match="declaration"):
         write_bridge_capability_exclusively(tmp_path / "no.json", generic_result, candidate=frozen)
+
+
+def test_writer_binds_result_specimen_count_to_candidate(tmp_path: Path) -> None:
+    frozen = load_bridge_candidates(REGISTRY_PATH)["gse274447_msafe_bridge"]
+    generic = audit_bridge_capability(candidate(5), metadata_summary(animals=5))
+    unsigned = generic.to_mapping()
+    unsigned.pop("capability_identity_sha256")
+    unsigned["candidate_id"] = frozen.candidate_id
+    forged = BridgeCapabilityResult(
+        **unsigned,
+        capability_identity_sha256=_unsigned_digest(unsigned),
+    )  # type: ignore[arg-type]
+    output = tmp_path / "forged.json"
+    with pytest.raises(SpatialPerturbationRegistryError, match="specimen count"):
+        write_bridge_capability_exclusively(output, forged, candidate=frozen)
+    assert not output.exists()
 
 
 def _unsigned_digest(mapping: dict[str, object]) -> str:
