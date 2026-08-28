@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from dataclasses import replace
 from importlib import import_module
+import hashlib
 import inspect
+import json
 import random
 import sys
 from typing import Any, overload
@@ -123,6 +125,43 @@ def test_final_review_minimal_relation_table_single_mutations_fail_closed(
         )
     with pytest.raises(SpatialPerturbationSplitError, match="logical|physical neighbor"):
         module.freeze_bridge_neighbour_table(relations + (bad,))
+
+
+@settings(max_examples=12, deadline=None)
+@given(st.permutations((0, 1, 2, 3)))
+def test_final_review_four_band_table_identity_and_serialization_are_permutation_safe(
+    order: list[int],
+) -> None:
+    module = import_module("src.evaluation.spatial_perturbation_split")
+    band_ranks = (
+        ("proximal", 1),
+        ("local", 6),
+        ("transition", 16),
+        ("distal", 31),
+    )
+    rows = tuple(
+        {
+            "animal_id": "mouse_1", "section_id": "section_1",
+            "spatial_block": "block_1", "source_cell_id": "source_1",
+            "neighbor_cell_id": f"neighbor_{index}",
+            "perturbation_id": "guide_0", "source_cell_type": "source_type",
+            "neighbor_cell_type": "astrocyte", "rank": rank,
+            "band": band, "is_safe_control": False,
+        }
+        for index, (band, rank) in enumerate(band_ranks)
+    )
+    baseline_table = module.freeze_bridge_neighbour_table(rows)
+    table = module.freeze_bridge_neighbour_table(
+        tuple(rows[index] for index in order)
+    )
+    assert table.identity_sha256 == baseline_table.identity_sha256
+    assert {(item.band, item.rank) for item in table.relations} == set(band_ranks)
+    serialized = b"".join(module.iter_bridge_neighbour_table_json(table))
+    assert hashlib.sha256(serialized).hexdigest() == table.identity_sha256
+    payload = json.loads(serialized)
+    assert {
+        (item["band"], item["rank"]) for item in payload["relations"]
+    } == set(band_ranks)
 
 
 @settings(max_examples=8, deadline=None)

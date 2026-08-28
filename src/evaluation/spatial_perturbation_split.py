@@ -86,6 +86,16 @@ def _science() -> dict[str, object]:
     }
 
 
+def _relation_band_rank_bounds() -> dict[str, tuple[int, int]]:
+    """Return the complete Task 6 neighbour-table band contract."""
+    return {
+        "proximal": (1, 5),
+        "local": (6, 15),
+        "transition": (16, 30),
+        "distal": (31, 60),
+    }
+
+
 class SpatialPerturbationSplitError(ValueError):
     """The frozen split or its eligibility evidence is inconsistent."""
 
@@ -318,13 +328,10 @@ class BridgeNeighbourRelation:
             raise SpatialPerturbationSplitError(
                 "is_safe_control must be a built-in boolean"
             )
-        if values["band"] not in cast(tuple[str, str], _science()["primary_bands"]):
+        band_bounds = _relation_band_rank_bounds().get(values["band"])
+        if band_bounds is None:
             raise SpatialPerturbationSplitError("relation band is not frozen")
-        if (
-            values["band"] == "proximal" and rank not in range(1, 6)
-        ) or (
-            values["band"] == "local" and rank not in range(6, 16)
-        ):
+        if not band_bounds[0] <= rank <= band_bounds[1]:
             raise SpatialPerturbationSplitError("relation rank does not match its frozen band")
         identity_values: dict[str, object] = {
             **values, "rank": rank, "contamination": contamination,

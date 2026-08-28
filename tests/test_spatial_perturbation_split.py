@@ -606,6 +606,42 @@ def test_last_review_task6_raw_adapter_has_exact_planned_columns() -> None:
     assert table.schema == "bridge_neighbour_artifact_v1"
 
 
+@pytest.mark.parametrize(
+    ("band", "rank"),
+    (("transition", 16), ("distal", 31)),
+)
+def test_final_review_task6_adapter_accepts_later_band_first_ranks(
+    band: str, rank: int,
+) -> None:
+    raw = _task6_relation_row()
+    raw.update({"band": band, "rank": rank})
+    relation = split_module.freeze_bridge_neighbour_relation(**raw)
+    table = split_module.freeze_bridge_neighbour_table((raw,))
+    assert relation.band == band
+    assert relation.rank == rank
+    assert table.relations == (relation,)
+
+
+@pytest.mark.parametrize(
+    ("band", "rank"),
+    (
+        ("proximal", 6), ("local", 5), ("local", 16),
+        ("transition", 15), ("transition", 31),
+        ("distal", 30), ("distal", 61),
+    ),
+)
+def test_final_review_task6_adapter_rejects_cross_band_ranks(
+    band: str, rank: int,
+) -> None:
+    raw = _task6_relation_row()
+    raw.update({"band": band, "rank": rank})
+    with pytest.raises(
+        SpatialPerturbationSplitError,
+        match="rank does not match its frozen band",
+    ):
+        split_module.freeze_bridge_neighbour_relation(**raw)
+
+
 def test_last_review_physical_neighbor_cannot_be_treatment_and_safe() -> None:
     treatment = _task6_relation_row()
     safe = _task6_relation_row(
