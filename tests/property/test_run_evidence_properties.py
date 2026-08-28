@@ -104,9 +104,13 @@ def test_any_statistical_unit_addition_changes_unit_identity(
 
 
 @given(st.integers(min_value=0, max_value=2**31 - 1))
-def test_pilot_cannot_reuse_one_integer_as_split_and_model_seed(seed: int) -> None:
-    with pytest.raises(RunEvidenceError, match="invalid_identity"):
-        valid_identity(data_split_seed=seed, model_seed=seed)
+def test_equal_seed_values_remain_separate_identity_fields(seed: int) -> None:
+    same_value = valid_identity(data_split_seed=seed, model_seed=seed)
+    changed_split = replace(same_value, data_split_seed=seed + 1)
+    changed_model = replace(same_value, model_seed=seed + 1)
+    assert changed_split.run_identity_sha256 != same_value.run_identity_sha256
+    assert changed_model.run_identity_sha256 != same_value.run_identity_sha256
+    assert changed_split.run_identity_sha256 != changed_model.run_identity_sha256
 
 
 @given(

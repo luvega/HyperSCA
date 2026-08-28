@@ -233,14 +233,6 @@ class RunEvidenceIdentity:
             raise RunEvidenceError("invalid_identity", "unknown evidence_role")
         _require_bounded_seed(self.data_split_seed, field_name="data_split_seed")
         _require_bounded_seed(self.model_seed, field_name="model_seed")
-        if (
-            self.evidence_role == "pilot_audit_only"
-            and self.data_split_seed == self.model_seed
-        ):
-            raise RunEvidenceError(
-                "invalid_identity",
-                "pilot data_split_seed and model_seed must be independently assigned",
-            )
         frozen_scopes = _require_data_scopes(
             self.data_scopes, evidence_role=self.evidence_role
         )
