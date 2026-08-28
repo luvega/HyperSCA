@@ -11,8 +11,12 @@ from dataclasses import dataclass
 from typing import cast
 
 
-BRIDGE_PRIMARY_BANDS = (("proximal", 1, 5), ("local", 6, 15))
-BRIDGE_SECONDARY_BANDS = (("transition", 16, 30), ("distal", 31, 60))
+_BRIDGE_PRIMARY_BANDS = (("proximal", 1, 5), ("local", 6, 15))
+_BRIDGE_SECONDARY_BANDS = (("transition", 16, 30), ("distal", 31, 60))
+
+# Public reference constants; canonical serialization always uses the private literals.
+BRIDGE_PRIMARY_BANDS = _BRIDGE_PRIMARY_BANDS
+BRIDGE_SECONDARY_BANDS = _BRIDGE_SECONDARY_BANDS
 
 _CLAIM_IDS = ("spatial", "intracellular_causal", "bridge")
 _PRIMARY_METRICS = (
@@ -177,37 +181,59 @@ def _band_mappings(bands: tuple[tuple[str, int, int], ...]) -> list[dict[str, ob
     ]
 
 
-def protocol_to_mapping_v3(protocol: MethodsProtocolV3) -> dict[str, object]:
-    """Return the ordered public contract used to calculate the protocol identity."""
+def _validated_snapshot(protocol: MethodsProtocolV3) -> MethodsProtocolV3:
+    """Reconstruct protocol state so serialization cannot trust mutated objects."""
     if type(protocol) is not MethodsProtocolV3:
         raise ValueError("protocol must be MethodsProtocolV3")
+    return MethodsProtocolV3(
+        protocol_version=protocol.protocol_version,
+        claim_ids=protocol.claim_ids,
+        primary_metrics=protocol.primary_metrics,
+        pilot_seeds=protocol.pilot_seeds,
+        release_seeds=protocol.release_seeds,
+        bootstrap_resamples=protocol.bootstrap_resamples,
+        confidence=protocol.confidence,
+        multiple_testing=protocol.multiple_testing,
+        integrated_gate=protocol.integrated_gate,
+        bridge_role=protocol.bridge_role,
+        capability_identity_sha256=protocol.capability_identity_sha256,
+        integrated_claim_enabled=protocol.integrated_claim_enabled,
+        crc_role=protocol.crc_role,
+    )
+
+
+def protocol_to_mapping_v3(protocol: MethodsProtocolV3) -> dict[str, object]:
+    """Return the ordered public contract used to calculate the protocol identity."""
+    snapshot = _validated_snapshot(protocol)
     return {
         "schema": "hypersca_methods_protocol_v3",
-        "protocol_version": protocol.protocol_version,
+        "protocol_version": snapshot.protocol_version,
+        "bridge_role": snapshot.bridge_role,
         "claims": {
             "spatial": {
-                "claim_id": protocol.claim_ids[0],
+                "claim_id": snapshot.claim_ids[0],
                 "benchmark": "osta_colon",
-                "primary_metric": protocol.primary_metrics[0],
+                "primary_metric": snapshot.primary_metrics[0],
+                "primary_k": 15,
                 "comparators": {
                     "confirmatory": "matched_euclidean_autoencoder",
                     "attribution": "hypersca_without_hierarchy_loss",
                 },
             },
             "intracellular_causal": {
-                "claim_id": protocol.claim_ids[1],
+                "claim_id": snapshot.claim_ids[1],
                 "benchmark": "causalbench_intracellular_interventional_causal_recovery",
-                "primary_metric": protocol.primary_metrics[1],
+                "primary_metric": snapshot.primary_metrics[1],
                 "comparators": {
                     "confirmatory": "matched_non_hyperbolic_baseline",
                     "attribution": "hypersca_c_shared_only",
                 },
             },
             "bridge": {
-                "claim_id": protocol.claim_ids[2],
-                "primary_metric": protocol.primary_metrics[2],
-                "primary_bands": _band_mappings(BRIDGE_PRIMARY_BANDS),
-                "secondary_bands": _band_mappings(BRIDGE_SECONDARY_BANDS),
+                "claim_id": snapshot.claim_ids[2],
+                "primary_metric": snapshot.primary_metrics[2],
+                "primary_bands": _band_mappings(_BRIDGE_PRIMARY_BANDS),
+                "secondary_bands": _band_mappings(_BRIDGE_SECONDARY_BANDS),
                 "iut": {
                     "comparators": [
                         "matched_euclidean_spatial_causal",
@@ -219,28 +245,28 @@ def protocol_to_mapping_v3(protocol: MethodsProtocolV3) -> dict[str, object]:
             },
         },
         "statistics": {
-            "pilot_seeds": list(protocol.pilot_seeds),
-            "release_seeds": list(protocol.release_seeds),
-            "bootstrap_resamples": protocol.bootstrap_resamples,
-            "confidence": protocol.confidence,
+            "pilot_seeds": list(snapshot.pilot_seeds),
+            "release_seeds": list(snapshot.release_seeds),
+            "bootstrap_resamples": snapshot.bootstrap_resamples,
+            "confidence": snapshot.confidence,
             "family_decision_rule": "nominal_one_sided_paired_95_percent_ci_lower_bound_gt_zero",
             "cross_family_adjustment": "none",
-            "multiple_testing": protocol.multiple_testing,
+            "multiple_testing": snapshot.multiple_testing,
         },
         "integration": {
-            "gate": protocol.integrated_gate,
-            "integrated_claim_enabled": protocol.integrated_claim_enabled,
+            "gate": snapshot.integrated_gate,
+            "integrated_claim_enabled": snapshot.integrated_claim_enabled,
             "evidence_policy": "all_three_family_gates_required",
             "extra_p_value": "none",
         },
         "governance": {
-            "crc_role": protocol.crc_role,
+            "crc_role": snapshot.crc_role,
             "crc_may_tune_hyperparameters": False,
             "crc_may_select_baselines": False,
             "crc_may_change_thresholds": False,
             "crc_may_rescue_promotion": False,
         },
-        "capability_identity_sha256": protocol.capability_identity_sha256,
+        "capability_identity_sha256": snapshot.capability_identity_sha256,
     }
 
 
@@ -251,5 +277,6 @@ def protocol_identity_v3(protocol: MethodsProtocolV3) -> str:
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
