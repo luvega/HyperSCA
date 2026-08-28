@@ -15,7 +15,6 @@ import math
 import os
 from pathlib import Path
 import re
-import secrets
 import stat
 from types import MappingProxyType
 from typing import cast
@@ -31,6 +30,7 @@ MAXIMUM_GENE_NAMES = 4096
 MAXIMUM_COUNT = 10_000_000
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _RENAME_NOREPLACE = 1
+_AT_EMPTY_PATH = 0x1000
 _FROZEN_CANDIDATE_ORDER = ("gse274447_msafe_bridge",)
 _FROZEN_GSE274447_SOURCE = "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE274447"
 _FROZEN_GSE274447_SOURCE_IDENTITY = "0e908ba2f21cab2bd222daf31a85ff8369407c8df53f5d9a2424f081528ffa46"
@@ -521,11 +521,22 @@ def _bound_parent(path: str | Path, label: str) -> tuple[_BoundDirectories, str]
     current_fd = root_fd
     try:
         for name in names:
-            descriptor = os.open(name, _directory_flags(), dir_fd=current_fd)
-            details = os.fstat(descriptor)
-            if not stat.S_ISDIR(details.st_mode):
-                os.close(descriptor)
-                raise SpatialPerturbationRegistryError(f"{label} has a non-directory ancestor")
+            descriptor: int | None = None
+            try:
+                descriptor = os.open(name, _directory_flags(), dir_fd=current_fd)
+                details = os.fstat(descriptor)
+                if not stat.S_ISDIR(details.st_mode):
+                    raise SpatialPerturbationRegistryError(
+                        f"{label} has a non-directory ancestor"
+                    )
+            except BaseException:
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                raise
+            assert descriptor is not None
             directory_fds.append(descriptor)
             identities.append((details.st_dev, details.st_ino))
             current_fd = descriptor
@@ -723,22 +734,37 @@ def load_asset_metadata(asset_root: str | Path, candidate: BridgeCandidate) -> M
     return metadata_summary_from_mapping(_json_payload(payload, "asset metadata"))
 
 
-def _rename_noreplace(parent_fd: int, temporary: str, output: str) -> None:
+def _link_anonymous_noreplace(anonymous_fd: int, parent_fd: int, output: str) -> None:
+    """Link the exact anonymous inode into *parent_fd* without replacement."""
     try:
         library = ctypes.CDLL(None, use_errno=True)
-        renameat2 = library.renameat2
+        linkat = library.linkat
     except (AttributeError, OSError) as exc:
-        raise SpatialPerturbationRegistryError("exclusive atomic publication is unavailable") from exc
-    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-    renameat2.restype = ctypes.c_int
-    if renameat2(parent_fd, os.fsencode(temporary), parent_fd, os.fsencode(output), _RENAME_NOREPLACE) == 0:
+        raise SpatialPerturbationRegistryError(
+            "anonymous exclusive publication is unavailable"
+        ) from exc
+    linkat.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    ]
+    linkat.restype = ctypes.c_int
+    if linkat(
+        anonymous_fd,
+        b"",
+        parent_fd,
+        os.fsencode(output),
+        _AT_EMPTY_PATH,
+    ) == 0:
         return
     error = ctypes.get_errno()
-    if error in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
-        raise SpatialPerturbationRegistryError("exclusive atomic publication is unavailable")
+    if error in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.ENOENT, errno.EPERM):
+        raise SpatialPerturbationRegistryError("anonymous exclusive publication is unavailable")
     if error in (errno.EEXIST, errno.ENOTEMPTY):
         raise SpatialPerturbationRegistryError("refusing to overwrite output")
-    raise SpatialPerturbationRegistryError("exclusive atomic publication failed") from OSError(error, os.strerror(error))
+    raise SpatialPerturbationRegistryError("anonymous exclusive publication failed") from OSError(error, os.strerror(error))
 
 
 def write_bridge_capability_exclusively(path: str | Path, result: BridgeCapabilityResult) -> None:
@@ -749,9 +775,9 @@ def write_bridge_capability_exclusively(path: str | Path, result: BridgeCapabili
     except FileNotFoundError as exc:
         raise SpatialPerturbationRegistryError("output parent is unavailable") from exc
     parent_fd = bound.parent_fd
-    temporary_fd: int | None = None
-    temporary_name: str | None = None
+    anonymous_fd: int | None = None
     committed = False
+    primary_error: BaseException | None = None
     try:
         bound.verify("output")
         try:
@@ -760,41 +786,59 @@ def write_bridge_capability_exclusively(path: str | Path, result: BridgeCapabili
             pass
         else:
             raise SpatialPerturbationRegistryError("refusing to overwrite output")
-        for _ in range(8):
-            proposed = f".{output_name}.{secrets.token_hex(16)}.tmp"
-            try:
-                temporary_fd = os.open(proposed, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=parent_fd)
-            except FileExistsError:
-                continue
-            temporary_name = proposed
-            break
-        if temporary_fd is None or temporary_name is None:
-            raise SpatialPerturbationRegistryError("unable to allocate exclusive staging output")
+        if not hasattr(os, "O_TMPFILE"):
+            raise SpatialPerturbationRegistryError("anonymous exclusive publication is unavailable")
+        try:
+            anonymous_fd = os.open(
+                ".",
+                os.O_TMPFILE | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise SpatialPerturbationRegistryError(
+                "anonymous exclusive publication is unavailable"
+            ) from exc
         payload = _canonical_bytes(record) + b"\n"
         view = memoryview(payload)
         while view:
-            written = os.write(temporary_fd, view)
+            written = os.write(anonymous_fd, view)
             if written < 1:
                 raise SpatialPerturbationRegistryError("short output write")
             view = view[written:]
-        os.fsync(temporary_fd)
-        details = os.fstat(temporary_fd)
-        if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
-            raise SpatialPerturbationRegistryError("staging output changed")
-        os.close(temporary_fd)
-        temporary_fd = None
+        os.fsync(anonymous_fd)
+        details = os.fstat(anonymous_fd)
+        if not stat.S_ISREG(details.st_mode) or details.st_nlink != 0:
+            raise SpatialPerturbationRegistryError("anonymous output changed")
         bound.verify("output")
-        _rename_noreplace(parent_fd, temporary_name, output_name)
+        _link_anonymous_noreplace(anonymous_fd, parent_fd, output_name)
+        published = os.fstat(anonymous_fd)
+        if not stat.S_ISREG(published.st_mode) or published.st_nlink != 1:
+            raise SpatialPerturbationRegistryError("published anonymous output changed")
         os.fsync(parent_fd)
         bound.verify("output")
         committed = True
     except OSError as exc:
+        primary_error = exc
         raise SpatialPerturbationRegistryError("output publication failed") from exc
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        if temporary_fd is not None:
-            os.close(temporary_fd)
-        # Never unlink an uncertain staging name: concurrent replacement cannot be
-        # distinguished safely after a failed operation.
-        bound.close()
+        close_error: BaseException | None = None
+        if anonymous_fd is not None:
+            try:
+                os.close(anonymous_fd)
+            except OSError as exc:
+                close_error = exc
+        try:
+            bound.close()
+        except BaseException as exc:
+            if close_error is None:
+                close_error = exc
+        if primary_error is None and close_error is not None:
+            raise SpatialPerturbationRegistryError("output cleanup failed") from close_error
+        # An unpublished anonymous inode disappears on close.  After publication,
+        # uncertainty preserves the destination and never removes a pathname.
         if not committed:
             pass

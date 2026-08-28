@@ -264,7 +264,10 @@ def test_cli_without_assets_publishes_explicit_unavailable_capability(tmp_path: 
         capture_output=True,
         check=False,
     )
-    assert probe.returncode == 0, probe.stderr
+    if probe.returncode != 0:
+        assert "anonymous exclusive publication" in probe.stderr
+        assert not output.exists()
+        return
     published = json.loads(output.read_text(encoding="utf-8"))
     assert published["status"] == "assets_unavailable"
     assert "asset_metadata_unavailable" in published["blocking_reasons"]
@@ -395,14 +398,72 @@ def test_output_ancestor_swap_is_rejected_without_redirected_publication(
     redirected.mkdir()
     output = trusted_parent / "capability.json"
     holding = tmp_path / "holding"
-    real_rename = registry_module._rename_noreplace
+    real_link = registry_module._link_anonymous_noreplace
 
-    def swap_before_publish(parent_fd: int, temporary: str, target: str) -> None:
+    def swap_before_publish(anonymous_fd: int, parent_fd: int, target: str) -> None:
         trusted_parent.rename(holding)
         trusted_parent.symlink_to(redirected, target_is_directory=True)
-        real_rename(parent_fd, temporary, target)
+        real_link(anonymous_fd, parent_fd, target)
 
-    monkeypatch.setattr(registry_module, "_rename_noreplace", swap_before_publish)
+    monkeypatch.setattr(registry_module, "_link_anonymous_noreplace", swap_before_publish)
     with pytest.raises(SpatialPerturbationRegistryError):
         write_bridge_capability_exclusively(output, audit_bridge_capability(candidate(), metadata_summary(animals=3)))
     assert not (redirected / "capability.json").exists()
+
+
+def test_adversarial_replacement_cannot_publish_attacker_staging_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "capability.json"
+    attacker = tmp_path / "attacker.json"
+    attacker_bytes = b'{"attacker":"content"}\n'
+    attacker.write_bytes(attacker_bytes)
+    real_close = registry_module.os.close
+    swapped = False
+
+    def replace_named_staging(descriptor: int) -> None:
+        nonlocal swapped
+        try:
+            staged = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        except OSError:
+            staged = Path("")
+        if not swapped and staged.name.startswith(".capability.json."):
+            swapped = True
+            real_close(descriptor)
+            os.replace(attacker, staged)
+            return
+        real_close(descriptor)
+
+    monkeypatch.setattr(registry_module.os, "close", replace_named_staging)
+    try:
+        write_bridge_capability_exclusively(
+            output, audit_bridge_capability(candidate(), metadata_summary(animals=3))
+        )
+    except SpatialPerturbationRegistryError:
+        assert not output.exists()
+    else:
+        assert output.read_bytes() != attacker_bytes
+        assert json.loads(output.read_text(encoding="utf-8"))["candidate_id"] == "gse274447_msafe_bridge"
+
+
+def test_component_walk_closes_descriptor_when_immediate_fstat_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "nested" / "registry.json"
+    target.parent.mkdir()
+    before = len(os.listdir("/proc/self/fd"))
+    real_fstat = registry_module.os.fstat
+    injected = False
+
+    def fail_first_component_fstat(descriptor: int):  # type: ignore[no-untyped-def]
+        nonlocal injected
+        if not injected:
+            injected = True
+            raise OSError("injected fstat failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(registry_module.os, "fstat", fail_first_component_fstat)
+    with pytest.raises(SpatialPerturbationRegistryError):
+        registry_module._bound_parent(target, "registry")
+    assert injected is True
+    assert len(os.listdir("/proc/self/fd")) == before
