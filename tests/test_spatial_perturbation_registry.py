@@ -20,6 +20,7 @@ from src.evaluation.spatial_perturbation_registry import (
     metadata_summary_from_mapping,
     write_bridge_capability_exclusively,
 )
+from src.evaluation import spatial_perturbation_registry as registry_module
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -338,3 +339,70 @@ def test_exclusive_writer_never_clobbers_existing_output(tmp_path: Path) -> None
     with pytest.raises(SpatialPerturbationRegistryError):
         write_bridge_capability_exclusively(output, result)
     assert output.read_bytes() == b"existing"
+
+
+def test_metadata_and_result_defensively_copy_mutable_mappings() -> None:
+    raw_summary = metadata_summary(animals=3).to_mapping()
+    summary = metadata_summary_from_mapping(raw_summary)
+    raw_summary["biological_specimen_ids"].clear()  # type: ignore[union-attr]
+    raw_summary["sections_by_specimen"][0][1].append("forged")  # type: ignore[index,union-attr]
+    assert summary.biological_specimen_ids == ("mouse_1", "mouse_2", "mouse_3")
+    assert summary.sections_by_specimen[0] == ("mouse_1", ("mouse_1_section",))
+
+    original = audit_bridge_capability(candidate(5), metadata_summary(animals=5))
+    raw_result = original.to_mapping()
+    copied = BridgeCapabilityResult(**raw_result)  # type: ignore[arg-type]
+    raw_result["coverage"]["cohorts"] = 0.0  # type: ignore[index,union-attr]
+    raw_result["blocking_reasons"].append("forged")  # type: ignore[union-attr]
+    assert copied.capability_identity_sha256 == original.capability_identity_sha256
+    assert copied.to_mapping() == original.to_mapping()
+
+
+def test_registry_ancestor_swap_between_validation_and_leaf_open_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted_parent = tmp_path / "trusted" / "nested"
+    trusted_parent.mkdir(parents=True)
+    registry_path = trusted_parent / "registry.json"
+    registry_path.write_bytes(REGISTRY_PATH.read_bytes())
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
+    (redirected / "registry.json").write_bytes(REGISTRY_PATH.read_bytes())
+    holding = tmp_path / "holding"
+    real_open = registry_module.os.open
+    swapped = False
+
+    def swap_before_leaf(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        if not swapped and str(path).endswith("registry.json"):
+            swapped = True
+            trusted_parent.rename(holding)
+            trusted_parent.symlink_to(redirected, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(registry_module.os, "open", swap_before_leaf)
+    with pytest.raises(SpatialPerturbationRegistryError):
+        load_bridge_candidates(registry_path)
+    assert swapped is True
+
+
+def test_output_ancestor_swap_is_rejected_without_redirected_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted_parent = tmp_path / "trusted" / "nested"
+    trusted_parent.mkdir(parents=True)
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
+    output = trusted_parent / "capability.json"
+    holding = tmp_path / "holding"
+    real_rename = registry_module._rename_noreplace
+
+    def swap_before_publish(parent_fd: int, temporary: str, target: str) -> None:
+        trusted_parent.rename(holding)
+        trusted_parent.symlink_to(redirected, target_is_directory=True)
+        real_rename(parent_fd, temporary, target)
+
+    monkeypatch.setattr(registry_module, "_rename_noreplace", swap_before_publish)
+    with pytest.raises(SpatialPerturbationRegistryError):
+        write_bridge_capability_exclusively(output, audit_bridge_capability(candidate(), metadata_summary(animals=3)))
+    assert not (redirected / "capability.json").exists()

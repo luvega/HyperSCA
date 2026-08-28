@@ -446,24 +446,134 @@ def audit_bridge_capability(candidate: BridgeCandidate, summary: MetadataSummary
                                   coverage, frozen_reasons, identity)
 
 
-def _absolute_without_symlinks(path: str | Path, label: str) -> Path:
+@dataclass(frozen=True, slots=True)
+class _BoundDirectories:
+    """A root-to-parent directory walk bound only through file descriptors."""
+
+    root_fd: int
+    directory_fds: tuple[int, ...]
+    component_names: tuple[str, ...]
+    component_identities: tuple[tuple[int, int], ...]
+
+    @property
+    def parent_fd(self) -> int:
+        return self.directory_fds[-1] if self.directory_fds else self.root_fd
+
+    def verify(self, label: str) -> None:
+        current_fd = self.root_fd
+        for name, expected, next_fd in zip(
+            self.component_names, self.component_identities, self.directory_fds
+        ):
+            try:
+                named = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
+                bound = os.fstat(next_fd)
+            except OSError as exc:
+                raise SpatialPerturbationRegistryError(
+                    f"{label} directory path changed while bound"
+                ) from exc
+            if (
+                not stat.S_ISDIR(named.st_mode)
+                or not stat.S_ISDIR(bound.st_mode)
+                or (named.st_dev, named.st_ino) != expected
+                or (bound.st_dev, bound.st_ino) != expected
+            ):
+                raise SpatialPerturbationRegistryError(
+                    f"{label} directory path changed while bound"
+                )
+            current_fd = next_fd
+
+    def close(self) -> None:
+        failures: list[OSError] = []
+        for descriptor in reversed((*self.directory_fds, self.root_fd)):
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                failures.append(exc)
+        if failures:
+            raise SpatialPerturbationRegistryError("bound directory close failed") from failures[0]
+
+
+def _directory_flags() -> int:
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise SpatialPerturbationRegistryError(
+            "safe component-wise directory traversal is unavailable"
+        )
+    return (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _bound_parent(path: str | Path, label: str) -> tuple[_BoundDirectories, str]:
     absolute = Path(os.path.abspath(os.fspath(path)))
-    for component in (absolute, *absolute.parents):
-        try:
-            details = component.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            raise SpatialPerturbationRegistryError(f"{label} path is unavailable") from exc
-        if stat.S_ISLNK(details.st_mode):
-            raise SpatialPerturbationRegistryError(f"{label} must not traverse a symbolic link")
-    return absolute
-
-
-def _safe_regular_payload(path: str | Path, label: str, *, maximum: int = MAXIMUM_REGISTRY_BYTES) -> bytes:
-    absolute = _absolute_without_symlinks(path, label)
+    leaf = absolute.name
+    if not leaf or leaf in (".", ".."):
+        raise SpatialPerturbationRegistryError(f"{label} must name a leaf file")
+    names = absolute.parent.parts[1:]
     try:
-        descriptor = os.open(absolute, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
+        root_fd = os.open(os.sep, _directory_flags())
+    except OSError as exc:
+        raise SpatialPerturbationRegistryError(f"{label} trusted root is unavailable") from exc
+    directory_fds: list[int] = []
+    identities: list[tuple[int, int]] = []
+    current_fd = root_fd
+    try:
+        for name in names:
+            descriptor = os.open(name, _directory_flags(), dir_fd=current_fd)
+            details = os.fstat(descriptor)
+            if not stat.S_ISDIR(details.st_mode):
+                os.close(descriptor)
+                raise SpatialPerturbationRegistryError(f"{label} has a non-directory ancestor")
+            directory_fds.append(descriptor)
+            identities.append((details.st_dev, details.st_ino))
+            current_fd = descriptor
+        bound = _BoundDirectories(
+            root_fd, tuple(directory_fds), tuple(names), tuple(identities)
+        )
+        bound.verify(label)
+        return bound, leaf
+    except FileNotFoundError:
+        for descriptor in reversed((*directory_fds, root_fd)):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    except OSError as exc:
+        for descriptor in reversed((*directory_fds, root_fd)):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise SpatialPerturbationRegistryError(
+            f"{label} parent is unavailable or unsafe"
+        ) from exc
+    except BaseException:
+        for descriptor in reversed((*directory_fds, root_fd)):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def _safe_regular_payload_at(
+    bound: _BoundDirectories, leaf: str, label: str, *, maximum: int = MAXIMUM_REGISTRY_BYTES
+) -> bytes:
+    bound.verify(label)
+    try:
+        descriptor = os.open(
+            leaf,
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=bound.parent_fd,
+        )
+    except FileNotFoundError:
+        raise
     except OSError as exc:
         raise SpatialPerturbationRegistryError(f"{label} is not a safe regular file") from exc
     try:
@@ -487,6 +597,7 @@ def _safe_regular_payload(path: str | Path, label: str, *, maximum: int = MAXIMU
     identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_nlink)
     if identity_before != identity_after or observed != before.st_size:
         raise SpatialPerturbationRegistryError(f"{label} changed while being read")
+    bound.verify(label)
     return b"".join(parts)
 
 
@@ -544,7 +655,18 @@ def _json_payload(payload: bytes, label: str) -> object:
 
 
 def load_bridge_candidates(path: str | Path) -> Mapping[str, BridgeCandidate]:
-    raw = _json_payload(_safe_regular_payload(path, "registry"), "registry")
+    try:
+        bound, leaf = _bound_parent(path, "registry")
+    except FileNotFoundError as exc:
+        raise SpatialPerturbationRegistryError("registry parent is unavailable") from exc
+    try:
+        try:
+            payload = _safe_regular_payload_at(bound, leaf, "registry")
+        except FileNotFoundError as exc:
+            raise SpatialPerturbationRegistryError("registry is unavailable") from exc
+    finally:
+        bound.close()
+    raw = _json_payload(payload, "registry")
     if type(raw) is not dict or set(raw) != {"schema_version", "candidates"}:
         raise SpatialPerturbationRegistryError("registry has unknown or missing fields")
     if raw["schema_version"] != "spatial_perturbation_bridge_candidates_v1":
@@ -587,16 +709,18 @@ def unavailable_metadata_summary(candidate: BridgeCandidate) -> MetadataSummary:
 
 
 def load_asset_metadata(asset_root: str | Path, candidate: BridgeCandidate) -> MetadataSummary:
-    metadata_path = _absolute_without_symlinks(Path(asset_root) / "metadata_summary.json", "asset metadata")
     try:
-        leaf = metadata_path.lstat()
+        bound, leaf = _bound_parent(Path(asset_root) / "metadata_summary.json", "asset metadata")
     except FileNotFoundError:
         return unavailable_metadata_summary(candidate)
-    except OSError as exc:
-        raise SpatialPerturbationRegistryError("asset metadata path is unavailable") from exc
-    if stat.S_ISLNK(leaf.st_mode):
-        raise SpatialPerturbationRegistryError("asset metadata must not be a symbolic link")
-    return metadata_summary_from_mapping(_json_payload(_safe_regular_payload(metadata_path, "asset metadata"), "asset metadata"))
+    try:
+        try:
+            payload = _safe_regular_payload_at(bound, leaf, "asset metadata")
+        except FileNotFoundError:
+            return unavailable_metadata_summary(candidate)
+    finally:
+        bound.close()
+    return metadata_summary_from_mapping(_json_payload(payload, "asset metadata"))
 
 
 def _rename_noreplace(parent_fd: int, temporary: str, output: str) -> None:
@@ -617,48 +741,27 @@ def _rename_noreplace(parent_fd: int, temporary: str, output: str) -> None:
     raise SpatialPerturbationRegistryError("exclusive atomic publication failed") from OSError(error, os.strerror(error))
 
 
-def _bound_directory_matches(path: Path, identity: tuple[int, int]) -> bool:
-    try:
-        details = path.stat(follow_symlinks=False)
-    except OSError:
-        return False
-    return stat.S_ISDIR(details.st_mode) and (details.st_dev, details.st_ino) == identity
-
-
 def write_bridge_capability_exclusively(path: str | Path, result: BridgeCapabilityResult) -> None:
     """Publish one JSON record with Linux no-clobber rename and durable fsync."""
     record = _result_snapshot(result).to_mapping()
-    output = Path(path)
-    parent = Path(os.path.abspath(os.fspath(output.parent)))
-    if output.name in ("", ".", ".."):
-        raise SpatialPerturbationRegistryError("output must name a file")
-    for component in (parent, *parent.parents):
-        try:
-            details = component.lstat()
-        except OSError as exc:
-            raise SpatialPerturbationRegistryError("output parent is unavailable") from exc
-        if stat.S_ISLNK(details.st_mode):
-            raise SpatialPerturbationRegistryError("output parent must not traverse a symbolic link")
     try:
-        parent_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
-    except OSError as exc:
-        raise SpatialPerturbationRegistryError("output parent is unsafe") from exc
+        bound, output_name = _bound_parent(path, "output")
+    except FileNotFoundError as exc:
+        raise SpatialPerturbationRegistryError("output parent is unavailable") from exc
+    parent_fd = bound.parent_fd
     temporary_fd: int | None = None
     temporary_name: str | None = None
     committed = False
     try:
-        parent_details = os.fstat(parent_fd)
-        parent_identity = (parent_details.st_dev, parent_details.st_ino)
-        if not stat.S_ISDIR(parent_details.st_mode) or not _bound_directory_matches(parent, parent_identity):
-            raise SpatialPerturbationRegistryError("output parent changed while being bound")
+        bound.verify("output")
         try:
-            os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
+            os.stat(output_name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
             pass
         else:
             raise SpatialPerturbationRegistryError("refusing to overwrite output")
         for _ in range(8):
-            proposed = f".{output.name}.{secrets.token_hex(16)}.tmp"
+            proposed = f".{output_name}.{secrets.token_hex(16)}.tmp"
             try:
                 temporary_fd = os.open(proposed, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=parent_fd)
             except FileExistsError:
@@ -680,12 +783,10 @@ def write_bridge_capability_exclusively(path: str | Path, result: BridgeCapabili
             raise SpatialPerturbationRegistryError("staging output changed")
         os.close(temporary_fd)
         temporary_fd = None
-        if not _bound_directory_matches(parent, parent_identity):
-            raise SpatialPerturbationRegistryError("output parent changed before publication")
-        _rename_noreplace(parent_fd, temporary_name, output.name)
+        bound.verify("output")
+        _rename_noreplace(parent_fd, temporary_name, output_name)
         os.fsync(parent_fd)
-        if not _bound_directory_matches(parent, parent_identity):
-            raise SpatialPerturbationRegistryError("output parent changed after publication")
+        bound.verify("output")
         committed = True
     except OSError as exc:
         raise SpatialPerturbationRegistryError("output publication failed") from exc
@@ -694,6 +795,6 @@ def write_bridge_capability_exclusively(path: str | Path, result: BridgeCapabili
             os.close(temporary_fd)
         # Never unlink an uncertain staging name: concurrent replacement cannot be
         # distinguished safely after a failed operation.
-        os.close(parent_fd)
+        bound.close()
         if not committed:
             pass
