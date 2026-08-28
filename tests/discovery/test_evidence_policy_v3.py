@@ -12,6 +12,10 @@ from src.discovery.evidence_policy import (
     evaluate_bridge_claim,
     evaluate_v3_claim,
 )
+from src.evaluation.methods_protocol_v3 import (
+    build_methods_protocol_v3,
+    protocol_to_mapping_v3,
+)
 
 
 IDENTITY = "a" * 64
@@ -35,7 +39,7 @@ def policy_v3(**overrides: object) -> EvidencePolicyV3:
             ),
             (
                 "intracellular_causal",
-                ("matched_non_hyperbolic_causal", "hypersca_c_shared_only"),
+                ("matched_non_hyperbolic_baseline", "hypersca_c_shared_only"),
             ),
             (
                 "bridge",
@@ -140,6 +144,21 @@ def test_integrated_claim_requires_all_three_components() -> None:
     assert result.allowed_use == "separate_module_claims_only"
 
 
+def test_real_admitted_modules_with_missing_bridge_are_separate_module_audit_only() -> (
+    None
+):
+    policy = policy_v3()
+    spatial = evaluate_v3_claim(pair("spatial"), policy)
+    causal = evaluate_v3_claim(pair("intracellular_causal"), policy)
+    bridge = evaluate_bridge_claim((), policy)
+
+    result = derive_integrated_claim((spatial, causal, bridge), policy)
+
+    assert bridge.status == "blocked"
+    assert result.status == "audit_only"
+    assert result.allowed_use == "separate_module_claims_only"
+
+
 def test_bridge_uses_intersection_union_without_holm() -> None:
     decision = evaluate_bridge_claim(bridge_pair(0.01, 0.04), policy_v3())
     assert decision.nominal_p_value == 0.04
@@ -189,6 +208,33 @@ def test_bridge_requires_two_completed_confirmatory_comparators() -> None:
     )
     assert evaluate_bridge_claim((first, incomplete), policy_v3()).status == "blocked"
     assert evaluate_bridge_claim((first,), policy_v3()).status == "blocked"
+
+
+def test_incomplete_pilot_bridge_evidence_is_blocked_before_role_downgrade() -> None:
+    first, second = bridge_pair(0.01, 0.01)
+    incomplete_pilot = evidence(
+        "bridge",
+        second.comparator_id,
+        role="pilot_audit_only",
+        attempted=3,
+        completed=2,
+        identity="f" * 64,
+    )
+
+    decision = evaluate_bridge_claim((first, incomplete_pilot), policy_v3())
+
+    assert decision.status == "blocked"
+    assert decision.allowed_use == "not_used"
+    result = derive_integrated_claim(
+        (
+            evaluate_v3_claim(pair("spatial"), policy_v3()),
+            evaluate_v3_claim(pair("intracellular_causal"), policy_v3()),
+            decision,
+        ),
+        policy_v3(),
+    )
+    assert result.status == "blocked"
+    assert result.allowed_use == "not_used"
 
 
 def test_bridge_requires_common_paired_units() -> None:
@@ -271,7 +317,8 @@ def test_integrated_claim_requires_exact_claim_wording_and_enabled_policy() -> N
     )
     assert (
         derive_integrated_claim(
-            (spatial, causal, bridge), policy_v3(integrated_claim_enabled=False)
+            (spatial, causal, bridge),
+            policy_v3(bridge_role="pilot_audit_only", integrated_claim_enabled=False),
         ).status
         == "audit_only"
     )
@@ -301,6 +348,39 @@ def test_direct_mutation_of_identity_and_policy_is_detected_by_mapping() -> None
 def test_v3_policy_does_not_allow_threshold_tuning(override: dict[str, object]) -> None:
     with pytest.raises(ValueError, match="frozen v3"):
         policy_v3(**override)
+
+
+def test_v3_policy_binds_exact_protocol_and_bridge_role_capability() -> None:
+    with pytest.raises(ValueError, match="protocol_version"):
+        policy_v3(protocol_version="hypersca-methods-v3.1")
+    with pytest.raises(ValueError, match="integrated_claim_enabled"):
+        policy_v3(bridge_role="pilot_audit_only", integrated_claim_enabled=True)
+    pilot = policy_v3(bridge_role="pilot_audit_only", integrated_claim_enabled=False)
+    assert pilot.to_mapping()["bridge_role"] == "pilot_audit_only"
+
+
+def test_policy_mapping_rejects_mutated_protocol_and_bridge_capability() -> None:
+    policy = policy_v3()
+    object.__setattr__(policy, "protocol_version", "hypersca-methods-v3.1")
+    with pytest.raises(ValueError, match="protocol_version"):
+        policy.to_mapping()
+    policy = policy_v3()
+    object.__setattr__(policy, "bridge_role", "pilot_audit_only")
+    with pytest.raises(ValueError, match="integrated_claim_enabled"):
+        evaluate_bridge_claim(bridge_pair(0.01, 0.01), policy)
+
+
+def test_v3_policy_uses_the_methods_protocol_causal_comparator() -> None:
+    protocol = build_methods_protocol_v3(
+        bridge_role="confirmatory", capability_identity_sha256="a" * 64
+    )
+    claims = protocol_to_mapping_v3(protocol)["claims"]
+    causal_comparator = claims["intracellular_causal"]["comparators"]["confirmatory"]  # type: ignore[index]
+
+    assert (
+        dict(policy_v3().required_comparators)["intracellular_causal"][0]
+        == causal_comparator
+    )
 
 
 @pytest.mark.parametrize(

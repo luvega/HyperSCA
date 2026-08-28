@@ -362,6 +362,8 @@ class EvidencePolicyV3:
 
     def __post_init__(self) -> None:
         _require_v3_text(self.protocol_version, "protocol_version")
+        if self.protocol_version != "hypersca-methods-v3.0":
+            raise ValueError("protocol_version is frozen to hypersca-methods-v3.0")
         expected_metrics = (
             ("spatial", "neighborhood_preservation_at_k"),
             ("intracellular_causal", "directed_edge_average_precision"),
@@ -387,7 +389,7 @@ class EvidencePolicyV3:
             ),
             (
                 "intracellular_causal",
-                ("matched_non_hyperbolic_causal", "hypersca_c_shared_only"),
+                ("matched_non_hyperbolic_baseline", "hypersca_c_shared_only"),
             ),
             (
                 "bridge",
@@ -426,10 +428,15 @@ class EvidencePolicyV3:
             raise ValueError("nominal_alpha must equal the frozen v3 value 0.05")
         if lower_bound != 0.0:
             raise ValueError("minimum_lower_bound must equal the frozen v3 value 0.0")
-        if self.bridge_role != "confirmatory" or type(self.bridge_role) is not str:
-            raise ValueError("bridge_role must be the frozen confirmatory role")
+        if type(self.bridge_role) is not str or self.bridge_role not in {
+            "pilot_audit_only",
+            "confirmatory",
+        }:
+            raise ValueError("bridge_role must be pilot_audit_only or confirmatory")
         if type(self.integrated_claim_enabled) is not bool:
             raise ValueError("integrated_claim_enabled must be a built-in bool")
+        if self.integrated_claim_enabled is not (self.bridge_role == "confirmatory"):
+            raise ValueError("integrated_claim_enabled must match the bridge_role")
 
     def to_mapping(self) -> dict[str, object]:
         self.__post_init__()
@@ -491,7 +498,11 @@ class V3ClaimDecision:
             "not_applicable",
         }:
             raise ValueError("multiplicity_adjustment is not valid for v3")
-        if self.evidence_role not in {"confirmatory", "integrated"}:
+        if self.evidence_role not in {
+            "confirmatory",
+            "pilot_audit_only",
+            "integrated",
+        }:
             raise ValueError("evidence_role is not valid for a v3 decision")
         if type(self.application_evidence_identities) is not tuple or any(
             type(value) is not str or _SHA256_PATTERN.fullmatch(value) is None
@@ -710,8 +721,10 @@ def _v3_decision(
     nominal_p_value: float | None,
     multiplicity_adjustment: str,
     application_evidence_identities: tuple[str, ...],
-    evidence_role: str = "confirmatory",
+    evidence_role: str | None = None,
 ) -> V3ClaimDecision:
+    if evidence_role is None:
+        evidence_role = policy.bridge_role if claim_id == "bridge" else "confirmatory"
     return V3ClaimDecision(
         claim_id=claim_id,
         protocol_version=policy.protocol_version,
@@ -803,29 +816,6 @@ def _evaluate_v3_family(
             application_evidence_identities=application_identities,
         )
 
-    expected_roles = (
-        ("confirmatory", "confirmatory")
-        if claim_id == "bridge"
-        else ("confirmatory", "attribution")
-    )
-    role_failures = tuple(
-        f"{comparator} must have evidence role {expected_role}"
-        for comparator, expected_role in zip(required, expected_roles)
-        if by_comparator[comparator].evidence_role != expected_role
-    )
-    if role_failures:
-        return _v3_decision(
-            claim_id=claim_id,
-            policy=policy,
-            status="audit_only",
-            allowed_use="audit_only",
-            reasons=role_failures,
-            identity_payload=identity_payload,
-            nominal_p_value=None,
-            multiplicity_adjustment=multiplicity,
-            application_evidence_identities=application_identities,
-        )
-
     paired_counts = {
         (
             by_comparator[comparator].attempted_units,
@@ -849,6 +839,29 @@ def _evaluate_v3_family(
             status="blocked",
             allowed_use="not_used",
             reasons=(detail,),
+            identity_payload=identity_payload,
+            nominal_p_value=None,
+            multiplicity_adjustment=multiplicity,
+            application_evidence_identities=application_identities,
+        )
+
+    expected_roles = (
+        (policy.bridge_role, policy.bridge_role)
+        if claim_id == "bridge"
+        else ("confirmatory", "attribution")
+    )
+    role_failures = tuple(
+        f"{comparator} must have evidence role {expected_role}"
+        for comparator, expected_role in zip(required, expected_roles)
+        if by_comparator[comparator].evidence_role != expected_role
+    )
+    if role_failures:
+        return _v3_decision(
+            claim_id=claim_id,
+            policy=policy,
+            status="audit_only",
+            allowed_use="audit_only",
+            reasons=role_failures,
             identity_payload=identity_payload,
             nominal_p_value=None,
             multiplicity_adjustment=multiplicity,
@@ -991,7 +1004,22 @@ def derive_integrated_claim(
     status: str
     allowed_use: str
     reasons: tuple[str, ...]
-    if "blocked" in component_statuses:
+    bridge_unavailable = (
+        by_claim["spatial"].status == "admitted"
+        and by_claim["intracellular_causal"].status == "admitted"
+        and by_claim["bridge"].status == "blocked"
+        and any(
+            reason.startswith("missing comparator evidence:")
+            for reason in by_claim["bridge"].blocking_reasons
+        )
+    )
+    if bridge_unavailable:
+        status, allowed_use, reasons = (
+            "audit_only",
+            "separate_module_claims_only",
+            ("integrated claim requires available bridge evidence",),
+        )
+    elif "blocked" in component_statuses:
         status, allowed_use, reasons = (
             "blocked",
             "not_used",
