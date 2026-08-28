@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import math
@@ -10,7 +12,7 @@ import os
 from pathlib import Path
 import secrets
 import stat
-from typing import Mapping, Sequence, cast
+from typing import Mapping, cast
 
 from src.evaluation.run_evidence_identity import canonical_json_bytes, validate_strict_json
 
@@ -19,6 +21,7 @@ PROTOCOL_VERSION = "hypersca-methods-v2.1"
 PROTOCOL_IDENTITY_SHA256 = "caa2f9a4aed7e474c123cb815435f65df5011387a4be1181d324a635b1a01613"
 PILOT_SUMMARY_SHA256 = "3fe9e90443f82a911fe02314a540cd8e3383ee016cff9c3dbb46b802490d694c"
 MAXIMUM_OUTCOME_BYTES = 128 * 1024
+_RENAME_NOREPLACE = 1
 
 _OUTCOME_KEYS = frozenset(
     {
@@ -226,7 +229,9 @@ def strict_json(path: Path) -> dict[str, object]:
     return _strict_json_from_bytes(_read_bounded_regular_file(path, "JSON input"), "JSON input")
 
 
-def _freeze_text_sequence(value: Sequence[str], label: str) -> tuple[str, ...]:
+def _freeze_text_sequence(
+    value: list[str] | tuple[str, ...], label: str
+) -> tuple[str, ...]:
     if type(value) not in {list, tuple}:
         raise ValueError(f"{label} must be an ordered built-in sequence")
     frozen: tuple[str, ...] = tuple(value)
@@ -266,9 +271,9 @@ class ProtocolOutcome:
         pilot_summary_sha256: str,
         status: str,
         release_authorized: bool,
-        run_identity_sha256: Sequence[str],
-        collection_identity_sha256: Sequence[str],
-        blocking_reasons: Sequence[str],
+        run_identity_sha256: list[str] | tuple[str, ...],
+        collection_identity_sha256: list[str] | tuple[str, ...],
+        blocking_reasons: list[str] | tuple[str, ...],
     ) -> None:
         object.__setattr__(self, "protocol_version", protocol_version)
         object.__setattr__(self, "protocol_identity_sha256", protocol_identity_sha256)
@@ -336,11 +341,15 @@ class ProtocolOutcome:
             pilot_summary_sha256=cast(str, value["pilot_summary_sha256"]),
             status=cast(str, value["status"]),
             release_authorized=cast(bool, value["release_authorized"]),
-            run_identity_sha256=cast(Sequence[str], value["run_identity_sha256"]),
-            collection_identity_sha256=cast(
-                Sequence[str], value["collection_identity_sha256"]
+            run_identity_sha256=cast(
+                list[str] | tuple[str, ...], value["run_identity_sha256"]
             ),
-            blocking_reasons=cast(Sequence[str], value["blocking_reasons"]),
+            collection_identity_sha256=cast(
+                list[str] | tuple[str, ...], value["collection_identity_sha256"]
+            ),
+            blocking_reasons=cast(
+                list[str] | tuple[str, ...], value["blocking_reasons"]
+            ),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -386,23 +395,27 @@ def outcome_from_pilot_summary(path: Path) -> ProtocolOutcome:
     collections = summary.get("paired_collections")
     if type(runs) is not list or type(collections) is not list:
         raise ValueError("pilot summary does not contain the audited identities")
-    try:
-        run_identities = [item["run_identity_sha256"] for item in runs if type(item) is dict]
-        collection_identities = [
-            item["collection_identity_sha256"] for item in collections if type(item) is dict
-        ]
-    except KeyError as exc:
-        raise ValueError("pilot summary does not contain the audited identities") from exc
-    if len(run_identities) != len(runs) or len(collection_identities) != len(collections):
-        raise ValueError("pilot summary identity records must be JSON objects")
+    run_identities: list[str] = []
+    collection_identities: list[str] = []
+    for item in runs:
+        if type(item) is not dict or type(item.get("run_identity_sha256")) is not str:
+            raise ValueError("pilot summary identity records must be JSON objects")
+        run_identities.append(item["run_identity_sha256"])
+    for item in collections:
+        if (
+            type(item) is not dict
+            or type(item.get("collection_identity_sha256")) is not str
+        ):
+            raise ValueError("pilot summary identity records must be JSON objects")
+        collection_identities.append(item["collection_identity_sha256"])
     return ProtocolOutcome(
         protocol_version=PROTOCOL_VERSION,
         protocol_identity_sha256=PROTOCOL_IDENTITY_SHA256,
         pilot_summary_sha256=PILOT_SUMMARY_SHA256,
         status="pilot_failed_no_release",
         release_authorized=False,
-        run_identity_sha256=run_identities,  # type: ignore[arg-type]
-        collection_identity_sha256=collection_identities,  # type: ignore[arg-type]
+        run_identity_sha256=run_identities,
+        collection_identity_sha256=collection_identities,
         blocking_reasons=_FROZEN_BLOCKING_REASONS,
     )
 
@@ -416,18 +429,6 @@ def _stat_at(directory_fd: int, name: str) -> os.stat_result | None:
         return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
         return None
-
-
-def _unlink_if_owned(
-    directory_fd: int,
-    name: str,
-    identity: tuple[int, int],
-) -> bool:
-    observed = _stat_at(directory_fd, name)
-    if observed is None or _inode_identity(observed) != identity:
-        return False
-    os.unlink(name, dir_fd=directory_fd)
-    return True
 
 
 def _parent_path_matches_identity(parent: Path, identity: tuple[int, int]) -> bool:
@@ -462,6 +463,47 @@ def _open_bound_parent_directory(parent: Path) -> tuple[int, tuple[int, int]]:
         raise
 
 
+def _verify_bound_parent_directory(parent: Path, identity: tuple[int, int]) -> None:
+    """Reject path substitution before a dirfd-relative publication commits."""
+
+    _reject_symlink_components(parent, "protocol outcome parent")
+    if not _parent_path_matches_identity(parent, identity):
+        raise ValueError("protocol outcome parent changed while it was bound")
+
+
+def _rename_noreplace(parent_fd: int, source_name: str, target_name: str) -> None:
+    """Atomically publish *source_name* only when *target_name* is absent."""
+
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        renameat2 = library.renameat2
+    except (AttributeError, OSError) as exc:
+        raise ValueError("exclusive protocol outcome publication is unavailable") from exc
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        parent_fd,
+        os.fsencode(source_name),
+        parent_fd,
+        os.fsencode(target_name),
+        _RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise ValueError("refusing to overwrite existing protocol outcome")
+    if error_number in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP}:
+        raise ValueError("exclusive protocol outcome publication is unavailable")
+    raise ValueError("protocol outcome atomic publication failed") from OSError(error_number, os.strerror(error_number))
+
+
 def _write_all(descriptor: int, payload: bytes) -> None:
     view = memoryview(payload)
     while view:
@@ -472,7 +514,14 @@ def _write_all(descriptor: int, payload: bytes) -> None:
 
 
 def write_protocol_outcome_exclusively(path: Path, outcome: ProtocolOutcome) -> None:
-    """Publish one canonical closure record without overwriting any output."""
+    """Atomically publish a canonical closure record without clobbering output.
+
+    A successful ``renameat2(RENAME_NOREPLACE)`` followed by a successful fsync
+    of the already-bound parent directory is the commit point.  On every
+    pre-commit or post-publication uncertainty this function raises while
+    preserving the involved names: Linux/Python has no inode-conditional unlink
+    primitive, so deleting a name after an adversarial replacement is unsafe.
+    """
 
     destination = Path(path)
     _reject_symlink_components(destination.parent, "protocol outcome parent")
@@ -484,8 +533,8 @@ def write_protocol_outcome_exclusively(path: Path, outcome: ProtocolOutcome) -> 
     parent_identity: tuple[int, int] | None = None
     temporary_name: str | None = None
     temporary_identity: tuple[int, int] | None = None
-    published_identity: tuple[int, int] | None = None
-    publication_completed = False
+    publication_committed = False
+    operation_failed = False
     try:
         parent_fd, parent_identity = _open_bound_parent_directory(destination.parent)
         if _stat_at(parent_fd, destination.name) is not None:
@@ -531,24 +580,24 @@ def write_protocol_outcome_exclusively(path: Path, outcome: ProtocolOutcome) -> 
         ):
             raise ValueError("protocol outcome staging inode changed before publication")
 
-        try:
-            os.link(
-                temporary_name,
-                destination.name,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-        except FileExistsError as exc:
-            raise ValueError("refusing to overwrite existing protocol outcome") from exc
+        _verify_bound_parent_directory(destination.parent, parent_identity)
+        immediately_before_publish = _stat_at(parent_fd, temporary_name)
+        if (
+            immediately_before_publish is None
+            or not stat.S_ISREG(immediately_before_publish.st_mode)
+            or immediately_before_publish.st_nlink != 1
+            or _inode_identity(immediately_before_publish) != temporary_identity
+        ):
+            raise ValueError("protocol outcome staging inode changed before publication")
+
+        _rename_noreplace(parent_fd, temporary_name, destination.name)
         published_metadata = _stat_at(parent_fd, destination.name)
         if published_metadata is None:
             raise ValueError("published protocol outcome inode is missing")
-        published_identity = _inode_identity(published_metadata)
         if (
             not stat.S_ISREG(published_metadata.st_mode)
-            or published_identity != temporary_identity
-            or published_metadata.st_nlink != 2
+            or _inode_identity(published_metadata) != temporary_identity
+            or published_metadata.st_nlink != 1
         ):
             raise ValueError("published protocol outcome inode is invalid")
 
@@ -564,49 +613,39 @@ def write_protocol_outcome_exclusively(path: Path, outcome: ProtocolOutcome) -> 
         if (
             not stat.S_ISREG(final_metadata.st_mode)
             or _inode_identity(final_metadata) != temporary_identity
-            or final_metadata.st_nlink != 2
+            or final_metadata.st_nlink != 1
         ):
             raise ValueError("published protocol outcome inode is invalid")
 
-        if not _unlink_if_owned(parent_fd, temporary_name, temporary_identity):
-            raise ValueError("protocol outcome staging file changed before cleanup")
         try:
             os.fsync(parent_fd)
         except OSError as exc:
-            _unlink_if_owned(parent_fd, destination.name, published_identity)
-            try:
-                os.fsync(parent_fd)
-            except OSError:
-                pass
             raise ValueError(
-                "protocol outcome publication directory fsync failed; output removed"
+                "protocol outcome publication directory fsync failed; output is preserved"
             ) from exc
-
-        final_after_cleanup = _stat_at(parent_fd, destination.name)
-        if (
-            final_after_cleanup is None
-            or not stat.S_ISREG(final_after_cleanup.st_mode)
-            or _inode_identity(final_after_cleanup) != temporary_identity
-            or final_after_cleanup.st_nlink != 1
-        ):
-            raise ValueError("published protocol outcome inode is invalid")
-        if not _parent_path_matches_identity(destination.parent, parent_identity):
-            raise ValueError("protocol outcome parent changed after publication")
-        publication_completed = True
+        publication_committed = True
     except OSError as exc:
+        operation_failed = True
         raise ValueError("protocol outcome publication failed") from exc
+    except ValueError:
+        operation_failed = True
+        raise
     finally:
+        close_error: OSError | None = None
         if temporary_fd is not None:
-            os.close(temporary_fd)
+            try:
+                os.close(temporary_fd)
+            except OSError as exc:
+                close_error = exc
         if parent_fd is not None:
-            if temporary_name is not None and temporary_identity is not None:
-                try:
-                    _unlink_if_owned(parent_fd, temporary_name, temporary_identity)
-                except OSError:
-                    pass
-            if not publication_completed and published_identity is not None:
-                try:
-                    _unlink_if_owned(parent_fd, destination.name, published_identity)
-                except OSError:
-                    pass
-            os.close(parent_fd)
+            try:
+                os.close(parent_fd)
+            except OSError as exc:
+                close_error = close_error or exc
+        if close_error is not None:
+            if publication_committed:
+                raise ValueError(
+                    "protocol outcome publication committed but descriptor cleanup failed"
+                ) from close_error
+            if not operation_failed:
+                raise ValueError("protocol outcome descriptor cleanup failed") from close_error

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 
@@ -215,36 +216,33 @@ def test_outcome_publication_rejects_replaced_staging_symlink(
 ) -> None:
     output = tmp_path / "protocol_outcome.json"
     outcome = load_protocol_outcome(OUTCOME_PATH)
-    original_link = protocol_outcome.os.link
+    original_rename = getattr(protocol_outcome, "_rename_noreplace", None)
     staging: Path | None = None
 
-    def replace_staging_then_link(
-        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
-        destination: str | bytes | os.PathLike[str] | os.PathLike[bytes],
-        *args: object,
-        **kwargs: object,
+    def replace_staging_then_publish(
+        parent_fd: int,
+        source_name: str,
+        target_name: str,
     ) -> None:
         nonlocal staging
-        source_name = os.fsdecode(source)
-        source_dir_fd = kwargs.get("src_dir_fd")
-        if source_dir_fd is None:
-            staging = Path(source_name)
-            os.unlink(source_name)
-            os.symlink("/etc/passwd", source_name)
-        else:
-            assert type(source_dir_fd) is int
-            staging = output.parent / source_name
-            os.unlink(source_name, dir_fd=source_dir_fd)
-            os.symlink("/etc/passwd", source_name, dir_fd=source_dir_fd)
-        original_link(source, destination, *args, **kwargs)  # type: ignore[arg-type]
+        staging = output.parent / source_name
+        os.unlink(source_name, dir_fd=parent_fd)
+        os.symlink("/etc/passwd", source_name, dir_fd=parent_fd)
+        assert original_rename is not None
+        original_rename(parent_fd, source_name, target_name)
 
-    monkeypatch.setattr(protocol_outcome.os, "link", replace_staging_then_link)
+    monkeypatch.setattr(
+        protocol_outcome,
+        "_rename_noreplace",
+        replace_staging_then_publish,
+        raising=False,
+    )
 
     with pytest.raises(ValueError):
         write_protocol_outcome_exclusively(output, outcome)
 
-    assert staging is not None and staging.is_symlink()
-    assert not os.path.lexists(output)
+    assert staging is not None
+    assert output.is_symlink()
 
 
 def test_outcome_publication_verifies_the_final_link_identity(
@@ -254,36 +252,32 @@ def test_outcome_publication_verifies_the_final_link_identity(
     outcome = load_protocol_outcome(OUTCOME_PATH)
 
     def forge_final_file(
-        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
-        destination: str | bytes | os.PathLike[str] | os.PathLike[bytes],
-        *args: object,
-        **kwargs: object,
+        parent_fd: int,
+        source_name: str,
+        target_name: str,
     ) -> None:
-        destination_dir_fd = kwargs.get("dst_dir_fd")
-        if destination_dir_fd is None:
-            descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        else:
-            assert type(destination_dir_fd) is int
-            descriptor = os.open(
-                destination,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-                dir_fd=destination_dir_fd,
-            )
+        descriptor = os.open(
+            target_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_fd,
+        )
         try:
             os.write(descriptor, b"forged publication")
         finally:
             os.close(descriptor)
 
-    monkeypatch.setattr(protocol_outcome.os, "link", forge_final_file)
+    monkeypatch.setattr(
+        protocol_outcome, "_rename_noreplace", forge_final_file, raising=False
+    )
 
     with pytest.raises(ValueError, match="inode"):
         write_protocol_outcome_exclusively(output, outcome)
 
-    assert not os.path.lexists(output)
+    assert output.read_bytes() == b"forged publication"
 
 
-def test_outcome_publication_removes_output_after_directory_fsync_failure(
+def test_outcome_publication_preserves_output_after_directory_fsync_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     output = tmp_path / "protocol_outcome.json"
@@ -304,5 +298,144 @@ def test_outcome_publication_removes_output_after_directory_fsync_failure(
         write_protocol_outcome_exclusively(output, outcome)
 
     assert fsync_calls >= 2
-    assert not os.path.lexists(output)
-    assert not list(tmp_path.glob(f".{output.name}.*.tmp"))
+    assert output.exists()
+
+
+def test_outcome_publication_preserves_staging_replaced_before_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "protocol_outcome.json"
+    outcome = load_protocol_outcome(OUTCOME_PATH)
+    original_rename = getattr(protocol_outcome, "_rename_noreplace", None)
+
+    def replace_staging_then_publish(parent_fd: int, source_name: str, target_name: str) -> None:
+        os.unlink(source_name, dir_fd=parent_fd)
+        descriptor = os.open(
+            source_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            os.write(descriptor, b"unowned staging replacement")
+        finally:
+            os.close(descriptor)
+        assert original_rename is not None
+        original_rename(parent_fd, source_name, target_name)
+
+    monkeypatch.setattr(
+        protocol_outcome,
+        "_rename_noreplace",
+        replace_staging_then_publish,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError):
+        write_protocol_outcome_exclusively(output, outcome)
+
+    assert output.read_bytes() == b"unowned staging replacement"
+
+
+def test_outcome_publication_preserves_destination_swapped_after_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "protocol_outcome.json"
+    outcome = load_protocol_outcome(OUTCOME_PATH)
+    original_rename = getattr(protocol_outcome, "_rename_noreplace", None)
+
+    def publish_then_replace_destination(
+        parent_fd: int,
+        source_name: str,
+        target_name: str,
+    ) -> None:
+        assert original_rename is not None
+        original_rename(parent_fd, source_name, target_name)
+        os.unlink(target_name, dir_fd=parent_fd)
+        descriptor = os.open(
+            target_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            os.write(descriptor, b"unowned destination")
+        finally:
+            os.close(descriptor)
+
+    monkeypatch.setattr(
+        protocol_outcome,
+        "_rename_noreplace",
+        publish_then_replace_destination,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError):
+        write_protocol_outcome_exclusively(output, outcome)
+
+    assert output.read_bytes() == b"unowned destination"
+
+
+def test_outcome_publication_rechecks_ancestor_symlinks_before_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container = tmp_path / "container"
+    ancestor = container / "ancestor"
+    terminal = ancestor / "terminal"
+    terminal.mkdir(parents=True)
+    output = terminal / "protocol_outcome.json"
+    outcome = load_protocol_outcome(OUTCOME_PATH)
+    original_fsync = protocol_outcome.os.fsync
+    replacement_done = False
+
+    def insert_equivalent_ancestor_symlink(descriptor: int) -> None:
+        nonlocal replacement_done
+        original_fsync(descriptor)
+        if not replacement_done:
+            real_ancestor = container / "real_ancestor"
+            ancestor.rename(real_ancestor)
+            ancestor.symlink_to(real_ancestor, target_is_directory=True)
+            replacement_done = True
+
+    monkeypatch.setattr(protocol_outcome.os, "fsync", insert_equivalent_ancestor_symlink)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        write_protocol_outcome_exclusively(output, outcome)
+
+
+def test_late_publication_failure_never_rolls_back_without_directory_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "protocol_outcome.json"
+    outcome = load_protocol_outcome(OUTCOME_PATH)
+    original_parent_match = protocol_outcome._parent_path_matches_identity
+    parent_match_calls = 0
+    original_fsync = protocol_outcome.os.fsync
+    fsync_calls = 0
+
+    def fail_final_parent_check(path: Path, identity: tuple[int, int]) -> bool:
+        nonlocal parent_match_calls
+        parent_match_calls += 1
+        return original_parent_match(path, identity)
+
+    def count_fsync(descriptor: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        original_fsync(descriptor)
+
+    original_close = protocol_outcome.os.close
+
+    def fail_after_commit(descriptor: int) -> None:
+        if fsync_calls >= 2 and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("simulated late descriptor cleanup failure")
+        original_close(descriptor)
+
+    monkeypatch.setattr(protocol_outcome, "_parent_path_matches_identity", fail_final_parent_check)
+    monkeypatch.setattr(protocol_outcome.os, "fsync", count_fsync)
+    monkeypatch.setattr(protocol_outcome.os, "close", fail_after_commit)
+
+    with pytest.raises(ValueError, match="committed"):
+        write_protocol_outcome_exclusively(output, outcome)
+
+    assert parent_match_calls >= 2
+    assert fsync_calls >= 2
+    assert load_protocol_outcome(output) == outcome
