@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -10,7 +11,10 @@ from src.evaluation.run_evidence_identity import (
     RunEvidenceIdentity,
     canonical_sha256,
 )
-from src.evaluation.run_evidence_publisher import RunEvidencePublisher
+from src.evaluation.run_evidence_publisher import (
+    RunEvidencePublisher,
+    verify_run_evidence_bundle,
+)
 
 
 def valid_identity(*, unit_record: object | None = None) -> RunEvidenceIdentity:
@@ -254,3 +258,250 @@ def test_existing_or_symlinked_output_is_rejected_without_modification(
     with pytest.raises(RunEvidenceError, match="publication_conflict"):
         begin_publisher(tmp_path, required_artifacts=())
     assert output.is_symlink()
+
+
+def publish_completed_bundle(tmp_path: Path) -> tuple[Path, RunEvidenceIdentity]:
+    source = tmp_path / "source.csv"
+    source.write_bytes(b"a,b\n1,2\n")
+    publisher = begin_publisher(tmp_path, maximum_bundle_bytes=16_384)
+    identity = publisher.identity
+    publisher.add_bytes("metrics.json", b'{"average_precision":0.5}', media_type="application/json")
+    publisher.add_file("table.csv", source, media_type="text/csv")
+    output = publisher.finalize_completed(
+        summary={"status": "audit_only", "average_precision": 0.5}
+    )
+    return output, identity
+
+
+def test_completed_bundle_has_cross_bound_status_manifest_and_inventory(
+    tmp_path: Path,
+) -> None:
+    output, identity = publish_completed_bundle(tmp_path)
+
+    verified = verify_run_evidence_bundle(output, expected_identity=identity)
+
+    assert verified.identity == identity
+    assert verified.terminal_status == "completed"
+    assert tuple(record.relative_path for record in verified.artifacts) == (
+        "metrics.json",
+        "table.csv",
+    )
+    assert verified.summary["status"] == "audit_only"
+    assert set(path.name for path in output.iterdir()) == {
+        "metrics.json",
+        "table.csv",
+        "method_status.json",
+        "run_manifest.json",
+    }
+
+
+def test_failure_bundle_has_no_scientific_summary(tmp_path: Path) -> None:
+    publisher = begin_publisher(
+        tmp_path, required_artifacts=(), maximum_bundle_bytes=16_384
+    )
+    identity = publisher.identity
+    output = publisher.finalize_failure(
+        status="failed_runtime", reason="worker exited before metrics"
+    )
+
+    verified = verify_run_evidence_bundle(output, expected_identity=identity)
+
+    assert verified.terminal_status == "failed_runtime"
+    assert verified.summary is None
+    assert verified.artifacts == ()
+    assert set(path.name for path in output.iterdir()) == {
+        "method_status.json",
+        "run_manifest.json",
+    }
+
+
+def test_completed_requires_exact_declared_artifact_set(tmp_path: Path) -> None:
+    publisher = begin_publisher(tmp_path, maximum_bundle_bytes=16_384)
+    publisher.add_bytes("metrics.json", b"{}", media_type="application/json")
+    staging = publisher.staging_path
+
+    with pytest.raises(RunEvidenceError, match="invalid_state_transition"):
+        publisher.finalize_completed(summary={"status": "audit_only"})
+
+    assert publisher.state == "aborted"
+    assert not staging.exists()
+    assert not (tmp_path / "bundle").exists()
+
+
+def test_finalize_is_single_use_and_all_writes_are_closed(tmp_path: Path) -> None:
+    output, identity = publish_completed_bundle(tmp_path)
+    verified = verify_run_evidence_bundle(output, expected_identity=identity)
+    assert verified.terminal_status == "completed"
+
+    failed = RunEvidencePublisher.begin(
+        output_dir=tmp_path / "failed-bundle",
+        identity=valid_identity(),
+        statistical_unit_record={"units": ["sample:block-1"]},
+        required_artifacts=(),
+        maximum_bundle_bytes=16_384,
+    )
+    failed.finalize_failure(status="failed_timeout", reason="time limit reached")
+    with pytest.raises(RunEvidenceError, match="invalid_state_transition"):
+        failed.add_bytes("late.txt", b"late", media_type="text/plain")
+    with pytest.raises(RunEvidenceError, match="invalid_state_transition"):
+        failed.finalize_failure(status="failed_timeout", reason="again")
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["completed", "failed", "failed_unknown", "passed_real_rehearsal"],
+)
+def test_failure_status_must_be_registered(tmp_path: Path, status: str) -> None:
+    publisher = begin_publisher(
+        tmp_path, required_artifacts=(), maximum_bundle_bytes=16_384
+    )
+    with pytest.raises(RunEvidenceError, match="invalid_state_transition"):
+        publisher.finalize_failure(status=status, reason="reason")
+    assert publisher.state == "aborted"
+
+
+def test_publish_conflict_after_begin_never_overwrites_target(tmp_path: Path) -> None:
+    publisher = begin_publisher(
+        tmp_path, required_artifacts=(), maximum_bundle_bytes=16_384
+    )
+    output = tmp_path / "bundle"
+    output.mkdir()
+    marker = output / "marker"
+    marker.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(RunEvidenceError, match="publication_conflict"):
+        publisher.finalize_failure(status="failed_runtime", reason="worker failed")
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert publisher.state == "aborted"
+
+
+def test_unsupported_exclusive_publish_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher = begin_publisher(
+        tmp_path, required_artifacts=(), maximum_bundle_bytes=16_384
+    )
+    import src.evaluation.run_evidence_publisher as publisher_module
+
+    def unsupported(*args: object, **kwargs: object) -> None:
+        raise RunEvidenceError(
+            "publication_infrastructure", "exclusive rename is unavailable"
+        )
+
+    monkeypatch.setattr(publisher_module, "_rename_noreplace", unsupported)
+    with pytest.raises(RunEvidenceError, match="publication_infrastructure"):
+        publisher.finalize_failure(status="failed_runtime", reason="worker failed")
+    assert not (tmp_path / "bundle").exists()
+    assert publisher.state == "aborted"
+
+
+def test_replay_rejects_artifact_tampering_extra_files_and_hardlinks(
+    tmp_path: Path,
+) -> None:
+    output, identity = publish_completed_bundle(tmp_path)
+    (output / "metrics.json").write_bytes(b'{"average_precision":0.9}')
+    with pytest.raises(RunEvidenceError, match="invalid_artifact"):
+        verify_run_evidence_bundle(output, expected_identity=identity)
+
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    second, second_identity = publish_completed_bundle(second_root)
+    (second / "extra.txt").write_text("extra", encoding="utf-8")
+    with pytest.raises(RunEvidenceError, match="invalid_artifact"):
+        verify_run_evidence_bundle(second, expected_identity=second_identity)
+
+    third_root = tmp_path / "third"
+    third_root.mkdir()
+    third, third_identity = publish_completed_bundle(third_root)
+    os.link(third / "metrics.json", tmp_path / "external-metrics-link")
+    with pytest.raises(RunEvidenceError, match="invalid_artifact"):
+        verify_run_evidence_bundle(third, expected_identity=third_identity)
+
+
+def test_replay_rejects_missing_files_duplicate_inodes_and_symlink_roots(
+    tmp_path: Path,
+) -> None:
+    output, identity = publish_completed_bundle(tmp_path)
+    (output / "table.csv").unlink()
+    with pytest.raises(RunEvidenceError, match="invalid_artifact"):
+        verify_run_evidence_bundle(output, expected_identity=identity)
+
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    second, second_identity = publish_completed_bundle(second_root)
+    (second / "table.csv").unlink()
+    os.link(second / "metrics.json", second / "table.csv")
+    with pytest.raises(RunEvidenceError, match="invalid_artifact"):
+        verify_run_evidence_bundle(second, expected_identity=second_identity)
+
+    third_root = tmp_path / "third"
+    third_root.mkdir()
+    third, third_identity = publish_completed_bundle(third_root)
+    linked_root = tmp_path / "linked-bundle"
+    linked_root.symlink_to(third, target_is_directory=True)
+    with pytest.raises(RunEvidenceError):
+        verify_run_evidence_bundle(linked_root, expected_identity=third_identity)
+
+
+def test_replay_normalizes_unbounded_manifest_integer_to_domain_error(
+    tmp_path: Path,
+) -> None:
+    output, identity = publish_completed_bundle(tmp_path)
+    manifest_path = output / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"][0]["size_bytes"] = 10**400
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+
+    with pytest.raises(RunEvidenceError, match="invalid_artifact"):
+        verify_run_evidence_bundle(output, expected_identity=identity)
+
+
+def test_replay_rejects_status_or_manifest_tampering(tmp_path: Path) -> None:
+    output, identity = publish_completed_bundle(tmp_path)
+    status_path = output / "method_status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status["status"] = "failed_runtime"
+    status_path.write_text(
+        json.dumps(status, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+    with pytest.raises(RunEvidenceError, match="invalid_artifact"):
+        verify_run_evidence_bundle(output, expected_identity=identity)
+
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    second, second_identity = publish_completed_bundle(second_root)
+    manifest_path = second / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["summary"]["average_precision"] = 0.9
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+    with pytest.raises(RunEvidenceError, match="invalid_artifact"):
+        verify_run_evidence_bundle(second, expected_identity=second_identity)
+
+
+def test_expected_identity_rejects_synchronized_identity_resealing(
+    tmp_path: Path,
+) -> None:
+    output, identity = publish_completed_bundle(tmp_path)
+    manifest_path = output / "run_manifest.json"
+    status_path = output / "method_status.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    manifest["run_identity"]["model_seed"] = 23
+    attacker_identity = RunEvidenceIdentity.from_record(manifest["run_identity"])
+    manifest["run_identity_sha256"] = attacker_identity.run_identity_sha256
+    status["run_identity_sha256"] = attacker_identity.run_identity_sha256
+    manifest["terminal_status"] = status
+    status_path.write_text(
+        json.dumps(status, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+
+    with pytest.raises(RunEvidenceError, match="invalid_identity"):
+        verify_run_evidence_bundle(output, expected_identity=identity)
