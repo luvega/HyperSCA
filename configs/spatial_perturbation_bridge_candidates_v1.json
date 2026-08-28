@@ -1,0 +1,16 @@
+{
+  "schema_version": "spatial_perturbation_bridge_candidates_v1",
+  "candidates": [
+    {
+      "candidate_id": "gse274447_msafe_bridge",
+      "accession": "GSE274447",
+      "platform": "spatial_perturbation",
+      "biological_specimens": ["mouse_1", "mouse_2", "mouse_3"],
+      "sections_by_specimen": [["mouse_1", []], ["mouse_2", []], ["mouse_3", []]],
+      "safe_control_label": "mSafe",
+      "perturbation_labels": [],
+      "source_uri": "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE274447",
+      "source_identity_sha256": "0e908ba2f21cab2bd222daf31a85ff8369407c8df53f5d9a2424f081528ffa46"
+    }
+  ]
+}

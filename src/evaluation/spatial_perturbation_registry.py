@@ -1,0 +1,651 @@
+"""Outcome-blind registry and structural capability audit for spatial bridges.
+
+This module deliberately handles identifiers and metadata declarations only.  It
+does not open assay matrices or calculate scientific outcomes.
+"""
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+import ctypes
+import errno
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import secrets
+import stat
+from types import MappingProxyType
+from typing import cast
+import unicodedata
+
+
+MAXIMUM_REGISTRY_BYTES = 64 * 1024
+MAXIMUM_NESTING = 16
+MAXIMUM_TEXT_LENGTH = 256
+MAXIMUM_ITEMS = 256
+MAXIMUM_BLOCK_IDS = 1024
+MAXIMUM_GENE_NAMES = 4096
+MAXIMUM_COUNT = 10_000_000
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_RENAME_NOREPLACE = 1
+_FROZEN_CANDIDATE_ORDER = ("gse274447_msafe_bridge",)
+_FROZEN_GSE274447_SOURCE = "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE274447"
+_FROZEN_GSE274447_SOURCE_IDENTITY = "0e908ba2f21cab2bd222daf31a85ff8369407c8df53f5d9a2424f081528ffa46"
+
+
+class SpatialPerturbationRegistryError(ValueError):
+    """A registry, metadata declaration, or audit publication is unsafe."""
+
+
+def _safe_text(value: object, name: str, *, allow_empty: bool = False) -> str:
+    if type(value) is not str or len(value) > MAXIMUM_TEXT_LENGTH:
+        raise SpatialPerturbationRegistryError(
+            f"{name} must be bounded built-in NFC text"
+        )
+    if not allow_empty and not value:
+        raise SpatialPerturbationRegistryError(f"{name} must not be empty")
+    if value != value.strip() or unicodedata.normalize("NFC", value) != value:
+        raise SpatialPerturbationRegistryError(f"{name} must be trimmed NFC text")
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        raise SpatialPerturbationRegistryError(f"{name} contains unsafe control text")
+    return value
+
+
+def _sha(value: object, name: str) -> str:
+    text = _safe_text(value, name)
+    if _SHA256.fullmatch(text) is None:
+        raise SpatialPerturbationRegistryError(f"{name} must be a lowercase SHA-256")
+    return text
+
+
+def _count(value: object, name: str) -> int:
+    if type(value) is not int or value < 0 or value > MAXIMUM_COUNT:
+        raise SpatialPerturbationRegistryError(f"{name} must be a bounded nonnegative integer")
+    return value
+
+
+def _flag(value: object, name: str) -> bool:
+    if type(value) is not bool:
+        raise SpatialPerturbationRegistryError(f"{name} must be a built-in boolean")
+    return value
+
+
+def _items(value: object, name: str, *, maximum: int = MAXIMUM_ITEMS) -> tuple[object, ...]:
+    if type(value) not in (list, tuple):
+        raise SpatialPerturbationRegistryError(f"{name} must be a built-in list or tuple")
+    items = cast(list[object] | tuple[object, ...], value)
+    if len(items) > maximum:
+        raise SpatialPerturbationRegistryError(f"{name} exceeds the item limit")
+    return tuple(items)
+
+
+def _text_items(value: object, name: str, *, maximum: int = MAXIMUM_ITEMS) -> tuple[str, ...]:
+    frozen = tuple(
+        _safe_text(item, f"{name}[{index}]")
+        for index, item in enumerate(_items(value, name, maximum=maximum))
+    )
+    if len(set(frozen)) != len(frozen):
+        raise SpatialPerturbationRegistryError(f"{name} must contain unique ordered IDs")
+    return frozen
+
+
+def _text_count_pairs(value: object, name: str) -> tuple[tuple[str, int], ...]:
+    pairs: list[tuple[str, int]] = []
+    for index, pair in enumerate(_items(value, name)):
+        values = _items(pair, f"{name}[{index}]", maximum=2)
+        if len(values) != 2:
+            raise SpatialPerturbationRegistryError(f"{name}[{index}] must have two items")
+        pairs.append(
+            (_safe_text(values[0], f"{name}[{index}][0]"), _count(values[1], f"{name}[{index}][1]"))
+        )
+    labels = tuple(label for label, _ in pairs)
+    if len(set(labels)) != len(labels):
+        raise SpatialPerturbationRegistryError(f"{name} labels must be unique")
+    return tuple(pairs)
+
+
+def _sections(value: object, name: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    pairs: list[tuple[str, tuple[str, ...]]] = []
+    for index, pair in enumerate(_items(value, name)):
+        values = _items(pair, f"{name}[{index}]", maximum=2)
+        if len(values) != 2:
+            raise SpatialPerturbationRegistryError(f"{name}[{index}] must have two items")
+        pairs.append(
+            (
+                _safe_text(values[0], f"{name}[{index}][0]"),
+                _text_items(values[1], f"{name}[{index}][1]"),
+            )
+        )
+    labels = tuple(label for label, _ in pairs)
+    if len(set(labels)) != len(labels):
+        raise SpatialPerturbationRegistryError(f"{name} specimen IDs must be unique")
+    return tuple(pairs)
+
+
+def _canonical_bytes(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def _identity(value: Mapping[str, object]) -> str:
+    return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class BridgeCandidate:
+    candidate_id: str
+    accession: str
+    platform: str
+    biological_specimens: tuple[str, ...]
+    sections_by_specimen: tuple[tuple[str, tuple[str, ...]], ...]
+    safe_control_label: str
+    perturbation_labels: tuple[str, ...]
+    source_uri: str
+    source_identity_sha256: str
+
+    def __post_init__(self) -> None:
+        candidate_id = _safe_text(self.candidate_id, "candidate_id")
+        accession = _safe_text(self.accession, "accession")
+        platform = _safe_text(self.platform, "platform")
+        specimens = _text_items(self.biological_specimens, "biological_specimens")
+        sections = _sections(self.sections_by_specimen, "sections_by_specimen")
+        if tuple(item[0] for item in sections) != specimens:
+            raise SpatialPerturbationRegistryError(
+                "sections_by_specimen must follow biological_specimens exactly"
+            )
+        for specimen, section_ids in sections:
+            if specimen not in specimens or len(set(section_ids)) != len(section_ids):
+                raise SpatialPerturbationRegistryError("invalid specimen-section consistency")
+        for name, value in (
+            ("candidate_id", candidate_id), ("accession", accession),
+            ("platform", platform), ("biological_specimens", specimens),
+            ("sections_by_specimen", sections),
+            ("safe_control_label", _safe_text(self.safe_control_label, "safe_control_label")),
+            ("perturbation_labels", _text_items(self.perturbation_labels, "perturbation_labels")),
+            ("source_uri", _safe_text(self.source_uri, "source_uri")),
+            ("source_identity_sha256", _sha(self.source_identity_sha256, "source_identity_sha256")),
+        ):
+            object.__setattr__(self, name, value)
+
+    def to_mapping(self) -> dict[str, object]:
+        item = _candidate_snapshot(self)
+        return {
+            "candidate_id": item.candidate_id, "accession": item.accession,
+            "platform": item.platform, "biological_specimens": list(item.biological_specimens),
+            "sections_by_specimen": [[label, list(values)] for label, values in item.sections_by_specimen],
+            "safe_control_label": item.safe_control_label,
+            "perturbation_labels": list(item.perturbation_labels), "source_uri": item.source_uri,
+            "source_identity_sha256": item.source_identity_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MetadataSummary:
+    candidate_id: str
+    accession: str
+    cohort_ids: tuple[str, ...]
+    biological_specimen_ids: tuple[str, ...]
+    sections_by_specimen: tuple[tuple[str, tuple[str, ...]], ...]
+    block_ids: tuple[str, ...]
+    coordinate_available: bool
+    coordinate_finite: bool
+    measured_gene_names: tuple[str, ...]
+    measured_gene_count: int
+    perturbation_labels: tuple[str, ...]
+    perturbation_label_counts: tuple[tuple[str, int], ...]
+    safe_control_counts: tuple[tuple[str, int], ...]
+    barcode_quality_counts: tuple[tuple[str, int], ...]
+    label_quality_counts: tuple[tuple[str, int], ...]
+    license_identity: str
+    source_identity_sha256: str
+    executable_output_schema_capable: bool
+
+    def __post_init__(self) -> None:
+        candidate_id = _safe_text(self.candidate_id, "candidate_id")
+        accession = _safe_text(self.accession, "accession")
+        cohorts = _text_items(self.cohort_ids, "cohort_ids")
+        specimens = _text_items(self.biological_specimen_ids, "biological_specimen_ids")
+        sections = _sections(self.sections_by_specimen, "sections_by_specimen")
+        if tuple(item[0] for item in sections) != specimens:
+            raise SpatialPerturbationRegistryError("sections must follow specimen IDs exactly")
+        genes = _text_items(self.measured_gene_names, "measured_gene_names", maximum=MAXIMUM_GENE_NAMES)
+        gene_count = _count(self.measured_gene_count, "measured_gene_count")
+        if gene_count < len(genes):
+            raise SpatialPerturbationRegistryError("measured_gene_count is smaller than named genes")
+        labels = _text_items(self.perturbation_labels, "perturbation_labels")
+        label_counts = _text_count_pairs(self.perturbation_label_counts, "perturbation_label_counts")
+        if tuple(label for label, _ in label_counts) != labels:
+            raise SpatialPerturbationRegistryError("perturbation label counts must follow labels exactly")
+        values: tuple[tuple[str, object], ...] = (
+            ("candidate_id", candidate_id), ("accession", accession), ("cohort_ids", cohorts),
+            ("biological_specimen_ids", specimens), ("sections_by_specimen", sections),
+            ("block_ids", _text_items(self.block_ids, "block_ids", maximum=MAXIMUM_BLOCK_IDS)),
+            ("coordinate_available", _flag(self.coordinate_available, "coordinate_available")),
+            ("coordinate_finite", _flag(self.coordinate_finite, "coordinate_finite")),
+            ("measured_gene_names", genes), ("measured_gene_count", gene_count),
+            ("perturbation_labels", labels), ("perturbation_label_counts", label_counts),
+            ("safe_control_counts", _text_count_pairs(self.safe_control_counts, "safe_control_counts")),
+            ("barcode_quality_counts", _text_count_pairs(self.barcode_quality_counts, "barcode_quality_counts")),
+            ("label_quality_counts", _text_count_pairs(self.label_quality_counts, "label_quality_counts")),
+            ("license_identity", _safe_text(self.license_identity, "license_identity")),
+            ("source_identity_sha256", _sha(self.source_identity_sha256, "source_identity_sha256")),
+            ("executable_output_schema_capable", _flag(self.executable_output_schema_capable, "executable_output_schema_capable")),
+        )
+        for name, value in values:
+            object.__setattr__(self, name, value)
+
+    def to_mapping(self) -> dict[str, object]:
+        item = _summary_snapshot(self)
+        pairs = lambda values: [[label, count] for label, count in values]
+        return {
+            "candidate_id": item.candidate_id, "accession": item.accession,
+            "cohort_ids": list(item.cohort_ids), "biological_specimen_ids": list(item.biological_specimen_ids),
+            "sections_by_specimen": [[label, list(values)] for label, values in item.sections_by_specimen],
+            "block_ids": list(item.block_ids), "coordinate_available": item.coordinate_available,
+            "coordinate_finite": item.coordinate_finite, "measured_gene_names": list(item.measured_gene_names),
+            "measured_gene_count": item.measured_gene_count, "perturbation_labels": list(item.perturbation_labels),
+            "perturbation_label_counts": pairs(item.perturbation_label_counts),
+            "safe_control_counts": pairs(item.safe_control_counts),
+            "barcode_quality_counts": pairs(item.barcode_quality_counts),
+            "label_quality_counts": pairs(item.label_quality_counts), "license_identity": item.license_identity,
+            "source_identity_sha256": item.source_identity_sha256,
+            "executable_output_schema_capable": item.executable_output_schema_capable,
+        }
+
+
+_COVERAGE_KEYS = (
+    "candidate_identity", "specimen_structure", "cohorts", "coordinates", "genes",
+    "perturbation_labels", "safe_controls", "barcode_quality", "label_quality",
+    "license", "source_identity", "output_schema",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class BridgeCapabilityResult:
+    candidate_id: str
+    status: str
+    confirmatory_capable: bool
+    biological_specimen_count: int
+    cohort_count: int
+    coverage: Mapping[str, float]
+    blocking_reasons: tuple[str, ...]
+    capability_identity_sha256: str
+
+    def __post_init__(self) -> None:
+        candidate_id = _safe_text(self.candidate_id, "candidate_id")
+        status = _safe_text(self.status, "status")
+        capable = _flag(self.confirmatory_capable, "confirmatory_capable")
+        specimens = _count(self.biological_specimen_count, "biological_specimen_count")
+        cohorts = _count(self.cohort_count, "cohort_count")
+        if type(self.coverage) is not dict or tuple(self.coverage) != _COVERAGE_KEYS:
+            raise SpatialPerturbationRegistryError("coverage must be an exact ordered built-in mapping")
+        coverage: dict[str, float] = {}
+        for key in _COVERAGE_KEYS:
+            value = self.coverage[key]
+            if type(value) is not float or not math.isfinite(value) or value < 0.0 or value > 1.0:
+                raise SpatialPerturbationRegistryError("coverage values must be finite floats in [0, 1]")
+            coverage[key] = 0.0 if value == 0.0 else value
+        reasons = _text_items(self.blocking_reasons, "blocking_reasons")
+        if (status == "confirmatory_capable") is not capable or (capable and reasons):
+            raise SpatialPerturbationRegistryError("status, capability flag, and reasons are inconsistent")
+        if status not in ("confirmatory_capable", "pilot_audit_only", "assets_unavailable"):
+            raise SpatialPerturbationRegistryError("unknown capability status")
+        expected = _identity(_result_unsigned_mapping(candidate_id, status, capable, specimens, cohorts, coverage, reasons))
+        if _sha(self.capability_identity_sha256, "capability_identity_sha256") != expected:
+            raise SpatialPerturbationRegistryError("capability identity does not match declared structure")
+        for name, value in (("candidate_id", candidate_id), ("status", status), ("confirmatory_capable", capable),
+                            ("biological_specimen_count", specimens), ("cohort_count", cohorts),
+                            ("coverage", MappingProxyType(coverage)), ("blocking_reasons", reasons),
+                            ("capability_identity_sha256", expected)):
+            object.__setattr__(self, name, value)
+
+    def to_mapping(self) -> dict[str, object]:
+        item = _result_snapshot(self)
+        return {
+            "candidate_id": item.candidate_id, "status": item.status,
+            "confirmatory_capable": item.confirmatory_capable,
+            "biological_specimen_count": item.biological_specimen_count,
+            "cohort_count": item.cohort_count, "coverage": dict(item.coverage),
+            "blocking_reasons": list(item.blocking_reasons),
+            "capability_identity_sha256": item.capability_identity_sha256,
+        }
+
+
+def _candidate_snapshot(value: object) -> BridgeCandidate:
+    if type(value) is not BridgeCandidate:
+        raise SpatialPerturbationRegistryError("candidate must be BridgeCandidate")
+    return BridgeCandidate(value.candidate_id, value.accession, value.platform, value.biological_specimens,
+                           value.sections_by_specimen, value.safe_control_label, value.perturbation_labels,
+                           value.source_uri, value.source_identity_sha256)
+
+
+def _summary_snapshot(value: object) -> MetadataSummary:
+    if type(value) is not MetadataSummary:
+        raise SpatialPerturbationRegistryError("summary must be an immutable MetadataSummary")
+    return MetadataSummary(value.candidate_id, value.accession, value.cohort_ids, value.biological_specimen_ids,
+                           value.sections_by_specimen, value.block_ids, value.coordinate_available, value.coordinate_finite,
+                           value.measured_gene_names, value.measured_gene_count, value.perturbation_labels,
+                           value.perturbation_label_counts, value.safe_control_counts, value.barcode_quality_counts,
+                           value.label_quality_counts, value.license_identity, value.source_identity_sha256,
+                           value.executable_output_schema_capable)
+
+
+def _result_unsigned_mapping(candidate_id: str, status: str, capable: bool, specimens: int, cohorts: int,
+                             coverage: Mapping[str, float], reasons: tuple[str, ...]) -> dict[str, object]:
+    return {"candidate_id": candidate_id, "status": status, "confirmatory_capable": capable,
+            "biological_specimen_count": specimens, "cohort_count": cohorts,
+            "coverage": dict(coverage), "blocking_reasons": list(reasons)}
+
+
+def _result_snapshot(value: object) -> BridgeCapabilityResult:
+    if type(value) is not BridgeCapabilityResult:
+        raise SpatialPerturbationRegistryError("result must be BridgeCapabilityResult")
+    return BridgeCapabilityResult(value.candidate_id, value.status, value.confirmatory_capable,
+                                  value.biological_specimen_count, value.cohort_count, dict(value.coverage),
+                                  value.blocking_reasons, value.capability_identity_sha256)
+
+
+def metadata_summary_from_mapping(raw: object) -> MetadataSummary:
+    if type(raw) is not dict:
+        raise SpatialPerturbationRegistryError("metadata summary must be an exact JSON object")
+    fields = tuple(MetadataSummary.__dataclass_fields__)
+    if set(raw) != set(fields):
+        raise SpatialPerturbationRegistryError("metadata summary has unknown or missing fields")
+    return MetadataSummary(**cast(dict[str, object], raw))  # type: ignore[arg-type]
+
+
+def _coverage(summary: MetadataSummary, candidate: BridgeCandidate) -> dict[str, float]:
+    counts = dict(summary.perturbation_label_counts)
+    controls = dict(summary.safe_control_counts)
+    barcode = dict(summary.barcode_quality_counts)
+    labels = dict(summary.label_quality_counts)
+    return {
+        "candidate_identity": float(summary.candidate_id == candidate.candidate_id and summary.accession == candidate.accession),
+        "specimen_structure": float(bool(summary.biological_specimen_ids) and all(sections for _, sections in summary.sections_by_specimen)),
+        "cohorts": float(bool(summary.cohort_ids)), "coordinates": float(summary.coordinate_available and summary.coordinate_finite),
+        "genes": float(summary.measured_gene_count > 0 and bool(summary.measured_gene_names)),
+        "perturbation_labels": float(bool(summary.perturbation_labels) and all(counts.get(label, 0) > 0 for label in summary.perturbation_labels)),
+        "safe_controls": float(controls.get(candidate.safe_control_label, 0) > 0),
+        "barcode_quality": float(barcode.get("valid", 0) > 0), "label_quality": float(labels.get("valid", 0) > 0),
+        "license": float(summary.license_identity != "unavailable"),
+        "source_identity": float(summary.source_identity_sha256 == candidate.source_identity_sha256),
+        "output_schema": float(summary.executable_output_schema_capable),
+    }
+
+
+def audit_bridge_capability(candidate: BridgeCandidate, summary: MetadataSummary) -> BridgeCapabilityResult:
+    """Classify structural readiness without opening assay values or outcomes."""
+    frozen_candidate = _candidate_snapshot(candidate)
+    frozen_summary = _summary_snapshot(summary)
+    coverage = _coverage(frozen_summary, frozen_candidate)
+    reasons: list[str] = []
+    if len(frozen_summary.biological_specimen_ids) < 5:
+        reasons.append("insufficient_biological_replicates")
+    if len(frozen_summary.cohort_ids) < 2:
+        reasons.append("insufficient_independent_cohorts")
+    reason_by_gate = {
+        "candidate_identity": "candidate_identity_mismatch", "specimen_structure": "missing_specimen_sections",
+        "coordinates": "coordinates_unavailable_or_nonfinite", "genes": "measured_gene_declaration_missing",
+        "perturbation_labels": "perturbation_label_coverage_missing", "safe_controls": "safe_control_coverage_missing",
+        "barcode_quality": "barcode_quality_coverage_missing", "label_quality": "label_quality_coverage_missing",
+        "license": "license_identity_missing", "source_identity": "source_identity_mismatch",
+        "output_schema": "output_schema_capability_missing",
+    }
+    for gate, reason in reason_by_gate.items():
+        if coverage[gate] == 0.0:
+            reasons.append(reason)
+    unavailable = "asset_metadata_unavailable" in frozen_summary.block_ids
+    if unavailable:
+        reasons.append("asset_metadata_unavailable")
+    capable = not reasons
+    status = "confirmatory_capable" if capable else ("assets_unavailable" if unavailable else "pilot_audit_only")
+    frozen_reasons = tuple(reasons)
+    identity = _identity(_result_unsigned_mapping(frozen_candidate.candidate_id, status, capable,
+                                                  len(frozen_summary.biological_specimen_ids), len(frozen_summary.cohort_ids),
+                                                  coverage, frozen_reasons))
+    return BridgeCapabilityResult(frozen_candidate.candidate_id, status, capable,
+                                  len(frozen_summary.biological_specimen_ids), len(frozen_summary.cohort_ids),
+                                  coverage, frozen_reasons, identity)
+
+
+def _safe_regular_payload(path: str | Path, label: str, *, maximum: int = MAXIMUM_REGISTRY_BYTES) -> bytes:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    for component in (absolute, *absolute.parents):
+        try:
+            details = component.lstat()
+        except OSError as exc:
+            raise SpatialPerturbationRegistryError(f"{label} path is unavailable") from exc
+        if stat.S_ISLNK(details.st_mode):
+            raise SpatialPerturbationRegistryError(f"{label} must not traverse a symbolic link")
+    try:
+        descriptor = os.open(absolute, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        raise SpatialPerturbationRegistryError(f"{label} is not a safe regular file") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size < 1 or before.st_size > maximum:
+            raise SpatialPerturbationRegistryError(f"{label} violates safe file limits")
+        parts: list[bytes] = []
+        observed = 0
+        while True:
+            block = os.read(descriptor, min(65536, maximum + 1))
+            if not block:
+                break
+            observed += len(block)
+            if observed > maximum:
+                raise SpatialPerturbationRegistryError(f"{label} exceeds the byte limit")
+            parts.append(block)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns, before.st_nlink)
+    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_nlink)
+    if identity_before != identity_after or observed != before.st_size:
+        raise SpatialPerturbationRegistryError(f"{label} changed while being read")
+    return b"".join(parts)
+
+
+def _json_payload(payload: bytes, label: str) -> object:
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SpatialPerturbationRegistryError(f"{label} is not UTF-8") from exc
+    depth = 0
+    quoted = False
+    escaped = False
+    for character in text:
+        if ord(character) < 32 and character not in "\n\r\t":
+            raise SpatialPerturbationRegistryError(f"{label} contains control text")
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+        elif character == '"':
+            quoted = True
+        elif character in "[{":
+            depth += 1
+            if depth > MAXIMUM_NESTING:
+                raise SpatialPerturbationRegistryError(f"{label} is nested too deeply")
+        elif character in "]}":
+            depth -= 1
+    def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise SpatialPerturbationRegistryError(f"{label} has duplicate key {key}")
+            result[key] = value
+        return result
+    def reject_number(value: str) -> int:
+        if len(value.lstrip("-")) > 12:
+            raise SpatialPerturbationRegistryError(f"{label} has an oversized integer")
+        return int(value)
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=unique,
+            parse_int=reject_number,
+            parse_float=lambda value: (_ for _ in ()).throw(
+                SpatialPerturbationRegistryError(f"{label} does not permit JSON floats")
+            ),
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                SpatialPerturbationRegistryError(f"{label} has invalid JSON scalar {value}")
+            ),
+        )
+    except (json.JSONDecodeError, RecursionError, OverflowError) as exc:
+        raise SpatialPerturbationRegistryError(f"{label} is not valid JSON") from exc
+
+
+def load_bridge_candidates(path: str | Path) -> Mapping[str, BridgeCandidate]:
+    raw = _json_payload(_safe_regular_payload(path, "registry"), "registry")
+    if type(raw) is not dict or set(raw) != {"schema_version", "candidates"}:
+        raise SpatialPerturbationRegistryError("registry has unknown or missing fields")
+    if raw["schema_version"] != "spatial_perturbation_bridge_candidates_v1":
+        raise SpatialPerturbationRegistryError("registry schema version is not frozen")
+    values = _items(raw["candidates"], "candidates")
+    if not values:
+        raise SpatialPerturbationRegistryError("registry has no candidates")
+    candidates: dict[str, BridgeCandidate] = {}
+    expected = set(BridgeCandidate.__dataclass_fields__)
+    for index, raw_candidate in enumerate(values):
+        if type(raw_candidate) is not dict or set(raw_candidate) != expected:
+            raise SpatialPerturbationRegistryError(f"candidate {index} has unknown or missing fields")
+        item = BridgeCandidate(**cast(dict[str, object], raw_candidate))  # type: ignore[arg-type]
+        if item.candidate_id in candidates:
+            raise SpatialPerturbationRegistryError("candidate IDs must be unique and ordered")
+        candidates[item.candidate_id] = item
+    if tuple(candidates) != _FROZEN_CANDIDATE_ORDER:
+        raise SpatialPerturbationRegistryError("candidate registry order must remain frozen")
+    frozen = candidates[_FROZEN_CANDIDATE_ORDER[0]]
+    if (
+        frozen.accession != "GSE274447"
+        or frozen.platform != "spatial_perturbation"
+        or frozen.biological_specimens != ("mouse_1", "mouse_2", "mouse_3")
+        or frozen.sections_by_specimen
+        != (("mouse_1", ()), ("mouse_2", ()), ("mouse_3", ()))
+        or frozen.safe_control_label != "mSafe"
+        or frozen.perturbation_labels != ()
+        or frozen.source_uri != _FROZEN_GSE274447_SOURCE
+        or frozen.source_identity_sha256 != _FROZEN_GSE274447_SOURCE_IDENTITY
+    ):
+        raise SpatialPerturbationRegistryError("GSE274447 candidate declaration must remain frozen")
+    return MappingProxyType(candidates)
+
+
+def unavailable_metadata_summary(candidate: BridgeCandidate) -> MetadataSummary:
+    item = _candidate_snapshot(candidate)
+    return MetadataSummary(item.candidate_id, item.accession, (), (), (), ("asset_metadata_unavailable",),
+                           False, False, (), 0, (), (), (), (), (), "unavailable",
+                           item.source_identity_sha256, False)
+
+
+def load_asset_metadata(asset_root: str | Path, candidate: BridgeCandidate) -> MetadataSummary:
+    root = Path(asset_root)
+    metadata_path = root / "metadata_summary.json"
+    if not metadata_path.exists():
+        return unavailable_metadata_summary(candidate)
+    return metadata_summary_from_mapping(_json_payload(_safe_regular_payload(metadata_path, "asset metadata"), "asset metadata"))
+
+
+def _rename_noreplace(parent_fd: int, temporary: str, output: str) -> None:
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        renameat2 = library.renameat2
+    except (AttributeError, OSError) as exc:
+        raise SpatialPerturbationRegistryError("exclusive atomic publication is unavailable") from exc
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    if renameat2(parent_fd, os.fsencode(temporary), parent_fd, os.fsencode(output), _RENAME_NOREPLACE) == 0:
+        return
+    error = ctypes.get_errno()
+    if error in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
+        raise SpatialPerturbationRegistryError("exclusive atomic publication is unavailable")
+    if error in (errno.EEXIST, errno.ENOTEMPTY):
+        raise SpatialPerturbationRegistryError("refusing to overwrite output")
+    raise SpatialPerturbationRegistryError("exclusive atomic publication failed") from OSError(error, os.strerror(error))
+
+
+def _bound_directory_matches(path: Path, identity: tuple[int, int]) -> bool:
+    try:
+        details = path.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISDIR(details.st_mode) and (details.st_dev, details.st_ino) == identity
+
+
+def write_bridge_capability_exclusively(path: str | Path, result: BridgeCapabilityResult) -> None:
+    """Publish one JSON record with Linux no-clobber rename and durable fsync."""
+    record = _result_snapshot(result).to_mapping()
+    output = Path(path)
+    parent = Path(os.path.abspath(os.fspath(output.parent)))
+    if output.name in ("", ".", ".."):
+        raise SpatialPerturbationRegistryError("output must name a file")
+    for component in (parent, *parent.parents):
+        try:
+            details = component.lstat()
+        except OSError as exc:
+            raise SpatialPerturbationRegistryError("output parent is unavailable") from exc
+        if stat.S_ISLNK(details.st_mode):
+            raise SpatialPerturbationRegistryError("output parent must not traverse a symbolic link")
+    try:
+        parent_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        raise SpatialPerturbationRegistryError("output parent is unsafe") from exc
+    temporary_fd: int | None = None
+    temporary_name: str | None = None
+    committed = False
+    try:
+        parent_details = os.fstat(parent_fd)
+        parent_identity = (parent_details.st_dev, parent_details.st_ino)
+        if not stat.S_ISDIR(parent_details.st_mode) or not _bound_directory_matches(parent, parent_identity):
+            raise SpatialPerturbationRegistryError("output parent changed while being bound")
+        try:
+            os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise SpatialPerturbationRegistryError("refusing to overwrite output")
+        for _ in range(8):
+            proposed = f".{output.name}.{secrets.token_hex(16)}.tmp"
+            try:
+                temporary_fd = os.open(proposed, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            temporary_name = proposed
+            break
+        if temporary_fd is None or temporary_name is None:
+            raise SpatialPerturbationRegistryError("unable to allocate exclusive staging output")
+        payload = _canonical_bytes(record) + b"\n"
+        view = memoryview(payload)
+        while view:
+            written = os.write(temporary_fd, view)
+            if written < 1:
+                raise SpatialPerturbationRegistryError("short output write")
+            view = view[written:]
+        os.fsync(temporary_fd)
+        details = os.fstat(temporary_fd)
+        if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+            raise SpatialPerturbationRegistryError("staging output changed")
+        os.close(temporary_fd)
+        temporary_fd = None
+        if not _bound_directory_matches(parent, parent_identity):
+            raise SpatialPerturbationRegistryError("output parent changed before publication")
+        _rename_noreplace(parent_fd, temporary_name, output.name)
+        os.fsync(parent_fd)
+        if not _bound_directory_matches(parent, parent_identity):
+            raise SpatialPerturbationRegistryError("output parent changed after publication")
+        committed = True
+    except OSError as exc:
+        raise SpatialPerturbationRegistryError("output publication failed") from exc
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        # Never unlink an uncertain staging name: concurrent replacement cannot be
+        # distinguished safely after a failed operation.
+        os.close(parent_fd)
+        if not committed:
+            pass
