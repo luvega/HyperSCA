@@ -20,13 +20,14 @@ from src.evaluation.spatial_perturbation_registry import (
 def _candidate() -> BridgeCandidate:
     return BridgeCandidate(
         "candidate", "GSE1", "spatial", ("s1", "s2", "s3", "s4", "s5"),
-        (("s1", ()), ("s2", ()), ("s3", ()), ("s4", ()), ("s5", ())),
+        (("s1", ("s1_sec",)), ("s2", ("s2_sec",)), ("s3", ("s3_sec",)),
+         ("s4", ("s4_sec",)), ("s5", ("s5_sec",))),
         "mSafe", ("p1",), "https://example.test/GSE1", "a" * 64,
     )
 
 
 def _summary(specimens: int = 5, cohorts: int = 2) -> MetadataSummary:
-    ids = tuple(f"s{index}" for index in range(specimens))
+    ids = tuple(f"s{index}" for index in range(1, specimens + 1))
     return MetadataSummary(
         "candidate", "GSE1", tuple(f"c{index}" for index in range(cohorts)), ids,
         tuple((value, (f"{value}_sec",)) for value in ids), ("b1",), True, True,

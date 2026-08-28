@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -10,11 +12,13 @@ import pytest
 
 from src.evaluation.spatial_perturbation_registry import (
     BridgeCandidate,
+    BridgeCapabilityResult,
     MetadataSummary,
     SpatialPerturbationRegistryError,
     audit_bridge_capability,
     load_bridge_candidates,
     metadata_summary_from_mapping,
+    write_bridge_capability_exclusively,
 )
 
 
@@ -22,13 +26,14 @@ ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_PATH = ROOT / "configs/spatial_perturbation_bridge_candidates_v1.json"
 
 
-def candidate() -> BridgeCandidate:
+def candidate(specimen_count: int = 3) -> BridgeCandidate:
+    specimens = tuple(f"mouse_{index}" for index in range(1, specimen_count + 1))
     return BridgeCandidate(
         candidate_id="gse274447_msafe_bridge",
         accession="GSE274447",
         platform="spatial_perturbation",
-        biological_specimens=("mouse_1", "mouse_2", "mouse_3"),
-        sections_by_specimen=(("mouse_1", ()), ("mouse_2", ()), ("mouse_3", ())),
+        biological_specimens=specimens,
+        sections_by_specimen=tuple((item, (f"{item}_section",)) for item in specimens),
         safe_control_label="mSafe",
         perturbation_labels=("guide_a",),
         source_uri="https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE274447",
@@ -37,7 +42,7 @@ def candidate() -> BridgeCandidate:
 
 
 def metadata_summary(*, animals: int = 5, cohorts: int = 2) -> MetadataSummary:
-    specimens = tuple(f"mouse_{index}" for index in range(animals))
+    specimens = tuple(f"mouse_{index}" for index in range(1, animals + 1))
     return MetadataSummary(
         candidate_id="gse274447_msafe_bridge",
         accession="GSE274447",
@@ -71,10 +76,10 @@ def test_three_mice_are_pilot_only() -> None:
 
 def test_confirmatory_requires_five_specimens_and_two_cohorts() -> None:
     assert not audit_bridge_capability(
-        candidate(), metadata_summary(animals=5, cohorts=1)
+        candidate(5), metadata_summary(animals=5, cohorts=1)
     ).confirmatory_capable
     assert audit_bridge_capability(
-        candidate(), metadata_summary(animals=5, cohorts=2)
+        candidate(5), metadata_summary(animals=5, cohorts=2)
     ).confirmatory_capable
 
 
@@ -91,6 +96,75 @@ def test_frozen_registry_declares_only_three_gse274447_mice_without_sections() -
         ("mouse_3", ()),
     )
     assert loaded.safe_control_label == "mSafe"
+
+
+def test_registered_three_mice_cannot_be_upgraded_by_invented_metadata() -> None:
+    registry_candidate = load_bridge_candidates(REGISTRY_PATH)["gse274447_msafe_bridge"]
+    raw = metadata_summary(animals=5, cohorts=2).to_mapping()
+    raw["source_identity_sha256"] = registry_candidate.source_identity_sha256
+
+    result = audit_bridge_capability(registry_candidate, metadata_summary_from_mapping(raw))
+
+    assert result.status == "pilot_audit_only"
+    assert result.confirmatory_capable is False
+    assert "insufficient_biological_replicates" in result.blocking_reasons
+    assert "registered_specimens_mismatch" in result.blocking_reasons
+
+
+def _unsigned_digest(mapping: dict[str, object]) -> str:
+    return hashlib.sha256(
+        json.dumps(mapping, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def test_result_direct_construction_rejects_semantically_impossible_confirmatory_state() -> None:
+    coverage = {key: 1.0 for key in audit_bridge_capability(candidate(), metadata_summary(animals=3)).coverage}
+    unsigned = {
+        "candidate_id": "gse274447_msafe_bridge", "status": "confirmatory_capable",
+        "confirmatory_capable": True, "biological_specimen_count": 3, "cohort_count": 2,
+        "coverage": coverage, "blocking_reasons": [],
+    }
+    with pytest.raises(SpatialPerturbationRegistryError):
+        BridgeCapabilityResult(**unsigned, capability_identity_sha256=_unsigned_digest(unsigned))  # type: ignore[arg-type]
+
+
+def test_result_direct_construction_requires_every_structural_gate() -> None:
+    coverage = {key: 1.0 for key in audit_bridge_capability(candidate(5), metadata_summary(animals=5)).coverage}
+    coverage["cohorts"] = 0.0
+    unsigned = {
+        "candidate_id": "gse274447_msafe_bridge", "status": "confirmatory_capable",
+        "confirmatory_capable": True, "biological_specimen_count": 5, "cohort_count": 2,
+        "coverage": coverage, "blocking_reasons": [],
+    }
+    with pytest.raises(SpatialPerturbationRegistryError):
+        BridgeCapabilityResult(**unsigned, capability_identity_sha256=_unsigned_digest(unsigned))  # type: ignore[arg-type]
+
+
+def test_result_mapping_rejects_mutated_recomputed_impossible_state() -> None:
+    result = audit_bridge_capability(candidate(), metadata_summary(animals=3))
+    coverage = dict(result.coverage)
+    unsigned = {
+        "candidate_id": result.candidate_id, "status": "confirmatory_capable",
+        "confirmatory_capable": True, "biological_specimen_count": 3, "cohort_count": 2,
+        "coverage": coverage, "blocking_reasons": [],
+    }
+    object.__setattr__(result, "status", "confirmatory_capable")
+    object.__setattr__(result, "confirmatory_capable", True)
+    object.__setattr__(result, "blocking_reasons", ())
+    object.__setattr__(result, "capability_identity_sha256", _unsigned_digest(unsigned))
+
+    with pytest.raises(SpatialPerturbationRegistryError):
+        result.to_mapping()
+
+
+def test_candidate_rejects_global_section_reuse_and_control_label_overlap() -> None:
+    with pytest.raises(SpatialPerturbationRegistryError):
+        BridgeCandidate("candidate", "GSE1", "spatial", ("s1", "s2"),
+                        (("s1", ("same",)), ("s2", ("same",))), "mSafe", (),
+                        "https://example.test/GSE1", "a" * 64)
+    with pytest.raises(SpatialPerturbationRegistryError):
+        BridgeCandidate("candidate", "GSE1", "spatial", ("s1",), (("s1", ()),),
+                        "mSafe", ("mSafe",), "https://example.test/GSE1", "a" * 64)
 
 
 def test_metadata_mapping_is_closed_and_outcome_blind() -> None:
@@ -193,3 +267,74 @@ def test_cli_without_assets_publishes_explicit_unavailable_capability(tmp_path: 
     published = json.loads(output.read_text(encoding="utf-8"))
     assert published["status"] == "assets_unavailable"
     assert "asset_metadata_unavailable" in published["blocking_reasons"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"schema_version":999999999999999999999999999999999999}',
+        b'{"x":' + b"[" * 17 + b"0" + b"]" * 17 + b"}",
+        b"\xff\xfe",
+    ],
+)
+def test_registry_loader_rejects_deep_huge_and_invalid_utf8_payloads(tmp_path: Path, payload: bytes) -> None:
+    path = tmp_path / "hostile.json"
+    path.write_bytes(payload)
+    with pytest.raises(SpatialPerturbationRegistryError):
+        load_bridge_candidates(path)
+
+
+def test_registry_loader_rejects_link_and_nonregular_inputs(tmp_path: Path) -> None:
+    target = tmp_path / "target.json"
+    target.write_bytes(REGISTRY_PATH.read_bytes())
+    leaf = tmp_path / "leaf.json"
+    leaf.symlink_to(target)
+    with pytest.raises(SpatialPerturbationRegistryError):
+        load_bridge_candidates(leaf)
+    linked = tmp_path / "linked.json"
+    os.link(target, linked)
+    with pytest.raises(SpatialPerturbationRegistryError):
+        load_bridge_candidates(linked)
+    if hasattr(os, "mkfifo"):
+        fifo = tmp_path / "registry.fifo"
+        os.mkfifo(fifo)
+        with pytest.raises(SpatialPerturbationRegistryError):
+            load_bridge_candidates(fifo)
+
+
+def test_registry_loader_rejects_ancestor_symlink_and_malformed_frozen_candidate(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    (real_parent / "registry.json").write_bytes(REGISTRY_PATH.read_bytes())
+    link_parent = tmp_path / "linked"
+    link_parent.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(SpatialPerturbationRegistryError):
+        load_bridge_candidates(link_parent / "registry.json")
+    raw = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+    raw["candidates"][0]["candidate_id"] = "changed"
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(SpatialPerturbationRegistryError):
+        load_bridge_candidates(malformed)
+
+
+def test_missing_metadata_through_dangling_symlink_is_a_domain_error(tmp_path: Path) -> None:
+    asset_root = tmp_path / "assets"
+    asset_root.mkdir()
+    (asset_root / "metadata_summary.json").symlink_to(asset_root / "missing.json")
+    output = tmp_path / "capability.json"
+    probe = subprocess.run(
+        [sys.executable, "scripts/audit_spatial_perturbation_bridge.py", "--asset-root", str(asset_root), "--output", str(output)],
+        cwd=ROOT, text=True, capture_output=True, check=False,
+    )
+    assert probe.returncode != 0
+    assert not output.exists()
+
+
+def test_exclusive_writer_never_clobbers_existing_output(tmp_path: Path) -> None:
+    output = tmp_path / "capability.json"
+    output.write_bytes(b"existing")
+    result = audit_bridge_capability(candidate(), metadata_summary(animals=3))
+    with pytest.raises(SpatialPerturbationRegistryError):
+        write_bridge_capability_exclusively(output, result)
+    assert output.read_bytes() == b"existing"

@@ -122,6 +122,9 @@ def _sections(value: object, name: str) -> tuple[tuple[str, tuple[str, ...]], ..
     labels = tuple(label for label, _ in pairs)
     if len(set(labels)) != len(labels):
         raise SpatialPerturbationRegistryError(f"{name} specimen IDs must be unique")
+    section_ids = tuple(section_id for _, values in pairs for section_id in values)
+    if len(set(section_ids)) != len(section_ids):
+        raise SpatialPerturbationRegistryError(f"{name} section IDs must be globally unique")
     return tuple(pairs)
 
 
@@ -158,12 +161,16 @@ class BridgeCandidate:
         for specimen, section_ids in sections:
             if specimen not in specimens or len(set(section_ids)) != len(section_ids):
                 raise SpatialPerturbationRegistryError("invalid specimen-section consistency")
+        safe_control_label = _safe_text(self.safe_control_label, "safe_control_label")
+        perturbation_labels = _text_items(self.perturbation_labels, "perturbation_labels")
+        if safe_control_label in perturbation_labels:
+            raise SpatialPerturbationRegistryError("safe_control_label must not be a perturbation label")
         for name, value in (
             ("candidate_id", candidate_id), ("accession", accession),
             ("platform", platform), ("biological_specimens", specimens),
             ("sections_by_specimen", sections),
-            ("safe_control_label", _safe_text(self.safe_control_label, "safe_control_label")),
-            ("perturbation_labels", _text_items(self.perturbation_labels, "perturbation_labels")),
+            ("safe_control_label", safe_control_label),
+            ("perturbation_labels", perturbation_labels),
             ("source_uri", _safe_text(self.source_uri, "source_uri")),
             ("source_identity_sha256", _sha(self.source_identity_sha256, "source_identity_sha256")),
         ):
@@ -258,8 +265,48 @@ class MetadataSummary:
 _COVERAGE_KEYS = (
     "candidate_identity", "specimen_structure", "cohorts", "coordinates", "genes",
     "perturbation_labels", "safe_controls", "barcode_quality", "label_quality",
-    "license", "source_identity", "output_schema",
+    "license", "source_identity", "output_schema", "registered_specimens",
+    "registered_sections", "registered_perturbation_labels",
 )
+
+_GATE_REASONS = {
+    "candidate_identity": "candidate_identity_mismatch",
+    "specimen_structure": "missing_specimen_sections",
+    "cohorts": "cohort_identity_coverage_missing",
+    "coordinates": "coordinates_unavailable_or_nonfinite",
+    "genes": "measured_gene_declaration_missing",
+    "perturbation_labels": "perturbation_label_coverage_missing",
+    "safe_controls": "safe_control_coverage_missing",
+    "barcode_quality": "barcode_quality_coverage_missing",
+    "label_quality": "label_quality_coverage_missing",
+    "license": "license_identity_missing",
+    "source_identity": "source_identity_mismatch",
+    "output_schema": "output_schema_capability_missing",
+    "registered_specimens": "registered_specimens_mismatch",
+    "registered_sections": "registered_sections_mismatch",
+    "registered_perturbation_labels": "registered_perturbation_labels_mismatch",
+}
+
+
+def _semantic_state(
+    specimens: int, cohorts: int, coverage: Mapping[str, float], *, unavailable: bool
+) -> tuple[str, bool, tuple[str, ...]]:
+    reasons: list[str] = []
+    if specimens < 5:
+        reasons.append("insufficient_biological_replicates")
+    if cohorts < 2:
+        reasons.append("insufficient_independent_cohorts")
+    for gate, reason in _GATE_REASONS.items():
+        if coverage[gate] == 0.0:
+            reasons.append(reason)
+    if unavailable:
+        reasons.append("asset_metadata_unavailable")
+    frozen_reasons = tuple(reasons)
+    if unavailable:
+        return "assets_unavailable", False, frozen_reasons
+    if frozen_reasons:
+        return "pilot_audit_only", False, frozen_reasons
+    return "confirmatory_capable", True, ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,10 +335,13 @@ class BridgeCapabilityResult:
                 raise SpatialPerturbationRegistryError("coverage values must be finite floats in [0, 1]")
             coverage[key] = 0.0 if value == 0.0 else value
         reasons = _text_items(self.blocking_reasons, "blocking_reasons")
-        if (status == "confirmatory_capable") is not capable or (capable and reasons):
-            raise SpatialPerturbationRegistryError("status, capability flag, and reasons are inconsistent")
         if status not in ("confirmatory_capable", "pilot_audit_only", "assets_unavailable"):
             raise SpatialPerturbationRegistryError("unknown capability status")
+        expected_status, expected_capable, expected_reasons = _semantic_state(
+            specimens, cohorts, coverage, unavailable=status == "assets_unavailable"
+        )
+        if (status, capable, reasons) != (expected_status, expected_capable, expected_reasons):
+            raise SpatialPerturbationRegistryError("status, capability flag, and reasons violate the capability matrix")
         expected = _identity(_result_unsigned_mapping(candidate_id, status, capable, specimens, cohorts, coverage, reasons))
         if _sha(self.capability_identity_sha256, "capability_identity_sha256") != expected:
             raise SpatialPerturbationRegistryError("capability identity does not match declared structure")
@@ -372,6 +422,9 @@ def _coverage(summary: MetadataSummary, candidate: BridgeCandidate) -> dict[str,
         "license": float(summary.license_identity != "unavailable"),
         "source_identity": float(summary.source_identity_sha256 == candidate.source_identity_sha256),
         "output_schema": float(summary.executable_output_schema_capable),
+        "registered_specimens": float(summary.biological_specimen_ids == candidate.biological_specimens),
+        "registered_sections": float(summary.sections_by_specimen == candidate.sections_by_specimen),
+        "registered_perturbation_labels": float(summary.perturbation_labels == candidate.perturbation_labels),
     }
 
 
@@ -380,45 +433,35 @@ def audit_bridge_capability(candidate: BridgeCandidate, summary: MetadataSummary
     frozen_candidate = _candidate_snapshot(candidate)
     frozen_summary = _summary_snapshot(summary)
     coverage = _coverage(frozen_summary, frozen_candidate)
-    reasons: list[str] = []
-    if len(frozen_summary.biological_specimen_ids) < 5:
-        reasons.append("insufficient_biological_replicates")
-    if len(frozen_summary.cohort_ids) < 2:
-        reasons.append("insufficient_independent_cohorts")
-    reason_by_gate = {
-        "candidate_identity": "candidate_identity_mismatch", "specimen_structure": "missing_specimen_sections",
-        "coordinates": "coordinates_unavailable_or_nonfinite", "genes": "measured_gene_declaration_missing",
-        "perturbation_labels": "perturbation_label_coverage_missing", "safe_controls": "safe_control_coverage_missing",
-        "barcode_quality": "barcode_quality_coverage_missing", "label_quality": "label_quality_coverage_missing",
-        "license": "license_identity_missing", "source_identity": "source_identity_mismatch",
-        "output_schema": "output_schema_capability_missing",
-    }
-    for gate, reason in reason_by_gate.items():
-        if coverage[gate] == 0.0:
-            reasons.append(reason)
     unavailable = "asset_metadata_unavailable" in frozen_summary.block_ids
-    if unavailable:
-        reasons.append("asset_metadata_unavailable")
-    capable = not reasons
-    status = "confirmatory_capable" if capable else ("assets_unavailable" if unavailable else "pilot_audit_only")
-    frozen_reasons = tuple(reasons)
+    status, capable, frozen_reasons = _semantic_state(
+        len(frozen_candidate.biological_specimens), len(frozen_summary.cohort_ids), coverage,
+        unavailable=unavailable,
+    )
     identity = _identity(_result_unsigned_mapping(frozen_candidate.candidate_id, status, capable,
-                                                  len(frozen_summary.biological_specimen_ids), len(frozen_summary.cohort_ids),
+                                                  len(frozen_candidate.biological_specimens), len(frozen_summary.cohort_ids),
                                                   coverage, frozen_reasons))
     return BridgeCapabilityResult(frozen_candidate.candidate_id, status, capable,
-                                  len(frozen_summary.biological_specimen_ids), len(frozen_summary.cohort_ids),
+                                  len(frozen_candidate.biological_specimens), len(frozen_summary.cohort_ids),
                                   coverage, frozen_reasons, identity)
 
 
-def _safe_regular_payload(path: str | Path, label: str, *, maximum: int = MAXIMUM_REGISTRY_BYTES) -> bytes:
+def _absolute_without_symlinks(path: str | Path, label: str) -> Path:
     absolute = Path(os.path.abspath(os.fspath(path)))
     for component in (absolute, *absolute.parents):
         try:
             details = component.lstat()
+        except FileNotFoundError:
+            continue
         except OSError as exc:
             raise SpatialPerturbationRegistryError(f"{label} path is unavailable") from exc
         if stat.S_ISLNK(details.st_mode):
             raise SpatialPerturbationRegistryError(f"{label} must not traverse a symbolic link")
+    return absolute
+
+
+def _safe_regular_payload(path: str | Path, label: str, *, maximum: int = MAXIMUM_REGISTRY_BYTES) -> bytes:
+    absolute = _absolute_without_symlinks(path, label)
     try:
         descriptor = os.open(absolute, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
     except OSError as exc:
@@ -544,10 +587,15 @@ def unavailable_metadata_summary(candidate: BridgeCandidate) -> MetadataSummary:
 
 
 def load_asset_metadata(asset_root: str | Path, candidate: BridgeCandidate) -> MetadataSummary:
-    root = Path(asset_root)
-    metadata_path = root / "metadata_summary.json"
-    if not metadata_path.exists():
+    metadata_path = _absolute_without_symlinks(Path(asset_root) / "metadata_summary.json", "asset metadata")
+    try:
+        leaf = metadata_path.lstat()
+    except FileNotFoundError:
         return unavailable_metadata_summary(candidate)
+    except OSError as exc:
+        raise SpatialPerturbationRegistryError("asset metadata path is unavailable") from exc
+    if stat.S_ISLNK(leaf.st_mode):
+        raise SpatialPerturbationRegistryError("asset metadata must not be a symbolic link")
     return metadata_summary_from_mapping(_json_payload(_safe_regular_payload(metadata_path, "asset metadata"), "asset metadata"))
 
 
