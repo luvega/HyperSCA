@@ -549,11 +549,15 @@ def test_terminal_failure_cannot_be_reclassified_by_mutating_reasons() -> None:
         )
 
 
-def test_v3_evidence_rejects_estimate_outside_confidence_interval() -> None:
+def test_v3_evidence_allows_percentile_interval_outside_point_estimate() -> None:
     payload = pair("spatial")[0].to_mapping()
     payload.update({"paired_estimate": 0.09, "ci_low": 0.01, "ci_high": 0.08})
-    with pytest.raises(ValueError, match="paired_estimate"):
-        V3ClaimEvidence(**payload)  # type: ignore[arg-type]
+    first = V3ClaimEvidence(**payload)  # type: ignore[arg-type]
+    second = pair("spatial")[1]
+
+    decision = evaluate_v3_claim((first, second), policy_v3())
+
+    assert decision.status == "admitted"
 
 
 def test_policy_binds_revalidated_task2_protocol_and_capability_identity() -> None:

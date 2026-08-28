@@ -366,8 +366,6 @@ class V3ClaimEvidence:
             p_value = _require_v3_float(self.nominal_p_value, "nominal_p_value")
             if ci_low > ci_high:
                 raise ValueError("ci_low must not exceed ci_high")
-            if not ci_low <= estimate <= ci_high:
-                raise ValueError("paired_estimate must lie within [ci_low, ci_high]")
             if not 0.0 <= p_value <= 1.0:
                 raise ValueError("nominal_p_value must lie in [0, 1]")
             object.__setattr__(self, "paired_estimate", estimate)
