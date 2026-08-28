@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import re
 import subprocess
+import sys
 
 import pytest
 
@@ -642,19 +643,18 @@ def test_integrated_decisions_require_replayable_components_on_construction_and_
     None
 ):
     policy = policy_v3()
-    forged = V3ClaimDecision(
-        claim_id="integrated",
-        protocol_version=policy.protocol_version,
-        status="admitted",
-        allowed_use="integrated_spatial_causal_gain",
-        blocking_reasons=(),
-        evidence_identity="a" * 64,
-        nominal_p_value=None,
-        multiplicity_adjustment="not_applicable",
-        evidence_role="integrated",
-    )
     with pytest.raises(ValueError, match="integrated"):
-        forged.to_mapping()
+        V3ClaimDecision(
+            claim_id="integrated",
+            protocol_version=policy.protocol_version,
+            status="admitted",
+            allowed_use="integrated_spatial_causal_gain",
+            blocking_reasons=(),
+            evidence_identity="a" * 64,
+            nominal_p_value=None,
+            multiplicity_adjustment="not_applicable",
+            evidence_role="integrated",
+        )
 
     integrated = derive_integrated_claim(
         (
@@ -668,6 +668,37 @@ def test_integrated_decisions_require_replayable_components_on_construction_and_
     object.__setattr__(integrated, "allowed_use", "separate_module_claims_only")
     object.__setattr__(integrated, "evidence_role", "integrated")
     with pytest.raises(ValueError, match="replay"):
+        integrated.to_mapping()
+
+
+def test_family_component_cycles_and_large_tuples_are_rejected_before_mapping() -> None:
+    decision = evaluate_v3_claim(pair("spatial"), policy_v3())
+    object.__setattr__(decision, "component_decisions", (decision,))
+    with pytest.raises(ValueError, match="component_decisions"):
+        decision.to_mapping()
+
+    decision = evaluate_v3_claim(pair("spatial"), policy_v3())
+    object.__setattr__(decision, "component_decisions", (decision,) * 32)
+    with pytest.raises(ValueError, match="component_decisions"):
+        decision.to_mapping()
+
+
+def test_integrated_components_must_be_the_three_distinct_families() -> None:
+    policy = policy_v3()
+    integrated = derive_integrated_claim(
+        (
+            evaluate_v3_claim(pair("spatial"), policy),
+            evaluate_v3_claim(pair("intracellular_causal"), policy),
+            evaluate_bridge_claim(bridge_pair(0.01, 0.02), policy),
+        ),
+        policy,
+    )
+    object.__setattr__(
+        integrated,
+        "component_decisions",
+        (integrated.component_decisions[0],) * 3,
+    )
+    with pytest.raises(ValueError, match="component_decisions"):
         integrated.to_mapping()
 
 
@@ -700,18 +731,24 @@ def test_integrated_application_identity_bound_is_three_family_union() -> None:
     assert integrated.application_evidence_identities == tuple(
         sorted(integrated.application_evidence_identities)
     )
-    payload = integrated.to_mapping()
-    payload["application_evidence_identities"] = tuple(
-        f"{index:064x}" for index in range(25)
+    accepted = replace(
+        integrated,
+        application_evidence_identities=tuple(f"{index:064x}" for index in range(24)),
     )
+    assert len(accepted.application_evidence_identities) == 24
     with pytest.raises(ValueError, match="application_evidence_identities"):
-        V3ClaimDecision(**payload)  # type: ignore[arg-type]
+        replace(
+            integrated,
+            application_evidence_identities=tuple(
+                f"{index:064x}" for index in range(25)
+            ),
+        )
 
 
 def test_v3_policy_cold_import_does_not_load_numerical_stacks() -> None:
     result = subprocess.run(
         [
-            "python3.10",
+            sys.executable,
             "-c",
             "from src.methods_protocol_v3_contract import build_methods_protocol_v3; from src.discovery.evidence_policy import build_evidence_policy_v3; import sys; build_evidence_policy_v3(build_methods_protocol_v3(bridge_role='confirmatory', capability_identity_sha256='a'*64)); assert not set(sys.modules) & {'numpy', 'pandas', 'scipy', 'torch'}",
         ],
@@ -720,6 +757,7 @@ def test_v3_policy_cold_import_does_not_load_numerical_stacks() -> None:
         capture_output=True,
         text=True,
     )
+    assert sys.version_info[:2] >= (3, 10)
     assert result.returncode == 0, result.stderr
 
 

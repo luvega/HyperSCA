@@ -734,6 +734,25 @@ class V3ClaimDecision:
             sorted(self.application_evidence_identities)
         ):
             raise ValueError("application_evidence_identities must be canonical sorted")
+        if type(self.component_decisions) is not tuple or any(
+            type(item) is not V3ClaimDecision for item in self.component_decisions
+        ):
+            raise ValueError("component_decisions must be a tuple of V3ClaimDecision")
+        if self.claim_id != "integrated" and self.component_decisions != ():
+            raise ValueError("family component_decisions must be exactly empty")
+        if self.claim_id == "integrated":
+            expected_components = {"spatial", "intracellular_causal", "bridge"}
+            if (
+                len(self.component_decisions) != 3
+                or {item.claim_id for item in self.component_decisions}
+                != expected_components
+                or any(
+                    item.component_decisions != () for item in self.component_decisions
+                )
+            ):
+                raise ValueError(
+                    "integrated component_decisions must be three distinct family decisions"
+                )
         if (
             type(self.source_evidence) is not tuple
             or len(self.source_evidence) > max_source_evidence
@@ -759,17 +778,6 @@ class V3ClaimDecision:
             if type(self.source_policy) is not EvidencePolicyV3:
                 raise ValueError("source_policy must be an EvidencePolicyV3")
             self.source_policy.__post_init__()
-        if type(self.component_decisions) is not tuple or any(
-            type(item) is not V3ClaimDecision for item in self.component_decisions
-        ):
-            raise ValueError("component_decisions must be a tuple of V3ClaimDecision")
-        if self.claim_id == "integrated" and len(self.component_decisions) not in {
-            0,
-            3,
-        }:
-            raise ValueError(
-                "integrated component_decisions must contain exactly three decisions"
-            )
 
     def _unchecked_mapping(self) -> dict[str, object]:
         return {

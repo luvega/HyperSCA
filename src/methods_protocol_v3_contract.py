@@ -154,7 +154,21 @@ def build_methods_protocol_v3(
     *, bridge_role: str, capability_identity_sha256: str
 ) -> MethodsProtocolV3:
     science = _science()
-    return MethodsProtocolV3(science["version"], science["claim_ids"], science["metrics"], science["pilot_seeds"], science["release_seeds"], 10_000, 0.95, "distinct_families_no_cross_adjustment", "intersection_union_all_three", bridge_role, capability_identity_sha256, bridge_role == "confirmatory", "application_only")  # type: ignore[arg-type]
+    return MethodsProtocolV3(
+        protocol_version=science["version"],  # type: ignore[arg-type]
+        claim_ids=science["claim_ids"],  # type: ignore[arg-type]
+        primary_metrics=science["metrics"],  # type: ignore[arg-type]
+        pilot_seeds=science["pilot_seeds"],  # type: ignore[arg-type]
+        release_seeds=science["release_seeds"],  # type: ignore[arg-type]
+        bootstrap_resamples=10_000,
+        confidence=0.95,
+        multiple_testing="distinct_families_no_cross_adjustment",
+        integrated_gate="intersection_union_all_three",
+        bridge_role=bridge_role,
+        capability_identity_sha256=capability_identity_sha256,
+        integrated_claim_enabled=bridge_role == "confirmatory",
+        crc_role="application_only",
+    )
 
 
 def _snapshot(protocol: MethodsProtocolV3) -> MethodsProtocolV3:
