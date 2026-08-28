@@ -264,10 +264,7 @@ def test_cli_without_assets_publishes_explicit_unavailable_capability(tmp_path: 
         capture_output=True,
         check=False,
     )
-    if probe.returncode != 0:
-        assert "anonymous exclusive publication" in probe.stderr
-        assert not output.exists()
-        return
+    assert probe.returncode == 0, probe.stderr
     published = json.loads(output.read_text(encoding="utf-8"))
     assert published["status"] == "assets_unavailable"
     assert "asset_metadata_unavailable" in published["blocking_reasons"]
@@ -435,15 +432,11 @@ def test_adversarial_replacement_cannot_publish_attacker_staging_content(
         real_close(descriptor)
 
     monkeypatch.setattr(registry_module.os, "close", replace_named_staging)
-    try:
-        write_bridge_capability_exclusively(
-            output, audit_bridge_capability(candidate(), metadata_summary(animals=3))
-        )
-    except SpatialPerturbationRegistryError:
-        assert not output.exists()
-    else:
-        assert output.read_bytes() != attacker_bytes
-        assert json.loads(output.read_text(encoding="utf-8"))["candidate_id"] == "gse274447_msafe_bridge"
+    write_bridge_capability_exclusively(
+        output, audit_bridge_capability(candidate(), metadata_summary(animals=3))
+    )
+    assert output.read_bytes() != attacker_bytes
+    assert json.loads(output.read_text(encoding="utf-8"))["candidate_id"] == "gse274447_msafe_bridge"
 
 
 def test_component_walk_closes_descriptor_when_immediate_fstat_fails(

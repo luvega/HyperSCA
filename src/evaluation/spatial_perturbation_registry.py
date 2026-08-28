@@ -31,6 +31,8 @@ MAXIMUM_COUNT = 10_000_000
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _RENAME_NOREPLACE = 1
 _AT_EMPTY_PATH = 0x1000
+_AT_FDCWD = -100
+_AT_SYMLINK_FOLLOW = 0x400
 _FROZEN_CANDIDATE_ORDER = ("gse274447_msafe_bridge",)
 _FROZEN_GSE274447_SOURCE = "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE274447"
 _FROZEN_GSE274447_SOURCE_IDENTITY = "0e908ba2f21cab2bd222daf31a85ff8369407c8df53f5d9a2424f081528ffa46"
@@ -751,20 +753,37 @@ def _link_anonymous_noreplace(anonymous_fd: int, parent_fd: int, output: str) ->
         ctypes.c_int,
     ]
     linkat.restype = ctypes.c_int
-    if linkat(
+    direct = linkat(
         anonymous_fd,
         b"",
         parent_fd,
         os.fsencode(output),
         _AT_EMPTY_PATH,
-    ) == 0:
+    )
+    if direct == 0:
         return
     error = ctypes.get_errno()
-    if error in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.ENOENT, errno.EPERM):
-        raise SpatialPerturbationRegistryError("anonymous exclusive publication is unavailable")
     if error in (errno.EEXIST, errno.ENOTEMPTY):
         raise SpatialPerturbationRegistryError("refusing to overwrite output")
-    raise SpatialPerturbationRegistryError("anonymous exclusive publication failed") from OSError(error, os.strerror(error))
+    unavailable = {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.ENOENT, errno.EPERM}
+    if error not in unavailable:
+        raise SpatialPerturbationRegistryError("anonymous exclusive publication failed") from OSError(error, os.strerror(error))
+    source = os.fsencode(f"/proc/self/fd/{anonymous_fd}")
+    fallback = linkat(
+        _AT_FDCWD,
+        source,
+        parent_fd,
+        os.fsencode(output),
+        _AT_SYMLINK_FOLLOW,
+    )
+    if fallback == 0:
+        return
+    fallback_error = ctypes.get_errno()
+    if fallback_error in (errno.EEXIST, errno.ENOTEMPTY):
+        raise SpatialPerturbationRegistryError("refusing to overwrite output")
+    raise SpatialPerturbationRegistryError("anonymous exclusive publication failed") from OSError(
+        fallback_error, os.strerror(fallback_error)
+    )
 
 
 def write_bridge_capability_exclusively(path: str | Path, result: BridgeCapabilityResult) -> None:
@@ -814,6 +833,14 @@ def write_bridge_capability_exclusively(path: str | Path, result: BridgeCapabili
         _link_anonymous_noreplace(anonymous_fd, parent_fd, output_name)
         published = os.fstat(anonymous_fd)
         if not stat.S_ISREG(published.st_mode) or published.st_nlink != 1:
+            raise SpatialPerturbationRegistryError("published anonymous output changed")
+        destination = os.stat(output_name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(destination.st_mode)
+            or destination.st_nlink != 1
+            or (destination.st_dev, destination.st_ino)
+            != (published.st_dev, published.st_ino)
+        ):
             raise SpatialPerturbationRegistryError("published anonymous output changed")
         os.fsync(parent_fd)
         bound.verify("output")
