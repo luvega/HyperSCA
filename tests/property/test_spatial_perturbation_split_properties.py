@@ -231,7 +231,10 @@ def test_holdout_only_perturbations_are_structurally_secondary(
     )
     relations = tuple(
         item for item in metadata.neighbour_relations
-        if not (item.animal_id in {"mouse_2", "mouse_3"} and item.perturbation_id == holdout_only)
+        if not (
+            item.animal_id in {"mouse_2", "mouse_3"}
+            and item.matched_perturbation_id == holdout_only
+        )
     )
     pruned = BridgeSplitMetadata(
         rows, metadata.gene_names, metadata.perturbations,
@@ -262,7 +265,7 @@ def test_development_only_perturbations_are_not_secondary(
         item for item in metadata.neighbour_relations
         if not (
             item.animal_id == "mouse_1"
-            and item.perturbation_id == development_only
+            and item.matched_perturbation_id == development_only
         )
     )
     module = import_module("src.evaluation.spatial_perturbation_split")
@@ -290,7 +293,7 @@ def test_registered_perturbation_requires_at_least_one_atomic_source(
     )
     relations = tuple(
         item for item in metadata.neighbour_relations
-        if item.perturbation_id != deleted
+        if item.matched_perturbation_id != deleted
     )
     module = import_module("src.evaluation.spatial_perturbation_split")
     with pytest.raises(SpatialPerturbationSplitError, match="registered.*source"):
@@ -343,7 +346,53 @@ def test_safe_neighbour_cells_may_be_reused_by_distinct_relation_keys(
     reused = tuple(item for item in safe_relations if item.neighbor_cell_id == reused_id)
     assert len(reused[:reuse_count]) == reuse_count
     assert len({item.relation_id for item in reused[:reuse_count]}) == reuse_count
-    assert {item.perturbation_id for item in reused[:reuse_count]} <= set(metadata.perturbations)
+    assert {
+        item.matched_perturbation_id for item in reused[:reuse_count]
+    } <= set(metadata.perturbations)
+    assert {item.source_perturbation_id for item in reused[:reuse_count]} == {"mSafe"}
+
+
+@settings(max_examples=4, deadline=None)
+@given(st.integers(min_value=0, max_value=4))
+def test_generic_partition_identity_is_invariant_to_animal_order(rotation: int) -> None:
+    module = import_module("src.evaluation.spatial_perturbation_split")
+    metadata = _small_metadata(animal_count=5)
+    development = ("mouse_1", "mouse_2", "mouse_3")
+    evaluation = ("mouse_4", "mouse_5")
+    shifted_development = development[rotation % 3:] + development[:rotation % 3]
+    shifted_evaluation = evaluation[rotation % 2:] + evaluation[:rotation % 2]
+    first = module.build_bridge_partition_manifest(
+        metadata, "generic_partition:property", "generic",
+        ("mouse_1", "mouse_2"), ("mouse_3",), evaluation,
+    )
+    second = module.build_bridge_partition_manifest(
+        metadata, "generic_partition:property", "generic",
+        tuple(item for item in shifted_development if item != "mouse_3"),
+        ("mouse_3",), shifted_evaluation,
+    )
+    assert split_manifest_to_mapping(first) == split_manifest_to_mapping(second)
+
+
+@settings(max_examples=2, deadline=None)
+@given(st.sampled_from(("mouse_1", "mouse_4")))
+def test_confirmatory_cohort_mismatch_is_rejected(mutated_tune: str) -> None:
+    module = import_module("src.evaluation.spatial_perturbation_split")
+    metadata = _contract_helpers.synthetic_metadata(
+        animal_count=5, neighbour_types=("astrocyte",), confirmatory=True,
+    )
+    if mutated_tune == "mouse_1":
+        manifest = module.build_bridge_partition_manifest(
+            metadata, "confirmatory_partition:property", "confirmatory",
+            ("mouse_1", "mouse_2"), ("mouse_3",), ("mouse_4", "mouse_5"),
+        )
+        assert manifest.capability_result.confirmatory_capable
+    else:
+        with pytest.raises(SpatialPerturbationSplitError, match="external.*cohort"):
+            module.build_bridge_partition_manifest(
+                metadata, "confirmatory_partition:property", "confirmatory",
+                ("mouse_1", "mouse_2"), (mutated_tune,),
+                ("mouse_3", "mouse_5"),
+            )
 
 
 @settings(max_examples=4, deadline=None)

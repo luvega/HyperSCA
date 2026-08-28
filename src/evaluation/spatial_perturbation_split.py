@@ -15,7 +15,8 @@ from fractions import Fraction
 import hashlib
 import json
 import re
-from typing import cast
+from types import SimpleNamespace
+from typing import Any, cast
 import unicodedata
 
 from src.evaluation.spatial_perturbation_registry import (
@@ -277,7 +278,8 @@ class BridgeNeighbourRelation:
     spatial_block: str
     source_cell_id: str
     neighbor_cell_id: str
-    perturbation_id: str
+    source_perturbation_id: str
+    matched_perturbation_id: str
     source_cell_type: str
     neighbor_cell_type: str
     rank: int
@@ -290,13 +292,18 @@ class BridgeNeighbourRelation:
             name: _safe_text(getattr(self, name), name)
             for name in (
                 "animal_id", "section_id", "spatial_block", "source_cell_id",
-                "neighbor_cell_id", "perturbation_id", "source_cell_type",
+                "neighbor_cell_id", "source_perturbation_id",
+                "matched_perturbation_id", "source_cell_type",
                 "neighbor_cell_type", "band",
             )
         }
         rank = _integer(self.rank, "rank", maximum=1_000_000)
         if rank < 1:
             raise SpatialPerturbationSplitError("rank must be positive")
+        if values["source_cell_id"] == values["neighbor_cell_id"]:
+            raise SpatialPerturbationSplitError(
+                "a neighbour relation source and neighbor must be distinct"
+            )
         contamination = self.contamination
         if type(contamination) is not bool:
             raise SpatialPerturbationSplitError(
@@ -326,13 +333,14 @@ class BridgeNeighbourRelation:
         object.__setattr__(self, "relation_id", relation_id)
 
 
-def _make_relation(
+def freeze_bridge_neighbour_relation(
     animal_id: str,
     section_id: str,
     spatial_block: str,
     source_cell_id: str,
     neighbor_cell_id: str,
-    perturbation_id: str,
+    source_perturbation_id: str,
+    matched_perturbation_id: str,
     source_cell_type: str,
     neighbor_cell_type: str,
     rank: int,
@@ -340,18 +348,34 @@ def _make_relation(
     contamination: bool,
     is_safe_control: bool,
 ) -> BridgeNeighbourRelation:
+    text_values = {
+        name: _safe_text(value, name)
+        for name, value in (
+            ("animal_id", animal_id), ("section_id", section_id),
+            ("spatial_block", spatial_block), ("source_cell_id", source_cell_id),
+            ("neighbor_cell_id", neighbor_cell_id),
+            ("source_perturbation_id", source_perturbation_id),
+            ("matched_perturbation_id", matched_perturbation_id),
+            ("source_cell_type", source_cell_type),
+            ("neighbor_cell_type", neighbor_cell_type), ("band", band),
+        )
+    }
+    rank = _integer(rank, "rank", maximum=1_000_000)
+    if type(contamination) is not bool or type(is_safe_control) is not bool:
+        raise SpatialPerturbationSplitError(
+            "relation control flags must be built-in booleans"
+        )
     values: dict[str, object] = {
-        "animal_id": animal_id, "section_id": section_id,
-        "spatial_block": spatial_block, "source_cell_id": source_cell_id,
-        "neighbor_cell_id": neighbor_cell_id, "perturbation_id": perturbation_id,
-        "source_cell_type": source_cell_type,
-        "neighbor_cell_type": neighbor_cell_type, "rank": rank, "band": band,
+        **text_values, "rank": rank,
         "contamination": contamination, "is_safe_control": is_safe_control,
     }
     return BridgeNeighbourRelation(
         _context_id("bridge_neighbour_relation_v1", values),
-        animal_id, section_id, spatial_block, source_cell_id, neighbor_cell_id,
-        perturbation_id, source_cell_type, neighbor_cell_type, rank, band,
+        text_values["animal_id"], text_values["section_id"],
+        text_values["spatial_block"], text_values["source_cell_id"],
+        text_values["neighbor_cell_id"], text_values["source_perturbation_id"],
+        text_values["matched_perturbation_id"], text_values["source_cell_type"],
+        text_values["neighbor_cell_type"], rank, text_values["band"],
         contamination, is_safe_control,
     )
 
@@ -373,10 +397,14 @@ def _relation_mapping(item: BridgeNeighbourRelation) -> dict[str, object]:
 
 
 def _neighbour_table_identity(relations: tuple[BridgeNeighbourRelation, ...]) -> str:
-    return _identity({
-        "schema": "bridge_neighbour_table_v1",
-        "relations": [_relation_mapping(item) for item in relations],
-    })
+    digest = hashlib.sha256()
+    digest.update(b'{"relations":[')
+    for index, item in enumerate(relations):
+        if index:
+            digest.update(b",")
+        digest.update(_canonical_bytes(_relation_mapping(item)))
+    digest.update(b'],"schema":"bridge_neighbour_table_v1"}')
+    return digest.hexdigest()
 
 
 def _target_pairs(value: object, name: str) -> tuple[tuple[str, str], ...]:
@@ -410,12 +438,20 @@ def _validate_rows(
         prior = section_animals.setdefault(row.section_id, row.animal_id)
         if prior != row.animal_id:
             raise SpatialPerturbationSplitError("a section cannot be assigned to two animals")
-        if row.cell_role.endswith("source") and row.context_perturbation_id not in perturbations:
+        if (
+            row.cell_role == "perturbation_source"
+            and row.context_perturbation_id not in perturbations
+        ):
             raise SpatialPerturbationSplitError("row context perturbation is not registered")
         if row.cell_role == "perturbation_source" and row.observed_label != row.context_perturbation_id:
             raise SpatialPerturbationSplitError("perturbation source label does not match context")
-        if row.cell_role == "safe_source" and row.observed_label != safe_label:
-            raise SpatialPerturbationSplitError("safe source label does not match frozen control")
+        if row.cell_role == "safe_source" and (
+            row.context_perturbation_id != safe_label
+            or row.observed_label != safe_label
+        ):
+            raise SpatialPerturbationSplitError(
+                "safe source context/label does not match frozen control"
+            )
         if row.cell_role == "neighbour":
             if row.observed_label != "unperturbed" or row.cell_type not in neighbour_types:
                 raise SpatialPerturbationSplitError("neighbour row labels are not frozen")
@@ -542,6 +578,29 @@ class BridgeSplitMetadata:
         relations = tuple(sorted(relations, key=lambda item: item.relation_id))
         if len({item.relation_id for item in relations}) != len(relations):
             raise SpatialPerturbationSplitError("neighbour relation keys must be unique")
+        logical_keys = {
+            (
+                item.animal_id, item.section_id,
+                item.matched_perturbation_id, item.neighbor_cell_id,
+            )
+            for item in relations
+        }
+        if len(logical_keys) != len(relations):
+            raise SpatialPerturbationSplitError(
+                "neighbour relation logical keys must be unique"
+            )
+        treatment_neighbour_contexts: dict[tuple[str, str, str], str] = {}
+        for relation in relations:
+            if relation.is_safe_control:
+                continue
+            key = (relation.animal_id, relation.section_id, relation.neighbor_cell_id)
+            prior = treatment_neighbour_contexts.setdefault(
+                key, relation.matched_perturbation_id
+            )
+            if prior != relation.matched_perturbation_id:
+                raise SpatialPerturbationSplitError(
+                    "a treatment neighbor cannot cross matched perturbations"
+                )
         row_by_cell = {row.cell_id: row for row in rows}
         for relation in relations:
             source = row_by_cell.get(relation.source_cell_id)
@@ -551,11 +610,17 @@ class BridgeSplitMetadata:
                     "neighbour relation endpoint is absent from atomic provenance"
                 )
             expected_source_role = "safe_source" if relation.is_safe_control else "perturbation_source"
+            expected_source_perturbation = (
+                safe_label if relation.is_safe_control
+                else relation.matched_perturbation_id
+            )
             if (
-                source.cell_role != expected_source_role
+                relation.matched_perturbation_id not in perturbations
+                or relation.source_perturbation_id != expected_source_perturbation
+                or source.cell_role != expected_source_role
                 or source.animal_id != relation.animal_id
                 or source.section_id != relation.section_id
-                or source.context_perturbation_id != relation.perturbation_id
+                or source.context_perturbation_id != relation.source_perturbation_id
                 or source.source_cell_type != relation.source_cell_type
                 or neighbor.cell_role != "neighbour"
                 or neighbor.animal_id != relation.animal_id
@@ -771,8 +836,11 @@ def _manifest_unsigned(manifest: "BridgeSplitManifest") -> dict[str, object]:
         "perturbation_targets": [list(item) for item in manifest.perturbation_targets],
         "block_adjacency": [_adjacency_mapping(item) for item in manifest.block_adjacency],
         "safe_control_label": manifest.safe_control_label,
-        "neighbour_relations": [_relation_mapping(item) for item in manifest.neighbour_relations],
-        "neighbour_table_identity_sha256": manifest.neighbour_table_identity_sha256,
+        "neighbour_table": {
+            "schema": "bridge_neighbour_table_v1",
+            "relation_count": len(manifest.neighbour_relations),
+            "identity_sha256": manifest.neighbour_table_identity_sha256,
+        },
         "candidate": manifest.candidate.to_mapping(),
         "registry_summary": manifest.registry_summary.to_mapping(),
         "capability_result": manifest.capability_result.to_mapping(),
@@ -868,6 +936,10 @@ class BridgeSplitManifest:
             raise SpatialPerturbationSplitError(
                 "a legal split requires a nonempty train partition"
             )
+        if split_role == "confirmatory" and (not tune or not held_out):
+            raise SpatialPerturbationSplitError(
+                "confirmatory role requires three nonempty train, tune, and evaluation partitions"
+            )
         genes = _text_items(self.gene_names, "gene_names", sort=True)
         perturbations = _text_items(self.perturbations, "perturbations", sort=True)
         registered = _text_items(
@@ -906,6 +978,32 @@ class BridgeSplitManifest:
             self.registry_summary, self.capability_result,
         )
         rows = metadata.rows
+        if split_role == "confirmatory":
+            if (
+                metadata.capability_result.status != "confirmatory_capable"
+                or metadata.capability_result.confirmatory_capable is not True
+            ):
+                raise SpatialPerturbationSplitError(
+                    "confirmatory role requires confirmatory_capable upstream status"
+                )
+            cohort_by_animal = dict(
+                metadata.registry_summary.specimen_cohort_assignments
+            )
+            external_cohorts = set(
+                metadata.registry_summary.external_untouched_cohort_ids
+            )
+            external_animals = {
+                animal for animal, cohort in cohort_by_animal.items()
+                if cohort in external_cohorts
+            }
+            nonexternal_animals = set(cohort_by_animal) - external_animals
+            if (
+                set(evaluation) != external_animals
+                or set(development) != nonexternal_animals
+            ):
+                raise SpatialPerturbationSplitError(
+                    "confirmatory evaluation animals must exactly equal untouched external cohort animals"
+                )
         animals = tuple(sorted({row.animal_id for row in rows}))
         if tuple(sorted(development + evaluation)) != animals:
             raise SpatialPerturbationSplitError("manifest animals do not match row provenance")
@@ -1060,13 +1158,22 @@ def _snapshot_manifest(manifest: BridgeSplitManifest) -> BridgeSplitManifest:
 def split_manifest_to_mapping(manifest: BridgeSplitManifest) -> dict[str, object]:
     snapshot = _snapshot_manifest(manifest)
     mapping = _manifest_unsigned(snapshot)
+    mapping["neighbour_relations"] = [
+        _relation_mapping(item) for item in snapshot.neighbour_relations
+    ]
     mapping["split_identity_sha256"] = snapshot.split_identity_sha256
     return mapping
 
 
-def build_pilot_fold(
-    metadata: BridgeSplitMetadata, evaluation_animal: str
+def build_bridge_partition_manifest(
+    metadata: BridgeSplitMetadata,
+    split_id: str,
+    split_role: str,
+    train_animals: tuple[str, ...],
+    tune_animals: tuple[str, ...],
+    evaluation_animals: tuple[str, ...],
 ) -> BridgeSplitManifest:
+    """Freeze a whole-animal bridge partition from registered metadata."""
     if type(metadata) is not BridgeSplitMetadata:
         raise SpatialPerturbationSplitError("metadata must be BridgeSplitMetadata")
     snapshot = BridgeSplitMetadata(
@@ -1077,19 +1184,20 @@ def build_pilot_fold(
         metadata.candidate, metadata.registry_summary, metadata.capability_result,
     )
     animals = tuple(sorted({row.animal_id for row in snapshot.rows}))
-    if len(animals) != 3:
-        raise SpatialPerturbationSplitError("pilot requires exactly three animals")
-    evaluation = _safe_text(evaluation_animal, "evaluation_animal")
-    if evaluation not in animals:
-        raise SpatialPerturbationSplitError("evaluation_animal must be an exact registered animal")
-    development = tuple(animal for animal in animals if animal != evaluation)
+    train_animals = _text_items(train_animals, "train_animals", sort=True)
+    tune_animals = _text_items(tune_animals, "tune_animals", sort=True)
+    evaluation_animals = _text_items(
+        evaluation_animals, "evaluation_animals", sort=True
+    )
+    development = tuple(sorted(train_animals + tune_animals))
     development_perturbations = {
         row.context_perturbation_id for row in snapshot.rows
         if row.animal_id in development and row.cell_role == "perturbation_source"
     }
     evaluation_perturbations = {
         row.context_perturbation_id for row in snapshot.rows
-        if row.animal_id == evaluation and row.cell_role == "perturbation_source"
+        if row.animal_id in evaluation_animals
+        and row.cell_role == "perturbation_source"
     }
     primary = tuple(sorted(development_perturbations & evaluation_perturbations))
     secondary = tuple(sorted(evaluation_perturbations - development_perturbations))
@@ -1097,7 +1205,7 @@ def build_pilot_fold(
         sorted(development_perturbations - evaluation_perturbations)
     )
     if not primary:
-        raise SpatialPerturbationSplitError("pilot has no shared primary perturbation")
+        raise SpatialPerturbationSplitError("partition has no shared primary perturbation")
     target_map = dict(snapshot.perturbation_targets)
     _checked_cartesian_size(len(animals), len(primary))
     _checked_cartesian_size(
@@ -1121,13 +1229,23 @@ def build_pilot_fold(
         )
     )
     unsigned: dict[str, object] = {
-        "split_id": f"pilot_leave_one_animal_out:{evaluation}",
-        "split_role": "pilot",
+        "split_id": _safe_text(split_id, "split_id"),
+        "split_role": _safe_text(split_role, "split_role"),
         "split_seed": _science()["split_seed"],
-        "development_animals": list(development), "evaluation_animals": [evaluation],
-        "train_rows": [row.stable_row_id for row in snapshot.rows if row.animal_id in development],
-        "tune_rows": [],
-        "evaluation_rows": [row.stable_row_id for row in snapshot.rows if row.animal_id == evaluation],
+        "development_animals": development,
+        "evaluation_animals": evaluation_animals,
+        "train_rows": tuple(
+            row.stable_row_id for row in snapshot.rows
+            if row.animal_id in train_animals
+        ),
+        "tune_rows": tuple(
+            row.stable_row_id for row in snapshot.rows
+            if row.animal_id in tune_animals
+        ),
+        "evaluation_rows": tuple(
+            row.stable_row_id for row in snapshot.rows
+            if row.animal_id in evaluation_animals
+        ),
         "gene_names": list(snapshot.gene_names), "perturbations": list(primary),
         "registered_perturbations": list(snapshot.perturbations),
         "secondary_perturbations": list(secondary),
@@ -1139,7 +1257,7 @@ def build_pilot_fold(
         "perturbation_targets": [list(item) for item in snapshot.perturbation_targets],
         "block_adjacency": [_adjacency_mapping(item) for item in snapshot.block_adjacency],
         "safe_control_label": snapshot.safe_control_label,
-        "neighbour_relations": [_relation_mapping(item) for item in snapshot.neighbour_relations],
+        "neighbour_relations": snapshot.neighbour_relations,
         "neighbour_table_identity_sha256": snapshot.neighbour_table_identity_sha256,
         "candidate": snapshot.candidate.to_mapping(),
         "registry_summary": snapshot.registry_summary.to_mapping(),
@@ -1148,7 +1266,7 @@ def build_pilot_fold(
         "metadata_identity_sha256": snapshot.registry_summary.metadata_identity_sha256,
         "capability_identity_sha256": snapshot.capability_result.capability_identity_sha256,
     }
-    constructor_values = dict(unsigned)
+    constructor_values: dict[str, object] = dict(unsigned)
     constructor_values.update({
         "row_provenance": snapshot.rows,
         "perturbation_parents": parents,
@@ -1159,8 +1277,36 @@ def build_pilot_fold(
         "registry_summary": snapshot.registry_summary,
         "capability_result": snapshot.capability_result,
     })
-    return BridgeSplitManifest(
-        **constructor_values, split_identity_sha256=_identity(unsigned)  # type: ignore[arg-type]
+    unsigned_mapping = _manifest_unsigned(cast(
+        BridgeSplitManifest, SimpleNamespace(**constructor_values)
+    ))
+    constructor = cast(Any, BridgeSplitManifest)
+    return constructor(
+        **constructor_values,
+        split_identity_sha256=_identity(unsigned_mapping),
+    )
+
+
+def build_pilot_fold(
+    metadata: BridgeSplitMetadata, evaluation_animal: str
+) -> BridgeSplitManifest:
+    if type(metadata) is not BridgeSplitMetadata:
+        raise SpatialPerturbationSplitError("metadata must be BridgeSplitMetadata")
+    animals = tuple(sorted({row.animal_id for row in metadata.rows}))
+    if len(animals) != 3:
+        raise SpatialPerturbationSplitError("pilot requires exactly three animals")
+    evaluation = _safe_text(evaluation_animal, "evaluation_animal")
+    if evaluation not in animals:
+        raise SpatialPerturbationSplitError(
+            "evaluation_animal must be an exact registered animal"
+        )
+    return build_bridge_partition_manifest(
+        metadata,
+        f"pilot_leave_one_animal_out:{evaluation}",
+        "pilot",
+        tuple(animal for animal in animals if animal != evaluation),
+        (),
+        (evaluation,),
     )
 
 
@@ -1525,7 +1671,7 @@ def _require_relations(
         )
     if any(
         item.animal_id != animal
-        or item.perturbation_id != perturbation
+        or item.matched_perturbation_id != perturbation
         or item.neighbor_cell_type != cell_type
         or item.band != band
         or item.is_safe_control is not safe
@@ -1634,7 +1780,8 @@ def _derive_eligibility(
             role="perturbation_source", label=frozen.perturbation_id, band="own",
         )
         _require_rows(
-            safe, animal=frozen.animal_id, perturbation=frozen.perturbation_id,
+            safe, animal=frozen.animal_id,
+            perturbation=manifest.safe_control_label,
             role="safe_source", label=manifest.safe_control_label, band="own",
         )
         treatment_meets_threshold = len(treatment) >= minimum_source
