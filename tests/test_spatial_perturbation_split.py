@@ -6,6 +6,8 @@ import hashlib
 import inspect
 import json
 import random
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -38,6 +40,11 @@ PERTURBATIONS = tuple(f"guide_{index}" for index in range(5))
 TARGETS = tuple(f"Gene{index}" for index in range(5))
 NEIGHBOUR_TYPES = ("astrocyte", "microglia")
 BANDS = ("proximal", "local")
+
+
+class _HostileSequence:
+    def __iter__(self) -> object:
+        raise AssertionError("hostile sequence was iterated before validation")
 
 
 def _canonical_sha(mapping: dict[str, object]) -> str:
@@ -349,6 +356,58 @@ def test_parent_matching_uses_exact_block_multisets_not_sets() -> None:
         evaluate_bridge_eligibility(manifest, altered)
 
 
+@pytest.mark.parametrize(
+    ("source_count", "safe_count", "expected_reason", "absent_reason"),
+    (
+        (19, 20, "insufficient_perturbation_coverage", "insufficient_safe_control_coverage"),
+        (20, 19, "insufficient_safe_control_coverage", "insufficient_perturbation_coverage"),
+    ),
+)
+def test_asymmetric_parent_thresholds_are_ineligible_before_matching(
+    source_count: int,
+    safe_count: int,
+    expected_reason: str,
+    absent_reason: str,
+) -> None:
+    manifest, _ = baseline()
+    parent_ids = tuple(
+        parent.parent_id
+        for parent in manifest.perturbation_parents
+        if parent.animal_id == "mouse_1"
+    )[:2]
+    result = evaluate_bridge_eligibility(
+        manifest,
+        complete_evidence(
+            manifest,
+            source_overrides={parent_id: source_count for parent_id in parent_ids},
+            safe_source_overrides={parent_id: safe_count for parent_id in parent_ids},
+        ),
+    )
+    assert expected_reason in result.reasons
+    assert absent_reason not in result.reasons
+
+
+@pytest.mark.parametrize(
+    ("treatment_count", "safe_count"),
+    ((29, 30), (30, 29)),
+)
+def test_asymmetric_unit_thresholds_are_retained_as_abstentions(
+    treatment_count: int, safe_count: int
+) -> None:
+    manifest, _ = baseline()
+    unit_id = manifest.primary_units[0].unit_id
+    result = evaluate_bridge_eligibility(
+        manifest,
+        complete_evidence(
+            manifest,
+            unit_overrides={unit_id: treatment_count},
+            safe_unit_overrides={unit_id: safe_count},
+        ),
+    )
+    assert result.eligible is True
+    assert result.abstained_unit_ids == (unit_id,)
+
+
 def test_neighbour_matching_rejects_disjoint_block_multisets() -> None:
     manifest = build_pilot_fold(
         synthetic_metadata(block_count=4, neighbour_types=("astrocyte",)), "mouse_1"
@@ -394,6 +453,81 @@ def test_empty_matched_sources_are_threshold_failures_not_provenance_errors() ->
     result = evaluate_bridge_eligibility(manifest, altered)
     assert "insufficient_perturbation_coverage" in result.reasons
     assert "insufficient_safe_control_coverage" in result.reasons
+
+
+@pytest.mark.parametrize("hostile_field", ("manifest", "evidence"))
+def test_public_evaluation_revalidates_hostile_sequences_before_derivation(
+    hostile_field: str,
+) -> None:
+    baseline_manifest, baseline_evidence = baseline()
+    manifest = replace(baseline_manifest)
+    evidence = replace(baseline_evidence)
+    target = manifest if hostile_field == "manifest" else evidence
+    field_name = "perturbations" if hostile_field == "manifest" else "parent_evidence"
+    object.__setattr__(target, field_name, _HostileSequence())
+    with pytest.raises(SpatialPerturbationSplitError):
+        evaluate_bridge_eligibility(manifest, evidence)
+
+
+def test_public_evaluation_normalizes_low_level_empty_perturbations_mutation() -> None:
+    baseline_manifest, baseline_evidence = baseline()
+    manifest = replace(baseline_manifest)
+    object.__setattr__(manifest, "perturbations", ())
+    with pytest.raises(SpatialPerturbationSplitError):
+        evaluate_bridge_eligibility(manifest, baseline_evidence)
+
+
+def test_independent_triple_search_has_a_bounded_membership_operation_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    block_count = 200
+    rows = tuple(
+        BridgeSplitRow(
+            index, f"graph_cell_{index}", "mouse", "section", f"block_{index}",
+            "guide", "guide", "source", "source", "perturbation_source", "own",
+        )
+        for index in range(block_count)
+    )
+    adjacency = tuple(
+        BridgeBlockAdjacency("mouse", "section", f"block_{first}", f"block_{second}")
+        for first in range(block_count)
+        for second in range(first + 1, block_count)
+    )
+    real_adjacency = split_module._adjacent_block_pairs
+
+    class BoundedContainsSet(set[frozenset[tuple[str, str, str]]]):
+        contains_calls = 0
+
+        def __contains__(self, item: object) -> bool:
+            self.contains_calls += 1
+            if self.contains_calls > 40_000:
+                raise AssertionError("independent-triple search exceeded its operation bound")
+            return super().__contains__(item)
+
+    graph_manifest = cast(
+        BridgeSplitManifest, SimpleNamespace(block_adjacency=adjacency)
+    )
+    counted = BoundedContainsSet(real_adjacency(graph_manifest))
+    monkeypatch.setattr(split_module, "_adjacent_block_pairs", lambda _: counted)
+    assert split_module._has_non_adjacent_block_subset(
+        rows, graph_manifest, 3
+    ) is False
+    assert counted.contains_calls <= 40_000
+
+
+def test_independent_triple_search_rejects_adversarial_block_cardinality() -> None:
+    rows = tuple(
+        BridgeSplitRow(
+            index, f"huge_graph_cell_{index}", "mouse", "section", f"block_{index}",
+            "guide", "guide", "source", "source", "perturbation_source", "own",
+        )
+        for index in range(5_000)
+    )
+    graph_manifest = cast(BridgeSplitManifest, SimpleNamespace(block_adjacency=()))
+    with pytest.raises(SpatialPerturbationSplitError, match="block graph"):
+        split_module._has_non_adjacent_block_subset(
+            rows, graph_manifest, 3
+        )
 
 
 def test_exact_treatment_and_safe_thresholds_are_derived_from_ids() -> None:
