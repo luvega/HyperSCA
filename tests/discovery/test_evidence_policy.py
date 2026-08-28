@@ -239,6 +239,22 @@ def test_decisions_are_immutable_and_legacy_view_is_derived() -> None:
     assert legacy.loc["hyperbolic_joint", "status"] == joint.status
 
 
+def test_v2_decision_identities_remain_golden_after_v3_extension() -> None:
+    spatial = evaluate_spatial_claim(_spatial_pair(), _policy())
+    causal = evaluate_causal_claim(_causal_pair(), _policy())
+    joint = derive_joint_claim(spatial, causal)
+
+    assert spatial.evidence_identity == (
+        "8f04e57bd2623a018fa524e4d039d6f5606599b7889b49b2ec89461a80b0b155"
+    )
+    assert causal.evidence_identity == (
+        "434d276b80e9f682285d99dd03a889116013515d854baa02c945059a135f5652"
+    )
+    assert joint.evidence_identity == (
+        "3f3fc98ed347a2be5ba96e52655910e16ed64f956e9d9a30a627ecd8164225c8"
+    )
+
+
 @pytest.mark.parametrize(
     "field_override",
     [
