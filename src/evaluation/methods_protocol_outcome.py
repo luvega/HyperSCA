@@ -80,7 +80,7 @@ def _reject_deep_json(text: str) -> None:
         if in_string:
             if escaped:
                 escaped = False
-            elif character == "\\\\":
+            elif character == "\\":
                 escaped = True
             elif character == '"':
                 in_string = False
@@ -139,7 +139,14 @@ def _strict_json_from_bytes(payload: bytes, label: str) -> dict[str, object]:
             parse_float=_bounded_float,
         )
         normalized = validate_strict_json(value)
-    except (_DuplicateJsonKey, UnicodeError, json.JSONDecodeError, OverflowError, ValueError) as exc:
+    except (
+        _DuplicateJsonKey,
+        UnicodeError,
+        json.JSONDecodeError,
+        OverflowError,
+        RecursionError,
+        ValueError,
+    ) as exc:
         raise ValueError(f"{label} is not strict JSON: {exc}") from exc
     if type(normalized) is not dict:
         raise ValueError(f"{label} must contain one JSON object")
@@ -162,7 +169,12 @@ def _reject_symlink_components(path: Path, label: str) -> None:
 def _read_bounded_regular_file(path: Path, label: str) -> bytes:
     source = Path(path)
     _reject_symlink_components(source, label)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         descriptor = os.open(source, flags)
     except OSError as exc:

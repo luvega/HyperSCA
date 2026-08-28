@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -86,6 +88,49 @@ def test_strict_json_rejects_duplicate_keys_and_unsafe_files(tmp_path: Path) -> 
     linked.hardlink_to(regular)
     with pytest.raises(ValueError, match="hard-linked"):
         strict_json(linked)
+
+
+def test_strict_json_rejects_deep_json_after_an_escaped_quote(tmp_path: Path) -> None:
+    deep = tmp_path / "deep.json"
+    deep.write_bytes(
+        b'{"marker":'
+        + json.dumps('"').encode("utf-8")
+        + b',"deep":'
+        + (b"[" * 10_000)
+        + b"0"
+        + (b"]" * 10_000)
+        + b"}"
+    )
+
+    with pytest.raises(ValueError, match="too deeply nested"):
+        strict_json(deep)
+
+
+def test_strict_json_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    fifo = tmp_path / "input.fifo"
+    os.mkfifo(fifo)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; "
+                "from src.evaluation.methods_protocol_outcome import strict_json; "
+                "import sys; "
+                "\ntry:\n strict_json(Path(sys.argv[1]))\n"
+                "except ValueError:\n raise SystemExit(0)\n"
+                "raise SystemExit(1)"
+            ),
+            str(fifo),
+        ],
+        cwd=REPOSITORY_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_freeze_cli_help_does_not_require_evaluation_imports(tmp_path: Path) -> None:
