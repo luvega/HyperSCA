@@ -1,0 +1,85 @@
+[importlinter]
+root_package = src
+
+[importlinter:contract:run-evidence-no-models]
+name = Run evidence core does not depend on model implementations
+type = forbidden
+source_modules =
+    src.evaluation.run_evidence_identity
+    src.evaluation.run_evidence_publisher
+    src.evaluation.run_evidence_collection
+forbidden_modules =
+    src.models
+
+[importlinter:contract:run-evidence-no-data]
+name = Run evidence core does not depend on data implementations
+type = forbidden
+source_modules =
+    src.evaluation.run_evidence_identity
+    src.evaluation.run_evidence_publisher
+    src.evaluation.run_evidence_collection
+forbidden_modules =
+    src.data
+
+[importlinter:contract:run-evidence-no-causal]
+name = Run evidence core does not depend on causal implementations
+type = forbidden
+source_modules =
+    src.evaluation.run_evidence_identity
+    src.evaluation.run_evidence_publisher
+    src.evaluation.run_evidence_collection
+forbidden_modules =
+    src.causal
+
+[importlinter:contract:run-evidence-no-discovery]
+name = Run evidence core does not depend on discovery policy
+type = forbidden
+source_modules =
+    src.evaluation.run_evidence_identity
+    src.evaluation.run_evidence_publisher
+    src.evaluation.run_evidence_collection
+forbidden_modules =
+    src.discovery
+
+[importlinter:contract:run-evidence-no-perturbation]
+name = Run evidence core does not depend on perturbation implementations
+type = forbidden
+source_modules =
+    src.evaluation.run_evidence_identity
+    src.evaluation.run_evidence_publisher
+    src.evaluation.run_evidence_collection
+forbidden_modules =
+    src.perturbation
+
+[importlinter:contract:run-evidence-no-orchestration]
+name = Run evidence core does not depend on orchestration or presentation
+type = forbidden
+source_modules =
+    src.evaluation.run_evidence_identity
+    src.evaluation.run_evidence_publisher
+    src.evaluation.run_evidence_collection
+forbidden_modules =
+    src.pipeline
+    src.behavior_grammar
+    src.visualization
+
+[importlinter:contract:run-evidence-no-benchmark-runners]
+name = Run evidence core does not depend on benchmark runners
+type = forbidden
+source_modules =
+    src.evaluation.run_evidence_identity
+    src.evaluation.run_evidence_publisher
+    src.evaluation.run_evidence_collection
+forbidden_modules =
+    src.evaluation.methods_pilot
+    src.evaluation.methods_causal_pilot
+    src.evaluation.task_c_method_run
+    src.evaluation.task_c_rehearsal
+
+[importlinter:contract:run-evidence-layers]
+name = Collection depends downward on publisher and immutable identity only
+type = layers
+layers =
+    src.evaluation.run_evidence_collection
+    src.evaluation.run_evidence_publisher
+    src.evaluation.run_evidence_identity
