@@ -30,6 +30,8 @@ MAXIMUM_GENE_NAMES = 4096
 MAXIMUM_COUNT = 10_000_000
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _GEO_ACCESSION = re.compile(r"GSE[1-9][0-9]*")
+_DNS_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*")
+_URI_PATH = re.compile(r"[A-Za-z0-9._~!$&'()*+,;=:@/\-]+")
 _RENAME_NOREPLACE = 1
 _AT_EMPTY_PATH = 0x1000
 _AT_FDCWD = -100
@@ -74,20 +76,23 @@ def _canonical_source_uri(accession: str, value: object) -> str:
         port = parsed.port
     except ValueError as exc:
         raise SpatialPerturbationRegistryError("source_uri is not a canonical HTTPS URI") from exc
+    hostname = parsed.hostname or ""
     if (
         parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.hostname.endswith(".")
+        or not hostname
+        or len(hostname) > 253
+        or _DNS_HOST.fullmatch(hostname) is None
         or parsed.username is not None
         or parsed.password is not None
         or port is not None
-        or parsed.netloc != parsed.hostname
+        or parsed.netloc != hostname
         or parsed.fragment
         or "%" in parsed.netloc
-        or "%" in parsed.hostname
+        or "%" in hostname
         or not parsed.path.startswith("/")
         or parsed.path == "/"
         or "%" in parsed.path
+        or _URI_PATH.fullmatch(parsed.path) is None
         or any(piece in ("", ".", "..") for piece in parsed.path.split("/")[1:])
     ):
         raise SpatialPerturbationRegistryError("source_uri is not a canonical HTTPS URI")
@@ -96,7 +101,7 @@ def _canonical_source_uri(accession: str, value: object) -> str:
     if begins_geo and not is_geo:
         raise SpatialPerturbationRegistryError("GEO accession must be uppercase canonical GSE text")
     is_geo_endpoint = (
-        parsed.hostname == "www.ncbi.nlm.nih.gov"
+        hostname == "www.ncbi.nlm.nih.gov"
         and parsed.path == "/geo/query/acc.cgi"
     )
     if is_geo:
