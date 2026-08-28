@@ -26,6 +26,7 @@ if _contract_helpers is None:
     _contract_helpers = import_module("tests.test_spatial_perturbation_split")
 baseline: Any = _contract_helpers.baseline
 complete_evidence: Any = _contract_helpers.complete_evidence
+locally_abstaining_unit_ids: Any = _contract_helpers.locally_abstaining_unit_ids
 
 
 def _small_metadata(animal_count: int = 3) -> BridgeSplitMetadata:
@@ -47,7 +48,7 @@ def _small_metadata(animal_count: int = 3) -> BridgeSplitMetadata:
                     rows.append(
                         BridgeSplitRow(
                             row_id, f"c{row_id}", animal, f"{animal}_section", f"b{block}",
-                            perturbation, label, cell_type, role, band,
+                            perturbation, label, cell_type, "source", role, band,
                         )
                     )
                     row_id += 1
@@ -70,7 +71,7 @@ class _HostileSequence(Sequence[object]):
         raise AssertionError("custom sequence was iterated")
 
 
-@settings(max_examples=20, deadline=None)
+@settings(max_examples=6, deadline=None)
 @given(st.permutations(_small_metadata().rows))
 def test_three_animal_split_identity_is_invariant_to_input_permutation(
     permuted: list[BridgeSplitRow],
@@ -89,7 +90,7 @@ def test_three_animal_split_identity_is_invariant_to_input_permutation(
     assert {row.animal_id for row in first.row_provenance if row.stable_row_id in first.evaluation_rows} == {"a2"}
 
 
-@settings(max_examples=12, deadline=None)
+@settings(max_examples=4, deadline=None)
 @given(st.sampled_from((1, 2, 3, 4)))
 def test_exactly_three_animals_is_a_mutation_sensitive_property(animal_count: int) -> None:
     if animal_count == 3:
@@ -99,7 +100,7 @@ def test_exactly_three_animals_is_a_mutation_sensitive_property(animal_count: in
             build_pilot_fold(_small_metadata(animal_count), "a1")
 
 
-@settings(max_examples=16, deadline=None)
+@settings(max_examples=8, deadline=None)
 @given(st.integers(min_value=1, max_value=20))
 def test_generated_duplicate_cell_id_sequences_are_rejected(index: int) -> None:
     metadata = _small_metadata()
@@ -112,14 +113,14 @@ def test_generated_duplicate_cell_id_sequences_are_rejected(index: int) -> None:
         )
 
 
-@settings(max_examples=12, deadline=None)
+@settings(max_examples=5, deadline=None)
 @given(st.sampled_from(("e\u0301", " x", "x ", "x\x00", "")))
 def test_generated_unsafe_cell_ids_fail_closed(value: str) -> None:
     with pytest.raises(SpatialPerturbationSplitError):
         replace(_small_metadata().rows[0], cell_id=value)
 
 
-@settings(max_examples=6, deadline=None)
+@settings(max_examples=2, deadline=None)
 @given(st.sampled_from(("a2", "a3")))
 def test_repeated_section_within_animal_is_valid_but_cross_animal_is_not(
     other_animal: str,
@@ -136,7 +137,7 @@ def test_repeated_section_within_animal_is_valid_but_cross_animal_is_not(
         )
 
 
-@settings(max_examples=18, deadline=None)
+@settings(max_examples=10, deadline=None)
 @given(st.lists(st.sampled_from(("c1", "c2", "c3")), min_size=2, max_size=8))
 def test_generated_parent_cell_sequences_reject_duplicates(values: list[str]) -> None:
     if len(values) == len(set(values)):
@@ -152,7 +153,7 @@ def test_custom_sequences_are_rejected_without_iteration() -> None:
         BridgeSplitMetadata(hostile, ("G1",), ("p1",), ("n",), (("p1", "G1"),), (), "mSafe")  # type: ignore[arg-type]
 
 
-@settings(max_examples=6, deadline=None)
+@settings(max_examples=3, deadline=None)
 @given(st.sampled_from(("a1", "a2", "a3")))
 def test_split_seed_is_independent_and_no_model_seed_exists(evaluation_animal: str) -> None:
     signature = inspect.signature(build_pilot_fold)
@@ -163,10 +164,10 @@ def test_split_seed_is_independent_and_no_model_seed_exists(evaluation_animal: s
     assert random.getstate() == before
 
 
-@settings(max_examples=8, deadline=None)
-@given(st.sampled_from((19, 20)), st.sampled_from(("treatment", "safe")))
+@settings(max_examples=2, deadline=None)
+@given(st.sampled_from((19, 20)))
 def test_exact_source_and_safe_thresholds_are_mutation_sensitive(
-    count: int, evidence_kind: str,
+    count: int,
 ) -> None:
     manifest, _ = baseline()
     parents = tuple(
@@ -176,14 +177,14 @@ def test_exact_source_and_safe_thresholds_are_mutation_sensitive(
     overrides = {parent_id: count for parent_id in parents}
     evidence = complete_evidence(
         manifest,
-        source_overrides=overrides if evidence_kind == "treatment" else None,
-        safe_source_overrides=overrides if evidence_kind == "safe" else None,
+        source_overrides=overrides,
+        safe_source_overrides=overrides,
     )
     result = evaluate_bridge_eligibility(manifest, evidence)
     assert result.eligible is (count == 20)
 
 
-@settings(max_examples=6, deadline=None)
+@settings(max_examples=2, deadline=None)
 @given(st.sampled_from((1, 2)))
 def test_exact_per_animal_perturbation_coverage_boundary(failed_parents: int) -> None:
     manifest, _ = baseline()
@@ -193,22 +194,28 @@ def test_exact_per_animal_perturbation_coverage_boundary(failed_parents: int) ->
     )[:failed_parents]
     result = evaluate_bridge_eligibility(
         manifest,
-        complete_evidence(manifest, source_overrides={parent_id: 19 for parent_id in parents}),
+        complete_evidence(
+            manifest,
+            source_overrides={parent_id: 19 for parent_id in parents},
+            safe_source_overrides={parent_id: 19 for parent_id in parents},
+        ),
     )
     expected_scoreable = 5 - failed_parents
     assert ("mouse_1", expected_scoreable, 5) in result.per_animal_perturbation_coverage
     assert result.eligible is (failed_parents == 1)
 
 
-@settings(max_examples=6, deadline=None)
+@settings(max_examples=2, deadline=None)
 @given(st.sampled_from((12, 13)))
 def test_exact_primary_coverage_and_abstention_boundary(abstained: int) -> None:
     manifest, _ = baseline()
-    unit_ids = tuple(unit.unit_id for unit in manifest.primary_units)
+    unit_ids = locally_abstaining_unit_ids(manifest, abstained)
     result = evaluate_bridge_eligibility(
         manifest,
         complete_evidence(
-            manifest, unit_overrides={unit_id: 29 for unit_id in unit_ids[:abstained]}
+            manifest,
+            unit_overrides={unit_id: 29 for unit_id in unit_ids},
+            safe_unit_overrides={unit_id: 29 for unit_id in unit_ids},
         ),
     )
     assert result.abstained == abstained

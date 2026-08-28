@@ -8,6 +8,7 @@ standalone frozen-unit digest.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from fractions import Fraction
@@ -148,6 +149,7 @@ class BridgeSplitRow:
     context_perturbation_id: str
     observed_label: str
     cell_type: str
+    source_cell_type: str
     cell_role: str
     distance_band: str
 
@@ -158,7 +160,7 @@ class BridgeSplitRow:
         for name in (
             "cell_id", "animal_id", "section_id", "spatial_block",
             "context_perturbation_id", "observed_label", "cell_type",
-            "cell_role", "distance_band",
+            "source_cell_type", "cell_role", "distance_band",
         ):
             object.__setattr__(self, name, _safe_text(getattr(self, name), name))
         if self.cell_role not in _ROLES:
@@ -167,6 +169,10 @@ class BridgeSplitRow:
         if self.cell_role.endswith("source"):
             if self.distance_band != "own":
                 raise SpatialPerturbationSplitError("source rows must use the own band")
+            if self.source_cell_type != self.cell_type:
+                raise SpatialPerturbationSplitError(
+                    "source rows must bind source_cell_type to their cell_type"
+                )
         elif self.distance_band not in bands:
             raise SpatialPerturbationSplitError("neighbour rows must use a primary band")
 
@@ -177,14 +183,14 @@ def _row_from(value: object, name: str) -> BridgeSplitRow:
         return BridgeSplitRow(
             row.stable_row_id, row.cell_id, row.animal_id, row.section_id,
             row.spatial_block, row.context_perturbation_id, row.observed_label,
-            row.cell_type, row.cell_role, row.distance_band,
+            row.cell_type, row.source_cell_type, row.cell_role, row.distance_band,
         )
     if type(value) is dict:
         raw = cast(dict[object, object], value)
         expected = {
             "stable_row_id", "cell_id", "animal_id", "section_id", "spatial_block",
             "context_perturbation_id", "observed_label", "cell_type", "cell_role",
-            "distance_band",
+            "source_cell_type", "distance_band",
         }
         if set(raw) != expected:
             raise SpatialPerturbationSplitError(f"{name} has unexpected fields")
@@ -443,6 +449,7 @@ def _row_mapping(row: BridgeSplitRow) -> dict[str, object]:
         "spatial_block": item.spatial_block,
         "context_perturbation_id": item.context_perturbation_id,
         "observed_label": item.observed_label, "cell_type": item.cell_type,
+        "source_cell_type": item.source_cell_type,
         "cell_role": item.cell_role, "distance_band": item.distance_band,
     }
 
@@ -901,22 +908,65 @@ def _block_key(row: BridgeSplitRow) -> tuple[str, str, str]:
     return (row.animal_id, row.section_id, row.spatial_block)
 
 
-def _non_adjacent_block_count(
-    rows: tuple[BridgeSplitRow, ...], manifest: BridgeSplitManifest
-) -> int:
-    blocks = {_block_key(row) for row in rows}
-    adjacent = {
-        (
-            (item.animal_id, item.section_id, item.first_block),
-            (item.animal_id, item.section_id, item.second_block),
+def _adjacent_block_pairs(
+    manifest: BridgeSplitManifest,
+) -> set[frozenset[tuple[str, str, str]]]:
+    return {
+        frozenset(
+            (
+                (item.animal_id, item.section_id, item.first_block),
+                (item.animal_id, item.section_id, item.second_block),
+            )
         )
         for item in manifest.block_adjacency
     }
-    for first, second in itertools.combinations(sorted(blocks), 2):
-        pair = tuple(sorted((first, second)))
-        if pair in adjacent:
-            return 0
-    return len(blocks)
+
+
+def _has_non_adjacent_block_subset(
+    rows: tuple[BridgeSplitRow, ...],
+    manifest: BridgeSplitManifest,
+    minimum: int,
+) -> bool:
+    blocks = tuple(sorted({_block_key(row) for row in rows}))
+    if len(blocks) < minimum:
+        return False
+    adjacent = _adjacent_block_pairs(manifest)
+    return any(
+        all(frozenset(pair) not in adjacent for pair in itertools.combinations(candidate, 2))
+        for candidate in itertools.combinations(blocks, minimum)
+    )
+
+
+def _distinct_block_count(rows: tuple[BridgeSplitRow, ...]) -> int:
+    return len({_block_key(row) for row in rows})
+
+
+def _source_strata(
+    rows: tuple[BridgeSplitRow, ...],
+) -> Counter[tuple[str, str, str]]:
+    return Counter(
+        (
+            row.section_id,
+            row.spatial_block,
+            row.source_cell_type,
+        )
+        for row in rows
+    )
+
+
+def _neighbour_strata(
+    rows: tuple[BridgeSplitRow, ...],
+) -> Counter[tuple[str, str, str, str, str]]:
+    return Counter(
+        (
+            row.section_id,
+            row.spatial_block,
+            row.source_cell_type,
+            row.cell_type,
+            row.distance_band,
+        )
+        for row in rows
+    )
 
 
 def _resolve_rows(
@@ -950,10 +1000,6 @@ def _require_rows(
         raise SpatialPerturbationSplitError(
             "evidence cell does not match expected animal/context/role/type/band"
         )
-
-
-def _strata(rows: tuple[BridgeSplitRow, ...]) -> set[tuple[str, str]]:
-    return {(row.section_id, row.cell_type) for row in rows}
 
 
 @dataclass(frozen=True, slots=True)
@@ -995,6 +1041,16 @@ def _derive_eligibility(
     minimum_band = cast(int, _science()["minimum_band_neighbours"])
     minimum_cell_type = cast(int, _science()["minimum_cell_type_neighbours"])
     minimum_blocks = cast(int, _science()["minimum_spatial_blocks"])
+    frozen_source_strata = {
+        context: {
+            (row.section_id, row.source_cell_type)
+            for row in manifest.row_provenance
+            if row.animal_id == context[0]
+            and row.context_perturbation_id == context[1]
+            and row.cell_role == "perturbation_source"
+        }
+        for context in frozen_parent_by_context
+    }
     parent_failures: dict[tuple[str, str], set[str]] = {}
     for context, frozen in frozen_parent_by_context.items():
         item = evidence_parent_by_context[context]
@@ -1008,21 +1064,24 @@ def _derive_eligibility(
             safe, animal=frozen.animal_id, perturbation=frozen.perturbation_id,
             role="safe_source", label=manifest.safe_control_label, band="own",
         )
-        if treatment and safe and _strata(treatment) != _strata(safe):
-            raise SpatialPerturbationSplitError("safe source controls do not match section/source-cell-type strata")
+        if _source_strata(treatment) != _source_strata(safe):
+            raise SpatialPerturbationSplitError(
+                "safe source controls do not match the frozen stratum multiset"
+            )
         failures: set[str] = set()
         if len(treatment) < minimum_source:
             failures.add("insufficient_perturbation_coverage")
         if len(safe) < minimum_safe_source:
             failures.add("insufficient_safe_control_coverage")
-        if _non_adjacent_block_count(treatment, manifest) < minimum_blocks:
+        if not _has_non_adjacent_block_subset(treatment, manifest, minimum_blocks):
             failures.add("insufficient_spatial_blocks")
-        if _non_adjacent_block_count(safe, manifest) < minimum_blocks:
+        if _distinct_block_count(safe) < minimum_blocks:
             failures.add("insufficient_safe_control_spatial_blocks")
         if frozen.target_gene not in manifest.gene_names:
             failures.add("target_gene_not_measurable")
         parent_failures[context] = failures
     unit_scoreable: dict[str, bool] = {}
+    unit_failures: dict[str, set[str]] = {}
     unit_rows: dict[str, tuple[tuple[BridgeSplitRow, ...], tuple[BridgeSplitRow, ...]]] = {}
     for unit_id, frozen_unit in frozen_unit_by_id.items():
         unit_evidence = evidence_unit_by_id[unit_id]
@@ -1038,15 +1097,31 @@ def _derive_eligibility(
             role="safe_neighbour", label="unperturbed",
             cell_type=frozen_unit.neighbour_cell_type, band=frozen_unit.band,
         )
-        if treatment and safe and _strata(treatment) != _strata(safe):
-            raise SpatialPerturbationSplitError("matched safe neighbours do not match section/cell-type strata")
-        local_scoreable = (
-            len(treatment) >= minimum_cell_type
-            and len(safe) >= minimum_cell_type
-            and _non_adjacent_block_count(treatment, manifest) >= minimum_blocks
-            and _non_adjacent_block_count(safe, manifest) >= minimum_blocks
-        )
-        unit_scoreable[unit_id] = local_scoreable
+        if _neighbour_strata(treatment) != _neighbour_strata(safe):
+            raise SpatialPerturbationSplitError(
+                "matched safe neighbours do not match the frozen stratum multiset"
+            )
+        source_strata = frozen_source_strata[
+            (frozen_unit.animal_id, frozen_unit.perturbation_id)
+        ]
+        if any(
+            (row.section_id, row.source_cell_type) not in source_strata
+            for row in treatment + safe
+        ):
+            raise SpatialPerturbationSplitError(
+                "neighbour source_cell_type is not frozen by its perturbation parent"
+            )
+        unit_local_failures: set[str] = set()
+        if len(treatment) < minimum_cell_type:
+            unit_local_failures.add("insufficient_band_neighbours")
+        if len(safe) < minimum_cell_type:
+            unit_local_failures.add("insufficient_safe_control_band_neighbours")
+        if _distinct_block_count(treatment) < minimum_blocks:
+            unit_local_failures.add("insufficient_spatial_blocks")
+        if _distinct_block_count(safe) < minimum_blocks:
+            unit_local_failures.add("insufficient_safe_control_spatial_blocks")
+        unit_failures[unit_id] = unit_local_failures
+        unit_scoreable[unit_id] = not unit_local_failures
         unit_rows[unit_id] = (treatment, safe)
     bands = cast(tuple[str, str], _science()["primary_bands"])
     for context in frozen_parent_by_context:
@@ -1064,10 +1139,9 @@ def _derive_eligibility(
                 parent_failures[context].add("insufficient_band_neighbours")
             if len({row.cell_id for row in safe}) < minimum_band:
                 parent_failures[context].add("insufficient_safe_control_band_neighbours")
-            if _non_adjacent_block_count(treatment, manifest) < minimum_blocks:
-                parent_failures[context].add("insufficient_spatial_blocks")
-            if _non_adjacent_block_count(safe, manifest) < minimum_blocks:
-                parent_failures[context].add("insufficient_safe_control_spatial_blocks")
+            if not any(unit_scoreable[unit_id] for unit_id in unit_ids):
+                for unit_id in unit_ids:
+                    parent_failures[context].update(unit_failures[unit_id])
     parent_scoreable = {
         context: not failures for context, failures in parent_failures.items()
     }
@@ -1197,9 +1271,14 @@ class BridgeEligibilityResult:
 def evaluate_bridge_eligibility(
     manifest: BridgeSplitManifest, evidence: BridgeEligibilityEvidence
 ) -> BridgeEligibilityResult:
-    manifest_snapshot = _snapshot_manifest(manifest)
-    evidence_snapshot = _snapshot_evidence(evidence)
-    derived = _derive_eligibility(manifest_snapshot, evidence_snapshot)
+    if type(manifest) is not BridgeSplitManifest:
+        raise SpatialPerturbationSplitError("manifest must be BridgeSplitManifest")
+    if type(evidence) is not BridgeEligibilityEvidence:
+        raise SpatialPerturbationSplitError("evidence must be BridgeEligibilityEvidence")
+    # BridgeEligibilityResult takes and revalidates the defensive snapshots.  Derive
+    # the constructor values from the supplied immutable records first so the public
+    # path never holds two complete row-provenance snapshots simultaneously.
+    derived = _derive_eligibility(manifest, evidence)
     unsigned: dict[str, object] = {
         "eligible": not derived.reasons,
         "reason": derived.reasons[0] if derived.reasons else None,
@@ -1209,13 +1288,13 @@ def evaluate_bridge_eligibility(
         "per_animal_perturbation_coverage": [list(item) for item in derived.per_animal_perturbation_coverage],
         "primary_scoreable": derived.primary_scoreable, "primary_total": derived.primary_total,
         "abstained": derived.abstained, "attempted": derived.attempted,
-        "manifest": manifest_snapshot, "evidence": evidence_snapshot,
+        "manifest": manifest, "evidence": evidence,
     }
     identity_mapping = {
         key: value for key, value in unsigned.items() if key not in {"manifest", "evidence"}
     }
-    identity_mapping["split_identity_sha256"] = manifest_snapshot.split_identity_sha256
-    identity_mapping["evidence_identity_sha256"] = evidence_snapshot.evidence_identity_sha256
+    identity_mapping["split_identity_sha256"] = manifest.split_identity_sha256
+    identity_mapping["evidence_identity_sha256"] = evidence.evidence_identity_sha256
     return BridgeEligibilityResult(
         **unsigned, eligibility_identity_sha256=_identity(identity_mapping)  # type: ignore[arg-type]
     )

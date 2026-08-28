@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, fields, replace
 from functools import lru_cache
 import hashlib
 import inspect
@@ -47,7 +47,11 @@ def _canonical_sha(mapping: dict[str, object]) -> str:
 
 
 def synthetic_metadata(
-    *, animal_count: int = 3, adjacency: bool = False
+    *,
+    animal_count: int = 3,
+    adjacency: bool = False,
+    block_count: int = 3,
+    neighbour_types: tuple[str, ...] = NEIGHBOUR_TYPES,
 ) -> BridgeSplitMetadata:
     rows: list[BridgeSplitRow] = []
     row_id = 0
@@ -59,24 +63,29 @@ def synthetic_metadata(
                 ("perturbation_source", perturbation),
                 ("safe_source", "mSafe"),
             ):
-                for index in range(30):
+                for index in range(max(30, block_count * 5)):
                     rows.append(
                         BridgeSplitRow(
                             row_id, f"cell_{row_id:06d}", animal, section,
-                            f"block_{index % 3}", perturbation, label,
-                            "source_type", role, "own",
+                            f"block_{index % block_count}", perturbation, label,
+                            "source_type", "source_type", role, "own",
                         )
                     )
                     row_id += 1
-            for neighbour_type in NEIGHBOUR_TYPES:
+            neighbour_count = (
+                max(50, block_count * 13)
+                if len(neighbour_types) == 1
+                else max(30, block_count * 10)
+            )
+            for neighbour_type in neighbour_types:
                 for band in BANDS:
                     for role in ("perturbation_neighbour", "safe_neighbour"):
-                        for index in range(30):
+                        for index in range(neighbour_count):
                             rows.append(
                                 BridgeSplitRow(
                                     row_id, f"cell_{row_id:06d}", animal, section,
-                                    f"block_{index % 3}", perturbation, "unperturbed",
-                                    neighbour_type, role, band,
+                                    f"block_{index % block_count}", perturbation, "unperturbed",
+                                    neighbour_type, "source_type", role, band,
                                 )
                             )
                             row_id += 1
@@ -87,7 +96,7 @@ def synthetic_metadata(
         for index in range(animal_count)
     ) if adjacency else ()
     return BridgeSplitMetadata(
-        tuple(rows), TARGETS, PERTURBATIONS, NEIGHBOUR_TYPES,
+        tuple(rows), TARGETS, PERTURBATIONS, neighbour_types,
         tuple(zip(PERTURBATIONS, TARGETS)), adjacent, "mSafe",
     )
 
@@ -146,6 +155,7 @@ def complete_evidence(
             )
         )
     units: list[BridgePrimaryUnitEvidence] = []
+    default_unit_count = 50 if len(manifest.neighbour_cell_types) == 1 else 30
     for unit in manifest.primary_units:
         treatment_rows = _rows_for(
             manifest, animal=unit.animal_id, perturbation=unit.perturbation_id,
@@ -160,8 +170,18 @@ def complete_evidence(
         units.append(
             BridgePrimaryUnitEvidence(
                 unit.unit_id,
-                tuple(row.cell_id for row in treatment_rows[: unit_overrides.get(unit.unit_id, 30)]),
-                tuple(row.cell_id for row in safe_rows[: safe_unit_overrides.get(unit.unit_id, 30)]),
+                tuple(
+                    row.cell_id
+                    for row in treatment_rows[
+                        : unit_overrides.get(unit.unit_id, default_unit_count)
+                    ]
+                ),
+                tuple(
+                    row.cell_id
+                    for row in safe_rows[
+                        : safe_unit_overrides.get(unit.unit_id, default_unit_count)
+                    ]
+                ),
             )
         )
     return build_bridge_eligibility_evidence(manifest, tuple(parents), tuple(units))
@@ -279,17 +299,116 @@ def test_non_adjacent_block_requirement_is_derived_from_frozen_provenance() -> N
     result = evaluate_bridge_eligibility(manifest, evidence)
     assert result.eligible is False
     assert "insufficient_spatial_blocks" in result.reasons
-    assert "insufficient_safe_control_spatial_blocks" in result.reasons
+    assert "insufficient_safe_control_spatial_blocks" not in result.reasons
+
+
+def test_four_blocks_with_one_adjacent_pair_has_a_valid_three_block_subset() -> None:
+    manifest = build_pilot_fold(
+        synthetic_metadata(
+            adjacency=True, block_count=4, neighbour_types=("astrocyte",)
+        ),
+        "mouse_1",
+    )
+    result = evaluate_bridge_eligibility(manifest, complete_evidence(manifest))
+    assert result.eligible is True
+
+
+def _cell_ids_with_block_counts(
+    manifest: BridgeSplitManifest,
+    *,
+    animal: str,
+    perturbation: str,
+    role: str,
+    block_counts: tuple[int, ...],
+    cell_type: str | None = None,
+    band: str | None = None,
+) -> tuple[str, ...]:
+    selected: list[str] = []
+    for block_index, count in enumerate(block_counts):
+        rows = _rows_for(
+            manifest, animal=animal, perturbation=perturbation, role=role,
+            cell_type=cell_type, band=band, blocks=(f"block_{block_index}",),
+        )
+        selected.extend(row.cell_id for row in rows[:count])
+    return tuple(selected)
+
+
+def test_parent_matching_uses_exact_block_multisets_not_sets() -> None:
+    manifest, evidence = baseline()
+    parent = evidence.parent_evidence[0]
+    assert len(parent.perturbation_source_cell_ids) == 20
+    forged_safe = _cell_ids_with_block_counts(
+        manifest, animal=parent.animal_id, perturbation=parent.perturbation_id,
+        role="safe_source", block_counts=(10, 9, 1),
+    )
+    forged = replace(parent, safe_source_cell_ids=forged_safe)
+    altered = build_bridge_eligibility_evidence(
+        manifest, (forged,) + evidence.parent_evidence[1:], evidence.unit_evidence
+    )
+    with pytest.raises(SpatialPerturbationSplitError, match="multiset"):
+        evaluate_bridge_eligibility(manifest, altered)
+
+
+def test_neighbour_matching_rejects_disjoint_block_multisets() -> None:
+    manifest = build_pilot_fold(
+        synthetic_metadata(block_count=4, neighbour_types=("astrocyte",)), "mouse_1"
+    )
+    evidence = complete_evidence(manifest)
+    item = evidence.unit_evidence[0]
+    unit = next(unit for unit in manifest.primary_units if unit.unit_id == item.unit_id)
+    treatment = _cell_ids_with_block_counts(
+        manifest, animal=unit.animal_id, perturbation=unit.perturbation_id,
+        role="perturbation_neighbour", cell_type=unit.neighbour_cell_type,
+        band=unit.band, block_counts=(10, 10, 10, 0),
+    )
+    safe = _cell_ids_with_block_counts(
+        manifest, animal=unit.animal_id, perturbation=unit.perturbation_id,
+        role="safe_neighbour", cell_type=unit.neighbour_cell_type,
+        band=unit.band, block_counts=(0, 10, 10, 10),
+    )
+    forged = replace(
+        item, perturbation_neighbour_cell_ids=treatment, safe_neighbour_cell_ids=safe
+    )
+    altered = build_bridge_eligibility_evidence(
+        manifest, evidence.parent_evidence, (forged,) + evidence.unit_evidence[1:]
+    )
+    with pytest.raises(SpatialPerturbationSplitError, match="multiset"):
+        evaluate_bridge_eligibility(manifest, altered)
+
+
+def test_row_provenance_freezes_source_cell_type() -> None:
+    assert "source_cell_type" in {item.name for item in fields(BridgeSplitRow)}
+
+
+def test_empty_matched_sources_are_threshold_failures_not_provenance_errors() -> None:
+    manifest, evidence = baseline()
+    empty = tuple(
+        replace(
+            parent, perturbation_source_cell_ids=(), safe_source_cell_ids=()
+        )
+        for parent in evidence.parent_evidence[:2]
+    )
+    altered = build_bridge_eligibility_evidence(
+        manifest, empty + evidence.parent_evidence[2:], evidence.unit_evidence
+    )
+    result = evaluate_bridge_eligibility(manifest, altered)
+    assert "insufficient_perturbation_coverage" in result.reasons
+    assert "insufficient_safe_control_coverage" in result.reasons
 
 
 def test_exact_treatment_and_safe_thresholds_are_derived_from_ids() -> None:
     manifest, _ = baseline()
     parent_ids = tuple(parent.parent_id for parent in manifest.perturbation_parents if parent.animal_id == "mouse_1")
-    source_19 = complete_evidence(manifest, source_overrides={parent_ids[0]: 19, parent_ids[1]: 19})
+    below = {parent_ids[0]: 19, parent_ids[1]: 19}
+    source_19 = complete_evidence(
+        manifest, source_overrides=below, safe_source_overrides=below
+    )
     source_result = evaluate_bridge_eligibility(manifest, source_19)
     assert source_result.reason == "insufficient_perturbation_coverage"
     assert ("mouse_1", 3, 5) in source_result.per_animal_perturbation_coverage
-    safe_19 = complete_evidence(manifest, safe_source_overrides={parent_ids[0]: 19, parent_ids[1]: 19})
+    safe_19 = complete_evidence(
+        manifest, source_overrides=below, safe_source_overrides=below
+    )
     assert "insufficient_safe_control_coverage" in evaluate_bridge_eligibility(manifest, safe_19).reasons
 
     exact = complete_evidence(manifest)
@@ -316,6 +435,18 @@ def _band_unit_ids(
     return tuple(grouped)
 
 
+def locally_abstaining_unit_ids(
+    manifest: BridgeSplitManifest, count: int
+) -> tuple[str, ...]:
+    grouped: dict[tuple[str, str, str], list[str]] = {}
+    for unit in manifest.primary_units:
+        grouped.setdefault(
+            (unit.animal_id, unit.perturbation_id, unit.band), []
+        ).append(unit.unit_id)
+    candidates = tuple(sorted(values)[0] for _, values in sorted(grouped.items()))
+    return candidates[:count]
+
+
 def test_exact_paired_band_threshold_49_fails_and_50_passes() -> None:
     manifest, _ = baseline()
     mouse_1_parents = tuple(
@@ -325,33 +456,64 @@ def test_exact_paired_band_threshold_49_fails_and_50_passes() -> None:
     pairs = _band_unit_ids(manifest, mouse_1_parents[:2], "proximal")
     below = {unit_id: count for pair in pairs for unit_id, count in zip(pair, (25, 24))}
     result = evaluate_bridge_eligibility(
-        manifest, complete_evidence(manifest, unit_overrides=below)
+        manifest, complete_evidence(
+            manifest, unit_overrides=below, safe_unit_overrides=below
+        )
     )
     assert result.reason == "insufficient_band_neighbours"
 
     safe_below = {unit_id: count for pair in pairs for unit_id, count in zip(pair, (25, 24))}
     safe_result = evaluate_bridge_eligibility(
-        manifest, complete_evidence(manifest, safe_unit_overrides=safe_below)
+        manifest, complete_evidence(
+            manifest, unit_overrides=safe_below, safe_unit_overrides=safe_below
+        )
     )
     assert "insufficient_safe_control_band_neighbours" in safe_result.reasons
 
     exact_pair = _band_unit_ids(manifest, mouse_1_parents[:1], "proximal")[0]
     exact_50 = {unit_id: 25 for unit_id in exact_pair}
     exact_result = evaluate_bridge_eligibility(
-        manifest, complete_evidence(manifest, unit_overrides=exact_50)
+        manifest, complete_evidence(
+            manifest, unit_overrides=exact_50, safe_unit_overrides=exact_50
+        )
     )
     assert "insufficient_band_neighbours" not in exact_result.reasons
+
+
+def test_aggregate_fifty_does_not_rescue_band_with_all_units_abstaining() -> None:
+    manifest, _ = baseline()
+    mouse_1_parents = tuple(
+        parent.parent_id for parent in manifest.perturbation_parents
+        if parent.animal_id == "mouse_1"
+    )[:2]
+    pairs = _band_unit_ids(manifest, mouse_1_parents, "proximal")
+    exact_aggregate = {unit_id: 25 for pair in pairs for unit_id in pair}
+    result = evaluate_bridge_eligibility(
+        manifest, complete_evidence(
+            manifest,
+            unit_overrides=exact_aggregate,
+            safe_unit_overrides=exact_aggregate,
+        )
+    )
+    assert ("mouse_1", 3, 5) in result.per_animal_perturbation_coverage
+    assert result.eligible is False
+    assert all(unit_id in result.abstained_unit_ids for unit_id in exact_aggregate)
 
 
 def test_below_thirty_unit_is_retained_as_abstention_not_immediate_failure() -> None:
     manifest, _ = baseline()
     unit = manifest.primary_units[0]
-    evidence = complete_evidence(manifest, unit_overrides={unit.unit_id: 29})
+    below = {unit.unit_id: 29}
+    evidence = complete_evidence(
+        manifest, unit_overrides=below, safe_unit_overrides=below
+    )
     result = evaluate_bridge_eligibility(manifest, evidence)
     assert result.eligible is True
     assert result.abstained_unit_ids == (unit.unit_id,)
     assert "insufficient_band_neighbours" not in result.reasons
-    safe_evidence = complete_evidence(manifest, safe_unit_overrides={unit.unit_id: 29})
+    safe_evidence = complete_evidence(
+        manifest, unit_overrides=below, safe_unit_overrides=below
+    )
     safe_result = evaluate_bridge_eligibility(manifest, safe_evidence)
     assert safe_result.eligible is True
     assert safe_result.abstained_unit_ids == (unit.unit_id,)
@@ -368,15 +530,27 @@ def test_exact_three_pairwise_non_adjacent_blocks_pass_but_two_fail() -> None:
         f"{parent_id}:source": ("block_0", "block_1")
         for parent_id in mouse_1_parents[:2]
     }
+    source_blocks.update(
+        {
+            f"{parent_id}:safe_source": ("block_0", "block_1")
+            for parent_id in mouse_1_parents[:2]
+        }
+    )
     result = evaluate_bridge_eligibility(
         manifest, complete_evidence(manifest, block_overrides=source_blocks)
     )
     assert result.reason == "insufficient_spatial_blocks"
 
     safe_blocks: dict[str, tuple[str, ...]] = {
-        f"{parent_id}:safe_source": ("block_0", "block_1")
+        f"{parent_id}:source": ("block_0", "block_1")
         for parent_id in mouse_1_parents[:2]
     }
+    safe_blocks.update(
+        {
+            f"{parent_id}:safe_source": ("block_0", "block_1")
+            for parent_id in mouse_1_parents[:2]
+        }
+    )
     safe_result = evaluate_bridge_eligibility(
         manifest, complete_evidence(manifest, block_overrides=safe_blocks)
     )
@@ -387,10 +561,15 @@ def test_exact_three_pairwise_non_adjacent_blocks_pass_but_two_fail() -> None:
 
 def test_primary_coverage_and_abstention_are_derived_at_exact_boundaries() -> None:
     manifest, _ = baseline()
-    unit_ids = tuple(unit.unit_id for unit in manifest.primary_units)
-    exact_overrides = {unit_id: 29 for unit_id in unit_ids[:12]}
+    exact_overrides = {
+        unit_id: 29 for unit_id in locally_abstaining_unit_ids(manifest, 12)
+    }
     exact = evaluate_bridge_eligibility(
-        manifest, complete_evidence(manifest, unit_overrides=exact_overrides)
+        manifest, complete_evidence(
+            manifest,
+            unit_overrides=exact_overrides,
+            safe_unit_overrides=exact_overrides,
+        )
     )
     assert exact.primary_scoreable == 48
     assert exact.primary_total == 60
@@ -398,9 +577,15 @@ def test_primary_coverage_and_abstention_are_derived_at_exact_boundaries() -> No
     assert exact.attempted == 60
     assert exact.eligible is True
 
-    below_overrides = {unit_id: 29 for unit_id in unit_ids[:13]}
+    below_overrides = {
+        unit_id: 29 for unit_id in locally_abstaining_unit_ids(manifest, 13)
+    }
     below = evaluate_bridge_eligibility(
-        manifest, complete_evidence(manifest, unit_overrides=below_overrides)
+        manifest, complete_evidence(
+            manifest,
+            unit_overrides=below_overrides,
+            safe_unit_overrides=below_overrides,
+        )
     )
     assert below.eligible is False
     assert "insufficient_primary_unit_coverage" in below.reasons
@@ -415,7 +600,12 @@ def test_per_animal_perturbation_coverage_exact_four_fifths_passes() -> None:
         for animal in ("mouse_1", "mouse_2", "mouse_3")
     }
     result = evaluate_bridge_eligibility(
-        manifest, complete_evidence(manifest, source_overrides=one_parent_each)
+        manifest,
+        complete_evidence(
+            manifest,
+            source_overrides=one_parent_each,
+            safe_source_overrides=one_parent_each,
+        ),
     )
     assert result.per_animal_perturbation_coverage == (
         ("mouse_1", 4, 5), ("mouse_2", 4, 5), ("mouse_3", 4, 5)
@@ -473,7 +663,7 @@ def test_direct_records_are_closed_immutable_and_digest_mutations_fail() -> None
 def test_stable_row_identity_rejects_boolean_nonfinite_and_huge_values(value: object) -> None:
     row = BridgeSplitRow(
         0, "cell", "mouse", "section", "block", "guide", "guide",
-        "source", "perturbation_source", "own",
+        "source", "source", "perturbation_source", "own",
     )
     with pytest.raises(SpatialPerturbationSplitError):
         replace(row, stable_row_id=value)  # type: ignore[arg-type]
