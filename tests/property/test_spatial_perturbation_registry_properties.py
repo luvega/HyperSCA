@@ -17,11 +17,11 @@ from src.evaluation.spatial_perturbation_registry import (
 )
 
 
-def _candidate() -> BridgeCandidate:
+def _candidate(specimens: int = 5) -> BridgeCandidate:
+    ids = tuple(f"s{index}" for index in range(1, specimens + 1))
     return BridgeCandidate(
-        "candidate", "GSE1", "spatial", ("s1", "s2", "s3", "s4", "s5"),
-        (("s1", ("s1_sec",)), ("s2", ("s2_sec",)), ("s3", ("s3_sec",)),
-         ("s4", ("s4_sec",)), ("s5", ("s5_sec",))),
+        "candidate", "GSE1", "spatial", ids,
+        tuple((value, (f"{value}_sec",)) for value in ids),
         "mSafe", ("p1",), "https://example.test/GSE1", "a" * 64,
     )
 
@@ -58,7 +58,7 @@ class _ExplodingSequence(Sequence[object]):
 @settings(max_examples=12, deadline=None)
 @given(st.sampled_from((4, 5)), st.sampled_from((1, 2)))
 def test_exact_specimen_and_cohort_thresholds(specimens: int, cohorts: int) -> None:
-    result = audit_bridge_capability(_candidate(), _summary(specimens, cohorts))
+    result = audit_bridge_capability(_candidate(specimens), _summary(specimens, cohorts))
     assert result.confirmatory_capable is (specimens >= 5 and cohorts >= 2)
 
 
