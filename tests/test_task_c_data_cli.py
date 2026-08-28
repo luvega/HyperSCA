@@ -107,7 +107,10 @@ def test_task7_and_task8_use_only_versioned_export_and_prepared_directories():
         task7_and_later.index("scripts/bootstrap_task_c_methods.py")
         < task7_and_later.index("scripts/export_causalbench_data.py")
     )
-    assert '--method-assets-root "$TASK_C_DATA_ROOT/method_assets"' in task7_and_later
+    assert (
+        '--method-assets-root "$TASK_C_DATA_ROOT/method_assets_v2"'
+        in task7_and_later
+    )
 
 
 def test_formal_export_requires_an_independent_acquisition_manifest(tmp_path):
