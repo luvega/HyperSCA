@@ -30,32 +30,7 @@ locally_abstaining_unit_ids: Any = _contract_helpers.locally_abstaining_unit_ids
 
 
 def _small_metadata(animal_count: int = 3) -> BridgeSplitMetadata:
-    rows: list[BridgeSplitRow] = []
-    row_id = 0
-    for animal_index in range(animal_count):
-        animal = f"a{animal_index + 1}"
-        for perturbation_index in range(5):
-            perturbation = f"p{perturbation_index}"
-            for block in range(3):
-                for role, label, cell_type, band in (
-                    ("perturbation_source", perturbation, "source", "own"),
-                    ("safe_source", "mSafe", "source", "own"),
-                    ("perturbation_neighbour", "unperturbed", "neighbour", "proximal"),
-                    ("safe_neighbour", "unperturbed", "neighbour", "proximal"),
-                    ("perturbation_neighbour", "unperturbed", "neighbour", "local"),
-                    ("safe_neighbour", "unperturbed", "neighbour", "local"),
-                ):
-                    rows.append(
-                        BridgeSplitRow(
-                            row_id, f"c{row_id}", animal, f"{animal}_section", f"b{block}",
-                            perturbation, label, cell_type, "source", role, band,
-                        )
-                    )
-                    row_id += 1
-    return BridgeSplitMetadata(
-        tuple(rows), tuple(f"G{i}" for i in range(5)), tuple(f"p{i}" for i in range(5)),
-        ("neighbour",), tuple((f"p{i}", f"G{i}") for i in range(5)), (), "mSafe",
-    )
+    return _contract_helpers.synthetic_metadata(animal_count=animal_count)
 
 
 class _HostileSequence(Sequence[object]):
@@ -72,32 +47,42 @@ class _HostileSequence(Sequence[object]):
 
 
 @settings(max_examples=6, deadline=None)
-@given(st.permutations(_small_metadata().rows))
+@given(st.integers(min_value=0, max_value=5))
 def test_three_animal_split_identity_is_invariant_to_input_permutation(
-    permuted: list[BridgeSplitRow],
+    rotation: int,
 ) -> None:
     metadata = _small_metadata()
-    first = build_pilot_fold(metadata, "a2")
+    offset = rotation % len(metadata.rows)
+    permuted = metadata.rows[offset:] + metadata.rows[:offset]
+    relation_offset = rotation % len(metadata.neighbour_relations)
+    permuted_relations = (
+        metadata.neighbour_relations[relation_offset:]
+        + metadata.neighbour_relations[:relation_offset]
+    )
+    first = build_pilot_fold(metadata, "mouse_2")
     second = build_pilot_fold(
         BridgeSplitMetadata(
             tuple(permuted), tuple(reversed(metadata.gene_names)),
             tuple(reversed(metadata.perturbations)), tuple(reversed(metadata.neighbour_cell_types)),
-            tuple(reversed(metadata.perturbation_targets)), (), "mSafe",
+            tuple(reversed(metadata.perturbation_targets)),
+            tuple(reversed(metadata.block_adjacency)), "mSafe", permuted_relations,
+            metadata.neighbour_table_identity_sha256, metadata.candidate,
+            metadata.registry_summary, metadata.capability_result,
         ),
-        "a2",
+        "mouse_2",
     )
     assert split_manifest_to_mapping(first) == split_manifest_to_mapping(second)
-    assert {row.animal_id for row in first.row_provenance if row.stable_row_id in first.evaluation_rows} == {"a2"}
+    assert {row.animal_id for row in first.row_provenance if row.stable_row_id in first.evaluation_rows} == {"mouse_2"}
 
 
 @settings(max_examples=4, deadline=None)
 @given(st.sampled_from((1, 2, 3, 4)))
 def test_exactly_three_animals_is_a_mutation_sensitive_property(animal_count: int) -> None:
     if animal_count == 3:
-        assert build_pilot_fold(_small_metadata(animal_count), "a1").evaluation_animals == ("a1",)
+        assert build_pilot_fold(_small_metadata(animal_count), "mouse_1").evaluation_animals == ("mouse_1",)
     else:
         with pytest.raises(SpatialPerturbationSplitError, match="exactly three animals"):
-            build_pilot_fold(_small_metadata(animal_count), "a1")
+            build_pilot_fold(_small_metadata(animal_count), "mouse_1")
 
 
 @settings(max_examples=8, deadline=None)
@@ -109,7 +94,9 @@ def test_generated_duplicate_cell_id_sequences_are_rejected(index: int) -> None:
     with pytest.raises(SpatialPerturbationSplitError, match="cell_id"):
         BridgeSplitMetadata(
             rows, metadata.gene_names, metadata.perturbations, metadata.neighbour_cell_types,  # type: ignore[arg-type]
-            metadata.perturbation_targets, (), "mSafe",
+            metadata.perturbation_targets, metadata.block_adjacency, "mSafe",
+            metadata.neighbour_relations, metadata.neighbour_table_identity_sha256,
+            metadata.candidate, metadata.registry_summary, metadata.capability_result,
         )
 
 
@@ -121,19 +108,21 @@ def test_generated_unsafe_cell_ids_fail_closed(value: str) -> None:
 
 
 @settings(max_examples=2, deadline=None)
-@given(st.sampled_from(("a2", "a3")))
+@given(st.sampled_from(("mouse_2", "mouse_3")))
 def test_repeated_section_within_animal_is_valid_but_cross_animal_is_not(
     other_animal: str,
 ) -> None:
     metadata = _small_metadata()
-    assert len({row.section_id for row in metadata.rows if row.animal_id == "a1"}) == 1
+    assert len({row.section_id for row in metadata.rows if row.animal_id == "mouse_1"}) == 1
     rows = list(metadata.rows)
     cross = next(index for index, row in enumerate(rows) if row.animal_id == other_animal)
-    rows[cross] = replace(rows[cross], section_id="a1_section")
+    rows[cross] = replace(rows[cross], section_id="mouse_1_section")
     with pytest.raises(SpatialPerturbationSplitError, match="section.*two animals"):
         BridgeSplitMetadata(
             rows, metadata.gene_names, metadata.perturbations, metadata.neighbour_cell_types,  # type: ignore[arg-type]
-            metadata.perturbation_targets, (), "mSafe",
+            metadata.perturbation_targets, metadata.block_adjacency, "mSafe",
+            metadata.neighbour_relations, metadata.neighbour_table_identity_sha256,
+            metadata.candidate, metadata.registry_summary, metadata.capability_result,
         )
 
 
@@ -149,12 +138,19 @@ def test_generated_parent_cell_sequences_reject_duplicates(values: list[str]) ->
 
 def test_custom_sequences_are_rejected_without_iteration() -> None:
     hostile = _HostileSequence()
+    metadata = _small_metadata()
     with pytest.raises(SpatialPerturbationSplitError):
-        BridgeSplitMetadata(hostile, ("G1",), ("p1",), ("n",), (("p1", "G1"),), (), "mSafe")  # type: ignore[arg-type]
+        BridgeSplitMetadata(
+            hostile, metadata.gene_names, metadata.perturbations,
+            metadata.neighbour_cell_types, metadata.perturbation_targets,
+            metadata.block_adjacency, "mSafe", metadata.neighbour_relations,
+            metadata.neighbour_table_identity_sha256, metadata.candidate,
+            metadata.registry_summary, metadata.capability_result,
+        )  # type: ignore[arg-type]
 
 
 @settings(max_examples=3, deadline=None)
-@given(st.sampled_from(("a1", "a2", "a3")))
+@given(st.sampled_from(("mouse_1", "mouse_2", "mouse_3")))
 def test_split_seed_is_independent_and_no_model_seed_exists(evaluation_animal: str) -> None:
     signature = inspect.signature(build_pilot_fold)
     assert tuple(signature.parameters) == ("metadata", "evaluation_animal")
@@ -221,3 +217,93 @@ def test_exact_primary_coverage_and_abstention_boundary(abstained: int) -> None:
     assert result.abstained == abstained
     assert result.primary_scoreable == 60 - abstained
     assert result.eligible is (abstained == 12)
+
+
+@settings(max_examples=3, deadline=None)
+@given(st.sampled_from(("guide_0", "guide_2", "guide_4")))
+def test_holdout_only_perturbations_are_structurally_secondary(
+    holdout_only: str,
+) -> None:
+    metadata = _small_metadata()
+    rows = tuple(
+        row for row in metadata.rows
+        if not (row.animal_id in {"mouse_2", "mouse_3"} and row.context_perturbation_id == holdout_only)
+    )
+    relations = tuple(
+        item for item in metadata.neighbour_relations
+        if not (item.animal_id in {"mouse_2", "mouse_3"} and item.perturbation_id == holdout_only)
+    )
+    pruned = BridgeSplitMetadata(
+        rows, metadata.gene_names, metadata.perturbations,
+        metadata.neighbour_cell_types, metadata.perturbation_targets,
+        metadata.block_adjacency, "mSafe", relations,
+        import_module("src.evaluation.spatial_perturbation_split")._neighbour_table_identity(relations),
+        metadata.candidate, metadata.registry_summary, metadata.capability_result,
+    )
+    manifest = build_pilot_fold(pruned, "mouse_1")
+    assert holdout_only not in manifest.perturbations
+    assert holdout_only in manifest.secondary_perturbations
+
+
+@settings(max_examples=3, deadline=None)
+@given(st.sampled_from(("guide_0", "guide_1", "guide_4")))
+def test_registry_binding_cannot_be_bypassed_by_upstream_perturbation_deletion(
+    deleted: str,
+) -> None:
+    metadata = _small_metadata()
+    raw_candidate = metadata.candidate.to_mapping()
+    raw_candidate["perturbation_labels"] = [
+        item for item in metadata.candidate.perturbation_labels if item != deleted
+    ]
+    candidate = type(metadata.candidate)(**raw_candidate)
+    registry = import_module("src.evaluation.spatial_perturbation_registry")
+    capability = registry.audit_bridge_capability(candidate, metadata.registry_summary)
+    with pytest.raises(SpatialPerturbationSplitError, match="registry declaration"):
+        BridgeSplitMetadata(
+            metadata.rows, metadata.gene_names, metadata.perturbations,
+            metadata.neighbour_cell_types, metadata.perturbation_targets,
+            metadata.block_adjacency, metadata.safe_control_label,
+            metadata.neighbour_relations, metadata.neighbour_table_identity_sha256,
+            candidate, metadata.registry_summary, capability,
+        )
+
+
+@settings(max_examples=4, deadline=None)
+@given(st.integers(min_value=2, max_value=5))
+def test_safe_neighbour_cells_may_be_reused_by_distinct_relation_keys(
+    reuse_count: int,
+) -> None:
+    metadata = _small_metadata()
+    safe_relations = tuple(
+        item for item in metadata.neighbour_relations
+        if item.is_safe_control
+        and item.animal_id == "mouse_1"
+        and item.neighbor_cell_type == metadata.neighbour_cell_types[0]
+        and item.band == "proximal"
+    )
+    reused_id = safe_relations[0].neighbor_cell_id
+    reused = tuple(item for item in safe_relations if item.neighbor_cell_id == reused_id)
+    assert len(reused[:reuse_count]) == reuse_count
+    assert len({item.relation_id for item in reused[:reuse_count]}) == reuse_count
+    assert {item.perturbation_id for item in reused[:reuse_count]} <= set(metadata.perturbations)
+
+
+@settings(max_examples=4, deadline=None)
+@given(st.integers(min_value=3, max_value=6))
+def test_complete_block_graph_has_exact_pair_count(block_count: int) -> None:
+    metadata = _contract_helpers.synthetic_metadata(block_count=block_count)
+    per_animal_pairs = block_count * (block_count - 1) // 2
+    assert len(metadata.block_adjacency) == 3 * per_animal_pairs
+    assert all(type(item.adjacent) is bool for item in metadata.block_adjacency)
+
+
+@settings(max_examples=3, deadline=None)
+@given(st.sampled_from((64, 96, 128)))
+def test_cartesian_limit_is_checked_by_bounded_integer_arithmetic(
+    neighbour_type_count: int,
+) -> None:
+    module = import_module("src.evaluation.spatial_perturbation_split")
+    checker = getattr(module, "_checked_cartesian_size", None)
+    assert callable(checker)
+    with pytest.raises(SpatialPerturbationSplitError, match="size|limit"):
+        checker(3, 256, neighbour_type_count, 2)

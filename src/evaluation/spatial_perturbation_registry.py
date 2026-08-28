@@ -242,6 +242,12 @@ class BridgeCandidate:
             "source_identity_sha256": item.source_identity_sha256,
         }
 
+    @property
+    def candidate_identity_sha256(self) -> str:
+        """Canonical identity of the complete revalidated registry declaration."""
+        item = _candidate_snapshot(self)
+        return _identity(item.to_mapping())
+
 
 def _validated_candidate_declaration(candidate: BridgeCandidate) -> BridgeCandidate:
     """Re-check the immutable declaration whenever it crosses an audit boundary."""
@@ -418,6 +424,12 @@ class MetadataSummary:
             "source_identity_sha256": item.source_identity_sha256,
             "executable_output_schema_capable": item.executable_output_schema_capable,
         }
+
+    @property
+    def metadata_identity_sha256(self) -> str:
+        """Canonical identity of the complete revalidated metadata summary."""
+        item = _summary_snapshot(self)
+        return _identity(item.to_mapping())
 
 
 _COVERAGE_KEYS = (

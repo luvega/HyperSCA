@@ -22,6 +22,7 @@ from src.evaluation.spatial_perturbation_split import (
     MIN_SPATIAL_BLOCKS,
     BridgeBlockAdjacency,
     BridgeEligibilityEvidence,
+    BridgeNeighbourRelation,
     BridgeParentEvidence,
     BridgePrimaryUnitEvidence,
     BridgeSplitManifest,
@@ -33,6 +34,11 @@ from src.evaluation.spatial_perturbation_split import (
     eligibility_evidence_to_mapping,
     evaluate_bridge_eligibility,
     split_manifest_to_mapping,
+)
+from src.evaluation.spatial_perturbation_registry import (
+    BridgeCandidate,
+    MetadataSummary,
+    audit_bridge_capability,
 )
 
 
@@ -62,55 +68,307 @@ def synthetic_metadata(
     neighbour_count: int | None = None,
 ) -> BridgeSplitMetadata:
     rows: list[BridgeSplitRow] = []
+    relations: list[BridgeNeighbourRelation] = []
     row_id = 0
+    source_cells: dict[tuple[str, str, bool, str], list[str]] = {}
     for animal_index in range(animal_count):
         animal = f"mouse_{animal_index + 1}"
         section = f"{animal}_section"
         for perturbation in PERTURBATIONS:
-            for role, label in (
-                ("perturbation_source", perturbation),
-                ("safe_source", "mSafe"),
+            for role, label, is_safe in (
+                ("perturbation_source", perturbation, False),
+                ("safe_source", "mSafe", True),
             ):
                 for index in range(max(30, block_count * 5)):
+                    block = f"block_{index % block_count}"
+                    cell_id = f"cell_{row_id:06d}"
                     rows.append(
                         BridgeSplitRow(
-                            row_id, f"cell_{row_id:06d}", animal, section,
-                            f"block_{index % block_count}", perturbation, label,
+                            row_id, cell_id, animal, section, block, perturbation, label,
                             "source_type", "source_type", role, "own",
                         )
                     )
+                    source_cells.setdefault((animal, perturbation, is_safe, block), []).append(cell_id)
                     row_id += 1
-            frozen_neighbour_count = (
-                neighbour_count
-                if neighbour_count is not None
-                else (
-                    max(50, block_count * 13)
-                    if len(neighbour_types) == 1
-                    else max(30, block_count * 10)
-                )
+        frozen_neighbour_count = (
+            neighbour_count
+            if neighbour_count is not None
+            else (
+                max(50, block_count * 13)
+                if len(neighbour_types) == 1
+                else max(30, block_count * 10)
             )
+        )
+        safe_neighbor_ids: dict[tuple[str, str], list[str]] = {}
+        for neighbour_type in neighbour_types:
+            for band in BANDS:
+                safe_ids: list[str] = []
+                for index in range(frozen_neighbour_count):
+                    block = f"block_{index % block_count}"
+                    cell_id = f"cell_{row_id:06d}"
+                    rows.append(BridgeSplitRow(
+                        row_id, cell_id, animal, section, block, "unassigned",
+                        "unperturbed", neighbour_type, neighbour_type, "neighbour", "none",
+                    ))
+                    safe_ids.append(cell_id)
+                    row_id += 1
+                safe_neighbor_ids[(neighbour_type, band)] = safe_ids
+        for perturbation in PERTURBATIONS:
             for neighbour_type in neighbour_types:
                 for band in BANDS:
-                    for role in ("perturbation_neighbour", "safe_neighbour"):
-                        for index in range(frozen_neighbour_count):
-                            rows.append(
-                                BridgeSplitRow(
-                                    row_id, f"cell_{row_id:06d}", animal, section,
-                                    f"block_{index % block_count}", perturbation, "unperturbed",
-                                    neighbour_type, "source_type", role, band,
-                                )
-                            )
-                            row_id += 1
+                    treatment_ids: list[str] = []
+                    for index in range(frozen_neighbour_count):
+                        block = f"block_{index % block_count}"
+                        cell_id = f"cell_{row_id:06d}"
+                        rows.append(BridgeSplitRow(
+                            row_id, cell_id, animal, section, block, "unassigned",
+                            "unperturbed", neighbour_type, neighbour_type,
+                            "neighbour", "none",
+                        ))
+                        treatment_ids.append(cell_id)
+                        row_id += 1
+                    for is_safe, neighbor_ids in (
+                        (False, treatment_ids),
+                        (True, safe_neighbor_ids[(neighbour_type, band)]),
+                    ):
+                        for index, neighbor_id in enumerate(neighbor_ids):
+                            block = f"block_{index % block_count}"
+                            sources = source_cells[(animal, perturbation, is_safe, block)]
+                            source_id = sources[(index // block_count) % len(sources)]
+                            relations.append(split_module._make_relation(
+                                animal, section, block, source_id, neighbor_id,
+                                perturbation, "source_type", neighbour_type,
+                                ((index % 5) + 1 if band == "proximal" else (index % 10) + 6),
+                                band, False, is_safe,
+                            ))
     adjacent = tuple(
         BridgeBlockAdjacency(
-            f"mouse_{index + 1}", f"mouse_{index + 1}_section", "block_0", "block_1"
+            f"mouse_{animal_index + 1}", f"mouse_{animal_index + 1}_section",
+            f"block_{first}", f"block_{second}", adjacency and first == 0 and second == 1,
         )
-        for index in range(animal_count)
-    ) if adjacency else ()
+        for animal_index in range(animal_count)
+        for first in range(block_count)
+        for second in range(first + 1, block_count)
+    )
+    animals = tuple(f"mouse_{index + 1}" for index in range(animal_count))
+    sections = tuple((animal, (f"{animal}_section",)) for animal in animals)
+    candidate = BridgeCandidate(
+        "generic_task5_bridge", "SYNTHETIC", "spatial_perturbation",
+        animals, sections, "mSafe", PERTURBATIONS,
+        "https://example.test/SYNTHETIC", "a" * 64,
+    )
+    total_rows = len(rows)
+    per_animal_rows = tuple((animal, sum(row.animal_id == animal for row in rows)) for animal in animals)
+    per_animal_sources = tuple(
+        (animal, sum(row.animal_id == animal and row.cell_role == "perturbation_source" for row in rows))
+        for animal in animals
+    )
+    per_animal_safe = tuple(
+        (animal, sum(row.animal_id == animal and row.cell_role == "safe_source" for row in rows))
+        for animal in animals
+    )
+    summary = MetadataSummary(
+        "generic_task5_bridge", "SYNTHETIC", ("pilot",), animals, sections,
+        tuple(f"block_{index}" for index in range(block_count)), True, True,
+        total_rows, TARGETS, len(TARGETS), PERTURBATIONS,
+        tuple((perturbation, sum(row.observed_label == perturbation for row in rows)) for perturbation in PERTURBATIONS),
+        (("mSafe", sum(count for _, count in per_animal_safe)),),
+        (("valid", total_rows),), (("valid", total_rows),),
+        tuple((animal, "pilot") for animal in animals), (), per_animal_rows,
+        per_animal_sources, per_animal_safe, per_animal_rows, per_animal_rows,
+        "CC-BY-4.0", "a" * 64, True,
+    )
+    capability = audit_bridge_capability(candidate, summary)
+    frozen_relations = tuple(sorted(relations, key=lambda item: item.relation_id))
     return BridgeSplitMetadata(
         tuple(rows), TARGETS, PERTURBATIONS, neighbour_types,
-        tuple(zip(PERTURBATIONS, TARGETS)), adjacent, "mSafe",
+        tuple(zip(PERTURBATIONS, TARGETS)), adjacent, "mSafe", frozen_relations,
+        split_module._neighbour_table_identity(frozen_relations),
+        candidate, summary, capability,
     )
+
+
+def test_review_primary_excludes_holdout_only_perturbations() -> None:
+    metadata = synthetic_metadata()
+    rows = tuple(
+        row for row in metadata.rows
+        if not (
+            row.animal_id in {"mouse_2", "mouse_3"}
+            and row.context_perturbation_id == "guide_0"
+        )
+    )
+    pruned = BridgeSplitMetadata(
+        rows, metadata.gene_names, metadata.perturbations,
+        metadata.neighbour_cell_types, metadata.perturbation_targets,
+        metadata.block_adjacency, metadata.safe_control_label,
+        tuple(
+            item for item in metadata.neighbour_relations
+            if not (item.animal_id in {"mouse_2", "mouse_3"} and item.perturbation_id == "guide_0")
+        ),
+        split_module._neighbour_table_identity(tuple(
+            item for item in metadata.neighbour_relations
+            if not (item.animal_id in {"mouse_2", "mouse_3"} and item.perturbation_id == "guide_0")
+        )),
+        metadata.candidate, metadata.registry_summary, metadata.capability_result,
+    )
+    manifest = build_pilot_fold(pruned, "mouse_1")
+
+    assert manifest.perturbations == PERTURBATIONS[1:]
+    assert manifest.secondary_perturbations == ("guide_0",)
+    assert evaluate_bridge_eligibility(manifest, complete_evidence(manifest)).eligible
+
+
+def test_review_metadata_contract_binds_task4_registry_objects() -> None:
+    names = {field.name for field in fields(BridgeSplitMetadata)}
+    assert {"candidate", "registry_summary", "capability_result"} <= names
+
+    manifest = build_pilot_fold(synthetic_metadata(), "mouse_1")
+    object.__setattr__(manifest.candidate, "perturbation_labels", PERTURBATIONS[1:])
+    with pytest.raises(SpatialPerturbationSplitError):
+        split_manifest_to_mapping(manifest)
+
+
+def test_review_neighbour_provenance_is_a_separate_reusable_relation_table() -> None:
+    relation_type = getattr(split_module, "BridgeNeighbourRelation", None)
+    assert relation_type is not None
+    relation_fields = {field.name for field in fields(relation_type)}
+    assert {
+        "relation_id", "source_cell_id", "neighbor_cell_id", "rank", "band",
+        "contamination", "perturbation_id", "source_cell_type",
+        "neighbor_cell_type", "is_safe_control",
+    } <= relation_fields
+    metadata_names = {field.name for field in fields(BridgeSplitMetadata)}
+    assert {"neighbour_relations", "neighbour_table_identity_sha256"} <= metadata_names
+
+    relation = synthetic_metadata().neighbour_relations[0]
+    with pytest.raises(SpatialPerturbationSplitError, match="contamination"):
+        replace(relation, contamination=0.0)
+    with pytest.raises(SpatialPerturbationSplitError, match="rank.*band"):
+        replace(relation, rank=15 if relation.band == "proximal" else 1)
+    contaminated = split_module._make_relation(
+        relation.animal_id, relation.section_id, relation.spatial_block,
+        relation.source_cell_id, relation.neighbor_cell_id,
+        relation.perturbation_id, relation.source_cell_type,
+        relation.neighbor_cell_type, relation.rank, relation.band, True,
+        relation.is_safe_control,
+    )
+    with pytest.raises(SpatialPerturbationSplitError, match="contaminated"):
+        split_module._require_relations(
+            (contaminated,), animal=relation.animal_id,
+            perturbation=relation.perturbation_id,
+            cell_type=relation.neighbor_cell_type, band=relation.band,
+            safe=relation.is_safe_control,
+        )
+
+
+def test_review_block_graph_records_every_pair_state() -> None:
+    adjacency_fields = {field.name for field in fields(BridgeBlockAdjacency)}
+    assert "adjacent" in adjacency_fields
+    metadata = synthetic_metadata()
+    # One section and three blocks per animal: all 3 choose 2 states are frozen.
+    assert len(metadata.block_adjacency) == 9
+    assert all(type(item.adjacent) is bool for item in metadata.block_adjacency)
+
+
+def test_review_generic_manifest_does_not_encode_pilot_cardinality() -> None:
+    implementation = inspect.getsource(BridgeSplitManifest.__post_init__)
+    assert "pilot requires exactly three animals" not in implementation
+    assert "one exact evaluation animal is required" not in implementation
+
+
+def test_review_generic_manifest_accepts_five_animal_whole_partitions() -> None:
+    metadata = synthetic_metadata(animal_count=5, neighbour_types=("astrocyte",))
+    animals = tuple(f"mouse_{index}" for index in range(1, 6))
+    development = animals[:3]
+    evaluation = animals[3:]
+    train_animals = set(animals[:2])
+    tune_animals = {animals[2]}
+    target_map = dict(metadata.perturbation_targets)
+    parents = tuple(sorted((
+        split_module._make_parent(animal, perturbation, target_map[perturbation])
+        for animal in animals for perturbation in metadata.perturbations
+    ), key=lambda item: item.parent_id))
+    units = tuple(sorted((
+        split_module._make_unit(animal, perturbation, target_map[perturbation], cell_type, band)
+        for animal in animals for perturbation in metadata.perturbations
+        for cell_type in metadata.neighbour_cell_types for band in BANDS
+    ), key=lambda item: item.unit_id))
+    values = dict(
+        split_id="confirmatory_partition:synthetic", split_seed=11,
+        development_animals=development, evaluation_animals=evaluation,
+        train_rows=tuple(row.stable_row_id for row in metadata.rows if row.animal_id in train_animals),
+        tune_rows=tuple(row.stable_row_id for row in metadata.rows if row.animal_id in tune_animals),
+        evaluation_rows=tuple(row.stable_row_id for row in metadata.rows if row.animal_id in set(evaluation)),
+        gene_names=metadata.gene_names, perturbations=metadata.perturbations,
+        registered_perturbations=metadata.perturbations, secondary_perturbations=(),
+        row_provenance=metadata.rows, perturbation_parents=parents,
+        primary_units=units, neighbour_cell_types=metadata.neighbour_cell_types,
+        perturbation_targets=metadata.perturbation_targets,
+        block_adjacency=metadata.block_adjacency,
+        safe_control_label=metadata.safe_control_label,
+        neighbour_relations=metadata.neighbour_relations,
+        neighbour_table_identity_sha256=metadata.neighbour_table_identity_sha256,
+        candidate=metadata.candidate, registry_summary=metadata.registry_summary,
+        capability_result=metadata.capability_result,
+        candidate_identity_sha256=metadata.candidate.candidate_identity_sha256,
+        metadata_identity_sha256=metadata.registry_summary.metadata_identity_sha256,
+        capability_identity_sha256=metadata.capability_result.capability_identity_sha256,
+    )
+    unsigned = split_module._manifest_unsigned(SimpleNamespace(**values))
+    manifest = BridgeSplitManifest(
+        **values, split_identity_sha256=_canonical_sha(unsigned),  # type: ignore[arg-type]
+    )
+
+    assert manifest.development_animals == development
+    assert manifest.evaluation_animals == evaluation
+    assert {row.animal_id for row in manifest.row_provenance if row.stable_row_id in manifest.tune_rows} == tune_animals
+    with pytest.raises(SpatialPerturbationSplitError, match="nonempty train"):
+        replace(
+            manifest, train_rows=(),
+            tune_rows=tuple(sorted(manifest.train_rows + manifest.tune_rows)),
+        )
+
+
+def test_review_deleting_any_block_pair_state_is_rejected() -> None:
+    metadata = synthetic_metadata(adjacency=True)
+    incomplete = metadata.block_adjacency[1:]
+    with pytest.raises(SpatialPerturbationSplitError, match="every block pair"):
+        BridgeSplitMetadata(
+            metadata.rows, metadata.gene_names, metadata.perturbations,
+            metadata.neighbour_cell_types, metadata.perturbation_targets,
+            incomplete, metadata.safe_control_label, metadata.neighbour_relations,
+            metadata.neighbour_table_identity_sha256, metadata.candidate,
+            metadata.registry_summary, metadata.capability_result,
+        )
+
+
+def test_review_cartesian_size_is_rejected_before_unit_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = synthetic_metadata()
+
+    def forbidden_materialization(*args: object) -> object:
+        raise AssertionError("primary units were materialized before the size check")
+
+    monkeypatch.setattr(split_module, "_make_unit", forbidden_materialization)
+    monkeypatch.setattr(split_module, "_MAX_FROZEN_CONTEXTS", 1)
+    with pytest.raises(SpatialPerturbationSplitError, match="Cartesian|cartesian|size|limit"):
+        build_pilot_fold(metadata, "mouse_1")
+
+    graph_checker = getattr(split_module, "_checked_complete_graph_size", None)
+    assert callable(graph_checker)
+    with pytest.raises(SpatialPerturbationSplitError, match="graph.*limit"):
+        graph_checker((449, 1, 1))
+
+
+def test_review_result_serializer_revalidates_low_level_mutation() -> None:
+    serializer = getattr(split_module, "eligibility_result_to_mapping", None)
+    assert callable(serializer)
+    manifest = build_pilot_fold(synthetic_metadata(), "mouse_1")
+    result = evaluate_bridge_eligibility(manifest, complete_evidence(manifest))
+    object.__setattr__(result, "primary_scoreable", 999)
+    with pytest.raises(SpatialPerturbationSplitError):
+        serializer(result)
 
 
 def _rows_for(
@@ -169,27 +427,30 @@ def complete_evidence(
     units: list[BridgePrimaryUnitEvidence] = []
     default_unit_count = 50 if len(manifest.neighbour_cell_types) == 1 else 30
     for unit in manifest.primary_units:
-        treatment_rows = _rows_for(
-            manifest, animal=unit.animal_id, perturbation=unit.perturbation_id,
-            role="perturbation_neighbour", cell_type=unit.neighbour_cell_type,
-            band=unit.band, blocks=block_overrides.get(f"{unit.unit_id}:neighbour"),
-        )
-        safe_rows = _rows_for(
-            manifest, animal=unit.animal_id, perturbation=unit.perturbation_id,
-            role="safe_neighbour", cell_type=unit.neighbour_cell_type,
-            band=unit.band, blocks=block_overrides.get(f"{unit.unit_id}:safe_neighbour"),
-        )
+        def matching_relations(safe: bool, key: str) -> tuple[BridgeNeighbourRelation, ...]:
+            blocks = block_overrides.get(key)
+            return tuple(sorted((
+                item for item in manifest.neighbour_relations
+                if item.animal_id == unit.animal_id
+                and item.perturbation_id == unit.perturbation_id
+                and item.neighbor_cell_type == unit.neighbour_cell_type
+                and item.band == unit.band
+                and item.is_safe_control is safe
+                and (blocks is None or item.spatial_block in blocks)
+            ), key=lambda item: (item.rank, item.spatial_block, item.relation_id)))
+        treatment_rows = matching_relations(False, f"{unit.unit_id}:neighbour")
+        safe_rows = matching_relations(True, f"{unit.unit_id}:safe_neighbour")
         units.append(
             BridgePrimaryUnitEvidence(
                 unit.unit_id,
                 tuple(
-                    row.cell_id
+                    row.relation_id
                     for row in treatment_rows[
                         : unit_overrides.get(unit.unit_id, default_unit_count)
                     ]
                 ),
                 tuple(
-                    row.cell_id
+                    row.relation_id
                     for row in safe_rows[
                         : safe_unit_overrides.get(unit.unit_id, default_unit_count)
                     ]
@@ -293,7 +554,7 @@ def test_all_selected_cells_resolve_to_expected_animal_role_band_and_type() -> N
     altered = build_bridge_eligibility_evidence(
         manifest, evidence.parent_evidence, tuple(units)
     )
-    with pytest.raises(SpatialPerturbationSplitError, match="expected animal/context/role/type/band"):
+    with pytest.raises(SpatialPerturbationSplitError, match="expected animal/context/role/type/band|absent from frozen neighbour table"):
         evaluate_bridge_eligibility(manifest, altered)
 
     source_cell = evidence.parent_evidence[0].perturbation_source_cell_ids[0]
@@ -301,7 +562,7 @@ def test_all_selected_cells_resolve_to_expected_animal_role_band_and_type() -> N
     altered = build_bridge_eligibility_evidence(
         manifest, evidence.parent_evidence, (forged,) + evidence.unit_evidence[1:]
     )
-    with pytest.raises(SpatialPerturbationSplitError, match="expected animal/context/role/type/band"):
+    with pytest.raises(SpatialPerturbationSplitError, match="expected animal/context/role/type/band|absent from frozen neighbour table"):
         evaluate_bridge_eligibility(manifest, altered)
 
 
@@ -337,6 +598,18 @@ def _cell_ids_with_block_counts(
 ) -> tuple[str, ...]:
     selected: list[str] = []
     for block_index, count in enumerate(block_counts):
+        if role in ("perturbation_neighbour", "safe_neighbour"):
+            relations = sorted((
+                item for item in manifest.neighbour_relations
+                if item.animal_id == animal
+                and item.perturbation_id == perturbation
+                and item.is_safe_control is (role == "safe_neighbour")
+                and (cell_type is None or item.neighbor_cell_type == cell_type)
+                and (band is None or item.band == band)
+                and item.spatial_block == f"block_{block_index}"
+            ), key=lambda item: (item.rank, item.relation_id))
+            selected.extend(item.relation_id for item in relations[:count])
+            continue
         rows = _rows_for(
             manifest, animal=animal, perturbation=perturbation, role=role,
             cell_type=cell_type, band=band, blocks=(f"block_{block_index}",),
@@ -514,30 +787,33 @@ def test_independent_triple_search_has_a_bounded_membership_operation_count(
         for index in range(block_count)
     )
     adjacency = tuple(
-        BridgeBlockAdjacency("mouse", "section", f"block_{first}", f"block_{second}")
+        BridgeBlockAdjacency(
+            "mouse", "section", f"block_{first}", f"block_{second}", True
+        )
         for first in range(block_count)
         for second in range(first + 1, block_count)
     )
     real_adjacency = split_module._adjacent_block_pairs
 
-    class BoundedContainsSet(set[frozenset[tuple[str, str, str]]]):
-        contains_calls = 0
+    class CountedEdgeSet(set[frozenset[tuple[str, str, str]]]):
+        iterated_edges = 0
 
-        def __contains__(self, item: object) -> bool:
-            self.contains_calls += 1
-            if self.contains_calls > 40_000:
-                raise AssertionError("independent-triple search exceeded its operation bound")
-            return super().__contains__(item)
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            for item in super().__iter__():
+                self.iterated_edges += 1
+                if self.iterated_edges > len(self):
+                    raise AssertionError("adjacency edges were rescanned")
+                yield item
 
     graph_manifest = cast(
         BridgeSplitManifest, SimpleNamespace(block_adjacency=adjacency)
     )
-    counted = BoundedContainsSet(real_adjacency(graph_manifest))
-    monkeypatch.setattr(split_module, "_adjacent_block_pairs", lambda _: counted)
+    counted = CountedEdgeSet(real_adjacency(graph_manifest))
     assert split_module._has_non_adjacent_block_subset(
-        rows, graph_manifest, 3
+        rows, graph_manifest, 3, adjacent_pairs=counted,
     ) is False
-    assert counted.contains_calls <= 40_000
+    assert counted.iterated_edges == len(counted)
+    assert "combinations" not in inspect.getsource(split_module._has_non_adjacent_block_subset)
 
 
 def test_independent_triple_search_rejects_adversarial_block_cardinality() -> None:

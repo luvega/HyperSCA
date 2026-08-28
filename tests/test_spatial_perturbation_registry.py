@@ -153,6 +153,29 @@ def test_explicit_cohort_assignments_and_external_coverage_are_required() -> Non
     assert "development_cohort_missing" in audit_bridge_capability(bridge, all_external).blocking_reasons
 
 
+def test_task5_can_bind_canonical_candidate_and_metadata_identities() -> None:
+    bridge = candidate(5)
+    summary = explicit_metadata_summary(animals=5, cohorts=2)
+    expected_candidate = hashlib.sha256(
+        json.dumps(
+            bridge.to_mapping(), ensure_ascii=False, allow_nan=False,
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    expected_summary = hashlib.sha256(
+        json.dumps(
+            summary.to_mapping(), ensure_ascii=False, allow_nan=False,
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    assert bridge.candidate_identity_sha256 == expected_candidate
+    assert summary.metadata_identity_sha256 == expected_summary
+
+    object.__setattr__(bridge, "perturbation_labels", ())
+    assert bridge.candidate_identity_sha256 != expected_candidate
+
+
 def test_category_specific_aggregate_evidence_cannot_be_hidden_by_other_categories() -> None:
     raw = explicit_metadata_summary(animals=5, cohorts=2).to_mapping()
     raw["safe_control_counts"] = [["mSafe", 1], ["other_safe", 4]]
