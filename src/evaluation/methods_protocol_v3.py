@@ -200,7 +200,7 @@ def protocol_to_mapping_v3(protocol: MethodsProtocolV3) -> dict[str, object]:
                 "primary_metric": protocol.primary_metrics[1],
                 "comparators": {
                     "confirmatory": "matched_non_hyperbolic_baseline",
-                    "attribution": "hypersca_without_hierarchy_loss",
+                    "attribution": "hypersca_c_shared_only",
                 },
             },
             "bridge": {

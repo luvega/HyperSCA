@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 import math
+from typing import overload
 
 import pytest
 from hypothesis import given, settings, strategies as st
@@ -38,8 +40,43 @@ class _IntSubclass(int):
     pass
 
 
+class _StringSubclass(str):
+    pass
+
+
+class _FloatSubclass(float):
+    pass
+
+
 class _ListSubclass(list[object]):
     pass
+
+
+class _TupleSubclass(tuple[object, ...]):
+    pass
+
+
+class _ExplodingSequence(Sequence[object]):
+    def __init__(self) -> None:
+        self.iterated = False
+
+    @overload
+    def __getitem__(self, index: int) -> object: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[object]: ...
+
+    def __getitem__(self, index: int | slice) -> object | Sequence[object]:
+        self.iterated = True
+        raise AssertionError("custom sequences must not be indexed")
+
+    def __len__(self) -> int:
+        self.iterated = True
+        raise AssertionError("custom sequences must not be measured")
+
+    def __iter__(self) -> Iterator[object]:
+        self.iterated = True
+        raise AssertionError("custom sequences must not be iterated")
 
 
 @settings(max_examples=20, deadline=None)
@@ -63,10 +100,64 @@ def test_direct_construction_rejects_integer_subclasses(value: int) -> None:
 
 
 @settings(max_examples=20, deadline=None)
+@given(st.sampled_from(("hypersca-methods-v3.0", "application_only")))
+def test_direct_construction_rejects_string_subclasses(value: str) -> None:
+    kwargs = _valid_kwargs()
+    kwargs["protocol_version"] = _StringSubclass(value)
+
+    with pytest.raises(ValueError):
+        MethodsProtocolV3(**kwargs)  # type: ignore[arg-type]
+
+
+@settings(max_examples=20, deadline=None)
+@given(st.just(0.95))
+def test_direct_construction_rejects_float_subclasses(value: float) -> None:
+    kwargs = _valid_kwargs()
+    kwargs["confidence"] = _FloatSubclass(value)
+
+    with pytest.raises(ValueError):
+        MethodsProtocolV3(**kwargs)  # type: ignore[arg-type]
+
+
+@settings(max_examples=20, deadline=None)
 @given(st.just(_ListSubclass(["spatial", "intracellular_causal", "bridge"])))
 def test_direct_construction_rejects_mutable_sequence_subclasses(value: list[object]) -> None:
     kwargs = _valid_kwargs()
     kwargs["claim_ids"] = value
+
+    with pytest.raises(ValueError):
+        MethodsProtocolV3(**kwargs)  # type: ignore[arg-type]
+
+
+@settings(max_examples=20, deadline=None)
+@given(st.just(_TupleSubclass(("spatial", "intracellular_causal", "bridge"))))
+def test_direct_construction_rejects_tuple_subclasses(value: tuple[object, ...]) -> None:
+    kwargs = _valid_kwargs()
+    kwargs["claim_ids"] = value
+
+    with pytest.raises(ValueError):
+        MethodsProtocolV3(**kwargs)  # type: ignore[arg-type]
+
+
+def test_direct_construction_rejects_custom_sequences_without_iteration() -> None:
+    """Characterization: exact container gates reject adversarial sequences first."""
+    kwargs = _valid_kwargs()
+    sequence = _ExplodingSequence()
+    kwargs["claim_ids"] = sequence
+
+    with pytest.raises(ValueError):
+        MethodsProtocolV3(**kwargs)  # type: ignore[arg-type]
+    assert sequence.iterated is False
+
+
+@settings(max_examples=20, deadline=None)
+@given(st.integers(min_value=4, max_value=10_000))
+def test_direct_construction_bounds_sequence_work_by_rejecting_wrong_lengths(
+    length: int,
+) -> None:
+    """Characterization: oversized concrete lists are rejected at the frozen length."""
+    kwargs = _valid_kwargs()
+    kwargs["claim_ids"] = ["spatial"] * length
 
     with pytest.raises(ValueError):
         MethodsProtocolV3(**kwargs)  # type: ignore[arg-type]

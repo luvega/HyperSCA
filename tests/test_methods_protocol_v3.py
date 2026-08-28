@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
+from typing import cast
 
 import pytest
 
@@ -77,15 +79,24 @@ def test_v3_mapping_encodes_fixed_comparators_and_bridge_iut_in_order() -> None:
         "governance",
         "capability_identity_sha256",
     )
-    assert tuple(payload["claims"]) == ("spatial", "intracellular_causal", "bridge")
-    assert payload["claims"]["spatial"]["comparators"] == {
+    claims = cast(Mapping[str, Mapping[str, object]], payload["claims"])
+    spatial_claim = claims["spatial"]
+    causal_claim = claims["intracellular_causal"]
+    bridge_claim = claims["bridge"]
+
+    assert tuple(claims) == ("spatial", "intracellular_causal", "bridge")
+    assert spatial_claim["comparators"] == {
         "confirmatory": "matched_euclidean_autoencoder",
         "attribution": "hypersca_without_hierarchy_loss",
     }
-    assert payload["claims"]["intracellular_causal"]["benchmark"] == (
+    assert causal_claim["benchmark"] == (
         "causalbench_intracellular_interventional_causal_recovery"
     )
-    assert payload["claims"]["bridge"]["iut"] == {
+    assert causal_claim["comparators"] == {
+        "confirmatory": "matched_non_hyperbolic_baseline",
+        "attribution": "hypersca_c_shared_only",
+    }
+    assert bridge_claim["iut"] == {
         "comparators": [
             "matched_euclidean_spatial_causal",
             "hypersca_own_only",
@@ -99,6 +110,7 @@ def test_v3_mapping_encodes_fixed_comparators_and_bridge_iut_in_order() -> None:
 
 
 def test_direct_construction_freezes_plain_list_inputs() -> None:
+    """Characterization: accepted plain lists are copied before caller mutation."""
     kwargs = _valid_kwargs()
     claim_ids = ["spatial", "intracellular_causal", "bridge"]
     kwargs["claim_ids"] = claim_ids
