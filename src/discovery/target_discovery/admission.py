@@ -5,6 +5,8 @@ from typing import Any
 
 import pandas as pd
 
+from src.discovery.evidence_policy import ClaimDecision
+
 
 ADMISSION_COLUMNS = [
     "module",
@@ -14,6 +16,37 @@ ADMISSION_COLUMNS = [
     "allowed_use",
     "blocking_reason",
 ]
+
+
+def build_claim_admission_status(
+    spatial: ClaimDecision,
+    causal: ClaimDecision,
+    joint: ClaimDecision,
+) -> pd.DataFrame:
+    """Expose immutable claim decisions as the legacy admission-table shape."""
+
+    expected = (("spatial", spatial), ("causal", causal), ("joint", joint))
+    if any(
+        type(decision) is not ClaimDecision or decision.claim_id != claim_id
+        for claim_id, decision in expected
+    ):
+        raise ValueError(
+            "claim decisions do not match spatial, causal, and joint slots"
+        )
+    rows = [
+        {
+            "module": f"hyperbolic_{claim_id}",
+            "status": decision.status,
+            "required_artifacts": "admission_decision.json",
+            "controls_passed": decision.status == "admitted",
+            "allowed_use": decision.allowed_use,
+            "blocking_reason": "; ".join(decision.blocking_reasons),
+        }
+        for claim_id, decision in expected
+    ]
+    frame = pd.DataFrame(rows, columns=ADMISSION_COLUMNS)
+    frame["controls_passed"] = frame["controls_passed"].map(bool).astype(object)
+    return frame
 
 
 def _bool_series(frame: pd.DataFrame, column: str) -> pd.Series:
