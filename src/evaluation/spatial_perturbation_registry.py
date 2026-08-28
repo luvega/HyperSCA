@@ -11,7 +11,6 @@ import ctypes
 import errno
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -177,6 +176,7 @@ class BridgeCandidate:
             ("source_identity_sha256", _sha(self.source_identity_sha256, "source_identity_sha256")),
         ):
             object.__setattr__(self, name, value)
+        _validated_candidate_declaration(self)
 
     def to_mapping(self) -> dict[str, object]:
         item = _candidate_snapshot(self)
@@ -190,6 +190,25 @@ class BridgeCandidate:
         }
 
 
+def _validated_candidate_declaration(candidate: BridgeCandidate) -> BridgeCandidate:
+    """Re-check the immutable declaration whenever it crosses an audit boundary."""
+    if type(candidate) is not BridgeCandidate:
+        raise SpatialPerturbationRegistryError("candidate must be BridgeCandidate")
+    if candidate.candidate_id == _FROZEN_CANDIDATE_ORDER[0] and (
+        candidate.accession != "GSE274447"
+        or candidate.platform != "spatial_perturbation"
+        or candidate.biological_specimens != ("mouse_1", "mouse_2", "mouse_3")
+        or candidate.sections_by_specimen
+        != (("mouse_1", ()), ("mouse_2", ()), ("mouse_3", ()))
+        or candidate.safe_control_label != "mSafe"
+        or candidate.perturbation_labels != ()
+        or candidate.source_uri != _FROZEN_GSE274447_SOURCE
+        or candidate.source_identity_sha256 != _FROZEN_GSE274447_SOURCE_IDENTITY
+    ):
+        raise SpatialPerturbationRegistryError("GSE274447 candidate declaration must remain frozen")
+    return candidate
+
+
 @dataclass(frozen=True, slots=True)
 class MetadataSummary:
     candidate_id: str
@@ -200,6 +219,7 @@ class MetadataSummary:
     block_ids: tuple[str, ...]
     coordinate_available: bool
     coordinate_finite: bool
+    coordinate_count: int
     measured_gene_names: tuple[str, ...]
     measured_gene_count: int
     perturbation_labels: tuple[str, ...]
@@ -207,6 +227,13 @@ class MetadataSummary:
     safe_control_counts: tuple[tuple[str, int], ...]
     barcode_quality_counts: tuple[tuple[str, int], ...]
     label_quality_counts: tuple[tuple[str, int], ...]
+    specimen_cohort_assignments: tuple[tuple[str, str], ...]
+    external_untouched_cohort_ids: tuple[str, ...]
+    per_specimen_coordinate_counts: tuple[tuple[str, int], ...]
+    per_specimen_perturbation_counts: tuple[tuple[str, int], ...]
+    per_specimen_safe_control_counts: tuple[tuple[str, int], ...]
+    per_specimen_barcode_valid_counts: tuple[tuple[str, int], ...]
+    per_specimen_label_valid_counts: tuple[tuple[str, int], ...]
     license_identity: str
     source_identity_sha256: str
     executable_output_schema_capable: bool
@@ -219,6 +246,38 @@ class MetadataSummary:
         sections = _sections(self.sections_by_specimen, "sections_by_specimen")
         if tuple(item[0] for item in sections) != specimens:
             raise SpatialPerturbationRegistryError("sections must follow specimen IDs exactly")
+        # Cohort labels are text rather than counts; revalidate their exact pair shape.
+        assignment_values = _items(self.specimen_cohort_assignments, "specimen_cohort_assignments")
+        assignment_pairs_list: list[tuple[str, str]] = []
+        for index, pair in enumerate(assignment_values):
+            pair_values = _items(pair, f"specimen_cohort_assignments[{index}]", maximum=2)
+            if len(pair_values) != 2:
+                raise SpatialPerturbationRegistryError("specimen_cohort_assignments pairs must have two items")
+            assignment_pairs_list.append((
+                _safe_text(pair_values[0], f"specimen_cohort_assignments[{index}][0]"),
+                _safe_text(pair_values[1], f"specimen_cohort_assignments[{index}][1]"),
+            ))
+        assignment_pairs = tuple(assignment_pairs_list)
+        assigned_specimens = tuple(specimen for specimen, _ in assignment_pairs)
+        if any(specimen not in specimens for specimen in assigned_specimens):
+            raise SpatialPerturbationRegistryError("cohort assignments contain an unknown specimen")
+        if assigned_specimens != tuple(specimen for specimen in specimens if specimen in assigned_specimens):
+            raise SpatialPerturbationRegistryError("cohort assignments must preserve specimen order")
+        if len(set(specimen for specimen, _ in assignment_pairs)) != len(assignment_pairs):
+            raise SpatialPerturbationRegistryError("cohort assignments must be unique")
+        def specimen_counts(value: object, name: str) -> tuple[tuple[str, int], ...]:
+            pairs = _text_count_pairs(value, name)
+            if tuple(label for label, _ in pairs) != specimens:
+                raise SpatialPerturbationRegistryError(f"{name} must follow specimen IDs exactly")
+            return pairs
+        coordinate_counts = specimen_counts(self.per_specimen_coordinate_counts, "per_specimen_coordinate_counts")
+        perturbation_counts = specimen_counts(self.per_specimen_perturbation_counts, "per_specimen_perturbation_counts")
+        safe_counts = specimen_counts(self.per_specimen_safe_control_counts, "per_specimen_safe_control_counts")
+        barcode_counts = specimen_counts(self.per_specimen_barcode_valid_counts, "per_specimen_barcode_valid_counts")
+        label_valid_counts = specimen_counts(self.per_specimen_label_valid_counts, "per_specimen_label_valid_counts")
+        coordinate_count = _count(self.coordinate_count, "coordinate_count")
+        if coordinate_count != sum(count for _, count in coordinate_counts):
+            raise SpatialPerturbationRegistryError("coordinate_count must equal per-specimen total")
         genes = _text_items(self.measured_gene_names, "measured_gene_names", maximum=MAXIMUM_GENE_NAMES)
         gene_count = _count(self.measured_gene_count, "measured_gene_count")
         if gene_count < len(genes):
@@ -227,22 +286,41 @@ class MetadataSummary:
         label_counts = _text_count_pairs(self.perturbation_label_counts, "perturbation_label_counts")
         if tuple(label for label, _ in label_counts) != labels:
             raise SpatialPerturbationRegistryError("perturbation label counts must follow labels exactly")
-        values: tuple[tuple[str, object], ...] = (
+        safe_control_counts = _text_count_pairs(self.safe_control_counts, "safe_control_counts")
+        barcode_quality_counts = _text_count_pairs(self.barcode_quality_counts, "barcode_quality_counts")
+        label_quality_counts = _text_count_pairs(self.label_quality_counts, "label_quality_counts")
+        if sum(count for _, count in label_counts) != sum(count for _, count in perturbation_counts):
+            raise SpatialPerturbationRegistryError("perturbation totals must equal per-specimen total")
+        if sum(count for _, count in safe_control_counts) != sum(count for _, count in safe_counts):
+            raise SpatialPerturbationRegistryError("safe-control totals must equal per-specimen total")
+        if sum(count for _, count in barcode_quality_counts) != sum(count for _, count in barcode_counts):
+            raise SpatialPerturbationRegistryError("barcode totals must equal per-specimen total")
+        if sum(count for _, count in label_quality_counts) != sum(count for _, count in label_valid_counts):
+            raise SpatialPerturbationRegistryError("label totals must equal per-specimen total")
+        normalized_values: tuple[tuple[str, object], ...] = (
             ("candidate_id", candidate_id), ("accession", accession), ("cohort_ids", cohorts),
             ("biological_specimen_ids", specimens), ("sections_by_specimen", sections),
             ("block_ids", _text_items(self.block_ids, "block_ids", maximum=MAXIMUM_BLOCK_IDS)),
             ("coordinate_available", _flag(self.coordinate_available, "coordinate_available")),
             ("coordinate_finite", _flag(self.coordinate_finite, "coordinate_finite")),
+            ("coordinate_count", coordinate_count),
             ("measured_gene_names", genes), ("measured_gene_count", gene_count),
             ("perturbation_labels", labels), ("perturbation_label_counts", label_counts),
-            ("safe_control_counts", _text_count_pairs(self.safe_control_counts, "safe_control_counts")),
-            ("barcode_quality_counts", _text_count_pairs(self.barcode_quality_counts, "barcode_quality_counts")),
-            ("label_quality_counts", _text_count_pairs(self.label_quality_counts, "label_quality_counts")),
+            ("safe_control_counts", safe_control_counts),
+            ("barcode_quality_counts", barcode_quality_counts),
+            ("label_quality_counts", label_quality_counts),
+            ("specimen_cohort_assignments", assignment_pairs),
+            ("external_untouched_cohort_ids", _text_items(self.external_untouched_cohort_ids, "external_untouched_cohort_ids")),
+            ("per_specimen_coordinate_counts", coordinate_counts),
+            ("per_specimen_perturbation_counts", perturbation_counts),
+            ("per_specimen_safe_control_counts", safe_counts),
+            ("per_specimen_barcode_valid_counts", barcode_counts),
+            ("per_specimen_label_valid_counts", label_valid_counts),
             ("license_identity", _safe_text(self.license_identity, "license_identity")),
             ("source_identity_sha256", _sha(self.source_identity_sha256, "source_identity_sha256")),
             ("executable_output_schema_capable", _flag(self.executable_output_schema_capable, "executable_output_schema_capable")),
         )
-        for name, value in values:
+        for name, value in normalized_values:
             object.__setattr__(self, name, value)
 
     def to_mapping(self) -> dict[str, object]:
@@ -253,12 +331,20 @@ class MetadataSummary:
             "cohort_ids": list(item.cohort_ids), "biological_specimen_ids": list(item.biological_specimen_ids),
             "sections_by_specimen": [[label, list(values)] for label, values in item.sections_by_specimen],
             "block_ids": list(item.block_ids), "coordinate_available": item.coordinate_available,
-            "coordinate_finite": item.coordinate_finite, "measured_gene_names": list(item.measured_gene_names),
+            "coordinate_finite": item.coordinate_finite, "coordinate_count": item.coordinate_count,
+            "measured_gene_names": list(item.measured_gene_names),
             "measured_gene_count": item.measured_gene_count, "perturbation_labels": list(item.perturbation_labels),
             "perturbation_label_counts": pairs(item.perturbation_label_counts),
             "safe_control_counts": pairs(item.safe_control_counts),
             "barcode_quality_counts": pairs(item.barcode_quality_counts),
             "label_quality_counts": pairs(item.label_quality_counts), "license_identity": item.license_identity,
+            "specimen_cohort_assignments": [[specimen, cohort] for specimen, cohort in item.specimen_cohort_assignments],
+            "external_untouched_cohort_ids": list(item.external_untouched_cohort_ids),
+            "per_specimen_coordinate_counts": pairs(item.per_specimen_coordinate_counts),
+            "per_specimen_perturbation_counts": pairs(item.per_specimen_perturbation_counts),
+            "per_specimen_safe_control_counts": pairs(item.per_specimen_safe_control_counts),
+            "per_specimen_barcode_valid_counts": pairs(item.per_specimen_barcode_valid_counts),
+            "per_specimen_label_valid_counts": pairs(item.per_specimen_label_valid_counts),
             "source_identity_sha256": item.source_identity_sha256,
             "executable_output_schema_capable": item.executable_output_schema_capable,
         }
@@ -268,7 +354,7 @@ _COVERAGE_KEYS = (
     "candidate_identity", "specimen_structure", "cohorts", "coordinates", "genes",
     "perturbation_labels", "safe_controls", "barcode_quality", "label_quality",
     "license", "source_identity", "output_schema", "registered_specimens",
-    "registered_sections", "registered_perturbation_labels",
+    "registered_sections", "registered_perturbation_labels", "external_cohort",
 )
 
 _GATE_REASONS = {
@@ -287,6 +373,7 @@ _GATE_REASONS = {
     "registered_specimens": "registered_specimens_mismatch",
     "registered_sections": "registered_sections_mismatch",
     "registered_perturbation_labels": "registered_perturbation_labels_mismatch",
+    "external_cohort": "external_cohort_missing",
 }
 
 
@@ -333,9 +420,9 @@ class BridgeCapabilityResult:
         coverage: dict[str, float] = {}
         for key in _COVERAGE_KEYS:
             value = self.coverage[key]
-            if type(value) is not float or not math.isfinite(value) or value < 0.0 or value > 1.0:
-                raise SpatialPerturbationRegistryError("coverage values must be finite floats in [0, 1]")
-            coverage[key] = 0.0 if value == 0.0 else value
+            if type(value) is not float or value not in (0.0, 1.0):
+                raise SpatialPerturbationRegistryError("coverage values must be binary built-in floats")
+            coverage[key] = 0.0 if value == 0.0 else 1.0
         reasons = _text_items(self.blocking_reasons, "blocking_reasons")
         if status not in ("confirmatory_capable", "pilot_audit_only", "assets_unavailable"):
             raise SpatialPerturbationRegistryError("unknown capability status")
@@ -368,9 +455,11 @@ class BridgeCapabilityResult:
 def _candidate_snapshot(value: object) -> BridgeCandidate:
     if type(value) is not BridgeCandidate:
         raise SpatialPerturbationRegistryError("candidate must be BridgeCandidate")
-    return BridgeCandidate(value.candidate_id, value.accession, value.platform, value.biological_specimens,
-                           value.sections_by_specimen, value.safe_control_label, value.perturbation_labels,
-                           value.source_uri, value.source_identity_sha256)
+    return _validated_candidate_declaration(BridgeCandidate(
+        value.candidate_id, value.accession, value.platform, value.biological_specimens,
+        value.sections_by_specimen, value.safe_control_label, value.perturbation_labels,
+        value.source_uri, value.source_identity_sha256,
+    ))
 
 
 def _summary_snapshot(value: object) -> MetadataSummary:
@@ -378,9 +467,13 @@ def _summary_snapshot(value: object) -> MetadataSummary:
         raise SpatialPerturbationRegistryError("summary must be an immutable MetadataSummary")
     return MetadataSummary(value.candidate_id, value.accession, value.cohort_ids, value.biological_specimen_ids,
                            value.sections_by_specimen, value.block_ids, value.coordinate_available, value.coordinate_finite,
-                           value.measured_gene_names, value.measured_gene_count, value.perturbation_labels,
+                           value.coordinate_count, value.measured_gene_names, value.measured_gene_count, value.perturbation_labels,
                            value.perturbation_label_counts, value.safe_control_counts, value.barcode_quality_counts,
-                           value.label_quality_counts, value.license_identity, value.source_identity_sha256,
+                           value.label_quality_counts, value.specimen_cohort_assignments,
+                           value.external_untouched_cohort_ids, value.per_specimen_coordinate_counts,
+                           value.per_specimen_perturbation_counts, value.per_specimen_safe_control_counts,
+                           value.per_specimen_barcode_valid_counts, value.per_specimen_label_valid_counts,
+                           value.license_identity, value.source_identity_sha256,
                            value.executable_output_schema_capable)
 
 
@@ -413,26 +506,44 @@ def _coverage(summary: MetadataSummary, candidate: BridgeCandidate) -> dict[str,
     controls = dict(summary.safe_control_counts)
     barcode = dict(summary.barcode_quality_counts)
     labels = dict(summary.label_quality_counts)
+    assignments = dict(summary.specimen_cohort_assignments)
+    assigned_cohorts = set(assignments.values())
+    every_declared_cohort_is_assigned = bool(summary.cohort_ids) and set(summary.cohort_ids) == assigned_cohorts
+    external_is_assigned = any(
+        cohort in assigned_cohorts and cohort in summary.cohort_ids
+        for cohort in summary.external_untouched_cohort_ids
+    )
+    def every_specimen_has(pairs: tuple[tuple[str, int], ...]) -> bool:
+        return tuple(label for label, _ in pairs) == candidate.biological_specimens and all(
+            count > 0 for _, count in pairs
+        )
     return {
         "candidate_identity": float(summary.candidate_id == candidate.candidate_id and summary.accession == candidate.accession),
         "specimen_structure": float(bool(summary.biological_specimen_ids) and all(sections for _, sections in summary.sections_by_specimen)),
-        "cohorts": float(bool(summary.cohort_ids)), "coordinates": float(summary.coordinate_available and summary.coordinate_finite),
+        "cohorts": float(
+            every_declared_cohort_is_assigned
+            and tuple(assignments) == candidate.biological_specimens
+            and all(cohort in summary.cohort_ids for cohort in assignments.values())
+        ),
+        "coordinates": float(summary.coordinate_available and summary.coordinate_finite and every_specimen_has(summary.per_specimen_coordinate_counts)),
         "genes": float(summary.measured_gene_count > 0 and bool(summary.measured_gene_names)),
-        "perturbation_labels": float(bool(summary.perturbation_labels) and all(counts.get(label, 0) > 0 for label in summary.perturbation_labels)),
-        "safe_controls": float(controls.get(candidate.safe_control_label, 0) > 0),
-        "barcode_quality": float(barcode.get("valid", 0) > 0), "label_quality": float(labels.get("valid", 0) > 0),
+        "perturbation_labels": float(bool(summary.perturbation_labels) and all(counts.get(label, 0) > 0 for label in summary.perturbation_labels) and every_specimen_has(summary.per_specimen_perturbation_counts)),
+        "safe_controls": float(controls.get(candidate.safe_control_label, 0) > 0 and every_specimen_has(summary.per_specimen_safe_control_counts)),
+        "barcode_quality": float(barcode.get("valid", 0) > 0 and every_specimen_has(summary.per_specimen_barcode_valid_counts)),
+        "label_quality": float(labels.get("valid", 0) > 0 and every_specimen_has(summary.per_specimen_label_valid_counts)),
         "license": float(summary.license_identity != "unavailable"),
         "source_identity": float(summary.source_identity_sha256 == candidate.source_identity_sha256),
         "output_schema": float(summary.executable_output_schema_capable),
         "registered_specimens": float(summary.biological_specimen_ids == candidate.biological_specimens),
         "registered_sections": float(summary.sections_by_specimen == candidate.sections_by_specimen),
         "registered_perturbation_labels": float(summary.perturbation_labels == candidate.perturbation_labels),
+        "external_cohort": float(external_is_assigned),
     }
 
 
 def audit_bridge_capability(candidate: BridgeCandidate, summary: MetadataSummary) -> BridgeCapabilityResult:
     """Classify structural readiness without opening assay values or outcomes."""
-    frozen_candidate = _candidate_snapshot(candidate)
+    frozen_candidate = _validated_candidate_declaration(_candidate_snapshot(candidate))
     frozen_summary = _summary_snapshot(summary)
     coverage = _coverage(frozen_summary, frozen_candidate)
     unavailable = "asset_metadata_unavailable" in frozen_summary.block_ids
@@ -692,33 +803,34 @@ def load_bridge_candidates(path: str | Path) -> Mapping[str, BridgeCandidate]:
     for index, raw_candidate in enumerate(values):
         if type(raw_candidate) is not dict or set(raw_candidate) != expected:
             raise SpatialPerturbationRegistryError(f"candidate {index} has unknown or missing fields")
-        item = BridgeCandidate(**cast(dict[str, object], raw_candidate))  # type: ignore[arg-type]
+        item = _validated_candidate_declaration(
+            BridgeCandidate(**cast(dict[str, object], raw_candidate))  # type: ignore[arg-type]
+        )
         if item.candidate_id in candidates:
             raise SpatialPerturbationRegistryError("candidate IDs must be unique and ordered")
         candidates[item.candidate_id] = item
     if tuple(candidates) != _FROZEN_CANDIDATE_ORDER:
         raise SpatialPerturbationRegistryError("candidate registry order must remain frozen")
-    frozen = candidates[_FROZEN_CANDIDATE_ORDER[0]]
-    if (
-        frozen.accession != "GSE274447"
-        or frozen.platform != "spatial_perturbation"
-        or frozen.biological_specimens != ("mouse_1", "mouse_2", "mouse_3")
-        or frozen.sections_by_specimen
-        != (("mouse_1", ()), ("mouse_2", ()), ("mouse_3", ()))
-        or frozen.safe_control_label != "mSafe"
-        or frozen.perturbation_labels != ()
-        or frozen.source_uri != _FROZEN_GSE274447_SOURCE
-        or frozen.source_identity_sha256 != _FROZEN_GSE274447_SOURCE_IDENTITY
-    ):
-        raise SpatialPerturbationRegistryError("GSE274447 candidate declaration must remain frozen")
+    _validated_candidate_declaration(candidates[_FROZEN_CANDIDATE_ORDER[0]])
     return MappingProxyType(candidates)
 
 
 def unavailable_metadata_summary(candidate: BridgeCandidate) -> MetadataSummary:
     item = _candidate_snapshot(candidate)
-    return MetadataSummary(item.candidate_id, item.accession, (), (), (), ("asset_metadata_unavailable",),
-                           False, False, (), 0, (), (), (), (), (), "unavailable",
-                           item.source_identity_sha256, False)
+    return MetadataSummary(
+        candidate_id=item.candidate_id, accession=item.accession, cohort_ids=(),
+        biological_specimen_ids=(), sections_by_specimen=(),
+        block_ids=("asset_metadata_unavailable",), coordinate_available=False,
+        coordinate_finite=False, coordinate_count=0, measured_gene_names=(),
+        measured_gene_count=0, perturbation_labels=(), perturbation_label_counts=(),
+        safe_control_counts=(), barcode_quality_counts=(), label_quality_counts=(),
+        specimen_cohort_assignments=(), external_untouched_cohort_ids=(),
+        per_specimen_coordinate_counts=(), per_specimen_perturbation_counts=(),
+        per_specimen_safe_control_counts=(), per_specimen_barcode_valid_counts=(),
+        per_specimen_label_valid_counts=(), license_identity="unavailable",
+        source_identity_sha256=item.source_identity_sha256,
+        executable_output_schema_capable=False,
+    )
 
 
 def load_asset_metadata(asset_root: str | Path, candidate: BridgeCandidate) -> MetadataSummary:
@@ -786,9 +898,15 @@ def _link_anonymous_noreplace(anonymous_fd: int, parent_fd: int, output: str) ->
     )
 
 
-def write_bridge_capability_exclusively(path: str | Path, result: BridgeCapabilityResult) -> None:
+def write_bridge_capability_exclusively(
+    path: str | Path, result: BridgeCapabilityResult, *, candidate: BridgeCandidate
+) -> None:
     """Publish one JSON record with Linux no-clobber rename and durable fsync."""
-    record = _result_snapshot(result).to_mapping()
+    frozen_result = _result_snapshot(result)
+    frozen_candidate = _validated_candidate_declaration(_candidate_snapshot(candidate))
+    if frozen_candidate.candidate_id != frozen_result.candidate_id:
+        raise SpatialPerturbationRegistryError("candidate does not match capability result")
+    record = frozen_result.to_mapping()
     try:
         bound, output_name = _bound_parent(path, "output")
     except FileNotFoundError as exc:

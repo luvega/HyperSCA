@@ -28,11 +28,17 @@ def _candidate() -> BridgeCandidate:
 
 def _summary(specimens: int = 5, cohorts: int = 2) -> MetadataSummary:
     ids = tuple(f"s{index}" for index in range(1, specimens + 1))
+    cohort_ids = tuple(f"c{index}" for index in range(cohorts))
     return MetadataSummary(
-        "candidate", "GSE1", tuple(f"c{index}" for index in range(cohorts)), ids,
+        "candidate", "GSE1", cohort_ids, ids,
         tuple((value, (f"{value}_sec",)) for value in ids), ("b1",), True, True,
-        ("G1",), 1, ("p1",), (("p1", 1),), (("mSafe", 1),),
-        (("valid", 2),), (("valid", 2),), "CC-BY-4.0", "a" * 64, True,
+        specimens, ("G1",), 1, ("p1",), (("p1", specimens),), (("mSafe", specimens),),
+        (("valid", specimens),), (("valid", specimens),),
+        tuple((value, cohort_ids[index % cohorts]) for index, value in enumerate(ids)) if cohorts else (),
+        (cohort_ids[-1],) if cohorts else (),
+        tuple((value, 1) for value in ids), tuple((value, 1) for value in ids),
+        tuple((value, 1) for value in ids), tuple((value, 1) for value in ids),
+        tuple((value, 1) for value in ids), "CC-BY-4.0", "a" * 64, True,
     )
 
 

@@ -30,14 +30,14 @@ REGISTRY_PATH = ROOT / "configs/spatial_perturbation_bridge_candidates_v1.json"
 def candidate(specimen_count: int = 3) -> BridgeCandidate:
     specimens = tuple(f"mouse_{index}" for index in range(1, specimen_count + 1))
     return BridgeCandidate(
-        candidate_id="gse274447_msafe_bridge",
-        accession="GSE274447",
+        candidate_id="generic_bridge",
+        accession="GSETEST",
         platform="spatial_perturbation",
         biological_specimens=specimens,
         sections_by_specimen=tuple((item, (f"{item}_section",)) for item in specimens),
         safe_control_label="mSafe",
         perturbation_labels=("guide_a",),
-        source_uri="https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE274447",
+        source_uri="https://example.test/GSETEST",
         source_identity_sha256="a" * 64,
     )
 
@@ -45,25 +45,139 @@ def candidate(specimen_count: int = 3) -> BridgeCandidate:
 def metadata_summary(*, animals: int = 5, cohorts: int = 2) -> MetadataSummary:
     specimens = tuple(f"mouse_{index}" for index in range(1, animals + 1))
     return MetadataSummary(
-        candidate_id="gse274447_msafe_bridge",
-        accession="GSE274447",
+        candidate_id="generic_bridge",
+        accession="GSETEST",
         cohort_ids=tuple(f"cohort_{index}" for index in range(cohorts)),
         biological_specimen_ids=specimens,
         sections_by_specimen=tuple((specimen, (f"{specimen}_section",)) for specimen in specimens),
         block_ids=("block_1",),
         coordinate_available=True,
         coordinate_finite=True,
+        coordinate_count=animals,
         measured_gene_names=("GeneA",),
         measured_gene_count=1,
         perturbation_labels=("guide_a",),
-        perturbation_label_counts=(("guide_a", 4),),
-        safe_control_counts=(("mSafe", 4),),
-        barcode_quality_counts=(("valid", 8),),
-        label_quality_counts=(("valid", 8),),
+        perturbation_label_counts=(("guide_a", animals),),
+        safe_control_counts=(("mSafe", animals),),
+        barcode_quality_counts=(("valid", animals),),
+        label_quality_counts=(("valid", animals),),
+        specimen_cohort_assignments=tuple(
+            (specimen, f"cohort_{index % cohorts}") for index, specimen in enumerate(specimens)
+        ) if cohorts else (),
+        external_untouched_cohort_ids=(f"cohort_{cohorts - 1}",) if cohorts else (),
+        per_specimen_coordinate_counts=tuple((specimen, 1) for specimen in specimens),
+        per_specimen_perturbation_counts=tuple((specimen, 1) for specimen in specimens),
+        per_specimen_safe_control_counts=tuple((specimen, 1) for specimen in specimens),
+        per_specimen_barcode_valid_counts=tuple((specimen, 1) for specimen in specimens),
+        per_specimen_label_valid_counts=tuple((specimen, 1) for specimen in specimens),
         license_identity="CC-BY-4.0",
         source_identity_sha256="a" * 64,
         executable_output_schema_capable=True,
     )
+
+
+def explicit_metadata_summary(
+    *,
+    animals: int = 5,
+    cohorts: int = 2,
+    assignments: tuple[tuple[str, str], ...] | None = None,
+    external_cohorts: tuple[str, ...] | None = None,
+    covered_specimens: tuple[str, ...] | None = None,
+) -> MetadataSummary:
+    """A generic, fully structural declaration for the future cohort contract."""
+    specimens = tuple(f"mouse_{index}" for index in range(1, animals + 1))
+    cohort_ids = tuple(f"cohort_{index}" for index in range(cohorts))
+    assignment_values = assignments if assignments is not None else tuple(
+        (specimen, cohort_ids[index % len(cohort_ids)]) for index, specimen in enumerate(specimens)
+    )
+    external_values = external_cohorts if external_cohorts is not None else (cohort_ids[-1],)
+    covered = set(covered_specimens if covered_specimens is not None else specimens)
+
+    def evidence() -> tuple[tuple[str, int], ...]:
+        return tuple((specimen, int(specimen in covered)) for specimen in specimens)
+
+    total = len(covered)
+    return MetadataSummary(
+        candidate_id="generic_bridge",
+        accession="GSETEST",
+        cohort_ids=cohort_ids,
+        biological_specimen_ids=specimens,
+        sections_by_specimen=tuple((specimen, (f"{specimen}_section",)) for specimen in specimens),
+        block_ids=("block_1",),
+        coordinate_available=True,
+        coordinate_finite=True,
+        coordinate_count=total,
+        measured_gene_names=("GeneA",),
+        measured_gene_count=1,
+        perturbation_labels=("guide_a",),
+        perturbation_label_counts=(("guide_a", total),),
+        safe_control_counts=(("mSafe", total),),
+        barcode_quality_counts=(("valid", total),),
+        label_quality_counts=(("valid", total),),
+        specimen_cohort_assignments=assignment_values,
+        external_untouched_cohort_ids=external_values,
+        per_specimen_coordinate_counts=evidence(),
+        per_specimen_perturbation_counts=evidence(),
+        per_specimen_safe_control_counts=evidence(),
+        per_specimen_barcode_valid_counts=evidence(),
+        per_specimen_label_valid_counts=evidence(),
+        license_identity="CC-BY-4.0",
+        source_identity_sha256="a" * 64,
+        executable_output_schema_capable=True,
+    )
+
+
+def test_explicit_cohort_assignments_and_external_coverage_are_required() -> None:
+    bridge = candidate(5)
+    absent_assignments = explicit_metadata_summary(animals=5, cohorts=2, assignments=())
+    assert "cohort_identity_coverage_missing" in audit_bridge_capability(bridge, absent_assignments).blocking_reasons
+
+    absent_external = explicit_metadata_summary(animals=5, cohorts=2, external_cohorts=())
+    assert "external_cohort_missing" in audit_bridge_capability(bridge, absent_external).blocking_reasons
+
+    orphan_external = explicit_metadata_summary(
+        animals=5, cohorts=2, external_cohorts=("cohort_1",),
+        assignments=tuple((f"mouse_{index}", "cohort_0") for index in range(1, 6)),
+    )
+    reasons = audit_bridge_capability(bridge, orphan_external).blocking_reasons
+    assert "external_cohort_missing" in reasons
+
+
+@pytest.mark.parametrize(
+    "field_reason",
+    (
+        ("per_specimen_coordinate_counts", "coordinates_unavailable_or_nonfinite"),
+        ("per_specimen_perturbation_counts", "perturbation_label_coverage_missing"),
+        ("per_specimen_safe_control_counts", "safe_control_coverage_missing"),
+        ("per_specimen_barcode_valid_counts", "barcode_quality_coverage_missing"),
+        ("per_specimen_label_valid_counts", "label_quality_coverage_missing"),
+    ),
+)
+def test_per_specimen_evidence_cannot_be_replaced_by_a_singleton_aggregate(
+    field_reason: tuple[str, str],
+) -> None:
+    field, reason = field_reason
+    raw = explicit_metadata_summary(animals=5, cohorts=2).to_mapping()
+    specimens = tuple(f"mouse_{index}" for index in range(1, 6))
+    raw[field] = [[specimens[0], 5]] + [[specimen, 0] for specimen in specimens[1:]]
+    result = audit_bridge_capability(candidate(5), metadata_summary_from_mapping(raw))
+    assert result.status == "pilot_audit_only"
+    assert reason in result.blocking_reasons
+
+
+def test_coverage_requires_binary_evidence() -> None:
+    result = audit_bridge_capability(candidate(), metadata_summary(animals=3))
+    coverage = dict(result.coverage)
+    coverage["coordinates"] = 5e-324
+    unsigned = {
+        "candidate_id": result.candidate_id, "status": result.status,
+        "confirmatory_capable": result.confirmatory_capable,
+        "biological_specimen_count": result.biological_specimen_count,
+        "cohort_count": result.cohort_count, "coverage": coverage,
+        "blocking_reasons": list(result.blocking_reasons),
+    }
+    with pytest.raises(SpatialPerturbationRegistryError):
+        BridgeCapabilityResult(**unsigned, capability_identity_sha256=_unsigned_digest(unsigned))  # type: ignore[arg-type]
 
 
 def test_three_mice_are_pilot_only() -> None:
@@ -110,6 +224,29 @@ def test_registered_three_mice_cannot_be_upgraded_by_invented_metadata() -> None
     assert result.confirmatory_capable is False
     assert "insufficient_biological_replicates" in result.blocking_reasons
     assert "registered_specimens_mismatch" in result.blocking_reasons
+
+
+def test_low_level_frozen_candidate_mutation_is_rejected_by_audit_and_writer(tmp_path: Path) -> None:
+    frozen = load_bridge_candidates(REGISTRY_PATH)["gse274447_msafe_bridge"]
+    specimens = tuple(f"mouse_{index}" for index in range(1, 6))
+    for field, value in (
+        ("biological_specimens", specimens),
+        ("sections_by_specimen", tuple((item, (f"{item}_section",)) for item in specimens)),
+        ("perturbation_labels", ("guide_a",)),
+    ):
+        object.__setattr__(frozen, field, value)
+    raw = explicit_metadata_summary(animals=5, cohorts=2).to_mapping()
+    raw.update({
+        "candidate_id": frozen.candidate_id,
+        "accession": frozen.accession,
+        "source_identity_sha256": frozen.source_identity_sha256,
+    })
+    summary = metadata_summary_from_mapping(raw)
+    with pytest.raises(SpatialPerturbationRegistryError, match="declaration"):
+        audit_bridge_capability(frozen, summary)
+    generic_result = audit_bridge_capability(candidate(), metadata_summary(animals=3))
+    with pytest.raises(SpatialPerturbationRegistryError, match="declaration"):
+        write_bridge_capability_exclusively(tmp_path / "no.json", generic_result, candidate=frozen)
 
 
 def _unsigned_digest(mapping: dict[str, object]) -> str:
@@ -188,7 +325,7 @@ def test_direct_construction_defensively_copies_and_revalidates() -> None:
     raw_specimens = ["mouse_1", "mouse_2", "mouse_3"]
     raw_sections = [("mouse_1", []), ("mouse_2", []), ("mouse_3", [])]
     value = BridgeCandidate(
-        "gse274447_msafe_bridge", "GSE274447", "spatial_perturbation", raw_specimens,
+        "defensive_copy_candidate", "GSE274447", "spatial_perturbation", raw_specimens,
         raw_sections, "mSafe", ["guide_a"],
         "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE274447", "a" * 64,
     )
@@ -270,6 +407,24 @@ def test_cli_without_assets_publishes_explicit_unavailable_capability(tmp_path: 
     assert "asset_metadata_unavailable" in published["blocking_reasons"]
 
 
+def test_cli_default_registry_is_resolved_from_script_root(tmp_path: Path) -> None:
+    output = tmp_path / "from_elsewhere.json"
+    probe = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "audit_spatial_perturbation_bridge.py"),
+            "--output",
+            str(output),
+        ],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert json.loads(output.read_text(encoding="utf-8"))["candidate_id"] == "gse274447_msafe_bridge"
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -337,7 +492,7 @@ def test_exclusive_writer_never_clobbers_existing_output(tmp_path: Path) -> None
     output.write_bytes(b"existing")
     result = audit_bridge_capability(candidate(), metadata_summary(animals=3))
     with pytest.raises(SpatialPerturbationRegistryError):
-        write_bridge_capability_exclusively(output, result)
+        write_bridge_capability_exclusively(output, result, candidate=candidate())
     assert output.read_bytes() == b"existing"
 
 
@@ -404,7 +559,9 @@ def test_output_ancestor_swap_is_rejected_without_redirected_publication(
 
     monkeypatch.setattr(registry_module, "_link_anonymous_noreplace", swap_before_publish)
     with pytest.raises(SpatialPerturbationRegistryError):
-        write_bridge_capability_exclusively(output, audit_bridge_capability(candidate(), metadata_summary(animals=3)))
+        write_bridge_capability_exclusively(
+            output, audit_bridge_capability(candidate(), metadata_summary(animals=3)), candidate=candidate()
+        )
     assert not (redirected / "capability.json").exists()
 
 
@@ -433,10 +590,10 @@ def test_adversarial_replacement_cannot_publish_attacker_staging_content(
 
     monkeypatch.setattr(registry_module.os, "close", replace_named_staging)
     write_bridge_capability_exclusively(
-        output, audit_bridge_capability(candidate(), metadata_summary(animals=3))
+        output, audit_bridge_capability(candidate(), metadata_summary(animals=3)), candidate=candidate()
     )
     assert output.read_bytes() != attacker_bytes
-    assert json.loads(output.read_text(encoding="utf-8"))["candidate_id"] == "gse274447_msafe_bridge"
+    assert json.loads(output.read_text(encoding="utf-8"))["candidate_id"] == "generic_bridge"
 
 
 def test_component_walk_closes_descriptor_when_immediate_fstat_fails(
