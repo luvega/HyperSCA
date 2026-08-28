@@ -301,6 +301,61 @@ def test_outcome_publication_preserves_output_after_directory_fsync_failure(
     assert output.exists()
 
 
+def test_outcome_publication_detects_destination_swap_during_directory_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "protocol_outcome.json"
+    outcome = load_protocol_outcome(OUTCOME_PATH)
+    original_fsync = protocol_outcome.os.fsync
+    fsync_calls = 0
+
+    def fsync_then_swap_destination(descriptor: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        original_fsync(descriptor)
+        if fsync_calls == 2:
+            output.unlink()
+            output.write_bytes(b"forged bytes after directory fsync")
+
+    monkeypatch.setattr(protocol_outcome.os, "fsync", fsync_then_swap_destination)
+
+    with pytest.raises(ValueError, match="inode"):
+        write_protocol_outcome_exclusively(output, outcome)
+
+    assert fsync_calls == 2
+    assert output.read_bytes() == b"forged bytes after directory fsync"
+
+
+def test_outcome_publication_detects_parent_replacement_after_precommit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "bound"
+    parent.mkdir()
+    displaced_parent = tmp_path / "displaced"
+    output = parent / "protocol_outcome.json"
+    outcome = load_protocol_outcome(OUTCOME_PATH)
+    original_rename = protocol_outcome._rename_noreplace
+
+    def replace_parent_then_publish(
+        parent_fd: int,
+        source_name: str,
+        target_name: str,
+    ) -> None:
+        parent.rename(displaced_parent)
+        parent.mkdir()
+        original_rename(parent_fd, source_name, target_name)
+
+    monkeypatch.setattr(
+        protocol_outcome, "_rename_noreplace", replace_parent_then_publish
+    )
+
+    with pytest.raises(ValueError, match="parent changed"):
+        write_protocol_outcome_exclusively(output, outcome)
+
+    assert not output.exists()
+    assert load_protocol_outcome(displaced_parent / output.name) == outcome
+
+
 def test_outcome_publication_preserves_staging_replaced_before_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

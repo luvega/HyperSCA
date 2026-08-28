@@ -521,6 +521,9 @@ def write_protocol_outcome_exclusively(path: Path, outcome: ProtocolOutcome) -> 
     pre-commit or post-publication uncertainty this function raises while
     preserving the involved names: Linux/Python has no inode-conditional unlink
     primitive, so deleting a name after an adversarial replacement is unsafe.
+    An uncertain or pre-commit failure can therefore leave a randomized staging
+    entry.  An operator must inspect its inode identity before any removal and
+    must never blindly delete a matching-looking staging filename.
     """
 
     destination = Path(path)
@@ -624,6 +627,15 @@ def write_protocol_outcome_exclusively(path: Path, outcome: ProtocolOutcome) -> 
                 "protocol outcome publication directory fsync failed; output is preserved"
             ) from exc
         publication_committed = True
+        final_after_commit = _stat_at(parent_fd, destination.name)
+        if (
+            final_after_commit is None
+            or not stat.S_ISREG(final_after_commit.st_mode)
+            or _inode_identity(final_after_commit) != temporary_identity
+            or final_after_commit.st_nlink != 1
+        ):
+            raise ValueError("published protocol outcome inode is invalid")
+        _verify_bound_parent_directory(destination.parent, parent_identity)
     except OSError as exc:
         operation_failed = True
         raise ValueError("protocol outcome publication failed") from exc
