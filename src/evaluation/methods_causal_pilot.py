@@ -27,6 +27,11 @@ import pandas as pd
 from sklearn.metrics import average_precision_score
 
 from src.causal.hypersca_c import HyperSCACContext
+from src.evaluation.run_evidence_identity import (
+    RunEvidenceIdentity,
+    canonical_sha256,
+)
+from src.evaluation.run_evidence_publisher import RunEvidencePublisher
 from src.evaluation.task_c_predictions import normalize_task_c_predictions
 
 
@@ -334,7 +339,7 @@ def run_causalbench_pilot_run(
         raise ValueError("protocol identity must be one lowercase SHA-256 value")
 
     public_manifest = Path(public_manifest_path).resolve(strict=True)
-    validate_causal_pilot_public_split(public_manifest)
+    public_split = validate_causal_pilot_public_split(public_manifest)
     config_path = Path(hypersca_config_path).resolve(strict=True)
     registry_path = Path(ablation_registry_path).resolve(strict=True)
     frozen_protocol_path = Path(protocol_path).resolve(strict=True)
@@ -365,7 +370,6 @@ def run_causalbench_pilot_run(
     staging = Path(
         tempfile.mkdtemp(prefix=f".{destination.name}.staging-", dir=destination.parent)
     )
-    published = False
     try:
         profiles = {}
         for stage in ("train", "tune"):
@@ -492,7 +496,6 @@ def run_causalbench_pilot_run(
             "data_scopes": ["train", "tune"],
             "promotion_eligible": False,
         }
-        _write_json(staging / "method_status.json", status_record)
         _write_json(
             staging / "claim_decision.json",
             {
@@ -511,6 +514,7 @@ def run_causalbench_pilot_run(
                 profile_manifest_path=validated.manifest_path,
                 public_manifest_path=public_manifest,
             )
+        publisher_source = Path(__file__).with_name("run_evidence_publisher.py")
         code_paths = tuple(
             Path(path).resolve()
             for path in (
@@ -522,6 +526,7 @@ def run_causalbench_pilot_run(
                 Path(__file__).with_name("task_c_benchmark.py"),
                 Path(__file__).with_name("task_c_predictions.py"),
                 Path(__file__).with_name("task_c_tuning.py"),
+                publisher_source,
             )
         )
         completed = subprocess.run(
@@ -535,57 +540,123 @@ def run_causalbench_pilot_run(
             sorted(
                 path
                 for path in staging.rglob("*")
-                if path.is_file() and path.name != "run_manifest.json"
+                if path.is_file()
             )
         )
-        _write_json(
-            staging / "run_manifest.json",
-            {
-                "schema_version": "1.0",
-                "protocol_version": "hypersca-methods-v2.1",
-                "protocol_identity": protocol_identity_value,
-                "protocol": {
-                    "path": str(frozen_protocol_path),
-                    "sha256": _sha256_path(frozen_protocol_path),
-                },
-                "execution_code": {
-                    "git_commit": completed.stdout.strip(),
-                    "files": {
-                        str(path): {"sha256": _sha256_path(path)}
-                        for path in code_paths
-                    },
-                },
-                "benchmark_id": "causalbench_k562_rpe1",
-                "direction": direction,
-                "seed": seed,
-                "data_scopes": ["train", "tune"],
-                "public_manifest": {
-                    "path": str(public_manifest),
-                    "sha256": _sha256_path(public_manifest),
-                },
-                "hypersca_config": {
-                    "path": str(config_path),
-                    "sha256": _sha256_path(config_path),
-                },
-                "ablation_registry": {
-                    "path": str(registry_path),
-                    "sha256": _sha256_path(registry_path),
-                },
-                "eligible_sources": list(eligible_sources),
-                "tuning_edges": [list(edge) for edge in sorted(tuning_edges)],
-                "artifacts": {
-                    str(path.relative_to(staging)): {"sha256": _sha256_path(path)}
-                    for path in artifact_paths
-                },
+        relation_universe = [
+            [source, target]
+            for source in sorted(eligible_sources)
+            for target in train.gene_names
+            if source != target
+        ]
+        statistical_unit_record = {
+            "schema_version": "causalbench_direction_source_relation_v1",
+            "direction": direction,
+            "ordered_genes": list(train.gene_names),
+            "eligible_sources": list(sorted(eligible_sources)),
+            "relation_universe_sha256": canonical_sha256(relation_universe),
+            "tune_reference_identity_sha256": canonical_sha256(
+                [list(edge) for edge in sorted(tuning_edges)]
+            ),
+        }
+        profile_record = {
+            stage: {
+                "input_sha256": _sha256_path(profiles[stage].input_path),
+                "manifest_sha256": _sha256_path(profiles[stage].manifest_path),
+            }
+            for stage in ("train", "tune")
+        }
+        split_record = {
+            "schema_version": "causalbench_public_split_v1",
+            "split_seed": CAUSALBENCH_SPLIT_SEED,
+            "split_id": public_split["split_id"],
+            "public_manifest_sha256": _sha256_path(public_manifest),
+            "direction": direction,
+            "profiles": profile_record,
+        }
+        analysis_record = {
+            "schema_version": "causalbench_analysis_v1",
+            "primary_metric": "directed_edge_average_precision",
+            "confirmatory_comparator": "mean_difference",
+            "attribution_comparator": "hypersca_c_shared_only",
+            "q_value_threshold": 0.1,
+        }
+        code_record = {
+            "git_commit": completed.stdout.strip(),
+            "files": {
+                path.name: {"sha256": _sha256_path(path)} for path in code_paths
             },
+        }
+        input_record = {
+            "schema_version": "causalbench_input_v1",
+            "public_manifest_sha256": _sha256_path(public_manifest),
+            "direction": direction,
+            "profiles": profile_record,
+        }
+        config_record = {
+            "schema_version": "causalbench_model_config_v1",
+            "model_seed": seed,
+            "device": device,
+            "hypersca_config_sha256": _sha256_path(config_path),
+            "ablation_registry_sha256": _sha256_path(registry_path),
+        }
+        identity = RunEvidenceIdentity(
+            schema_version="1.0",
+            protocol_version="hypersca-methods-v2.1",
+            protocol_identity=protocol_identity_value,
+            claim_id="causal",
+            benchmark_id="causalbench_k562_rpe1",
+            data_scopes=("train", "tune"),
+            data_split_seed=CAUSALBENCH_SPLIT_SEED,
+            model_seed=seed,
+            data_split_identity_sha256=canonical_sha256(split_record),
+            statistical_unit_schema="causalbench_direction_source_relation_v1",
+            statistical_unit_identity_sha256=canonical_sha256(
+                statistical_unit_record
+            ),
+            analysis_identity_sha256=canonical_sha256(analysis_record),
+            input_identity_sha256=canonical_sha256(input_record),
+            config_identity_sha256=canonical_sha256(config_record),
+            code_identity_sha256=canonical_sha256(code_record),
+            evidence_role="pilot_audit_only",
         )
-        if destination.exists() or destination.is_symlink():
-            raise ValueError("causal pilot output appeared before publication")
-        os.rename(staging, destination)
-        published = True
+        summary = {
+            **status_record,
+            "protocol_sha256": _sha256_path(frozen_protocol_path),
+            "public_manifest_sha256": _sha256_path(public_manifest),
+            "hypersca_config_sha256": _sha256_path(config_path),
+            "ablation_registry_sha256": _sha256_path(registry_path),
+            "eligible_sources": list(sorted(eligible_sources)),
+            "tuning_edges": [list(edge) for edge in sorted(tuning_edges)],
+            "metrics": metrics,
+            "execution_code": code_record,
+            "publisher": {"source_sha256": _sha256_path(publisher_source)},
+        }
+        publisher = RunEvidencePublisher.begin(
+            output_dir=destination,
+            identity=identity,
+            statistical_unit_record=statistical_unit_record,
+            required_artifacts=tuple(
+                path.relative_to(staging).as_posix() for path in artifact_paths
+            ),
+            maximum_bundle_bytes=5 * 1024**3,
+        )
+        with publisher:
+            for artifact_path in artifact_paths:
+                relative_path = artifact_path.relative_to(staging).as_posix()
+                suffix = artifact_path.suffix.lower()
+                media_type = {
+                    ".csv": "text/csv",
+                    ".json": "application/json",
+                    ".npz": "application/x-npz",
+                }.get(suffix, "application/octet-stream")
+                publisher.add_file(
+                    relative_path, artifact_path, media_type=media_type
+                )
+            publisher.finalize_completed(summary=summary)
         return status_record
     finally:
-        if not published and staging.exists() and not staging.is_symlink():
+        if staging.exists() and not staging.is_symlink():
             shutil.rmtree(staging)
 
 

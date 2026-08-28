@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 
 def test_causal_pilot_scores_complete_relation_universe_without_holdout() -> None:
@@ -132,3 +135,131 @@ def test_causal_pilot_requires_one_fixed_public_data_split(tmp_path: Path) -> No
     assert accepted["seed"] == 11
     with pytest.raises(ValueError, match="fixed data split seed 11"):
         validate_causal_pilot_public_split(rejected_path)
+
+
+def test_causal_runner_publishes_one_replayable_fixed_split_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.causal import hypersca_c_ablation
+    from src.evaluation.methods_causal_pilot import run_causalbench_pilot_run
+    from src.evaluation.run_evidence_publisher import verify_run_evidence_bundle
+    from src.evaluation.task_c_data import (
+        build_shared_task_c_split,
+        load_task_c_dataset,
+        materialize_task_c_split,
+    )
+
+    genes = tuple(f"G{index:03d}" for index in range(70))
+    interventions = ["non-targeting"] * 300 + [
+        gene for gene in genes[:30] for _ in range(20)
+    ]
+    loaded = {}
+    for context, seed in (("k562", 11), ("rpe1", 23)):
+        rng = np.random.default_rng(seed)
+        expression = rng.normal(size=(len(interventions), len(genes))).astype(
+            np.float32
+        )
+        for row, intervention in enumerate(interventions):
+            if intervention != "non-targeting":
+                source_index = genes.index(intervention)
+                expression[row, (source_index + 1) % len(genes)] += 8.0
+        raw = tmp_path / f"raw-{context}.npz"
+        np.savez(
+            raw,
+            expression_matrix=expression,
+            interventions=np.asarray(interventions),
+            var_names=np.asarray(genes),
+        )
+        loaded[context] = load_task_c_dataset(raw, context_id=context)
+    split = build_shared_task_c_split(
+        loaded["k562"], loaded["rpe1"], seed=11, min_cells=5
+    )
+    prepared = materialize_task_c_split(
+        loaded["k562"], loaded["rpe1"], split, tmp_path / "prepared"
+    )
+
+    def fake_fit(contexts, config, ablation_id, **kwargs):
+        selected_genes = contexts[0].gene_names
+        if ablation_id == "primary":
+            rows = [
+                (source, selected_genes[(index + 1) % len(selected_genes)], 10.0)
+                for index, source in enumerate(selected_genes)
+            ]
+        else:
+            rows = [
+                (source, selected_genes[(index + 2) % len(selected_genes)], 1.0)
+                for index, source in enumerate(selected_genes)
+            ]
+        return SimpleNamespace(
+            predictions=pd.DataFrame(rows, columns=["source", "target", "score"]),
+            summary={"requested_bootstraps": 20, "successful_bootstraps": 20},
+            failures=(),
+        )
+
+    monkeypatch.setattr(hypersca_c_ablation, "fit_hypersca_c_ablation", fake_fit)
+    protocol = tmp_path / "protocol.yaml"
+    protocol.write_text(
+        "\n".join(
+            (
+                "protocol_version: hypersca-methods-v2.1",
+                "execution:",
+                "  pilot_scopes: [train, tune]",
+                "comparators:",
+                "  causal:",
+                "    confirmatory: mean_difference",
+                "    attribution: hypersca_c_shared_only",
+            )
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "pilot"
+    record = run_causalbench_pilot_run(
+        public_manifest_path=Path(prepared["public_manifest"]),
+        direction="k562_to_rpe1",
+        output_dir=output,
+        seed=23,
+        hypersca_config_path=Path("configs/hypersca_c_v1.json"),
+        ablation_registry_path=Path("configs/hypersca_c_ablations_v1.json"),
+        protocol_path=protocol,
+        protocol_identity_value="a" * 64,
+        device="cpu",
+    )
+
+    verified = verify_run_evidence_bundle(output)
+    assert record["promotion_eligible"] is False
+    assert verified.identity.data_split_seed == 11
+    assert verified.identity.model_seed == 23
+    assert verified.identity.statistical_unit_schema == (
+        "causalbench_direction_source_relation_v1"
+    )
+    assert verified.identity.evidence_role == "pilot_audit_only"
+    assert verified.statistical_unit_record["direction"] == "k562_to_rpe1"
+    assert verified.statistical_unit_record["eligible_sources"]
+    assert verified.statistical_unit_record["relation_universe_sha256"]
+    summary_text = repr(verified.summary)
+    assert "private" not in summary_text
+    assert "refit" not in summary_text
+
+    second_output = tmp_path / "pilot-seed-11"
+    run_causalbench_pilot_run(
+        public_manifest_path=Path(prepared["public_manifest"]),
+        direction="k562_to_rpe1",
+        output_dir=second_output,
+        seed=11,
+        hypersca_config_path=Path("configs/hypersca_c_v1.json"),
+        ablation_registry_path=Path("configs/hypersca_c_ablations_v1.json"),
+        protocol_path=protocol,
+        protocol_identity_value="a" * 64,
+        device="cpu",
+    )
+    second = verify_run_evidence_bundle(second_output)
+    assert second.identity.data_split_seed == second.identity.model_seed == 11
+    assert (
+        second.identity.data_split_identity_sha256
+        == verified.identity.data_split_identity_sha256
+    )
+    assert (
+        second.identity.statistical_unit_identity_sha256
+        == verified.identity.statistical_unit_identity_sha256
+    )
+    assert second.identity.run_identity_sha256 != verified.identity.run_identity_sha256
