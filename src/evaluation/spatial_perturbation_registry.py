@@ -83,6 +83,8 @@ def _canonical_source_uri(accession: str, value: object) -> str:
         or port is not None
         or parsed.netloc != parsed.hostname
         or parsed.fragment
+        or "%" in parsed.netloc
+        or "%" in parsed.hostname
         or not parsed.path.startswith("/")
         or parsed.path == "/"
         or "%" in parsed.path

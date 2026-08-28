@@ -366,6 +366,8 @@ def test_source_identity_rejects_noncanonical_geo_aliases(accession: str, source
         "https://example.test./source",
         "https://EXAMPLE.test/source",
         "https://example.test:443/source",
+        "https://%65xample.test/source",
+        "https://example%2etest/source",
     ),
 )
 def test_source_identity_rejects_noncanonical_generic_https_spellings(source_uri: str) -> None:
