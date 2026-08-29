@@ -941,7 +941,9 @@ git commit -m "test: cover methods v3 bridge end to end"
 **Files:**
 - Create after audit: `configs/hypersca_methods_v3.yaml`
 - Create after audit: `reports/methods_protocol_v3_preflight/bridge_capability.json`
-- Create after audit: `reports/methods_protocol_v3_preflight/predictor_capability.json`
+- Create after audit: `reports/methods_protocol_v3_preflight/predictor_capability/`
+  containing exactly `capability_record.json`, `resource_usage.json`,
+  `run_manifest.json`, and `method_status.json`
 - Create after audit: `reports/methods_protocol_v3_preflight/review.md`
 - Modify: `tests/test_methods_protocol_v3.py`
 
@@ -977,12 +979,15 @@ protocol without a new protocol version and identity.
 - [ ] **Step 4: Audit the production predictor interface without outcomes**
 
 ```bash
-python scripts/validate_spatial_perturbation_predictor.py --registry configs/spatial_perturbation_bridge_candidates_v1.json --protocol configs/hypersca_methods_v3.yaml --method-id hypersca --output reports/methods_protocol_v3_preflight/predictor_capability.json
+python scripts/validate_spatial_perturbation_predictor.py --registry configs/spatial_perturbation_bridge_candidates_v1.json --protocol configs/hypersca_methods_v3.yaml --method-id hypersca --output reports/methods_protocol_v3_preflight/predictor_capability/
 ```
 
 Expected for the current repository:
 `status="method_adapter_not_executable"`, no adapter identity, no predictions,
 and no metric artifacts. This is a capability result, not an algorithm failure.
+Read that status from
+`reports/methods_protocol_v3_preflight/predictor_capability/capability_record.json`;
+the `--output` argument is the evidence-bundle directory, not a JSON filename.
 Do not call `propagate_perturbation()` as a substitute and do not construct a
 new predictor from HyperSCA-C output inside this task.
 

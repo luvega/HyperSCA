@@ -1356,6 +1356,128 @@ def _mean_for_cells(
     return total / len(unique)
 
 
+def _observed_group_means(
+    standardized: NDArray[np.float64],
+    *,
+    cells: tuple[str, ...],
+    genes: tuple[str, ...],
+    eligibility: BridgeEligibilityResult,
+    unit_by_id: dict[str, Any],
+    parent_by_id: dict[str, Any],
+) -> dict[tuple[str, str], tuple[float, float]]:
+    row_by_cell = {cell_id: index for index, cell_id in enumerate(cells)}
+    gene_index = {gene: index for index, gene in enumerate(genes)}
+    relation_by_id = {
+        relation.relation_id: relation
+        for relation in eligibility.manifest.neighbour_relations
+    }
+    unit_evidence = {
+        item.unit_id: item for item in eligibility.evidence.unit_evidence
+    }
+    result: dict[tuple[str, str], tuple[float, float]] = {}
+    for unit_id, unit in unit_by_id.items():
+        primary_evidence = unit_evidence[unit_id]
+        treatment_cells = tuple(
+            relation_by_id[relation_id].neighbor_cell_id
+            for relation_id in primary_evidence.perturbation_neighbour_relation_ids
+        )
+        safe_cells = tuple(
+            relation_by_id[relation_id].neighbor_cell_id
+            for relation_id in primary_evidence.safe_neighbour_relation_ids
+        )
+        column = gene_index[unit.target_gene]
+        result[("neighbor", unit_id)] = (
+            _mean_for_cells(
+                standardized, row_by_cell, treatment_cells, column,
+                f"neighbor unit {unit_id}",
+            ),
+            _mean_for_cells(
+                standardized, row_by_cell, safe_cells, column,
+                f"matched mSafe unit {unit_id}",
+            ),
+        )
+    parent_evidence = {
+        (item.animal_id, item.perturbation_id): item
+        for item in eligibility.evidence.parent_evidence
+    }
+    for parent_id, parent in parent_by_id.items():
+        own_evidence = parent_evidence[(parent.animal_id, parent.perturbation_id)]
+        column = gene_index[parent.target_gene]
+        result[("own", parent_id)] = (
+            _mean_for_cells(
+                standardized, row_by_cell,
+                own_evidence.perturbation_source_cell_ids, column,
+                f"own perturbation unit {parent_id}",
+            ),
+            _mean_for_cells(
+                standardized, row_by_cell, own_evidence.safe_source_cell_ids,
+                column, f"own mSafe unit {parent_id}",
+            ),
+        )
+    return result
+
+
+def build_bridge_observed_effect_projection(
+    expression: np.ndarray,
+    *,
+    cell_ids: tuple[str, ...],
+    gene_names: tuple[str, ...],
+    standardizer: TrainControlStandardizer,
+    eligibility: BridgeEligibilityResult,
+    data_identity_sha256: str,
+) -> dict[str, object]:
+    """Publish bounded sufficient statistics replayed from complete Task7 inputs."""
+
+    frozen_standardizer = _snapshot_standardizer(standardizer)
+    frozen_eligibility = _snapshot_eligibility(eligibility)
+    genes = _text_tuple(gene_names, "gene_names", maximum=MAX_GENES, unique=True)
+    if genes != frozen_standardizer.genes or genes != frozen_eligibility.manifest.gene_names:
+        raise SpatialPerturbationScoringError(
+            "observed projection requires the exact frozen gene order"
+        )
+    array = _validate_expression(expression, expected_genes=len(genes))
+    cells = _text_tuple(cell_ids, "cell_ids", maximum=MAX_EXPRESSION_ROWS, unique=True)
+    if len(cells) != array.shape[0]:
+        raise SpatialPerturbationScoringError(
+            "observed projection cell_ids length does not match expression rows"
+        )
+    _, unit_by_id, parent_by_id = _expected_keys(frozen_eligibility)
+    standardized = apply_train_control_standardizer(
+        array,
+        gene_names=genes,
+        standardizer=frozen_standardizer,
+        split_manifest=frozen_eligibility.manifest,
+    )
+    means = _observed_group_means(
+        standardized,
+        cells=cells,
+        genes=genes,
+        eligibility=frozen_eligibility,
+        unit_by_id=unit_by_id,
+        parent_by_id=parent_by_id,
+    )
+    effects = [
+        {
+            "unit_id": unit_id,
+            "endpoint": endpoint,
+            "treatment_mean_hex": treatment.hex(),
+            "safe_control_mean_hex": control.hex(),
+            "observed_delta_hex": (treatment - control).hex(),
+        }
+        for (endpoint, unit_id), (treatment, control) in sorted(
+            means.items(), key=lambda item: (_ENDPOINTS.index(item[0][0]), item[0][1])
+        )
+    ]
+    return {
+        "schema_version": "bridge_observed_effect_projection_v1",
+        "data_identity_sha256": _sha(data_identity_sha256, "data_identity_sha256"),
+        "split_identity_sha256": frozen_eligibility.manifest.split_identity_sha256,
+        "eligibility_identity_sha256": frozen_eligibility.eligibility_identity_sha256,
+        "standardizer_identity_sha256": frozen_standardizer.training_identity_sha256,
+        "effects": effects,
+    }
+
+
 def build_bridge_effect_table(
     expression: np.ndarray,
     *,
@@ -1416,34 +1538,18 @@ def build_bridge_effect_table(
         standardizer=frozen_standardizer,
         split_manifest=frozen_eligibility.manifest,
     )
-    row_by_cell = {cell_id: index for index, cell_id in enumerate(cells)}
-    gene_index = {gene: index for index, gene in enumerate(genes)}
-    relation_by_id = {
-        relation.relation_id: relation
-        for relation in frozen_eligibility.manifest.neighbour_relations
-    }
-    unit_evidence = {
-        item.unit_id: item for item in frozen_eligibility.evidence.unit_evidence
-    }
+    observed_means = _observed_group_means(
+        standardized,
+        cells=cells,
+        genes=genes,
+        eligibility=frozen_eligibility,
+        unit_by_id=unit_by_id,
+        parent_by_id=parent_by_id,
+    )
     effects: list[BridgeEffect] = []
     for unit_id, unit in unit_by_id.items():
-        primary_evidence = unit_evidence[unit_id]
-        treatment_cells = tuple(
-            relation_by_id[relation_id].neighbor_cell_id
-            for relation_id in primary_evidence.perturbation_neighbour_relation_ids
-        )
-        safe_cells = tuple(
-            relation_by_id[relation_id].neighbor_cell_id
-            for relation_id in primary_evidence.safe_neighbour_relation_ids
-        )
-        column = gene_index[unit.target_gene]
-        observed = _mean_for_cells(
-            standardized, row_by_cell, treatment_cells, column,
-            f"neighbor unit {unit_id}",
-        ) - _mean_for_cells(
-            standardized, row_by_cell, safe_cells, column,
-            f"matched mSafe unit {unit_id}",
-        )
+        treatment_mean, control_mean = observed_means[("neighbor", unit_id)]
+        observed = treatment_mean - control_mean
         effects.append(
             _make_effect(
                 unit_id, "neighbor", unit.animal_id, unit.perturbation_id,
@@ -1451,26 +1557,9 @@ def build_bridge_effect_table(
                 prediction_by_key[("neighbor", unit_id)],
             )
         )
-    parent_evidence = {
-        (item.animal_id, item.perturbation_id): item
-        for item in frozen_eligibility.evidence.parent_evidence
-    }
     for parent_id, parent in parent_by_id.items():
-        own_evidence = parent_evidence[(parent.animal_id, parent.perturbation_id)]
-        column = gene_index[parent.target_gene]
-        observed = _mean_for_cells(
-            standardized,
-            row_by_cell,
-            own_evidence.perturbation_source_cell_ids,
-            column,
-            f"own perturbation unit {parent_id}",
-        ) - _mean_for_cells(
-            standardized,
-            row_by_cell,
-            own_evidence.safe_source_cell_ids,
-            column,
-            f"own mSafe unit {parent_id}",
-        )
+        treatment_mean, control_mean = observed_means[("own", parent_id)]
+        observed = treatment_mean - control_mean
         effects.append(
             _make_effect(
                 parent_id, "own", parent.animal_id, parent.perturbation_id,
@@ -1704,6 +1793,16 @@ class _DistanceCalibration:
     total_contexts_by_animal: dict[str, int]
 
 
+def _coverage_and_abstention(numerator: int, denominator: int) -> tuple[float, float]:
+    """Compute both ratios in the frozen Task7 operand order."""
+
+    if denominator <= 0 or not 0 <= numerator <= denominator:
+        raise SpatialPerturbationScoringError(
+            "coverage numerator and denominator are invalid"
+        )
+    return numerator / denominator, (denominator - numerator) / denominator
+
+
 def _distance_calibration(
     effects: tuple[BridgeEffect, ...],
     expected_contexts: tuple[tuple[str, str, str, str], ...] | None = None,
@@ -1759,14 +1858,17 @@ def _distance_calibration(
             ("gene_name", "band", "neighbor_cell_type", "perturbation_id"),
         )
         by_animal.update(computed_by_animal)
-    coverage = eligible / total if total else 0.0
+    if total:
+        coverage, abstention = _coverage_and_abstention(eligible, total)
+    else:
+        coverage, abstention = 0.0, 0.0
     return _DistanceCalibration(
         overall_error,
         by_animal,
         eligible,
         total,
         coverage,
-        1.0 - coverage,
+        abstention,
         eligible_by_animal,
         total_by_animal,
     )
@@ -1937,8 +2039,9 @@ def _compute_score(table: BridgeEffectTable) -> _ComputedScore:
     if not evaluation_units:
         raise SpatialPerturbationScoringError("eligibility denominators must be positive")
     evaluation_scoreable = len(neighbor)
-    coverage = evaluation_scoreable / len(evaluation_units)
-    abstention = (len(evaluation_units) - evaluation_scoreable) / len(evaluation_units)
+    coverage, abstention = _coverage_and_abstention(
+        evaluation_scoreable, len(evaluation_units)
+    )
     animals = sorted(set(neighbor_by_animal) | set(own_by_animal))
     animal_units = tuple(
         _make_animal_unit(
@@ -2061,13 +2164,15 @@ class BridgeScore:
             raise SpatialPerturbationScoringError(
                 "accuracy, coverage, and abstention must be within [0, 1]"
             )
+        expected_calibration_ratios = (
+            _coverage_and_abstention(calibration_eligible, calibration_total)
+            if calibration_total
+            else (0.0, 0.0)
+        )
         if (
             calibration_eligible > calibration_total
             or (calibration is None) != (calibration_eligible == 0)
-            or numeric[3] != (
-                calibration_eligible / calibration_total if calibration_total else 0.0
-            )
-            or numeric[4] != 1.0 - numeric[3]
+            or (numeric[3], numeric[4]) != expected_calibration_ratios
         ):
             raise SpatialPerturbationScoringError(
                 "distance calibration availability and coverage are inconsistent"
@@ -2151,6 +2256,178 @@ class BridgeScore:
                 "score identity does not match its metrics and unit table"
             )
         object.__setattr__(self, "scoring_identity_sha256", scoring_identity)
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedBridgeScoreReplay:
+    """Task7 metric replay from the published effect-unit projection."""
+
+    neighbor_effect_rmse: float
+    own_effect_rmse: float
+    neighbor_effect_pcc: float
+    distance_decay_calibration_error: float | None
+    distance_calibration_eligible_pairs: int
+    distance_calibration_total_contexts: int
+    distance_calibration_coverage: float
+    distance_calibration_abstention: float
+    effect_sign_accuracy: float
+    coverage: float
+    abstention: float
+    animal_level_unit_table: tuple[BridgeAnimalUnit, ...]
+    effect_table_identity_sha256: str
+    scoring_identity_sha256: str
+
+
+def replay_published_bridge_effect_units(
+    effects: tuple[BridgeEffect, ...],
+    *,
+    expected_calibration_contexts: tuple[tuple[str, str, str, str], ...],
+    evaluation_neighbor_unit_count: int,
+    split_identity_sha256: str,
+    neighbour_table_identity_sha256: str,
+    eligibility_identity_sha256: str,
+    standardizer_identity_sha256: str,
+) -> PublishedBridgeScoreReplay:
+    """Recompute all Task7 metrics from an exact published effect-unit table."""
+
+    if type(effects) is not tuple or not effects or len(effects) > MAX_EFFECT_UNITS:
+        raise SpatialPerturbationScoringError(
+            "published effects must be a non-empty bounded exact tuple"
+        )
+    frozen = tuple(_snapshot_effect(effect) for effect in effects)
+    frozen = tuple(
+        sorted(frozen, key=lambda item: (_ENDPOINTS.index(item.endpoint), item.unit_id))
+    )
+    keys = tuple((effect.endpoint, effect.unit_id) for effect in frozen)
+    if len(set(keys)) != len(keys):
+        raise SpatialPerturbationScoringError("published effects contain duplicates")
+    if (
+        type(expected_calibration_contexts) is not tuple
+        or not expected_calibration_contexts
+        or any(
+            type(context) is not tuple
+            or len(context) != 4
+            or any(type(value) is not str for value in context)
+            for context in expected_calibration_contexts
+        )
+    ):
+        raise SpatialPerturbationScoringError(
+            "published calibration contexts must be exact string tuples"
+        )
+    expected_contexts = tuple(sorted(set(expected_calibration_contexts)))
+    if len(expected_contexts) != len(expected_calibration_contexts):
+        raise SpatialPerturbationScoringError(
+            "published calibration contexts must be unique"
+        )
+    if (
+        type(evaluation_neighbor_unit_count) is not int
+        or not 1 <= evaluation_neighbor_unit_count <= MAX_EFFECT_UNITS
+    ):
+        raise SpatialPerturbationScoringError(
+            "evaluation neighbor unit count is invalid"
+        )
+    identities = tuple(
+        _sha(value, name)
+        for name, value in (
+            ("split_identity_sha256", split_identity_sha256),
+            ("neighbour_table_identity_sha256", neighbour_table_identity_sha256),
+            ("eligibility_identity_sha256", eligibility_identity_sha256),
+            ("standardizer_identity_sha256", standardizer_identity_sha256),
+        )
+    )
+    neighbor = tuple(effect for effect in frozen if effect.endpoint == "neighbor")
+    own = tuple(effect for effect in frozen if effect.endpoint == "own")
+    if not neighbor or not own or len(neighbor) > evaluation_neighbor_unit_count:
+        raise SpatialPerturbationScoringError(
+            "published effects do not contain valid neighbor and own units"
+        )
+    neighbor_mse, neighbor_by_animal = _hierarchical_primary_means(
+        neighbor, lambda effect: (effect.predicted_delta - effect.observed_delta) ** 2
+    )
+    own_mse, own_by_animal = _hierarchical_means(
+        own,
+        lambda effect: (effect.predicted_delta - effect.observed_delta) ** 2,
+        ("gene_name", "band", "neighbor_cell_type", "perturbation_id"),
+    )
+    calibration = _distance_calibration(neighbor, expected_contexts)
+    weights = _neighbor_weights(neighbor)
+    sign_accuracy = math.fsum(
+        weight
+        for weight, effect in zip(weights, neighbor)
+        if (effect.observed_delta > 0) - (effect.observed_delta < 0)
+        == (effect.predicted_delta > 0) - (effect.predicted_delta < 0)
+    )
+    coverage, abstention = _coverage_and_abstention(
+        len(neighbor), evaluation_neighbor_unit_count
+    )
+    animals = sorted(set(neighbor_by_animal) | set(own_by_animal))
+    animal_units = tuple(
+        _make_animal_unit(
+            animal,
+            math.sqrt(neighbor_by_animal[animal]),
+            math.sqrt(own_by_animal[animal]),
+            calibration.by_animal.get(animal),
+            calibration.eligible_pairs_by_animal.get(animal, 0),
+            calibration.total_contexts_by_animal.get(animal, 0),
+            sum(effect.animal_id == animal for effect in neighbor),
+            sum(effect.animal_id == animal for effect in own),
+        )
+        for animal in animals
+    )
+    effect_table_unsigned = {
+        "schema": "bridge_effect_table_v1",
+        "split_identity_sha256": identities[0],
+        "neighbour_table_identity_sha256": identities[1],
+        "eligibility_identity_sha256": identities[2],
+        "standardizer_identity_sha256": identities[3],
+        "effects": [
+            {
+                **_effect_unsigned(effect),
+                "effect_identity_sha256": effect.effect_identity_sha256,
+            }
+            for effect in frozen
+        ],
+    }
+    effect_table_identity = _identity(effect_table_unsigned)
+    shell = object.__new__(BridgeScore)
+    score_values: tuple[tuple[str, object], ...] = (
+        ("neighbor_effect_rmse", math.sqrt(neighbor_mse)),
+        ("own_effect_rmse", math.sqrt(own_mse)),
+        ("neighbor_effect_pcc", _weighted_pcc(neighbor)),
+        ("distance_decay_calibration_error", calibration.error),
+        ("distance_calibration_eligible_pairs", calibration.eligible_pairs),
+        ("distance_calibration_total_contexts", calibration.total_contexts),
+        ("distance_calibration_coverage", calibration.coverage),
+        ("distance_calibration_abstention", calibration.abstention),
+        ("effect_sign_accuracy", min(1.0, max(0.0, sign_accuracy))),
+        ("coverage", coverage),
+        ("abstention", abstention),
+        ("animal_level_unit_table", animal_units),
+        ("split_identity_sha256", identities[0]),
+        ("neighbour_table_identity_sha256", identities[1]),
+        ("eligibility_identity_sha256", identities[2]),
+        ("standardizer_identity_sha256", identities[3]),
+        ("effect_table_identity_sha256", effect_table_identity),
+    )
+    for name, value in score_values:
+        object.__setattr__(shell, name, value)
+    scoring_identity = _identity(_score_unsigned(shell))
+    return PublishedBridgeScoreReplay(
+        math.sqrt(neighbor_mse),
+        math.sqrt(own_mse),
+        _weighted_pcc(neighbor),
+        calibration.error,
+        calibration.eligible_pairs,
+        calibration.total_contexts,
+        calibration.coverage,
+        calibration.abstention,
+        min(1.0, max(0.0, sign_accuracy)),
+        coverage,
+        abstention,
+        animal_units,
+        effect_table_identity,
+        scoring_identity,
+    )
 
 
 def _score_effect_table(effect_table: BridgeEffectTable) -> BridgeScore:

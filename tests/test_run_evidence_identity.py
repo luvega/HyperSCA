@@ -104,6 +104,19 @@ def test_unknown_or_overclaiming_evidence_roles_are_rejected(role: str) -> None:
         valid_identity(evidence_role=role)
 
 
+def test_synthetic_audit_role_requires_exact_synthetic_scope() -> None:
+    identity = valid_identity(
+        evidence_role="synthetic_audit_only", data_scopes=("synthetic",)
+    )
+
+    assert identity.evidence_role == "synthetic_audit_only"
+    assert identity.data_scopes == ("synthetic",)
+    with pytest.raises(RunEvidenceError, match="invalid_identity"):
+        valid_identity(
+            evidence_role="synthetic_audit_only", data_scopes=("train", "tune")
+        )
+
+
 @pytest.mark.parametrize(
     "field",
     [

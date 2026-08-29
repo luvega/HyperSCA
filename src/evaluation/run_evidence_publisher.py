@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath
 import secrets
 import stat
 from types import MappingProxyType, TracebackType
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping, cast
 import unicodedata
 
 from src.evaluation.run_evidence_identity import (
@@ -36,6 +36,44 @@ _FAILURE_STATUSES = frozenset(
         "failed_runtime_unavailable",
         "failed_resource",
         "failed_infrastructure",
+        "method_adapter_not_executable",
+    }
+)
+_ADAPTER_FAILURE_ARTIFACTS = frozenset(
+    {"capability_record.json", "resource_usage.json"}
+)
+_ADAPTER_FAILURE_REASON = "no_preregistered_bridge_predictor_adapter"
+_ADAPTER_FAILURE_SPLIT_RECORD = {
+    "schema_version": "1.0",
+    "split": "not_started_without_adapter",
+}
+_ADAPTER_FAILURE_UNIT_RECORD = {
+    "units": ["bridge_predictor_capability_audit"]
+}
+_ADAPTER_CAPABILITY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "method_id",
+        "registry_identity_sha256",
+        "protocol_identity_sha256",
+        "status",
+        "executable",
+        "adapter_identity_sha256",
+        "blocking_reasons",
+        "capability_identity_sha256",
+    }
+)
+_ADAPTER_RESOURCE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "audit",
+        "capability_identity_sha256",
+        "registry_identity_sha256",
+        "protocol_identity_sha256",
+        "code_identity_sha256",
+        "model_imported",
+        "outcomes_read",
+        "scientific_computation_performed",
     }
 )
 _MAX_CONTROL_JSON_BYTES = 4 * 1024 * 1024
@@ -89,9 +127,10 @@ def _safe_text(value: object, *, allow_slash: bool = False) -> bool:
 
 
 def _artifact_parts(value: object) -> tuple[str, ...]:
-    if not _safe_text(value, allow_slash=True) or "\\" in value:
+    value_text = cast(str, value) if type(value) is str else ""
+    if not _safe_text(value, allow_slash=True) or "\\" in value_text:
         raise RunEvidenceError("invalid_artifact", "artifact path is not safe text")
-    parsed = PurePosixPath(value)
+    parsed = PurePosixPath(value_text)
     parts = parsed.parts
     if parsed.is_absolute() or not parts or any(part in {"", ".", ".."} for part in parts):
         raise RunEvidenceError(
@@ -271,6 +310,93 @@ def _load_strict_canonical_json(payload: bytes, *, label: str) -> Any:
         raise RunEvidenceError("invalid_artifact", f"{label} is invalid JSON") from exc
     except (UnicodeError, json.JSONDecodeError, ValueError, OverflowError) as exc:
         raise RunEvidenceError("invalid_artifact", f"{label} is invalid JSON") from exc
+
+
+def _validate_adapter_failure_records(
+    *,
+    identity: RunEvidenceIdentity,
+    statistical_unit_record: object,
+    capability_payload: bytes,
+    resource_payload: bytes,
+) -> None:
+    if (
+        identity.protocol_version != "hypersca-methods-v3.0"
+        or identity.claim_id != "bridge"
+        or identity.benchmark_id != "spatial_perturbation_bridge"
+        or identity.evidence_role != "pilot_audit_only"
+        or identity.data_scopes != ("train", "tune")
+        or identity.model_seed != 0
+        or identity.data_split_seed != 11
+        or identity.data_split_identity_sha256
+        != canonical_sha256(_ADAPTER_FAILURE_SPLIT_RECORD)
+        or identity.statistical_unit_schema != "bridge_prediction_unit_v1"
+        or statistical_unit_record != _ADAPTER_FAILURE_UNIT_RECORD
+        or identity.statistical_unit_identity_sha256
+        != canonical_sha256(_ADAPTER_FAILURE_UNIT_RECORD)
+    ):
+        raise RunEvidenceError(
+            "invalid_identity",
+            "method adapter failure identity is not the exact bridge audit",
+        )
+    capability = _load_strict_canonical_json(
+        capability_payload, label="capability record"
+    )
+    resource = _load_strict_canonical_json(
+        resource_payload, label="resource usage record"
+    )
+    if type(capability) is not dict or set(capability) != _ADAPTER_CAPABILITY_FIELDS:
+        raise RunEvidenceError(
+            "invalid_artifact", "capability record fields do not match the exact schema"
+        )
+    if type(resource) is not dict or set(resource) != _ADAPTER_RESOURCE_FIELDS:
+        raise RunEvidenceError(
+            "invalid_artifact", "resource usage fields do not match the exact schema"
+        )
+    capability_unsigned = dict(capability)
+    capability_identity = capability_unsigned.pop("capability_identity_sha256")
+    if (
+        capability_unsigned
+        != {
+            "schema_version": "1.0",
+            "method_id": "hypersca",
+            "registry_identity_sha256": identity.input_identity_sha256,
+            "protocol_identity_sha256": identity.protocol_identity,
+            "status": "method_adapter_not_executable",
+            "executable": False,
+            "adapter_identity_sha256": None,
+            "blocking_reasons": [_ADAPTER_FAILURE_REASON],
+        }
+        or capability_identity != canonical_sha256(capability_unsigned)
+        or capability_identity != identity.config_identity_sha256
+    ):
+        raise RunEvidenceError(
+            "invalid_identity", "capability record does not match the adapter failure identity"
+        )
+    expected_analysis = {
+        "schema_version": "1.0",
+        "claim_id": "bridge",
+        "capability_identity_sha256": capability_identity,
+        "status": "method_adapter_not_executable",
+    }
+    if identity.analysis_identity_sha256 != canonical_sha256(expected_analysis):
+        raise RunEvidenceError(
+            "invalid_identity",
+            "adapter failure analysis identity does not match its capability and status",
+        )
+    if resource != {
+        "schema_version": "1.0",
+        "audit": "outcome_blind_predictor_capability",
+        "capability_identity_sha256": capability_identity,
+        "registry_identity_sha256": identity.input_identity_sha256,
+        "protocol_identity_sha256": identity.protocol_identity,
+        "code_identity_sha256": identity.code_identity_sha256,
+        "model_imported": False,
+        "outcomes_read": False,
+        "scientific_computation_performed": False,
+    }:
+        raise RunEvidenceError(
+            "invalid_identity", "resource usage record does not match the safe adapter audit"
+        )
 
 
 def _open_read_below(directory_fd: int, parts: tuple[str, ...]) -> int:
@@ -611,7 +737,7 @@ class RunEvidencePublisher:
         exception_type: type[BaseException] | None,
         exception: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool:
+    ) -> Literal[False]:
         if exception_type is not None and self._state is _PublisherState.STAGING:
             self.abort()
         return False
@@ -634,14 +760,15 @@ class RunEvidencePublisher:
 
     @staticmethod
     def _validate_media_type(media_type: object) -> str:
+        media_text = cast(str, media_type) if type(media_type) is str else ""
         if (
             not _safe_text(media_type, allow_slash=True)
-            or "\\" in media_type
-            or media_type.count("/") != 1
-            or any(not part for part in media_type.split("/"))
+            or "\\" in media_text
+            or media_text.count("/") != 1
+            or any(not part for part in media_text.split("/"))
         ):
             raise RunEvidenceError("invalid_artifact", "media_type is invalid")
-        return media_type
+        return media_text
 
     def _record_artifact(
         self, parts: tuple[str, ...], size_bytes: int, sha256: str, media_type: str
@@ -902,7 +1029,50 @@ class RunEvidencePublisher:
                 raise RunEvidenceError(
                     "invalid_state_transition", "failure reason is invalid"
                 )
-            if self._artifacts:
+            artifact_paths = set(self._artifact_paths)
+            required_paths = set(self._required_artifacts)
+            if status == "method_adapter_not_executable":
+                if reason != _ADAPTER_FAILURE_REASON:
+                    raise RunEvidenceError(
+                        "invalid_state_transition",
+                        "method adapter failure reason is not the fixed blocking reason",
+                    )
+                if (
+                    artifact_paths != _ADAPTER_FAILURE_ARTIFACTS
+                    or required_paths != _ADAPTER_FAILURE_ARTIFACTS
+                ):
+                    raise RunEvidenceError(
+                        "invalid_state_transition",
+                        "method adapter failure requires only capability and resource audit artifacts",
+                    )
+                artifact_records = {
+                    artifact.relative_path: artifact for artifact in self._artifacts
+                }
+                if any(
+                    artifact_records[path].media_type != "application/json"
+                    for path in _ADAPTER_FAILURE_ARTIFACTS
+                ):
+                    raise RunEvidenceError(
+                        "invalid_artifact",
+                        "method adapter failure records must be JSON artifacts",
+                    )
+                capability_payload, _ = _read_bound_regular_file(
+                    self._staging_fd,
+                    "capability_record.json",
+                    maximum_bytes=_MAX_CONTROL_JSON_BYTES,
+                )
+                resource_payload, _ = _read_bound_regular_file(
+                    self._staging_fd,
+                    "resource_usage.json",
+                    maximum_bytes=_MAX_CONTROL_JSON_BYTES,
+                )
+                _validate_adapter_failure_records(
+                    identity=self._identity,
+                    statistical_unit_record=self._statistical_unit_record,
+                    capability_payload=capability_payload,
+                    resource_payload=resource_payload,
+                )
+            elif self._artifacts or self._required_artifacts:
                 raise RunEvidenceError(
                     "invalid_state_transition",
                     "failure publication cannot contain scientific artifacts",
@@ -1189,7 +1359,48 @@ def verify_run_evidence_bundle(
                 reason, allow_slash=True
             ):
                 raise RunEvidenceError("invalid_artifact", "failure reason is invalid")
-            if artifacts or required_artifacts:
+            if terminal_status == "method_adapter_not_executable":
+                if reason != _ADAPTER_FAILURE_REASON:
+                    raise RunEvidenceError(
+                        "invalid_artifact",
+                        "method adapter failure reason changed",
+                    )
+                if (
+                    set(artifact_paths) != _ADAPTER_FAILURE_ARTIFACTS
+                    or set(required_artifacts) != _ADAPTER_FAILURE_ARTIFACTS
+                ):
+                    raise RunEvidenceError(
+                        "invalid_artifact",
+                        "method adapter failure artifact set changed",
+                    )
+                adapter_records = {
+                    artifact.relative_path: artifact for artifact in artifacts
+                }
+                if any(
+                    adapter_records[path].media_type != "application/json"
+                    for path in _ADAPTER_FAILURE_ARTIFACTS
+                ):
+                    raise RunEvidenceError(
+                        "invalid_artifact",
+                        "method adapter failure record media types changed",
+                    )
+                capability_payload, _ = _read_bound_regular_file(
+                    directory_fd,
+                    "capability_record.json",
+                    maximum_bytes=_MAX_CONTROL_JSON_BYTES,
+                )
+                resource_payload, _ = _read_bound_regular_file(
+                    directory_fd,
+                    "resource_usage.json",
+                    maximum_bytes=_MAX_CONTROL_JSON_BYTES,
+                )
+                _validate_adapter_failure_records(
+                    identity=identity,
+                    statistical_unit_record=unit_record,
+                    capability_payload=capability_payload,
+                    resource_payload=resource_payload,
+                )
+            elif artifacts or required_artifacts:
                 raise RunEvidenceError(
                     "invalid_artifact", "failure cannot contain scientific artifacts"
                 )

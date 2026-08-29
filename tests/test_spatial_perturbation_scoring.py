@@ -22,6 +22,7 @@ from src.evaluation.spatial_perturbation_scoring import (
     bridge_score_to_mapping,
     build_bridge_effect_table,
     fit_train_control_standardizer,
+    replay_published_bridge_effect_units,
     score_bridge_predictions,
     train_control_standardizer_to_mapping,
 )
@@ -42,6 +43,14 @@ from tests.test_spatial_perturbation_split import (
     complete_evidence,
     synthetic_metadata,
 )
+
+
+def test_frozen_two_of_three_coverage_uses_shared_operand_order() -> None:
+    import src.evaluation.spatial_perturbation_scoring as scoring_module
+
+    coverage, abstention = scoring_module._coverage_and_abstention(2, 3)
+    assert coverage.hex() == (2 / 3).hex()
+    assert abstention.hex() == ((3 - 2) / 3).hex()
 
 
 def _manifest_training_case(
@@ -765,6 +774,30 @@ def test_one_band_abstention_keeps_primary_sibling_and_only_abstains_calibration
     assert mapping["distance_calibration_total_contexts"] == 10
     assert mapping["distance_calibration_coverage"] == pytest.approx(0.9)
     assert mapping["distance_calibration_abstention"] == pytest.approx(0.1)
+    evaluation_units = tuple(
+        unit
+        for unit in manifest.primary_units
+        if unit.animal_id in set(manifest.evaluation_animals)
+    )
+    replay = replay_published_bridge_effect_units(
+        score.effect_table.effects,
+        expected_calibration_contexts=tuple(sorted({
+            (
+                unit.animal_id,
+                unit.perturbation_id,
+                unit.neighbour_cell_type,
+                unit.target_gene,
+            )
+            for unit in evaluation_units
+        })),
+        evaluation_neighbor_unit_count=len(evaluation_units),
+        split_identity_sha256=score.split_identity_sha256,
+        neighbour_table_identity_sha256=score.neighbour_table_identity_sha256,
+        eligibility_identity_sha256=score.eligibility_identity_sha256,
+        standardizer_identity_sha256=score.standardizer_identity_sha256,
+    )
+    assert replay.abstention.hex() == score.abstention.hex()
+    assert replay.scoring_identity_sha256 == score.scoring_identity_sha256
 
 
 def test_primary_band_weights_stay_fixed_half_when_one_proximal_unit_abstains() -> None:

@@ -248,3 +248,124 @@ def test_invalidation_record_is_exclusive_and_does_not_modify_runs(
             category="paired_identity_mismatch",
             reason="do not overwrite",
         )
+
+
+def publish_bridge_run(
+    root: Path,
+    *,
+    model_seed: int,
+    split_sha: str = "8" * 64,
+    unit_record: object | None = None,
+    artifact_paths: tuple[str, ...] = ("primary_metric_summary.json",),
+) -> VerifiedRunEvidence:
+    if unit_record is None:
+        unit_record = {
+            "units": [["a" * 64, "neighbor"], ["b" * 64, "own"]]
+        }
+    identity = RunEvidenceIdentity(
+        schema_version="1.0",
+        protocol_version="hypersca-methods-v3.0",
+        protocol_identity="7" * 64,
+        claim_id="bridge",
+        benchmark_id="spatial_perturbation_bridge",
+        data_scopes=("synthetic",),
+        data_split_seed=11,
+        model_seed=model_seed,
+        data_split_identity_sha256=split_sha,
+        statistical_unit_schema="bridge_prediction_unit_v1",
+        statistical_unit_identity_sha256=canonical_sha256(unit_record),
+        analysis_identity_sha256="6" * 64,
+        input_identity_sha256="5" * 64,
+        config_identity_sha256=f"{model_seed:064x}",
+        code_identity_sha256="4" * 64,
+        evidence_role="synthetic_audit_only",
+    )
+    publisher = RunEvidencePublisher.begin(
+        output_dir=root / f"bridge_{model_seed}",
+        identity=identity,
+        statistical_unit_record=unit_record,
+        required_artifacts=artifact_paths,
+        maximum_bundle_bytes=16_384,
+    )
+    for relative_path in artifact_paths:
+        publisher.add_bytes(
+            relative_path,
+            b'{"neighbor_effect_rmse":0.0}',
+            media_type=(
+                "application/json" if relative_path.endswith(".json") else "text/csv"
+            ),
+        )
+    output = publisher.finalize_completed(
+        summary={"claim_id": "bridge", "evidence_role": "synthetic_audit_only"}
+    )
+    return verify_run_evidence_bundle(output, expected_identity=identity)
+
+
+def test_incomplete_bridge_artifact_set_cannot_bypass_semantic_replay(
+    tmp_path: Path,
+) -> None:
+    first = publish_bridge_run(tmp_path, model_seed=11)
+    second = publish_bridge_run(tmp_path, model_seed=23)
+
+    with pytest.raises(RunEvidenceError, match="paired_identity_mismatch"):
+        validate_paired_collection((second, first), expected_model_seeds=(11, 23))
+
+
+@pytest.mark.parametrize("artifact_count", [10, 12])
+def test_bridge_collection_rejects_wrong_artifact_count_even_when_resealed(
+    tmp_path: Path, artifact_count: int
+) -> None:
+    expected = (
+        "split_manifest.json",
+        "capability_record.json",
+        "neighbor_units.csv",
+        "predictions_hypersca.csv",
+        "predictions_matched_euclidean.csv",
+        "predictions_hypersca_own_only.csv",
+        "primary_metric_units.csv",
+        "primary_metric_summary.json",
+        "secondary_metrics.csv",
+        "resource_usage.json",
+        "claim_decision.json",
+    )
+    artifact_paths = (
+        expected[:artifact_count]
+        if artifact_count == 10
+        else expected + ("unexpected.json",)
+    )
+    first = publish_bridge_run(
+        tmp_path, model_seed=11, artifact_paths=artifact_paths
+    )
+    second = publish_bridge_run(
+        tmp_path, model_seed=23, artifact_paths=artifact_paths
+    )
+
+    with pytest.raises(RunEvidenceError, match="paired_identity_mismatch"):
+        validate_paired_collection((first, second), expected_model_seeds=(11, 23))
+
+
+def test_bridge_collection_still_rejects_changed_statistical_units(
+    tmp_path: Path,
+) -> None:
+    first = publish_bridge_run(tmp_path, model_seed=11)
+
+    changed_root = tmp_path / "changed"
+    changed_root.mkdir()
+    changed = publish_bridge_run(
+        changed_root,
+        model_seed=23,
+        unit_record={"units": [["a" * 64, "neighbor"]]},
+    )
+    with pytest.raises(RunEvidenceError, match="paired_identity_mismatch"):
+        validate_paired_collection((first, changed), expected_model_seeds=(11, 23))
+
+
+def test_bridge_collection_replays_and_rejects_tampered_evidence(tmp_path: Path) -> None:
+    first = publish_bridge_run(tmp_path, model_seed=11)
+    second = publish_bridge_run(tmp_path, model_seed=23)
+    (second.output_dir / "primary_metric_summary.json").write_bytes(
+        b'{"neighbor_effect_rmse":1.0}'
+    )
+
+    with pytest.raises(RunEvidenceError, match="paired_identity_mismatch"):
+        validate_paired_collection((first, second), expected_model_seeds=(11, 23))

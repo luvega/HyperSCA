@@ -12,7 +12,7 @@ import json
 import math
 import re
 import unicodedata
-from typing import Any
+from typing import Any, cast
 
 
 ERROR_CATEGORIES = frozenset(
@@ -26,7 +26,12 @@ ERROR_CATEGORIES = frozenset(
     }
 )
 EVIDENCE_ROLES = frozenset(
-    {"pilot_audit_only", "release_candidate", "infrastructure_smoke"}
+    {
+        "pilot_audit_only",
+        "release_candidate",
+        "infrastructure_smoke",
+        "synthetic_audit_only",
+    }
 )
 IDENTITY_SCHEMA_VERSION = "1.0"
 MAX_EXACT_INTEGER = 2**63 - 1
@@ -63,7 +68,7 @@ def _require_exact_nfc_text(value: object, *, field_name: str) -> str:
         raise RunEvidenceError(
             "invalid_identity", f"{field_name} must be non-empty exact NFC text"
         )
-    return value
+    return cast(str, value)
 
 
 def _require_sha256(value: object, *, field_name: str) -> str:
@@ -98,6 +103,11 @@ def _require_data_scopes(value: object, *, evidence_role: str) -> tuple[str, ...
         raise RunEvidenceError(
             "invalid_identity",
             "pilot_audit_only data_scopes must equal ('train', 'tune')",
+        )
+    if evidence_role == "synthetic_audit_only" and frozen != ("synthetic",):
+        raise RunEvidenceError(
+            "invalid_identity",
+            "synthetic_audit_only data_scopes must equal ('synthetic',)",
         )
     return frozen
 

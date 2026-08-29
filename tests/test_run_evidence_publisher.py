@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import pytest
 from src.evaluation.run_evidence_identity import (
     RunEvidenceError,
     RunEvidenceIdentity,
+    canonical_json_bytes,
     canonical_sha256,
 )
 from src.evaluation.run_evidence_publisher import (
@@ -54,6 +56,111 @@ def begin_publisher(
         required_artifacts=required_artifacts,
         maximum_bundle_bytes=maximum_bundle_bytes,
     )
+
+
+def adapter_failure_records(
+    *,
+    capability_changes: dict[str, object] | None = None,
+    resource_changes: dict[str, object] | None = None,
+    identity_changes: dict[str, object] | None = None,
+    unit_record_changes: dict[str, object] | None = None,
+) -> tuple[RunEvidenceIdentity, dict[str, object], dict[str, object], dict[str, object]]:
+    unit_record: dict[str, object] = {"units": ["bridge_predictor_capability_audit"]}
+    if unit_record_changes:
+        unit_record.update(unit_record_changes)
+    capability: dict[str, object] = {
+        "schema_version": "1.0",
+        "method_id": "hypersca",
+        "registry_identity_sha256": "a" * 64,
+        "protocol_identity_sha256": "b" * 64,
+        "status": "method_adapter_not_executable",
+        "executable": False,
+        "adapter_identity_sha256": None,
+        "blocking_reasons": ["no_preregistered_bridge_predictor_adapter"],
+    }
+    if capability_changes:
+        capability.update(capability_changes)
+    capability["capability_identity_sha256"] = canonical_sha256(capability)
+    identity_values: dict[str, object] = {
+        "schema_version": "1.0",
+        "protocol_version": "hypersca-methods-v3.0",
+        "protocol_identity": "b" * 64,
+        "claim_id": "bridge",
+        "benchmark_id": "spatial_perturbation_bridge",
+        "data_scopes": ("train", "tune"),
+        "data_split_seed": 11,
+        "model_seed": 0,
+        "data_split_identity_sha256": canonical_sha256(
+            {"schema_version": "1.0", "split": "not_started_without_adapter"}
+        ),
+        "statistical_unit_schema": "bridge_prediction_unit_v1",
+        "statistical_unit_identity_sha256": canonical_sha256(unit_record),
+        "analysis_identity_sha256": canonical_sha256(
+            {
+                "schema_version": "1.0",
+                "claim_id": "bridge",
+                "capability_identity_sha256": capability[
+                    "capability_identity_sha256"
+                ],
+                "status": "method_adapter_not_executable",
+            }
+        ),
+        "input_identity_sha256": "a" * 64,
+        "config_identity_sha256": capability["capability_identity_sha256"],
+        "code_identity_sha256": "c" * 64,
+        "evidence_role": "pilot_audit_only",
+    }
+    if identity_changes:
+        identity_values.update(identity_changes)
+    identity = RunEvidenceIdentity(**identity_values)  # type: ignore[arg-type]
+    resource: dict[str, object] = {
+        "schema_version": "1.0",
+        "audit": "outcome_blind_predictor_capability",
+        "capability_identity_sha256": capability["capability_identity_sha256"],
+        "registry_identity_sha256": "a" * 64,
+        "protocol_identity_sha256": "b" * 64,
+        "code_identity_sha256": "c" * 64,
+        "model_imported": False,
+        "outcomes_read": False,
+        "scientific_computation_performed": False,
+    }
+    if resource_changes:
+        resource.update(resource_changes)
+    return identity, unit_record, capability, resource
+
+
+def stage_adapter_failure(
+    tmp_path: Path,
+    *,
+    capability_changes: dict[str, object] | None = None,
+    resource_changes: dict[str, object] | None = None,
+    identity_changes: dict[str, object] | None = None,
+    unit_record_changes: dict[str, object] | None = None,
+) -> RunEvidencePublisher:
+    identity, unit_record, capability, resource = adapter_failure_records(
+        capability_changes=capability_changes,
+        resource_changes=resource_changes,
+        identity_changes=identity_changes,
+        unit_record_changes=unit_record_changes,
+    )
+    publisher = RunEvidencePublisher.begin(
+        output_dir=tmp_path / "adapter-failure",
+        identity=identity,
+        statistical_unit_record=unit_record,
+        required_artifacts=("capability_record.json", "resource_usage.json"),
+        maximum_bundle_bytes=64 * 1024,
+    )
+    publisher.add_bytes(
+        "capability_record.json",
+        canonical_json_bytes(capability),
+        media_type="application/json",
+    )
+    publisher.add_bytes(
+        "resource_usage.json",
+        canonical_json_bytes(resource),
+        media_type="application/json",
+    )
+    return publisher
 
 
 def test_publisher_stages_bytes_and_streams_one_regular_file(tmp_path: Path) -> None:
@@ -313,6 +420,309 @@ def test_failure_bundle_has_no_scientific_summary(tmp_path: Path) -> None:
         "method_status.json",
         "run_manifest.json",
     }
+
+
+def test_method_adapter_not_executable_has_exact_audit_artifact_allowlist(
+    tmp_path: Path,
+) -> None:
+    publisher = stage_adapter_failure(tmp_path)
+    identity = publisher.identity
+
+    output = publisher.finalize_failure(
+        status="method_adapter_not_executable",
+        reason="no_preregistered_bridge_predictor_adapter",
+    )
+    verified = verify_run_evidence_bundle(output, expected_identity=identity)
+
+    assert verified.terminal_status == "method_adapter_not_executable"
+    assert tuple(item.relative_path for item in verified.artifacts) == (
+        "capability_record.json",
+        "resource_usage.json",
+    )
+    assert {item.name for item in output.iterdir()} == {
+        "capability_record.json",
+        "resource_usage.json",
+        "method_status.json",
+        "run_manifest.json",
+    }
+
+
+@pytest.mark.parametrize(
+    "identity_changes",
+    (
+        {"protocol_version": "hypersca-methods-v2.1"},
+        {"claim_id": "metrics"},
+        {"benchmark_id": "metrics"},
+        {"evidence_role": "release_candidate"},
+        {"evidence_role": "infrastructure_smoke"},
+    ),
+)
+def test_method_adapter_failure_requires_exact_bridge_v3_identity(
+    tmp_path: Path, identity_changes: dict[str, object]
+) -> None:
+    publisher = stage_adapter_failure(
+        tmp_path, identity_changes=identity_changes
+    )
+
+    with pytest.raises(RunEvidenceError, match="identity|adapter"):
+        publisher.finalize_failure(
+            status="method_adapter_not_executable",
+            reason="no_preregistered_bridge_predictor_adapter",
+        )
+    assert not (tmp_path / "adapter-failure").exists()
+
+
+@pytest.mark.parametrize(
+    ("identity_changes", "unit_record_changes"),
+    (
+        ({"model_seed": 1}, None),
+        ({"data_split_seed": 12}, None),
+        ({"data_split_identity_sha256": "9" * 64}, None),
+        ({"statistical_unit_schema": "other_unit_v1"}, None),
+        ({"analysis_identity_sha256": "8" * 64}, None),
+        (None, {"unknown": False}),
+        (None, {"units": ["different_audit"]}),
+    ),
+)
+def test_method_adapter_failure_closes_every_status_specific_identity_axis(
+    tmp_path: Path,
+    identity_changes: dict[str, object] | None,
+    unit_record_changes: dict[str, object] | None,
+) -> None:
+    publisher = stage_adapter_failure(
+        tmp_path,
+        identity_changes=identity_changes,
+        unit_record_changes=unit_record_changes,
+    )
+
+    with pytest.raises(RunEvidenceError, match="identity|adapter|unit|split|seed"):
+        publisher.finalize_failure(
+            status="method_adapter_not_executable",
+            reason="no_preregistered_bridge_predictor_adapter",
+        )
+    assert not (tmp_path / "adapter-failure").exists()
+
+
+@pytest.mark.parametrize(
+    ("capability_changes", "resource_changes"),
+    (
+        ({"unknown": "field"}, None),
+        (None, {"unknown": "field"}),
+        (None, {"outcomes_read": True}),
+        (None, {"model_imported": True}),
+        (None, {"scientific_computation_performed": True}),
+        ({"protocol_identity_sha256": "9" * 64}, None),
+        ({"registry_identity_sha256": "9" * 64}, None),
+        (None, {"code_identity_sha256": "9" * 64}),
+        ({"status": "failed_runtime"}, None),
+    ),
+)
+def test_method_adapter_failure_rejects_noncanonical_or_cross_identity_records(
+    tmp_path: Path,
+    capability_changes: dict[str, object] | None,
+    resource_changes: dict[str, object] | None,
+) -> None:
+    publisher = stage_adapter_failure(
+        tmp_path,
+        capability_changes=capability_changes,
+        resource_changes=resource_changes,
+    )
+
+    with pytest.raises(RunEvidenceError, match="capability|resource|identity|adapter"):
+        publisher.finalize_failure(
+            status="method_adapter_not_executable",
+            reason="no_preregistered_bridge_predictor_adapter",
+        )
+    assert not (tmp_path / "adapter-failure").exists()
+
+
+def test_replay_revalidates_adapter_failure_artifact_schemas_after_resealing(
+    tmp_path: Path,
+) -> None:
+    publisher = stage_adapter_failure(tmp_path)
+    identity = publisher.identity
+    output = publisher.finalize_failure(
+        status="method_adapter_not_executable",
+        reason="no_preregistered_bridge_predictor_adapter",
+    )
+    resource_path = output / "resource_usage.json"
+    resource = json.loads(resource_path.read_text(encoding="utf-8"))
+    resource["outcomes_read"] = True
+    resource_payload = canonical_json_bytes(resource)
+    resource_path.write_bytes(resource_payload)
+
+    manifest_path = output / "run_manifest.json"
+    status_path = output / "method_status.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    resource_artifact = next(
+        record
+        for record in manifest["artifacts"]
+        if record["relative_path"] == "resource_usage.json"
+    )
+    resource_artifact["size_bytes"] = len(resource_payload)
+    resource_artifact["sha256"] = hashlib.sha256(resource_payload).hexdigest()
+    inventory_sha256 = canonical_sha256(manifest["artifacts"])
+    manifest["artifact_inventory_sha256"] = inventory_sha256
+    manifest["terminal_status"]["artifact_inventory_sha256"] = inventory_sha256
+    status["artifact_inventory_sha256"] = inventory_sha256
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    status_path.write_bytes(canonical_json_bytes(status))
+
+    with pytest.raises(RunEvidenceError, match="resource|adapter"):
+        verify_run_evidence_bundle(output, expected_identity=identity)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("model_seed", 1),
+        ("data_split_seed", 12),
+        ("data_split_identity_sha256", "9" * 64),
+        ("statistical_unit_schema", "other_unit_v1"),
+        ("analysis_identity_sha256", "8" * 64),
+    ),
+)
+def test_replay_rejects_resealed_adapter_failure_identity_axis(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    output = stage_adapter_failure(tmp_path).finalize_failure(
+        status="method_adapter_not_executable",
+        reason="no_preregistered_bridge_predictor_adapter",
+    )
+    manifest_path = output / "run_manifest.json"
+    status_path = output / "method_status.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    manifest["run_identity"][field] = value
+    forged = RunEvidenceIdentity.from_record(manifest["run_identity"])
+    manifest["run_identity_sha256"] = forged.run_identity_sha256
+    status["run_identity_sha256"] = forged.run_identity_sha256
+    manifest["terminal_status"] = status
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    status_path.write_bytes(canonical_json_bytes(status))
+
+    with pytest.raises(RunEvidenceError, match="identity|adapter|split|seed"):
+        verify_run_evidence_bundle(output)
+
+
+def test_replay_rejects_resealed_adapter_failure_unit_record(tmp_path: Path) -> None:
+    output = stage_adapter_failure(tmp_path).finalize_failure(
+        status="method_adapter_not_executable",
+        reason="no_preregistered_bridge_predictor_adapter",
+    )
+    manifest_path = output / "run_manifest.json"
+    status_path = output / "method_status.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    forged_unit = {"units": ["different_audit"]}
+    forged_unit_identity = canonical_sha256(forged_unit)
+    manifest["statistical_unit_record"] = forged_unit
+    manifest["statistical_unit_identity_sha256"] = forged_unit_identity
+    manifest["run_identity"]["statistical_unit_identity_sha256"] = (
+        forged_unit_identity
+    )
+    forged = RunEvidenceIdentity.from_record(manifest["run_identity"])
+    manifest["run_identity_sha256"] = forged.run_identity_sha256
+    status["run_identity_sha256"] = forged.run_identity_sha256
+    manifest["terminal_status"] = status
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    status_path.write_bytes(canonical_json_bytes(status))
+
+    with pytest.raises(RunEvidenceError, match="identity|adapter|unit"):
+        verify_run_evidence_bundle(output)
+
+
+def test_method_adapter_failure_requires_the_fixed_blocking_reason(
+    tmp_path: Path,
+) -> None:
+    unit_record = {"units": ["adapter-capability-audit"]}
+    publisher = RunEvidencePublisher.begin(
+        output_dir=tmp_path / "wrong-adapter-reason",
+        identity=valid_identity(unit_record=unit_record),
+        statistical_unit_record=unit_record,
+        required_artifacts=("capability_record.json", "resource_usage.json"),
+        maximum_bundle_bytes=16_384,
+    )
+    publisher.add_bytes(
+        "capability_record.json", b"{}", media_type="application/json"
+    )
+    publisher.add_bytes(
+        "resource_usage.json", b"{}", media_type="application/json"
+    )
+
+    with pytest.raises(RunEvidenceError, match="reason"):
+        publisher.finalize_failure(
+            status="method_adapter_not_executable",
+            reason="adapter temporarily unavailable",
+        )
+    assert not (tmp_path / "wrong-adapter-reason").exists()
+
+
+@pytest.mark.parametrize(
+    "extra_path",
+    [
+        "primary_metric_summary.json",
+        "predictions_hypersca.csv",
+        "predictions.csv",
+        "claim_decision.json",
+        "extra.json",
+    ],
+)
+def test_method_adapter_failure_rejects_every_non_allowlisted_artifact(
+    tmp_path: Path, extra_path: str
+) -> None:
+    unit_record = {"units": ["adapter-capability-audit"]}
+    identity = valid_identity(unit_record=unit_record)
+    publisher = RunEvidencePublisher.begin(
+        output_dir=tmp_path / "adapter-failure",
+        identity=identity,
+        statistical_unit_record=unit_record,
+        required_artifacts=(
+            "capability_record.json",
+            "resource_usage.json",
+            extra_path,
+        ),
+        maximum_bundle_bytes=16_384,
+    )
+    publisher.add_bytes(
+        "capability_record.json", b"{}", media_type="application/json"
+    )
+    publisher.add_bytes("resource_usage.json", b"{}", media_type="application/json")
+    publisher.add_bytes(extra_path, b"{}", media_type="application/json")
+
+    with pytest.raises(RunEvidenceError, match="invalid_state_transition"):
+        publisher.finalize_failure(
+            status="method_adapter_not_executable",
+            reason="no_preregistered_bridge_predictor_adapter",
+        )
+    assert not (tmp_path / "adapter-failure").exists()
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "failed_runtime",
+        "failed_timeout",
+        "failed_invalid_output",
+        "failed_runtime_unavailable",
+        "failed_resource",
+        "failed_infrastructure",
+    ],
+)
+def test_legacy_failure_statuses_still_forbid_all_artifacts(
+    tmp_path: Path, status: str
+) -> None:
+    publisher = begin_publisher(
+        tmp_path, required_artifacts=("capability_record.json",), maximum_bundle_bytes=16_384
+    )
+    publisher.add_bytes(
+        "capability_record.json", b"{}", media_type="application/json"
+    )
+
+    with pytest.raises(RunEvidenceError, match="invalid_state_transition"):
+        publisher.finalize_failure(status=status, reason="registered failure")
+    assert not (tmp_path / "bundle").exists()
 
 
 def test_completed_requires_exact_declared_artifact_set(tmp_path: Path) -> None:

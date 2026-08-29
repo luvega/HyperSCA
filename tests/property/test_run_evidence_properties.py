@@ -186,3 +186,40 @@ def test_publisher_state_machine_publishes_at_most_once(
             publisher.abort()
         assert observed_publications <= 1
         assert sum(path.name == "bundle" for path in root.iterdir()) <= 1
+
+
+@given(
+    st.sampled_from(
+        (
+            "primary_metric_summary.json",
+            "predictions_hypersca.csv",
+            "claim_decision.json",
+            "other.json",
+        )
+    )
+)
+def test_adapter_failure_allowlist_never_accepts_extra_artifacts(
+    extra_path: str,
+) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        artifact_paths = (
+            "capability_record.json",
+            "resource_usage.json",
+            extra_path,
+        )
+        publisher = RunEvidencePublisher.begin(
+            output_dir=root / "bundle",
+            identity=valid_identity(),
+            statistical_unit_record={"units": ["sample:block-1"]},
+            required_artifacts=artifact_paths,
+            maximum_bundle_bytes=16_384,
+        )
+        for path in artifact_paths:
+            publisher.add_bytes(path, b"{}", media_type="application/json")
+        with pytest.raises(RunEvidenceError, match="invalid_state_transition"):
+            publisher.finalize_failure(
+                status="method_adapter_not_executable",
+                reason="no_preregistered_bridge_predictor_adapter",
+            )
+        assert not (root / "bundle").exists()
