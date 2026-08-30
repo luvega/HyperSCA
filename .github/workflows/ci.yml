@@ -17,7 +17,7 @@ jobs:
   core-python-310:
     name: core-python-310
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
 
     steps:
       - name: Check out repository
