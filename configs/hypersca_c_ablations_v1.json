@@ -1,0 +1,47 @@
+{
+  "schema_version": "1.0",
+  "ablations": {
+    "primary": {
+      "mode": "joint",
+      "configuration_changes": {}
+    },
+    "shared_only": {
+      "mode": "joint",
+      "configuration_changes": {
+        "enable_context_adjustments": false
+      }
+    },
+    "separate_contexts": {
+      "mode": "one_context_per_fit",
+      "configuration_changes": {}
+    },
+    "observational_only": {
+      "mode": "control_cells_only",
+      "configuration_changes": {}
+    },
+    "no_stability_weighting": {
+      "mode": "joint",
+      "configuration_changes": {
+        "bootstrap_repeats": 1
+      }
+    },
+    "acyclicity_off": {
+      "mode": "joint",
+      "configuration_changes": {
+        "acyclicity_weight": 0.0
+      }
+    },
+    "acyclicity_strong": {
+      "mode": "joint",
+      "configuration_changes": {
+        "acyclicity_weight": 0.1
+      }
+    },
+    "prior_on_secondary": {
+      "mode": "joint_with_external_prior",
+      "configuration_changes": {
+        "prior_discount": 0.5
+      }
+    }
+  }
+}

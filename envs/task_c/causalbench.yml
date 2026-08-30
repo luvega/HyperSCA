@@ -1,0 +1,20 @@
+name: hypersca-task-c-causalbench
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      # CausalBench 1.1.2 imports these versions together.  Newer NumPy and
+      # setuptools releases otherwise break its data reader before a method runs.
+      - numpy==1.24.4
+      - pandas==2.0.3
+      - scikit-learn==1.3.2
+      - pgmpy==1.0.0
+      - umap-learn==0.5.7
+      # Arboreto 0.1.6 unconditionally builds an empty metadata collection.
+      # The Dask expression engine rejects that fixed official-code path.
+      - dask[complete]==2023.5.0
+      - distributed==2023.5.0
+      - setuptools<81
+      - git+https://github.com/causalbench/causalbench.git@1a2143cffdc85f835b41ce8d52034be1bf903e71

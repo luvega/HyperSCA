@@ -1,0 +1,6 @@
+{
+  "schema_version": "1.0",
+  "relation_fingerprint_schema": "directed_edge_set_v1",
+  "intersection_audit_schema": "exact_directed_edge_set_intersection_v1",
+  "approved_priors": []
+}
