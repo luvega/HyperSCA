@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0",
+  "maximum_trials_per_method": 20,
+  "selection_metric": "average_precision_against_tuning_response_edges",
+  "q_value_threshold": 0.1,
+  "tie_break": [
+    "average_precision_descending",
+    "trial_index_ascending"
+  ],
+  "external_biological_references_allowed": false,
+  "final_holdout_allowed": false
+}

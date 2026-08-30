@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.0",
+  "seed": 11,
+  "promotion_eligible": false,
+  "feature_selection": "common_expression_genes_train_control_variance_v1",
+  "profiles": {
+    "connection": {
+      "maximum_genes": 64,
+      "maximum_cells_per_context": 2000,
+      "timeout_seconds_per_method": 1800
+    },
+    "comprehensive": {
+      "maximum_genes": 256,
+      "maximum_cells_per_context": 20000,
+      "timeout_seconds_per_method": 14400
+    }
+  },
+  "null_controls": {
+    "repeats": 20,
+    "minimum_empirical_advantage": 0.0,
+    "maximum_empirical_p_value": 0.05
+  },
+  "required_core_methods": [
+    "hypersca_c",
+    "mean_difference",
+    "random1000",
+    "grnboost",
+    "pc",
+    "notears_linear"
+  ],
+  "required_interventional_method_count": 1,
+  "required_artifacts": [
+    "run_manifest.json",
+    "input_summary.json",
+    "metrics.json",
+    "predictions.csv",
+    "promotion_decision.json"
+  ],
+  "full_run_seeds": [11, 23, 47, 71, 97]
+}

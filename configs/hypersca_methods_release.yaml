@@ -1,0 +1,82 @@
+schema: hypersca_methods_protocol_v2
+protocol_version: hypersca-methods-v2.1
+claims:
+  spatial:
+    benchmark: osta_colon
+    primary_metric: neighborhood_preservation_at_k
+    primary_k: 15
+    secondary_k: [5, 30]
+    split: contiguous_heldout_blocks_with_buffer
+    aggregation: sample_macro_with_platform_strata
+  causal:
+    benchmark: causalbench_k562_rpe1
+    primary_metric: directed_edge_average_precision
+    relation_universe: complete_p_times_p_minus_1_missing_scores_zero
+    contexts: [k562, rpe1]
+    aggregation: context_macro_eligible_holdout_sources_only
+comparators:
+  spatial:
+    confirmatory: euclidean_autoencoder
+    attribution: hypersca_without_hierarchy_loss
+  causal:
+    confirmatory: mean_difference
+    attribution: hypersca_c_shared_only
+  secondary:
+    - euclidean_pca
+    - external_registered_methods
+    - best_observed_method
+  parameter_tolerance: 0.05
+  same_budget_fields:
+    - data_identity
+    - gene_identity
+    - seed
+    - optimizer_family
+    - max_updates
+    - early_stopping_patience
+    - tuning_trials
+statistics:
+  bootstrap_resamples: 10000
+  bootstrap_confidence: 0.95
+  multiple_testing: holm_two_confirmatory_claims
+  minimum_ci_lower_bound: 0.0
+execution:
+  pilot_seeds: [11, 23, 47]
+  release_seeds: [11, 23, 47, 71, 101]
+  pilot_scopes: [train, tune]
+  release_holdout: score_once_only
+  maximum_protocol_redesigns: 1
+  redesigns_used: 1
+  redesign_reason: causalbench_representation_comparators_were_not_executable
+  infrastructure_retry: same_run_identity_only
+  terminal_statuses:
+    - completed
+    - failed_invalid_input
+    - failed_invalid_output
+    - failed_timeout
+    - failed_resource
+    - failed_runtime
+    - not_applicable
+resources:
+  gpu_count: 1
+  gpu_memory_gib: 40
+  ram_gib: 128
+  artifact_gib_per_run: 5
+  pilot_osta_gpu_hours: 2
+  pilot_causalbench_gpu_hours: 4
+  release_multiplier: 1.5
+  release_max_hours: 12
+evidence_bundle:
+  - run_manifest.json
+  - method_status.json
+  - resource_usage.json
+  - primary_metric_units.csv
+  - primary_metric_summary.json
+  - secondary_metrics.csv
+  - claim_decision.json
+crc:
+  role: application_only
+  allowed_analyses:
+    - patient_timepoint_resampling_stability
+    - rank_change
+    - response_association
+  may_rescue_public_promotion: false

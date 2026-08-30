@@ -1,0 +1,13 @@
+name: hypersca-task-c-psgrn
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - numpy==1.24.4
+      - pandas==2.0.3
+      - scikit-learn==1.3.2
+      - lightgbm==4.5.0
+      - tqdm==4.66.5
+      - git+https://github.com/causalbench/causalbench.git@1a2143cffdc85f835b41ce8d52034be1bf903e71
