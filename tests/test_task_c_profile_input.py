@@ -360,6 +360,44 @@ def test_gene_selection_does_not_shrink_the_target_universe_to_fit_cell_quotas(
         )
 
 
+def test_tune_profile_rejects_controls_only_after_gene_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.evaluation.task_c_profile_input as profile_module
+
+    bundle = _sparse_intervention_bundle(tmp_path)
+    public_manifest = json.loads(
+        Path(bundle["public_manifest"]).read_text(encoding="utf-8")
+    )
+    tune_sources = set(public_manifest["tune_sources"])
+    original = profile_module._selected_genes
+
+    def select_without_tune_sources(*args: object, **kwargs: object):
+        genes, indices, parents, dropped = original(*args, **kwargs)
+        retained = [
+            (gene, index) for gene, index in zip(genes, indices) if gene not in tune_sources
+        ][:2]
+        return (
+            tuple(gene for gene, _ in retained),
+            tuple(index for _, index in retained),
+            parents,
+            dropped + tuple(gene for gene in genes if gene in tune_sources),
+        )
+
+    monkeypatch.setattr(profile_module, "_selected_genes", select_without_tune_sources)
+
+    with pytest.raises(TaskCProfileInputError, match="tune.*source|source.*tune"):
+        materialize_task_c_profile_input(
+            public_manifest_path=Path(bundle["public_manifest"]),
+            profile="connection",
+            condition="within_environment",
+            context_id="k562",
+            stage="tune",
+            output_dir=tmp_path / "profile",
+        )
+
+
 def test_holdout_intervention_gene_can_enter_train_only_gene_universe(
     tmp_path: Path,
 ) -> None:

@@ -492,13 +492,22 @@ def _eligible_sources(dataset: TaskCDataset, min_cells: int) -> set[str]:
     return {label for label, count in counts.items() if label != CONTROL_LABEL and label in genes and count >= min_cells}
 
 
-def _control_partitions(dataset: TaskCDataset, seed: int) -> dict[str, tuple[int, ...]]:
+def _control_partitions(
+    dataset: TaskCDataset,
+    seed: int,
+    minimum_tune_controls: int,
+) -> dict[str, tuple[int, ...]]:
     controls = np.flatnonzero(dataset.interventions == CONTROL_LABEL)
-    if len(controls) < 5:
-        raise TaskCDataError("at least 5 control cells are required")
+    if len(controls) < minimum_tune_controls + 4:
+        raise TaskCDataError(
+            "control cells must reserve the public minimum for tuning and "
+            "at least two cells for train and holdout"
+        )
     shuffled = np.random.default_rng(seed).permutation(controls)
-    train_end = int(len(shuffled) * 0.6)
-    tune_end = train_end + int(len(shuffled) * 0.2)
+    tune_count = max(int(len(shuffled) * 0.2), minimum_tune_controls)
+    holdout_count = max(int(len(shuffled) * 0.2), 2)
+    train_end = len(shuffled) - tune_count - holdout_count
+    tune_end = train_end + tune_count
     return {
         "train": tuple(sorted(int(i) for i in shuffled[:train_end])),
         "tune": tuple(sorted(int(i) for i in shuffled[train_end:tune_end])),
@@ -544,8 +553,8 @@ def build_shared_task_c_split(
         tune_sources=source_parts["tune"],
         holdout_sources=source_parts["holdout"],
         control_indices=MappingProxyType({
-            "k562": MappingProxyType(_control_partitions(k562, seed)),
-            "rpe1": MappingProxyType(_control_partitions(rpe1, seed)),
+            "k562": MappingProxyType(_control_partitions(k562, seed, min_cells)),
+            "rpe1": MappingProxyType(_control_partitions(rpe1, seed, min_cells)),
         }),
         min_cells_per_intervention=min_cells,
     )
@@ -617,7 +626,11 @@ def validate_task_c_split(split: TaskCSplit, k562: TaskCDataset, rpe1: TaskCData
             all_indices.update(values)
         if all_indices != controls:
             raise TaskCDataError(f"{context} control partition union differs from all controls")
-        expected_controls = _control_partitions(dataset, int(split.seed))
+        expected_controls = _control_partitions(
+            dataset,
+            int(split.seed),
+            int(split.min_cells_per_intervention),
+        )
         if any(partitions[name] != expected_controls[name] for name in ("train", "tune", "holdout")):
             raise TaskCDataError(f"{context} control partitions do not match deterministic seed assignment")
 

@@ -893,11 +893,14 @@ def _build_profile(
         if stage == "train"
         else set(public_manifest["tune_sources"])
         if stage == "tune"
-        else set(genes)
+        else set(public_manifest["train_sources"])
+        | set(public_manifest["tune_sources"])
     )
-    required_response_sources = (
-        set(genes) & stage_sources & (set(final_counts) - {CONTROL_LABEL, EXCLUDED_LABEL})
-    )
+    required_response_sources = set(genes) & stage_sources
+    if not required_response_sources:
+        raise TaskCProfileInputError(
+            f"{stage} profile selects no registered response source for the stage"
+        )
     if (
         final_counts.get(CONTROL_LABEL, 0) < minimum_cells
         or any(
