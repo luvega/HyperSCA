@@ -2,15 +2,25 @@
   <img src="docs/Logo_high%20res.png" alt="HyperSCA Logo" width="280" />
 </p>
 
+**[中文](README.md)** | [English](README_EN.md)
+
 [![CI](https://github.com/luvega/HyperSCA/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/luvega/HyperSCA/actions/workflows/ci.yml)
 
 HyperSCA（Hyperbolic Spatiotemporal Causal Analysis）是一套联合处理单细胞和空间组学数据的多步骤分析流程（pipeline）。它先用双曲表示（hyperbolic embedding）整理细胞状态及其层级关系，再推断候选因果关系图，并用反事实扰动模拟评估候选靶点。结果用于形成待验证的机制假设和干预候选，不能单独证明药物机制或治疗效果。项目支持 scRNA-seq、空间转录组及临床/表型分层数据，可用于肿瘤免疫、自身免疫、慢性炎症、感染和组织损伤修复等研究场景。
 
 ## 当前发布状态
 
-`v0.6.0` 是由直接证据决定结论等级的审计版本。它汇总了 PR #1—#5 已审查的空间注释、模块准入和从头运行规则，并给出可重复的因果推断、空间扰动和药物机制方法评估。HyperSCA 仍是审计阶段的研究原型：该版本没有让双曲 v3/energy 独立的补充分析（sidecars）进入主要结论，不声称达到最先进性能，也不声称空间药物机制已得到外部验证。
+`v0.7.0` 是面向可审计方法比较与空间扰动桥接的研究版本。它继续遵循“由直接证据决定结论等级”的原则，并把比较约定、数据隔离、可作出判断的比例和证据发布路径固定为可重放工件。HyperSCA 仍是 Alpha 阶段的研究原型：软件检查通过不等于生物学或临床验证，也不构成最先进性能声明。
 
-- [v0.6.0 发布说明](docs/releases/v0.6.0.md)
+- Methods v3 固定任务 C/S/D 的比较角色、统计单位、资源边界、coverage、abstention 和保守升级条件。
+- 空间扰动桥接使用整只动物隔离的数据划分，并把候选登记、近邻、效应评分、简单对照和证据发布连接成可重放流程。
+- 运行证据必须通过身份、输入、工件和集合层检查；失败或资料不足状态不能被结果摘要改写成成功。
+- 导入架构和属性测试限制命令行入口、科学模块和证据模块之间的依赖方向，降低绕过冻结约定的风险。
+
+真实 GSE274447 空间扰动 pilot 没有运行，因为登记的外部队列根目录在执行环境中不存在。v0.7.0 只发布这一 stop-gate 事实；没有虚构 pilot 结果、预测能力工件或模块升级结论。
+
+- [v0.7.0 发布说明](docs/releases/v0.7.0.md)
+- [v0.6.0 历史发布说明](docs/releases/v0.6.0.md)
 - [HyperSCA 进度与研究版图报告](reports/research/hypersca_causal_spatial_drug_landscape_20260810.md)
 - [Bear 支持与反对证据综合报告](reports/research/bear_hypersca_spatial_causal_20260810/report.md)
 - [现有方法比较表](reports/research/bear_hypersca_spatial_causal_20260810/comparison_matrix.tsv)
@@ -41,9 +51,9 @@ HyperSCA 的研究完整版流程由六个连续阶段构成，可按具体队�
 - 阶段 4（动态干预，Dynamic Intervention）：在 PK/PD 约束下评估随时间传播的效应和多靶点组合，并支持实验结果回写后的往返更新。
 - 阶段 5（行为规则与虚拟组织，Behavior Grammar / Virtual Tissue）：把靶点发现和阶段 4 证据翻译成可读的细胞行为规则，再运行轻量虚拟组织模拟。该阶段是可选补充，不替换阶段 1—4。
 
-## 分析流程图
+## 设计思路图
 
-![HyperSCA Pipeline Flowchart v0.5](docs/hypersca_pipeline_flowchart_v0.5.png)
+![HyperSCA v0.7.0 项目设计思路：从多组学输入到证据门禁靶点发现](docs/hypersca_design_overview_v0.7.0.png)
 
 ## 方法对照评估与模块选择
 
