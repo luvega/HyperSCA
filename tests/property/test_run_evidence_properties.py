@@ -14,6 +14,14 @@ from src.evaluation.run_evidence_identity import (
     canonical_sha256,
 )
 from src.evaluation.run_evidence_publisher import RunEvidencePublisher
+from tests.integration.test_spatial_perturbation_bridge import (
+    MODEL_SEEDS,
+    _development_adapter_input,
+    _evaluation_prediction_units,
+    _fit_development_only_adapter,
+    _predict_evaluation_units,
+    build_five_animal_fixture,
+)
 
 
 SAFE_TEXT = st.text(
@@ -223,3 +231,82 @@ def test_adapter_failure_allowlist_never_accepts_extra_artifacts(
                 reason="no_preregistered_bridge_predictor_adapter",
             )
         assert not (root / "bundle").exists()
+
+
+@settings(max_examples=3, deadline=None)
+@given(st.sampled_from((1, 7, 101)))
+def test_five_animal_bridge_split_and_neighbors_ignore_input_row_order(
+    row_order_seed: int,
+) -> None:
+    baseline = build_five_animal_fixture(0)
+    permuted = build_five_animal_fixture(row_order_seed)
+
+    assert tuple(permuted.raw_cells["cell_id"]) != tuple(baseline.raw_cells["cell_id"])
+    assert permuted.manifest.split_identity_sha256 == (
+        baseline.manifest.split_identity_sha256
+    )
+    assert permuted.manifest.neighbour_table_identity_sha256 == (
+        baseline.manifest.neighbour_table_identity_sha256
+    )
+    assert permuted.eligibility.eligibility_identity_sha256 == (
+        baseline.eligibility.eligibility_identity_sha256
+    )
+
+
+@settings(max_examples=3, deadline=None)
+@given(st.integers(min_value=0, max_value=9_299))
+def test_five_animal_fixture_isolated_from_dataframe_row_mutation(
+    row_index: int,
+) -> None:
+    mutated = build_five_animal_fixture()
+    expected = build_five_animal_fixture()
+    mutated.raw_cells.loc[row_index, "cell_id"] = "property_mutation"
+    replayed = build_five_animal_fixture()
+
+    assert (
+        replayed.raw_cells.loc[row_index, "cell_id"]
+        == expected.raw_cells.loc[row_index, "cell_id"]
+    )
+    assert replayed.expression is not mutated.expression
+    assert replayed.expression.flags.writeable is False
+
+
+@settings(max_examples=3, deadline=None)
+@given(st.permutations(MODEL_SEEDS))
+def test_five_animal_prediction_identity_is_seed_bound_and_order_invariant(
+    seed_order: tuple[int, ...],
+) -> None:
+    fixture = build_five_animal_fixture()
+    development = _development_adapter_input(fixture)
+    evaluation_units = _evaluation_prediction_units(
+        fixture.manifest, fixture.eligibility
+    )
+
+    def identities(order: tuple[int, ...]) -> dict[int, str]:
+        observed: dict[int, str] = {}
+        for model_seed in order:
+            fitted = _fit_development_only_adapter(
+                development, method_id="hypersca", model_seed=model_seed
+            )
+            predicted = _predict_evaluation_units(
+                fitted, evaluation_units=evaluation_units
+            )
+            observed[model_seed] = canonical_sha256(
+                {
+                    "model_seed": model_seed,
+                    "predictions": [item.predicted_delta for item in predicted],
+                }
+            )
+        return observed
+
+    forward = identities(seed_order)
+    reverse = identities(tuple(reversed(seed_order)))
+    assert forward == reverse
+    assert len(set(forward.values())) == len(MODEL_SEEDS)
+    run_identities = {
+        valid_identity(
+            model_seed=seed, config_identity_sha256=identity
+        ).run_identity_sha256
+        for seed, identity in forward.items()
+    }
+    assert len(run_identities) == len(MODEL_SEEDS)
