@@ -750,9 +750,13 @@ git commit -m "feat: gate spatial perturbation prediction evidence"
 ## Task 10: Enforce eight architectural boundaries
 
 **Files:**
-- Create: `.importlinter`
+- Modify: `.importlinter`
 - Modify: `pyproject.toml`
 - Create: `tests/test_v3_import_boundaries.py`
+- Create: `src/evaluation/safe_declaration_reader.py`
+- Modify: `scripts/audit_spatial_perturbation_bridge.py`
+- Modify: `scripts/validate_spatial_perturbation_predictor.py`
+- Modify: `tests/test_spatial_perturbation_runner.py`
 
 - [ ] **Step 1: Add explicit development dependencies**
 
@@ -793,6 +797,22 @@ forbidden_modules =
     src.causal
     src.perturbation
     src.data
+    src.evaluation.methods_pilot
+    src.evaluation.methods_causal_pilot
+    src.evaluation.task_s_benchmark
+    src.evaluation.task_c_benchmark
+    src.evaluation.task_c_method_run
+    src.evaluation.task_c_aggregation
+    src.evaluation.task_c_rehearsal
+    src.evaluation.task_c_runtime
+    src.evaluation.task_c_data
+    src.evaluation.task_c_acquisition
+    src.evaluation.task_c_profile_input
+    src.evaluation.task_c_formal_export
+    src.evaluation.task_c_predictions
+    src.evaluation.task_c_tuning
+    src.evaluation.safe_declaration_reader
+    src.evaluation.spatial_perturbation_runner
 
 [importlinter:contract:publisher-model-free]
 name = Publisher is model-free
@@ -811,7 +831,34 @@ forbidden_modules =
     src.models
     src.causal
     src.perturbation
+    src.data
+    src.discovery
+    src.evaluation.msi_inference
+    src.evaluation.benchmark_evidence
     src.evaluation.spatial_perturbation_scoring
+    src.evaluation.causal_metrics
+    src.evaluation.cf_metrics
+    src.evaluation.cross_sample_metrics
+    src.evaluation.embedding_metrics
+    src.evaluation.spatial_metrics
+    src.evaluation.spatial_perturbation_runner
+    src.evaluation.task_s_benchmark
+    src.evaluation.task_c_benchmark
+    src.evaluation.task_c_aggregation
+    src.evaluation.task_c_tuning
+    src.evaluation.task_c_null_controls
+    src.evaluation.task_c_profile_input
+    src.evaluation.task_c_data
+    src.evaluation.task_c_acquisition
+    src.evaluation.task_c_formal_export
+    src.evaluation.task_c_predictions
+    src.evaluation.task_c_runtime
+    src.evaluation.task_c_rehearsal
+    src.evaluation.task_c_method_registry
+    src.evaluation.task_c_method_run
+    src.evaluation.methods_protocol_outcome
+    src.evaluation.methods_pilot
+    src.evaluation.methods_causal_pilot
 
 [importlinter:contract:split-model-free]
 name = Bridge split is model-free
@@ -838,14 +885,6 @@ forbidden_modules =
     src.causal
     src.perturbation
 
-[importlinter:contract:runner-crc-isolated]
-name = Bridge runner cannot consume CRC application code
-type = forbidden
-source_modules = src.evaluation.spatial_perturbation_runner
-forbidden_modules =
-    src.discovery.from_scratch
-    src.discovery.target_discovery
-
 [importlinter:contract:crc-promotion-isolated]
 name = CRC application code cannot decide methods promotion
 type = forbidden
@@ -859,17 +898,33 @@ forbidden_modules =
 
 These seven Import Linter contracts plus one AST contract form the eight frozen
 boundaries. Because `scripts/` is outside `root_package`, the eighth contract is
-an AST test over the three new CLIs. It permits imports, module constants,
-`parse_args`, and `main`; rejects scientific calculations, model construction,
-dataframe/array operations, and imports of `src.models`, `src.causal`, or
-`src.perturbation` at module import time.
+an AST test over the three new CLIs. It uses structural and call allowlists for
+imports, the repository-root constant, argument parsing (`parse_args` or the
+legacy `_arguments` spelling), and `main`; it rejects scientific calculations,
+model construction, dataframe/array operations, and dynamic or import-time
+scientific dependencies. Bounded JSON/YAML declaration reading remains under
+`src/evaluation/`, not in a CLI helper.
+
+The same AST test freezes the predictor-contract source with a recursively
+canonicalized, Python 3.10/3.13-stable manifest.  Its exact keys comprise the
+module declarations and every top-level function or class; each value is a
+per-declaration digest over all semantic AST fields.  A deliberate contract
+change therefore requires an explicit, locally reviewable manifest update,
+while ordinary location metadata and empty version-only `type_params` are
+ignored. `TypeIgnore` is the exception: both its tag and line binding remain
+semantic so moving a suppression requires review.
 
 - [ ] **Step 4: Run GREEN and commit**
 
 ```bash
 lint-imports --config .importlinter
 pytest tests/test_v3_import_boundaries.py -q -p no:cacheprovider
-git add .importlinter pyproject.toml tests/test_v3_import_boundaries.py
+git add .importlinter pyproject.toml tests/test_v3_import_boundaries.py \
+  src/evaluation/safe_declaration_reader.py \
+  scripts/audit_spatial_perturbation_bridge.py \
+  scripts/validate_spatial_perturbation_predictor.py \
+  tests/test_spatial_perturbation_runner.py \
+  docs/superpowers/plans/2026-08-28-hypersca-methods-v3-bridge.md
 git commit -m "test: enforce methods v3 architecture boundaries"
 ```
 

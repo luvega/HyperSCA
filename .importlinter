@@ -83,3 +83,110 @@ layers =
     src.evaluation.run_evidence_collection
     src.evaluation.run_evidence_publisher
     src.evaluation.run_evidence_identity
+
+[importlinter:contract:evidence-policy-domain-only]
+name = Evidence policy is domain-only
+type = forbidden
+source_modules = src.discovery.evidence_policy
+forbidden_modules =
+    src.models
+    src.causal
+    src.perturbation
+    src.data
+    src.evaluation.methods_pilot
+    src.evaluation.methods_causal_pilot
+    src.evaluation.task_s_benchmark
+    src.evaluation.task_c_benchmark
+    src.evaluation.task_c_method_run
+    src.evaluation.task_c_aggregation
+    src.evaluation.task_c_rehearsal
+    src.evaluation.task_c_runtime
+    src.evaluation.task_c_data
+    src.evaluation.task_c_acquisition
+    src.evaluation.task_c_profile_input
+    src.evaluation.task_c_formal_export
+    src.evaluation.task_c_predictions
+    src.evaluation.task_c_tuning
+    src.evaluation.safe_declaration_reader
+    src.evaluation.spatial_perturbation_runner
+
+[importlinter:contract:publisher-model-free]
+name = Publisher is model-free
+type = forbidden
+source_modules = src.evaluation.run_evidence_publisher
+forbidden_modules =
+    src.models
+    src.causal
+    src.perturbation
+
+[importlinter:contract:capability-audit-outcome-blind]
+name = Bridge capability audit is outcome-blind
+type = forbidden
+source_modules = src.evaluation.spatial_perturbation_registry
+forbidden_modules =
+    src.models
+    src.causal
+    src.perturbation
+    src.data
+    src.discovery
+    src.evaluation.msi_inference
+    src.evaluation.benchmark_evidence
+    src.evaluation.spatial_perturbation_scoring
+    src.evaluation.causal_metrics
+    src.evaluation.cf_metrics
+    src.evaluation.cross_sample_metrics
+    src.evaluation.embedding_metrics
+    src.evaluation.spatial_metrics
+    src.evaluation.spatial_perturbation_runner
+    src.evaluation.task_s_benchmark
+    src.evaluation.task_c_benchmark
+    src.evaluation.task_c_aggregation
+    src.evaluation.task_c_tuning
+    src.evaluation.task_c_null_controls
+    src.evaluation.task_c_profile_input
+    src.evaluation.task_c_data
+    src.evaluation.task_c_acquisition
+    src.evaluation.task_c_formal_export
+    src.evaluation.task_c_predictions
+    src.evaluation.task_c_runtime
+    src.evaluation.task_c_rehearsal
+    src.evaluation.task_c_method_registry
+    src.evaluation.task_c_method_run
+    src.evaluation.methods_protocol_outcome
+    src.evaluation.methods_pilot
+    src.evaluation.methods_causal_pilot
+
+[importlinter:contract:split-model-free]
+name = Bridge split is model-free
+type = forbidden
+source_modules = src.evaluation.spatial_perturbation_split
+forbidden_modules =
+    src.models
+    src.discovery.evidence_policy
+
+[importlinter:contract:scoring-policy-free]
+name = Bridge scoring cannot decide claims
+type = forbidden
+source_modules = src.evaluation.spatial_perturbation_scoring
+forbidden_modules =
+    src.discovery.evidence_policy
+    src.evaluation.run_evidence_publisher
+
+[importlinter:contract:predictor-contract-model-free]
+name = Prediction contract cannot fit models
+type = forbidden
+source_modules = src.evaluation.spatial_perturbation_predictor_contract
+forbidden_modules =
+    src.models
+    src.causal
+    src.perturbation
+
+[importlinter:contract:crc-promotion-isolated]
+name = CRC application code cannot decide methods promotion
+type = forbidden
+source_modules =
+    src.discovery.from_scratch.crc_icb_inputs
+    src.discovery.from_scratch.crc_icb_artifacts
+forbidden_modules =
+    src.discovery.evidence_policy
+    src.evaluation.methods_protocol_v3

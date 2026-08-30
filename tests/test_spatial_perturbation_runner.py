@@ -36,6 +36,7 @@ from src.evaluation.run_evidence_publisher import (
     VerifiedRunEvidence,
     verify_run_evidence_bundle,
 )
+from src.evaluation.safe_declaration_reader import read_safe_declaration
 from src.evaluation.spatial_perturbation_predictor_contract import (
     PREDICTION_SCHEMA,
     BridgePredictionBundle,
@@ -2435,6 +2436,16 @@ def test_cli_help_is_cold_and_cli_publishes_terminal_failure(tmp_path: Path) -> 
     )
 
 
+def test_safe_declaration_reader_is_owned_by_evaluation_package() -> None:
+    reader = importlib.import_module("src.evaluation.safe_declaration_reader")
+    assert callable(reader.read_safe_declaration)
+    script = Path("scripts/validate_spatial_perturbation_predictor.py").read_text(
+        encoding="utf-8"
+    )
+    assert "def _load_json" not in script
+    assert "read_safe_declaration" in script
+
+
 @pytest.mark.parametrize(
     ("suffix", "payload"),
     (
@@ -2445,16 +2456,11 @@ def test_cli_help_is_cold_and_cli_publishes_terminal_failure(tmp_path: Path) -> 
 def test_cli_declaration_loader_rejects_duplicate_keys(
     tmp_path: Path, suffix: str, payload: bytes
 ) -> None:
-    script = Path("scripts/validate_spatial_perturbation_predictor.py").resolve()
-    specification = importlib.util.spec_from_file_location("task9_cli_duplicates", script)
-    assert specification is not None and specification.loader is not None
-    module = importlib.util.module_from_spec(specification)
-    specification.loader.exec_module(module)
     declaration = tmp_path / f"declaration{suffix}"
     declaration.write_bytes(payload)
 
     with pytest.raises(ValueError, match="重复|duplicate"):
-        module._load_json(declaration, label="声明")
+        read_safe_declaration(declaration, label="声明")
 
 
 def test_cli_rejects_abbreviated_long_options(tmp_path: Path) -> None:
@@ -2517,11 +2523,6 @@ def test_cli_rejects_declaration_below_symlinked_ancestor(tmp_path: Path) -> Non
 def test_cli_rejects_regular_file_replacement_between_lstat_and_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    script = Path("scripts/validate_spatial_perturbation_predictor.py").resolve()
-    specification = importlib.util.spec_from_file_location("task9_cli", script)
-    assert specification is not None and specification.loader is not None
-    module = importlib.util.module_from_spec(specification)
-    specification.loader.exec_module(module)
     declaration = tmp_path / "registry.json"
     replacement = tmp_path / "replacement.json"
     declaration.write_bytes(canonical_json_bytes({"before": True}))
@@ -2539,7 +2540,7 @@ def test_cli_rejects_regular_file_replacement_between_lstat_and_open(
 
     monkeypatch.setattr(os, "open", racing_open)
     with pytest.raises(ValueError, match="变化|安全"):
-        module._load_json(declaration, label="注册表")
+        read_safe_declaration(declaration, label="注册表")
     assert swapped
 
 

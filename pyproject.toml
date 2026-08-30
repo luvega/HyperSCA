@@ -26,6 +26,8 @@ dynamic = ["dependencies"]
 dev = [
   "pytest>=7,<9",
   "tomli>=2; python_version < '3.11'",
+  "hypothesis>=6,<7",
+  "import-linter>=2,<3",
 ]
 
 [tool.setuptools.dynamic]

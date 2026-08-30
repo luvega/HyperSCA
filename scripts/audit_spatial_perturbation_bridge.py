@@ -19,8 +19,13 @@ def _arguments() -> argparse.ArgumentParser:
 def main() -> int:
     options = _arguments().parse_args()
     repository_root = Path(__file__).resolve().parents[1]
-    if options.registry is None:
-        options.registry = repository_root / "configs" / "spatial_perturbation_bridge_candidates_v1.json"
+    registry_path = options.registry
+    if registry_path is None:
+        registry_path = (
+            repository_root
+            / "configs"
+            / "spatial_perturbation_bridge_candidates_v1.json"
+        )
     repository_root_text = str(repository_root)
     if repository_root_text not in sys.path:
         sys.path.insert(0, repository_root_text)
@@ -33,7 +38,7 @@ def main() -> int:
         write_bridge_capability_exclusively,
     )
     try:
-        candidates = load_bridge_candidates(options.registry)
+        candidates = load_bridge_candidates(registry_path)
         candidate = candidates[options.candidate_id]
         summary = (load_asset_metadata(options.asset_root, candidate) if options.asset_root is not None
                    else unavailable_metadata_summary(candidate))
