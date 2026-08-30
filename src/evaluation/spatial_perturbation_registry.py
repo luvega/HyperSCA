@@ -585,6 +585,79 @@ def metadata_summary_from_mapping(raw: object) -> MetadataSummary:
     return MetadataSummary(**cast(dict[str, object], raw))  # type: ignore[arg-type]
 
 
+def bridge_capability_result_from_mapping(raw: object) -> BridgeCapabilityResult:
+    """Rebuild one published capability record from strict JSON-shaped data."""
+    if type(raw) is not dict:
+        raise SpatialPerturbationRegistryError(
+            "bridge capability result must be an exact JSON object"
+        )
+    fields = tuple(BridgeCapabilityResult.__dataclass_fields__)
+    if any(type(key) is not str for key in raw) or set(raw) != set(fields):
+        raise SpatialPerturbationRegistryError(
+            "bridge capability result has unknown or missing fields"
+        )
+    mapping = cast(dict[str, object], raw)
+    coverage_raw = mapping["coverage"]
+    if (
+        type(coverage_raw) is not dict
+        or any(type(key) is not str for key in coverage_raw)
+        or set(coverage_raw) != set(_COVERAGE_KEYS)
+    ):
+        raise SpatialPerturbationRegistryError(
+            "coverage must contain the exact frozen keys"
+        )
+    unordered_coverage = cast(dict[str, object], coverage_raw)
+    coverage: dict[str, float] = {}
+    for key in _COVERAGE_KEYS:
+        value = unordered_coverage[key]
+        if type(value) is not float or value not in (0.0, 1.0):
+            raise SpatialPerturbationRegistryError(
+                "coverage values must be binary built-in floats"
+            )
+        coverage[key] = value
+
+    reasons_raw = mapping["blocking_reasons"]
+    if type(reasons_raw) is not list:
+        raise SpatialPerturbationRegistryError(
+            "blocking_reasons must be a built-in JSON list"
+        )
+    provided_reasons = _text_items(reasons_raw, "blocking_reasons")
+    candidate_id = _safe_text(mapping["candidate_id"], "candidate_id")
+    status = _safe_text(mapping["status"], "status")
+    capable = _flag(mapping["confirmatory_capable"], "confirmatory_capable")
+    specimens = _count(
+        mapping["biological_specimen_count"], "biological_specimen_count"
+    )
+    cohorts = _count(mapping["cohort_count"], "cohort_count")
+    identity = _sha(
+        mapping["capability_identity_sha256"], "capability_identity_sha256"
+    )
+    expected_status, expected_capable, expected_reasons = _semantic_state(
+        specimens,
+        cohorts,
+        coverage,
+        unavailable=status == "assets_unavailable",
+    )
+    if (
+        status != expected_status
+        or capable != expected_capable
+        or provided_reasons != expected_reasons
+    ):
+        raise SpatialPerturbationRegistryError(
+            "status, capability flag, and reasons violate the capability matrix"
+        )
+    return BridgeCapabilityResult(
+        candidate_id,
+        status,
+        capable,
+        specimens,
+        cohorts,
+        coverage,
+        expected_reasons,
+        identity,
+    )
+
+
 def _coverage(summary: MetadataSummary, candidate: BridgeCandidate) -> dict[str, float]:
     counts = dict(summary.perturbation_label_counts)
     controls = dict(summary.safe_control_counts)

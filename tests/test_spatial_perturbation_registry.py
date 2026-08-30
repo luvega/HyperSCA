@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import MappingProxyType
+from typing import cast
 
 import pytest
 
@@ -594,6 +596,74 @@ def test_cli_default_registry_is_resolved_from_script_root(tmp_path: Path) -> No
     )
     assert probe.returncode == 0, probe.stderr
     assert json.loads(output.read_text(encoding="utf-8"))["candidate_id"] == "gse274447_msafe_bridge"
+
+
+def test_capability_result_parser_restores_frozen_order_after_canonical_json() -> None:
+    expected = audit_bridge_capability(
+        candidate(), metadata_summary(animals=3, cohorts=0)
+    )
+    canonical_json_mapping = json.loads(
+        json.dumps(expected.to_mapping(), sort_keys=True)
+    )
+
+    with pytest.raises(SpatialPerturbationRegistryError, match="exact ordered"):
+        BridgeCapabilityResult(**canonical_json_mapping)
+
+    parsed = registry_module.bridge_capability_result_from_mapping(
+        canonical_json_mapping
+    )
+
+    assert parsed.to_mapping() == expected.to_mapping()
+    assert parsed.capability_identity_sha256 == expected.capability_identity_sha256
+
+    cast(list[str], canonical_json_mapping["blocking_reasons"]).reverse()
+    with pytest.raises(SpatialPerturbationRegistryError, match="capability matrix"):
+        registry_module.bridge_capability_result_from_mapping(canonical_json_mapping)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "not_builtin_dict",
+        "missing_field",
+        "extra_field",
+        "bool_specimen_count",
+        "integer_capability_flag",
+        "missing_coverage_key",
+        "extra_coverage_key",
+        "integer_coverage_value",
+        "tuple_blocking_reasons",
+        "wrong_identity",
+    ),
+)
+def test_capability_result_parser_rejects_noncanonical_mappings(mutation: str) -> None:
+    raw = audit_bridge_capability(candidate(), metadata_summary(animals=3)).to_mapping()
+    if mutation == "not_builtin_dict":
+        raw = dict(raw)
+        hostile: object = MappingProxyType(raw)
+    else:
+        hostile = raw
+        if mutation == "missing_field":
+            raw.pop("status")
+        elif mutation == "extra_field":
+            raw["extra"] = None
+        elif mutation == "bool_specimen_count":
+            raw["biological_specimen_count"] = False
+        elif mutation == "integer_capability_flag":
+            raw["confirmatory_capable"] = 0
+        elif mutation == "missing_coverage_key":
+            cast(dict[str, object], raw["coverage"]).pop("genes")
+        elif mutation == "extra_coverage_key":
+            cast(dict[str, object], raw["coverage"])["extra"] = 0.0
+        elif mutation == "integer_coverage_value":
+            cast(dict[str, object], raw["coverage"])["genes"] = 0
+        elif mutation == "tuple_blocking_reasons":
+            raw["blocking_reasons"] = tuple(cast(list[str], raw["blocking_reasons"]))
+        elif mutation == "wrong_identity":
+            raw["capability_identity_sha256"] = "0" * 64
+
+    with pytest.raises(SpatialPerturbationRegistryError):
+        registry_module.bridge_capability_result_from_mapping(hostile)
 
 
 @pytest.mark.parametrize(

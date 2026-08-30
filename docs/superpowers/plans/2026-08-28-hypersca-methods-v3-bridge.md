@@ -994,9 +994,9 @@ git commit -m "test: cover methods v3 bridge end to end"
 ## Task 12: Run pre-freeze audits, freeze the foundation identity, and stop
 
 **Files:**
-- Create after audit: `configs/hypersca_methods_v3.yaml`
+- Create after a present-asset audit only: `configs/hypersca_methods_v3.yaml`
 - Create after audit: `reports/methods_protocol_v3_preflight/bridge_capability.json`
-- Create after audit: `reports/methods_protocol_v3_preflight/predictor_capability/`
+- Create after a present-asset audit only: `reports/methods_protocol_v3_preflight/predictor_capability/`
   containing exactly `capability_record.json`, `resource_usage.json`,
   `run_manifest.json`, and `method_status.json`
 - Create after audit: `reports/methods_protocol_v3_preflight/review.md`
@@ -1010,13 +1010,26 @@ test -d "$SPATIAL_PERTURB_ROOT"
 find "$SPATIAL_PERTURB_ROOT" -maxdepth 2 -type f -print
 ```
 
-If absent, publish `external_cohort_missing` and stop. Do not substitute
-simulation or create a confirmatory config.
+If absent, create the preflight directory and run the metadata-only audit
+without `--asset-root`:
+
+```bash
+mkdir -p reports/methods_protocol_v3_preflight
+python scripts/audit_spatial_perturbation_bridge.py --registry configs/spatial_perturbation_bridge_candidates_v1.json --candidate-id gse274447_msafe_bridge --output reports/methods_protocol_v3_preflight/bridge_capability.json
+```
+
+Publish `review.md` and stop. The capability status must be
+`assets_unavailable`, `confirmatory_capable` must be false, and
+`blocking_reasons` must include `external_cohort_missing`. Do not substitute
+simulation, freeze a v3 config, audit the predictor, or create pilot or paired
+collection outputs.
 
 - [ ] **Step 2: Run the metadata-only audit**
 
+This step and Steps 3–4 apply only when Step 1 found the registered asset root.
+
 ```bash
-python scripts/audit_spatial_perturbation_bridge.py --registry configs/spatial_perturbation_bridge_candidates_v1.json --candidate-id gse274447 --asset-root "$SPATIAL_PERTURB_ROOT" --output reports/methods_protocol_v3_preflight/bridge_capability.json
+python scripts/audit_spatial_perturbation_bridge.py --registry configs/spatial_perturbation_bridge_candidates_v1.json --candidate-id gse274447_msafe_bridge --asset-root "$SPATIAL_PERTURB_ROOT" --output reports/methods_protocol_v3_preflight/bridge_capability.json
 ```
 
 Expected for GSE274447: three specimens, `pilot_audit_only`,
@@ -1048,7 +1061,7 @@ new predictor from HyperSCA-C output inside this task.
 
 - [ ] **Step 5: Verify the stop decision**
 
-Write `review.md` stating all of the following:
+On the present-asset path, write `review.md` stating all of the following:
 
 - v2.1 remains `pilot_failed_no_release`;
 - the v3 bridge asset is pilot-only because it has three mice;
@@ -1058,24 +1071,34 @@ Write `review.md` stating all of the following:
 - a future adapter requires a separate preregistered design and protocol
   identity before it may see bridge outcomes.
 
+On the missing-asset path, instead record the `assets_unavailable` and
+`external_cohort_missing` stop, retain v2.1 as `pilot_failed_no_release`, and
+state explicitly that no v3 config was frozen, no predictor audit was run, no
+real pilot or paired scientific collection exists, and
+`integrated_claim_enabled=false`.
+
 - [ ] **Step 6: Run final verification**
 
+For a missing-asset early stop, run only the focused protocol and metadata-audit
+tests plus static checks; do not repeat the full suite already verified by the
+preceding tasks:
+
 ```bash
-pytest tests/test_methods_protocol.py tests/test_methods_protocol_v3.py tests/discovery/test_evidence_policy.py tests/discovery/test_evidence_policy_v3.py tests/test_run_evidence_publisher.py tests/test_run_evidence_collection.py tests/test_task_s_benchmark.py tests/test_methods_pilot.py tests/test_methods_causal_pilot.py -q -p no:cacheprovider
-pytest tests -q -p no:cacheprovider
-python3.10 -m py_compile src/evaluation/methods_protocol_v3.py src/evaluation/spatial_perturbation_registry.py src/evaluation/spatial_perturbation_split.py src/evaluation/spatial_perturbation_neighbors.py src/evaluation/spatial_perturbation_scoring.py src/evaluation/spatial_perturbation_comparators.py src/evaluation/spatial_perturbation_predictor_contract.py src/evaluation/spatial_perturbation_runner.py scripts/audit_spatial_perturbation_bridge.py scripts/validate_spatial_perturbation_predictor.py
+pytest tests/test_methods_protocol_v3.py tests/test_spatial_perturbation_registry.py -q -p no:cacheprovider
+python3.10 -m py_compile src/evaluation/methods_protocol_v3.py src/evaluation/spatial_perturbation_registry.py scripts/audit_spatial_perturbation_bridge.py
 lint-imports --config .importlinter
 git diff --check
 ```
+
+The broader commands remain required only on the present-asset path that reaches
+protocol freeze and predictor audit.
 
 Record actual test counts; do not predict them.
 
 - [ ] **Step 7: Commit tracked preflight evidence only**
 
-```bash
-git add configs/hypersca_methods_v3.yaml reports/methods_protocol_v3_preflight tests/test_methods_protocol_v3.py
-git commit -m "chore: freeze methods v3 pilot identity"
-```
+On the missing-asset path, commit only the capability record, stop review,
+focused test, and this clarified plan. Do not add either forbidden output.
 
 No real pilot result tree is created in this phase.
 

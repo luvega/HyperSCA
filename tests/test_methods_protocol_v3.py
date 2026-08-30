@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
 import json
 import math
+from pathlib import Path
+import re
 from typing import cast
 
 import pytest
@@ -15,6 +17,15 @@ from src.evaluation.methods_protocol_v3 import (
     protocol_identity_v3,
     protocol_to_mapping_v3,
 )
+from src.evaluation.spatial_perturbation_registry import (
+    audit_bridge_capability,
+    load_bridge_candidates,
+    unavailable_metadata_summary,
+)
+from src.evaluation import spatial_perturbation_registry as spatial_registry
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _valid_kwargs() -> dict[str, object]:
@@ -374,3 +385,83 @@ def test_identity_is_canonical_for_equal_valid_protocols() -> None:
 
     assert protocol_identity_v3(first) == protocol_identity_v3(second)
     assert len(protocol_identity_v3(first)) == 64
+
+
+def test_task12_missing_external_cohort_stops_before_protocol_freeze_and_pilot() -> None:
+    preflight = ROOT / "reports" / "methods_protocol_v3_preflight"
+    capability_path = preflight / "bridge_capability.json"
+    review_path = preflight / "review.md"
+
+    assert {path.name for path in preflight.iterdir()} == {
+        "bridge_capability.json",
+        "review.md",
+    }
+    capability_bytes = capability_path.read_bytes()
+    capability = json.loads(capability_bytes)
+    assert set(capability) == {
+        "candidate_id",
+        "status",
+        "confirmatory_capable",
+        "biological_specimen_count",
+        "cohort_count",
+        "coverage",
+        "blocking_reasons",
+        "capability_identity_sha256",
+    }
+    assert capability["candidate_id"] == "gse274447_msafe_bridge"
+    assert capability["status"] == "assets_unavailable"
+    assert capability["confirmatory_capable"] is False
+    assert "external_cohort_missing" in capability["blocking_reasons"]
+    forbidden_scientific_fields = {
+        "effect",
+        "effects",
+        "metric",
+        "metrics",
+        "prediction",
+        "predictions",
+        "rmse",
+    }
+    assert forbidden_scientific_fields.isdisjoint(capability)
+
+    parsed = spatial_registry.bridge_capability_result_from_mapping(capability)
+    candidate = load_bridge_candidates(
+        ROOT / "configs" / "spatial_perturbation_bridge_candidates_v1.json"
+    )["gse274447_msafe_bridge"]
+    recomputed = audit_bridge_capability(
+        candidate, unavailable_metadata_summary(candidate)
+    )
+    assert parsed.to_mapping() == recomputed.to_mapping()
+    assert (
+        parsed.capability_identity_sha256
+        == recomputed.capability_identity_sha256
+    )
+    canonical_bytes = (
+        json.dumps(
+            recomputed.to_mapping(),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    assert capability_bytes == canonical_bytes
+
+    review = " ".join(review_path.read_text(encoding="utf-8").split())
+    for required_statement in (
+        "pilot_failed_no_release",
+        "external_cohort_missing",
+        "assets_unavailable",
+        "No v3 protocol config was frozen",
+        "No predictor capability audit was run",
+        "No real bridge pilot was run",
+        "no paired scientific collection exists",
+        "integrated_claim_enabled=false",
+        "separate preregistered design and protocol identity",
+    ):
+        assert required_statement in review
+
+    assert not (ROOT / "configs" / "hypersca_methods_v3.yaml").exists()
+    assert not (preflight / "predictor_capability").exists()
+    assert "$SPATIAL_PERTURB_ROOT" in review
+    assert re.search(r"/(?:home|Users)/[^/\s`]+/", review) is None
