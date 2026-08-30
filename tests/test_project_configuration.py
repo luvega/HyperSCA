@@ -28,7 +28,7 @@ def test_pyproject_defines_editable_src_package_and_test_path() -> None:
         config = tomllib.load(handle)
 
     assert config["project"]["name"] == "hypersca"
-    assert config["project"]["version"] == "0.6.1.dev0"
+    assert config["project"]["version"] == "0.7.0"
     assert config["project"]["requires-python"] == ">=3.10"
     assert config["project"]["dynamic"] == ["dependencies"]
     assert config["tool"]["setuptools"]["packages"]["find"]["include"] == ["src*"]
