@@ -93,6 +93,14 @@ def test_shared_split_is_reproducible_disjoint_and_validated():
     validate_task_c_split(first, k562, rpe1)
 
 
+def test_shared_split_reserves_public_minimum_controls_for_tuning():
+    k562, rpe1 = dataset_for_split("k562"), dataset_for_split("rpe1")
+    split = build_shared_task_c_split(k562, rpe1, seed=11, min_cells=5)
+
+    assert len(split.control_indices["k562"]["tune"]) >= 5
+    assert len(split.control_indices["rpe1"]["tune"]) >= 5
+
+
 def test_shared_split_rejects_overlapping_source_partitions():
     k562, rpe1 = dataset_for_split("k562"), dataset_for_split("rpe1")
     split = build_shared_task_c_split(k562, rpe1, seed=11)
@@ -213,10 +221,10 @@ def test_shared_split_rejects_fewer_than_five_common_sources():
         build_shared_task_c_split(k562, rpe1, seed=11)
 
 
-def test_shared_split_rejects_fewer_than_five_controls():
+def test_shared_split_rejects_too_few_controls_to_reserve_tuning_minimum():
     k562, rpe1 = dataset_for_split("k562"), dataset_for_split("rpe1")
-    k562 = replace(k562, interventions=np.asarray(["non-targeting"] * 4 + [source for source in ("A", "B", "C", "D", "E") for _ in range(5)]))
-    with pytest.raises(TaskCDataError, match="5 control"):
+    k562 = replace(k562, interventions=np.asarray(["non-targeting"] * 8 + [source for source in ("A", "B", "C", "D", "E") for _ in range(5)]))
+    with pytest.raises(TaskCDataError, match="control.*tuning|tuning.*control"):
         build_shared_task_c_split(k562, rpe1, seed=11)
 
 
